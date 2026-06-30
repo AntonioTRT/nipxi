@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Test outputs
+data_output/
+logs/
+*.log
+*.db
+*.sqlite
+
+# Reports
+reports/
+
+# NI instrument session cache
+*.nidaqmx
+*.nidcpower
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets / local config overrides
+local_settings.py
+*.env
