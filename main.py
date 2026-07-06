@@ -1,11 +1,25 @@
 """
 NIPXI - Battery Test System
-Entry point. Run this file to start the application.
+============================
+Entry point. Thin orchestration layer only.
+
+Responsibilities (this file):
+  1. Parse command-line arguments
+  2. Validate configuration
+  3. Initialize logging
+  4. Create managers (HardwareManager, ResultManager, TestExecutor)
+  5. Run the test
+  6. Handle top-level exceptions
+
+All business logic lives in the managers:
+  - HardwareManager  (test_control/hardware_manager.py)  -- device lifecycle
+  - TestExecutor     (test_control/test_executor.py)     -- test sequences
+  - ResultManager    (test_control/result_manager.py)    -- storage + reports
 
 Usage:
     python main.py
-    python main.py --config config/settings.py
-    python main.py --channels 1 2 3
+    python main.py --channels 1 2 3     # test only channels 1, 2, 3
+    python main.py --dry-run            # config validation only, no hardware
 """
 
 import argparse
@@ -13,48 +27,82 @@ import logging
 import sys
 
 from config.settings import Settings
-from utils.errors import HardwareInitError
+from config import devices as dev_cfg
+from data.logger import setup as setup_logging
+from utils.errors import HardwareInitError, ValidationError
+from utils.validators import validate_settings
+from test_control.hardware_manager import HardwareManager
+from test_control.test_executor import TestExecutor
+from test_control.result_manager import ResultManager
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="NIPXI Battery Test System")
     parser.add_argument(
-        "--config", default="config/settings.py", help="Path to settings file"
+        "--channels", nargs="+", type=int,
+        help="Channel indices to test, e.g. --channels 1 2 3"
     )
     parser.add_argument(
-        "--channels", nargs="+", type=int, help="Channel indices to test (e.g. 1 2 3)"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Run without connecting to hardware"
+        "--dry-run", action="store_true",
+        help="Validate configuration only -- do not connect to hardware"
     )
     return parser.parse_args()
 
 
-def setup_logging(settings: Settings):
-    logging.basicConfig(
-        level=getattr(logging, settings.LOG_LEVEL),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(settings.LOG_FILE),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-
-
 def main():
     args = parse_args()
-    settings = Settings()
 
-    setup_logging(settings)
+    # --- 1. Logging (before anything else so errors are captured) ----------
+    setup_logging(Settings)
     log = logging.getLogger("nipxi.main")
-    log.info("NIPXI Battery Test System starting...")
+    log.info("NIPXI %s starting.", Settings.VERSION)
 
-    # TODO: Initialize hardware interfaces
-    # TODO: Run test sequence
-    # TODO: Save and report results
+    # --- 2. Configuration validation ---------------------------------------
+    try:
+        validate_settings(Settings)
+    except ValidationError as e:
+        log.error("Configuration error: %s", e)
+        sys.exit(1)
 
-    log.info("Startup complete. Application logic not yet implemented.")
-    print("NIPXI ready. Implement test_control/ modules to run a test.")
+    if args.dry_run:
+        log.info("Dry run: configuration is valid. Exiting without connecting hardware.")
+        return
+
+    # --- 3. Hardware -------------------------------------------------------
+    hw = HardwareManager(Settings, relay_cfg=dev_cfg.RELAY_CONFIG)
+
+    try:
+        hw.connect_all()
+    except HardwareInitError as e:
+        log.error("Hardware initialization failed: %s", e)
+        sys.exit(1)
+
+    # --- 4. Run the test ---------------------------------------------------
+    result_mgr = ResultManager(settings=Settings)
+    executor   = TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)
+
+    try:
+        with result_mgr:
+            result = executor.run(channels=args.channels)
+
+        result_mgr.generate_report(result.run_id)
+
+        if result.success:
+            log.info("Test complete. %s", result.summary())
+        else:
+            log.warning("Test finished with issues. %s", result.summary())
+            sys.exit(2)
+
+    except KeyboardInterrupt:
+        log.warning("Test interrupted by user (Ctrl+C).")
+
+    except Exception as e:
+        log.error("Unexpected error: %s", e, exc_info=True)
+        sys.exit(1)
+
+    # --- 5. Shutdown -------------------------------------------------------
+    finally:
+        hw.disconnect_all()
 
 
 if __name__ == "__main__":

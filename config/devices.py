@@ -44,14 +44,33 @@ DMM_CONFIG = {
     "range_v":  10.0,
 }
 
-# Relay matrix (COM port)
+# Relay matrix -- serial (COM port)
+# Set "type": "serial" and fill in the real command strings once you have the datasheet.
+# RelayFactory.create(RELAY_CONFIG) will return a SerialRelay instance.
 RELAY_CONFIG = {
-    "port":      "COM3",
-    "baud_rate": 9600,
-    "timeout_s": 2.0,
-    "model":     "Custom",          # TODO: fill in relay matrix manufacturer/model
+    "type":         "serial",
+    "name":         "MAIN_MATRIX",
+    "port":         "COM3",
+    "baud_rate":    9600,
+    "timeout":      2.0,
     "num_channels": 8,
-    "command_open":  "OPEN {ch}\r\n",   # TODO: replace with real command format
-    "command_close": "CLOSE {ch}\r\n",  # TODO: replace with real command format
-    "command_query": "QUERY {ch}\r\n",  # TODO: replace with real command format
+    # TODO: replace these with the real protocol strings from your relay controller datasheet
+    "command_open":  "OPEN {ch}\r\n",
+    "command_close": "CLOSE {ch}\r\n",
+    "command_query": "QUERY {ch}\r\n",
+}
+
+# Relay matrix -- Ethernet (Numato RELAY32ETHRL00)
+# Set "type": "ethernet" to use EthernetRelay instead of SerialRelay.
+# RelayFactory.create(RELAY_ETH_CONFIG) will return an EthernetRelay instance.
+RELAY_ETH_CONFIG = {
+    "type":         "ethernet",
+    "driver":       "RELAY32ETHRL00",
+    "name":         "MAIN_MATRIX_ETH",
+    "ip":           "192.168.1.50",     # TODO: set to the actual relay IP address
+    "port":         23,                 # default Numato Telnet port
+    "user":         "admin",
+    "password":     "admin",
+    "timeout":      5.0,
+    "num_channels": 8,
 }

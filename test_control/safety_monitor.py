@@ -26,7 +26,8 @@ class SafetyMonitor:
         self.s = settings
         self.log = logging.getLogger("nipxi.safety")
 
-    def check(self, voltage_v: float, current_a: float, temp_c: float) -> SafetyStatus:
+    def check(self, voltage_v: float, current_a: float, temp_c) -> SafetyStatus:
+        # temp_c may be None when NTC read is not yet wired in
         """Check a single measurement point against all limits."""
 
         if voltage_v > self.s.BAT_VOLTAGE_MAX:

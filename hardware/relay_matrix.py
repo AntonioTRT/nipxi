@@ -6,10 +6,10 @@ TODO: Fill in the actual serial command protocol for your relay controller.
       Replace command templates in config/devices.py with real commands.
 """
 
-import serial
 import time
 from hardware.base import HardwareBase
 from utils.errors import RelayError
+# serial imported lazily inside connect() so the module loads without pyserial installed
 
 
 class RelayMatrix(HardwareBase):
@@ -30,15 +30,17 @@ class RelayMatrix(HardwareBase):
 
     def connect(self):
         self.log.info("Opening relay COM port: %s @ %d baud", self.port, self.baud_rate)
-        # TODO: self._serial = serial.Serial(self.port, self.baud_rate, timeout=self.timeout_s)
+        # TODO: import serial; self._serial = serial.Serial(self.port, self.baud_rate, timeout=self.timeout_s)
         self.connected = True
         self.log.info("Relay matrix connected.")
 
     def disconnect(self):
-        self.open_all()   # safe state: all relays open
-        if self._serial and self._serial.is_open:
+        if self.connected:
+            self.open_all()   # safe state: all relays open
+        if self._serial is not None and self._serial.is_open:
             self._serial.close()
         self.connected = False
+        self.log.info("Relay matrix disconnected.")
 
     def close_channel(self, channel: int):
         """Close relay for the given channel (1-based). Opens all others first."""

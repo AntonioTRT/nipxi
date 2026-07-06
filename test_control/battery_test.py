@@ -19,16 +19,19 @@ class BatteryTestSequence:
         self,
         smu,
         daq,
-        relay_matrix,
+        relay,
         safety: SafetyMonitor,
         charge_cycle: ChargeCycle,
         discharge_cycle: DischargeCycle,
         data_collector,
         settings: Settings,
+        # relay_matrix accepted as alias for backward compatibility
+        relay_matrix=None,
     ):
         self.smu = smu
         self.daq = daq
-        self.relay = relay_matrix
+        # Accept either 'relay' (new RelayBase) or legacy 'relay_matrix' kwarg
+        self.relay = relay if relay is not None else relay_matrix
         self.safety = safety
         self.charge = charge_cycle
         self.discharge = discharge_cycle
@@ -52,7 +55,7 @@ class BatteryTestSequence:
                 self.log.error("Channel %d: current not zero - skipping relay switch.", ch)
                 continue
 
-            self.relay.close_channel(ch)
+            self.relay.close(ch)
 
             try:
                 # Charge step first (standardizes SOC per protocol recommendation)
@@ -72,7 +75,7 @@ class BatteryTestSequence:
                 self.safety.emergency_stop(self.smu, self.relay, str(e))
                 break
             finally:
-                self.relay.open_channel(ch)
+                self.relay.open(ch)
 
         self.log.info("Test sequence complete.")
 

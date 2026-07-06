@@ -27,8 +27,11 @@ class DAQ(HardwareBase):
         self.connected = True
 
     def disconnect(self):
-        # TODO: self._task.close()
+        if self._task is not None:
+            # TODO: self._task.close()
+            pass
         self.connected = False
+        self.log.info("DAQ session closed: %s", self.resource)
 
     def read_channel(self, physical_channel: str) -> float:
         """Read a single analog input. Returns voltage in V."""

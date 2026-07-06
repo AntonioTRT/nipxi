@@ -2,19 +2,16 @@
 # Install with: pip install -r requirements.txt
 
 # NI instrument control
-nidaqmx>=0.9.0          # NI DAQmx (6363 DAQ)
-nidcpower>=0.9.0        # NI DC Power (SMU 4140/4139/4130)
-nidmm>=0.9.0            # NI DMM (4065)
-pyvisa>=1.13.0          # NI-VISA resource manager
+nidaqmx>=0.9.0          # NI 6363 DAQ  (hardware/daq.py)
+nidcpower>=0.9.0        # NI SMU 4140/4139/4130  (hardware/smu.py)
+nidmm>=0.9.0            # NI 4065 DMM  (test.py)
 
-# Serial communication (relay matrix COM port)
-pyserial>=3.5
+# Serial relay (COM port)
+pyserial>=3.5           # hardware/relay_serial.py, hardware/relay_matrix.py
 
-# Data handling
-pandas>=2.0.0           # CSV analysis and report tables
+# --- Future / optional ---
 
-# Plotting (optional, for report generation)
-matplotlib>=3.7.0
-
-# Utilities
-tqdm>=4.65.0            # Progress bars (optional)
+# pyvisa>=1.13.0        # Needed when hardware/pxi_rack.py is implemented
+# minisql               # Needed when data/storage_minisql.py is implemented
+# matplotlib>=3.7.0     # Needed when data/report.py plotting is implemented
+# pandas>=2.0.0         # Needed when data/report.py table output is implemented

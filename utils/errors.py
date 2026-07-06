@@ -25,8 +25,13 @@ class SafetyViolationError(NIPXIError):
     """Raised when a safety limit is exceeded. Triggers emergency stop."""
 
 
-class TimeoutError(NIPXIError):
+class NIPXITimeoutError(NIPXIError):
     """Raised when a test step exceeds its allowed duration."""
+
+
+# Alias so existing imports of TimeoutError continue to work.
+# Prefer NIPXITimeoutError in new code to avoid shadowing the Python builtin.
+TimeoutError = NIPXITimeoutError
 
 
 class ValidationError(NIPXIError):

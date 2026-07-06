@@ -30,9 +30,17 @@ def validate_current(current_a: float, settings: Settings):
 
 
 def validate_settings(settings: Settings):
-    """Sanity-check the whole settings object at startup."""
-    assert settings.NUM_CHANNELS > 0, "NUM_CHANNELS must be > 0"
-    assert settings.BAT_VOLTAGE_MIN < settings.BAT_VOLTAGE_MAX
-    assert settings.CHARGE_CURRENT_A > 0
-    assert settings.DISCHARGE_CURRENT_A > 0
-    assert settings.SAMPLE_RATE_HZ > 0
+    """Sanity-check the whole settings object at startup. Raises ValidationError on failure."""
+    if settings.NUM_CHANNELS <= 0:
+        raise ValidationError("NUM_CHANNELS must be > 0")
+    if settings.BAT_VOLTAGE_MIN >= settings.BAT_VOLTAGE_MAX:
+        raise ValidationError(
+            f"BAT_VOLTAGE_MIN ({settings.BAT_VOLTAGE_MIN}) must be < "
+            f"BAT_VOLTAGE_MAX ({settings.BAT_VOLTAGE_MAX})"
+        )
+    if settings.CHARGE_CURRENT_A <= 0:
+        raise ValidationError(f"CHARGE_CURRENT_A must be > 0, got {settings.CHARGE_CURRENT_A}")
+    if settings.DISCHARGE_CURRENT_A <= 0:
+        raise ValidationError(f"DISCHARGE_CURRENT_A must be > 0, got {settings.DISCHARGE_CURRENT_A}")
+    if settings.SAMPLE_RATE_HZ <= 0:
+        raise ValidationError(f"SAMPLE_RATE_HZ must be > 0, got {settings.SAMPLE_RATE_HZ}")
