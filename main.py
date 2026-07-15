@@ -69,7 +69,9 @@ def main():
         return
 
     # --- 3. Hardware -------------------------------------------------------
-    hw = HardwareManager(Settings, relay_cfg=dev_cfg.RELAY_CONFIG)
+    # Production relay is the Numato Ethernet module -- RELAY_CONFIG (serial)
+    # is kept only for diagnostics via test.py options 5/6/7.
+    hw = HardwareManager(Settings, relay_cfg=dev_cfg.RELAY_ETH_CONFIG)
 
     try:
         hw.connect_all()

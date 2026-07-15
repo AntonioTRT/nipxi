@@ -16,7 +16,7 @@ Usage:
     from data.storage import DataStorage
     from config.settings import Settings
 
-    hw      = HardwareManager(Settings, relay_cfg=RELAY_CONFIG)
+    hw      = HardwareManager(Settings, relay_cfg=RELAY_ETH_CONFIG)  # production: Ethernet
     storage = DataStorage(settings=Settings)
 
     executor = TestExecutor(hw=hw, storage=storage, settings=Settings)

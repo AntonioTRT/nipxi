@@ -15,7 +15,7 @@ Usage:
     from config.settings import Settings
     from config import devices as dev_cfg
 
-    hw = HardwareManager(Settings, relay_cfg=dev_cfg.RELAY_CONFIG)
+    hw = HardwareManager(Settings, relay_cfg=dev_cfg.RELAY_ETH_CONFIG)  # production: Ethernet
 
     with hw:                        # calls connect_all() / disconnect_all()
         smu   = hw.smu
@@ -64,7 +64,8 @@ class HardwareManager:
 
         Args:
             settings:   Settings class (class-level attributes, not instance).
-            relay_cfg:  RELAY_CONFIG or RELAY_ETH_CONFIG dict from config/devices.py.
+            relay_cfg:  RELAY_ETH_CONFIG (production -- Numato Ethernet relay) or
+                        RELAY_CONFIG (serial, diagnostics only) from config/devices.py.
                         The factory reads cfg["type"] to select the correct driver.
 
         Raises:
@@ -77,6 +78,13 @@ class HardwareManager:
         self._smu   = SMU(settings.PXI_RESOURCE_SMU1)
         self._daq   = DAQ(settings.PXI_RESOURCE_DAQ)
         self._relay = RelayFactory.create(relay_cfg)
+
+        relay_class = self._relay.__class__.__name__
+        if relay_cfg.get("type", "serial").lower() == "ethernet":
+            detail = f"IP: {relay_cfg.get('ip', '')}"
+        else:
+            detail = f"Port: {relay_cfg.get('port', '')}"
+        self.log.info("Selected Relay: %s  %s", relay_class, detail)
 
         # DMM is optional: used for independent voltage verification, not required for cycling
         self._dmm = None

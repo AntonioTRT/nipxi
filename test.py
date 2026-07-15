@@ -28,6 +28,62 @@ logging.disable(logging.CRITICAL)
 
 
 # =============================================================================
+# Device selection -- config-driven, works for any device dict (name -> config)
+# =============================================================================
+
+def _select_device(devices: dict, label: str):
+    """
+    Prompt the user to pick one device from a {name: config_dict} mapping.
+    Prints every configured field for each device (no hardcoded fields, so
+    PXIe/USB/VISA/COM/Ethernet/Telnet devices all display correctly).
+    Returns (name, config) or (None, None) if cancelled / invalid.
+    """
+    names = list(devices.keys())
+    print(f"\nAvailable {label}\n")
+    for i, name in enumerate(names, 1):
+        cfg = devices[name]
+        print(f"{i}. {name}")
+        for key, value in cfg.items():
+            if key == "name":
+                continue
+            print(f"   {key}: {value}")
+        print()
+    print("0. Cancel")
+
+    try:
+        raw = input("\nChoice: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return None, None
+
+    if raw == "0" or raw == "":
+        return None, None
+    try:
+        idx = int(raw) - 1
+        if idx < 0 or idx >= len(names):
+            raise ValueError()
+    except ValueError:
+        print("Invalid choice.")
+        return None, None
+
+    name = names[idx]
+    return name, devices[name]
+
+
+def _print_device_config(name: str, cfg: dict):
+    """Print the effective configuration of the device under test."""
+    print(f"\n{'-' * 60}")
+    print("  Testing Device")
+    print(f"{'-' * 60}\n")
+    print(f"Name : {name}")
+    for key, value in cfg.items():
+        if key == "name":
+            continue
+        print(f"{key}: {value}")
+    print(f"\n{'-' * 60}")
+
+
+# =============================================================================
 # Result types
 # =============================================================================
 
@@ -172,7 +228,11 @@ def test_smu():
     Step 1: Import hardware.smu.SMU and verify interface.
     Step 2: Connect to real SMU via nidcpower (if library present).
     """
-    cfg        = dev_cfg.SMU_ASSIGNMENTS.get("SMU1", {})
+    name, cfg = _select_device(dev_cfg.SMU_ASSIGNMENTS, "SMUs")
+    if cfg is None:
+        return []
+    _print_device_config(name, cfg)
+
     resource   = cfg.get("resource", Settings.PXI_RESOURCE_SMU1)
     model      = cfg.get("model", "NI-SMU")
     config_ref = f"{resource} / {model}"
@@ -200,9 +260,9 @@ def test_smu():
     try:
         import nidcpower
     except ImportError:
-        results.append(_fail("SMU", "SMU1", config_ref,
+        results.append(_fail("SMU", name, config_ref,
                              "[ERROR] SMU not detected\n"
-                             f"Configuration : SMU1\n"
+                             f"Configuration : {name}\n"
                              f"Interface     : VISA / NI-DCPower\n"
                              f"Expected      : {resource} ({model})\n"
                              "Reason        : Library 'nidcpower' not installed\n"
@@ -214,12 +274,12 @@ def test_smu():
                                      simulate=Settings.PXI_SIMULATE)
         model_id = session.instrument_model
         session.close()
-        results.append(_ok("SMU", "SMU1", config_ref, f"Detected: {model_id}"))
+        results.append(_ok("SMU", name, config_ref, f"Detected: {model_id}"))
     except Exception as e:
         desc = getattr(e, "description", str(e))
-        results.append(_fail("SMU", "SMU1", config_ref,
+        results.append(_fail("SMU", name, config_ref,
                              f"[ERROR] SMU not detected\n"
-                             f"Configuration : SMU1\n"
+                             f"Configuration : {name}\n"
                              f"Interface     : VISA / NI-DCPower\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {desc}"))
@@ -236,8 +296,13 @@ def test_dmm():
     No hardware/dmm.py module yet -- tests nidmm library connection directly.
     Reports missing module as a WARNING (not FAIL) since DMM driver is not yet written.
     """
-    resource   = Settings.PXI_RESOURCE_DMM
-    model      = dev_cfg.DMM_CONFIG.get("model", "NI-4065")
+    name, cfg = _select_device(dev_cfg.DMM_CONFIGS, "DMMs")
+    if cfg is None:
+        return []
+    _print_device_config(name, cfg)
+
+    resource   = cfg.get("resource", Settings.PXI_RESOURCE_DMM)
+    model      = cfg.get("model", "NI-4065")
     config_ref = f"{resource} / {model}"
     results    = []
 
@@ -250,9 +315,9 @@ def test_dmm():
     try:
         import nidmm
     except ImportError:
-        results.append(_fail("DMM", "DMM_01", config_ref,
+        results.append(_fail("DMM", name, config_ref,
                              "[ERROR] DMM not detected\n"
-                             f"Configuration : DMM_01\n"
+                             f"Configuration : {name}\n"
                              f"Interface     : VISA / NI-DMM\n"
                              f"Expected      : {resource} ({model})\n"
                              "Reason        : Library 'nidmm' not installed\n"
@@ -264,12 +329,12 @@ def test_dmm():
                                  simulate=Settings.PXI_SIMULATE)
         model_id = session.instrument_model
         session.close()
-        results.append(_ok("DMM", "DMM_01", config_ref, f"Detected: {model_id}"))
+        results.append(_ok("DMM", name, config_ref, f"Detected: {model_id}"))
     except Exception as e:
         desc = getattr(e, "description", str(e))
-        results.append(_fail("DMM", "DMM_01", config_ref,
+        results.append(_fail("DMM", name, config_ref,
                              f"[ERROR] DMM not detected\n"
-                             f"Configuration : DMM_01\n"
+                             f"Configuration : {name}\n"
                              f"Interface     : VISA / NI-DMM\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {desc}"))
@@ -286,8 +351,13 @@ def test_daq():
     Step 1: Import hardware.daq.DAQ and verify interface.
     Step 2: Connect to real DAQ via nidaqmx (if library present).
     """
-    resource   = Settings.PXI_RESOURCE_DAQ
-    model      = dev_cfg.DAQ_CONFIG.get("model", "NI-6363")
+    name, cfg = _select_device(dev_cfg.DAQ_CONFIGS, "DAQs")
+    if cfg is None:
+        return []
+    _print_device_config(name, cfg)
+
+    resource   = cfg.get("resource", Settings.PXI_RESOURCE_DAQ)
+    model      = cfg.get("model", "NI-6363")
     config_ref = f"{resource} / {model}"
     test_ch    = dev_cfg.BATTERY_CHANNELS[1]["daq_voltage_ch"]
     results    = []
@@ -315,9 +385,9 @@ def test_daq():
         import nidaqmx.system
         import nidaqmx.errors
     except ImportError:
-        results.append(_fail("DAQ", "DAQ_01", config_ref,
+        results.append(_fail("DAQ", name, config_ref,
                              "[ERROR] DAQ not detected\n"
-                             f"Configuration : DAQ_01\n"
+                             f"Configuration : {name}\n"
                              f"Interface     : NI-DAQmx\n"
                              f"Expected      : {resource} ({model})\n"
                              "Reason        : Library 'nidaqmx' not installed\n"
@@ -328,36 +398,36 @@ def test_daq():
         system      = nidaqmx.system.System.local()
         dev_names   = [d.name for d in system.devices]
         if not dev_names:
-            results.append(_fail("DAQ", "DAQ_01", config_ref,
+            results.append(_fail("DAQ", name, config_ref,
                                  f"[ERROR] DAQ not detected\n"
-                                 f"Configuration : DAQ_01\n"
+                                 f"Configuration : {name}\n"
                                  f"Interface     : NI-DAQmx\n"
                                  f"Expected      : {resource} ({model})\n"
                                  "Reason        : No NI-DAQmx devices found on this system"))
             return results
     except Exception as e:
-        results.append(_fail("DAQ", "DAQ_01", config_ref,
+        results.append(_fail("DAQ", name, config_ref,
                              f"NI-DAQmx system query failed: {e}"))
         return results
 
     try:
         with nidaqmx.Task() as task:
-            v_range = dev_cfg.DAQ_CONFIG.get("voltage_range_v", 5.0)
+            v_range = cfg.get("voltage_range_v", 5.0)
             task.ai_channels.add_ai_voltage_chan(test_ch,
                                                  min_val=-v_range, max_val=v_range)
             val = task.read()
-        results.append(_ok("DAQ", "DAQ_01", config_ref,
+        results.append(_ok("DAQ", name, config_ref,
                            f"Channel {test_ch} read: {val:.4f} V  "
                            f"(devices: {dev_names})"))
     except nidaqmx.errors.DaqError as e:
-        results.append(_fail("DAQ", "DAQ_01", config_ref,
+        results.append(_fail("DAQ", name, config_ref,
                              f"[ERROR] DAQ channel read failed\n"
-                             f"Configuration : DAQ_01\n"
+                             f"Configuration : {name}\n"
                              f"Channel       : {test_ch}\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {e}"))
     except Exception as e:
-        results.append(_fail("DAQ", "DAQ_01", config_ref, str(e)))
+        results.append(_fail("DAQ", name, config_ref, str(e)))
 
     return results
 
@@ -377,10 +447,14 @@ def test_relay_serial():
     Returns PASS once the port opens cleanly.
     Returns FAIL if pyserial is missing, the port is absent, or the open fails.
     """
-    cfg        = dev_cfg.RELAY_CONFIG
+    name, cfg = _select_device(dev_cfg.RELAY_SERIAL_CONFIGS, "Serial Relays")
+    if cfg is None:
+        return []
+    _print_device_config(name, cfg)
+
     port       = cfg.get("port", Settings.RELAY_COM_PORT)
     baud       = cfg.get("baud_rate", Settings.RELAY_BAUD_RATE)
-    config_ref = f"config/devices.py -> RELAY_CONFIG ({port} / {baud} baud)"
+    config_ref = f"config/devices.py -> {name} ({port} / {baud} baud)"
     results    = []
 
     # Step 1: factory + interface check  -- offline, no hardware ---------------
@@ -406,9 +480,9 @@ def test_relay_serial():
                 else:
                     results.append(_warn("Relay Serial", "Driver interface",
                                          config_ref,
-                                         "SerialRelay interface OK, but command protocol "
-                                         "is still placeholder -- fill in RELAY_CONFIG "
-                                         "command_open/close/query from your controller datasheet"))
+                                         "Serial communication works, but protocol commands "
+                                         "are not implemented because production hardware is "
+                                         "Ethernet."))
     except Exception as e:
         results.append(_fail("Relay Serial", "Factory", config_ref,
                              f"Import / factory error: {e}"))
@@ -419,7 +493,7 @@ def test_relay_serial():
         import serial
         import serial.tools.list_ports
     except ImportError:
-        results.append(_fail("Relay Serial", "RELAY_SERIAL_01", config_ref,
+        results.append(_fail("Relay Serial", name, config_ref,
                              "[ERROR] Relay not detected\n"
                              f"Port   : {port}\n"
                              "Reason : Library 'pyserial' not installed\n"
@@ -428,7 +502,7 @@ def test_relay_serial():
 
     available = [p.device for p in serial.tools.list_ports.comports()]
     if port not in available:
-        results.append(_fail("Relay Serial", "RELAY_SERIAL_01", config_ref,
+        results.append(_fail("Relay Serial", name, config_ref,
                              f"[ERROR] Relay not detected\n"
                              f"Port           : {port}\n"
                              f"Available ports: {available if available else 'none'}\n"
@@ -438,38 +512,111 @@ def test_relay_serial():
     try:
         with serial.Serial(port, baud,
                            timeout=cfg.get("timeout", Settings.RELAY_TIMEOUT_S)) as _:
-            results.append(_ok("Relay Serial", "RELAY_SERIAL_01", config_ref,
+            results.append(_ok("Relay Serial", name, config_ref,
                                f"Port {port} opened at {baud} baud -- hardware present"))
     except serial.SerialException as e:
-        results.append(_fail("Relay Serial", "RELAY_SERIAL_01", config_ref,
+        results.append(_fail("Relay Serial", name, config_ref,
                              f"[ERROR] Could not open {port}: {e}"))
     except Exception as e:
-        results.append(_fail("Relay Serial", "RELAY_SERIAL_01", config_ref, str(e)))
+        results.append(_fail("Relay Serial", name, config_ref, str(e)))
 
     return results
 
 
 # =============================================================================
-# 5b. Relay -- Ethernet (Numato RELAY32ETHRL00)
+# 5b. Relay -- Ethernet (Numato RELAY32ETHRL00) -- shared diagnostics helpers
 # =============================================================================
+
+def _ping_host(host: str, timeout_s: float = 1.0):
+    """
+    ICMP ping (single echo request). Returns (ok, detail).
+    Uses the platform ping binary -- no extra dependency required.
+    """
+    import subprocess
+    if not host:
+        return False, "No IP configured"
+    timeout_ms = max(1, int(timeout_s * 1000))
+    if sys.platform.startswith("win"):
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(max(1, int(timeout_s))), host]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 2)
+        if proc.returncode == 0:
+            return True, f"{host} reachable"
+        return False, f"{host} unreachable (no ICMP reply)"
+    except Exception as e:
+        return False, f"ping failed to execute: {e}"
+
+
+def _check_web_interface(host: str, port: int = 80, timeout_s: float = 2.0):
+    """
+    Best-effort HTTP reachability check for the relay's built-in web UI.
+    A successful TCP connect + HTTP response (any status code) counts as reachable --
+    we're checking the interface exists, not asserting page content.
+    """
+    import http.client
+    if not host:
+        return False, "No IP configured"
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        status = resp.status
+        conn.close()
+        return True, f"HTTP connection successful (status {status})"
+    except Exception as e:
+        return False, f"HTTP connection failed: {e}"
+
+
+def _classify_relay_error(e: Exception) -> str:
+    """
+    Map a raw relay exception to one of the standardized, actionable
+    diagnostic reasons requested for commissioning: network / auth /
+    protocol / timeout.
+    """
+    msg = str(e)
+    if "Login failed" in msg or "Timeout during login" in msg:
+        return "Authentication failed"
+    if "invalid response" in msg:
+        return f"Relay read returned invalid response ({msg.splitlines()[-1]})"
+    if "command timeout" in msg:
+        return f"Device reachable but relay command timeout ({msg.splitlines()[-1]})"
+    if "not reachable" in msg or "refused" in msg.lower() or "timeout" in msg.lower():
+        return f"Device unreachable ({msg.splitlines()[-1]})"
+    return msg.splitlines()[-1] if msg else "Unknown error"
+
 
 def test_relay_eth():
     """
-    Tests the Ethernet relay driver (hardware/relay_eth.py via RelayFactory).
+    Real commissioning test for the Numato Lab 32-Channel Ethernet Relay
+    Module (hardware/relay_eth.py via RelayFactory).
 
     Step 1: Verify factory + module interface (RelayBase subclass, all methods present).
-    Step 2: Attempt TCP connection + Telnet login to the configured relay IP.
-    Step 3: If connected, open ch1, close ch1, query ch1, then disconnect.
+    Step 2: Ping the configured IP -- network-layer reachability, before any TCP/Telnet attempt.
+    Step 3: Check the relay's web interface (HTTP) -- confirms the unit is alive on the LAN.
+    Step 4: Connect (TCP) + authenticate (Telnet login from RELAY_ETH_CONFIG) -- reported
+            as two distinct steps so auth failures are never confused with network failures.
+    Step 5: Relay 1 command protocol -- READ, ON, OFF (each command and its response
+            reported independently).
+    Step 6: Disconnect (leaving relay 1 open / safe).
 
-    Returns PASS if all steps succeed.
-    Returns FAIL if the host is unreachable, login fails, or a command errors.
+    Every step is reported PASS/WARN/FAIL independently -- a failure at any step does
+    not stop later steps from being attempted where it is safe to do so. Failure
+    reasons are classified (network / authentication / protocol / timeout) via
+    _classify_relay_error() so commissioning engineers get an actionable diagnosis
+    instead of a bare exception.
     """
-    cfg        = dev_cfg.RELAY_ETH_CONFIG
+    name, cfg = _select_device(dev_cfg.RELAY_ETH_CONFIGS, "Ethernet Relays")
+    if cfg is None:
+        return []
+    _print_device_config(name, cfg)
+
     host       = cfg.get("ip", "")
     port       = cfg.get("port", 23)
     driver     = cfg.get("driver", "RELAY32ETHRL00")
-    name       = cfg.get("name", "ETH_RELAY")
-    config_ref = f"config/devices.py -> RELAY_ETH_CONFIG ({driver} / {host}:{port})"
+    user       = cfg.get("username", cfg.get("user", ""))
+    config_ref = f"config/devices.py -> {name} ({driver} / {host}:{port})"
     results    = []
 
     # Step 1: factory + interface check  -- offline, no hardware ---------------
@@ -495,46 +642,177 @@ def test_relay_eth():
                              f"Import / factory error: {e}"))
         return results
 
-    # Step 2: connection -------------------------------------------------------
+    # Step 2: ping -- network layer, before attempting TCP/Telnet ---------------
+    ping_ok, ping_detail = _ping_host(host)
+    if ping_ok:
+        results.append(_ok("Relay Ethernet", "Ping", config_ref, f"{host} reachable"))
+    else:
+        results.append(_warn("Relay Ethernet", "Ping", config_ref,
+                             f"Reason:\n{ping_detail} "
+                             "(ICMP may be blocked -- Telnet may still succeed)"))
+
+    # Step 3: web interface reachability -----------------------------------------
+    web_ok, web_detail = _check_web_interface(host)
+    if web_ok:
+        results.append(_ok("Relay Ethernet", "Web Interface", config_ref, web_detail))
+    else:
+        results.append(_warn("Relay Ethernet", "Web Interface", config_ref,
+                             f"Reason:\n{web_detail}"))
+
+    # Step 4: connection + authentication ----------------------------------------
+    # relay.connect() performs the TCP connect *and* the Telnet login in one
+    # call -- report them as two lines by classifying the failure reason.
     try:
         relay.connect()
     except Exception as e:
-        # Relay unreachable -- format matches the standardized error block
-        first_line = str(e).splitlines()[0] if str(e) else "Unknown error"
-        results.append(_fail("Relay Ethernet", "RELAY_ETH_01", config_ref,
-                             f"[ERROR] Relay controller not reachable\n"
-                             f"Driver : {driver}\n"
-                             f"Host   : {host}:{port}\n"
-                             f"Reason : {first_line}"))
+        reason = _classify_relay_error(e)
+        if reason == "Authentication failed":
+            results.append(_ok("Relay Ethernet", "Ethernet Connection", config_ref,
+                               f"TCP connected to {driver} at {host}:{port}"))
+            results.append(_fail("Relay Ethernet", "Authentication", config_ref,
+                                 f"Reason:\n{reason} (user='{user}')"))
+        else:
+            results.append(_fail("Relay Ethernet", "Ethernet Connection", config_ref,
+                                 f"Reason:\n{reason}"))
+            results.append(_fail("Relay Ethernet", "Authentication", config_ref,
+                                 "Reason:\nNot attempted -- connection failed"))
         return results
 
-    results.append(_ok("Relay Ethernet", "Connection", config_ref,
-                       f"Connected to {driver} at {host}:{port}"))
+    results.append(_ok("Relay Ethernet", "Ethernet Connection", config_ref,
+                       f"TCP connected to {driver} at {host}:{port}"))
+    results.append(_ok("Relay Ethernet", "Authentication", config_ref,
+                       f"Telnet login OK (user='{user}')"))
 
-    # Step 3: functional relay test  -- open, close, query ch1 ----------------
+    # Step 5: relay 1 command protocol -- READ, ON, OFF --------------------------
+    # Each command is tried independently so one failure doesn't hide the rest.
     test_ch = 1
+
     try:
-        relay.open(test_ch)
-        results.append(_ok("Relay Ethernet", f"open(ch{test_ch})", config_ref,
-                           f"open({test_ch}) sent OK"))
-
-        relay.close(test_ch)
-        results.append(_ok("Relay Ethernet", f"close(ch{test_ch})", config_ref,
-                           f"close({test_ch}) sent OK"))
-
-        state = relay.query(test_ch)
-        state_str = "closed (energized)" if state else "open (de-energized)"
-        results.append(_ok("Relay Ethernet", f"query(ch{test_ch})", config_ref,
-                           f"query({test_ch}) -> {state_str}"))
-
-        relay.open(test_ch)   # leave in safe state
-        results.append(_ok("Relay Ethernet", "Safe state", config_ref,
-                           f"ch{test_ch} returned to open state after test"))
+        state = relay.read(test_ch)   # "relay read 1"
+        results.append(_ok("Relay Ethernet", f"Relay {test_ch} READ", config_ref,
+                           f"relay read {test_ch} -> {'ON' if state else 'OFF'}"))
     except Exception as e:
-        results.append(_fail("Relay Ethernet", f"Command ch{test_ch}", config_ref,
-                             f"Relay command failed: {e}"))
-    finally:
+        results.append(_fail("Relay Ethernet", f"Relay {test_ch} READ", config_ref,
+                             f"Reason:\n{_classify_relay_error(e)}"))
+
+    try:
+        relay.close(test_ch)          # "relay on 1"
+        results.append(_ok("Relay Ethernet", f"Relay {test_ch} ON", config_ref,
+                           f"relay on {test_ch} sent OK"))
+    except Exception as e:
+        results.append(_fail("Relay Ethernet", f"Relay {test_ch} ON", config_ref,
+                             f"Reason:\n{_classify_relay_error(e)}"))
+
+    try:
+        relay.open(test_ch)           # "relay off 1"
+        results.append(_ok("Relay Ethernet", f"Relay {test_ch} OFF", config_ref,
+                           f"relay off {test_ch} sent OK"))
+    except Exception as e:
+        results.append(_fail("Relay Ethernet", f"Relay {test_ch} OFF", config_ref,
+                             f"Reason:\n{_classify_relay_error(e)}"))
+
+    # Step 6: disconnect ----------------------------------------------------------
+    try:
         relay.disconnect()
+        results.append(_ok("Relay Ethernet", "Disconnect", config_ref,
+                           f"Disconnected from {host}:{port}"))
+    except Exception as e:
+        results.append(_warn("Relay Ethernet", "Disconnect", config_ref, str(e)))
+
+    return results
+
+
+# =============================================================================
+# 5c. Relay -- Ethernet full matrix scan (commissioning)
+# =============================================================================
+
+def test_relay_matrix_scan():
+    """
+    Commissioning test: exercises every configured channel of the Numato
+    Ethernet relay module -- ON, READ, OFF -- one connection for the whole scan.
+
+    Before scanning, device availability is verified (ping + connect/auth) --
+    the scan itself only starts once the device is confirmed reachable and
+    authenticated.
+
+    Channel count comes from config/devices.py RELAY_ETH_CONFIG["channel_count"]
+    (falls back to "num_channels" for compat -- never hardcoded). A failure on
+    any single channel is recorded as FAIL and the scan continues to the
+    remaining channels -- it never aborts early.
+    """
+    name, cfg = _select_device(dev_cfg.RELAY_ETH_CONFIGS, "Ethernet Relays")
+    if cfg is None:
+        return []
+    _print_device_config(name, cfg)
+
+    host         = cfg.get("ip", "")
+    port         = cfg.get("port", 23)
+    driver       = cfg.get("driver", "RELAY32ETHRL00")
+    user         = cfg.get("username", cfg.get("user", ""))
+    num_channels = cfg.get("channel_count", cfg.get("num_channels", 8))
+    config_ref   = f"config/devices.py -> {name} ({driver} / {host}:{port}, {num_channels} ch)"
+    results      = []
+
+    try:
+        from hardware.relay_factory import RelayFactory
+        relay = RelayFactory.create(cfg)
+    except Exception as e:
+        results.append(_fail("Relay Matrix Scan", "Factory", config_ref,
+                             f"Import / factory error: {e}"))
+        return results
+
+    # Pre-scan device availability check -----------------------------------------
+    ping_ok, ping_detail = _ping_host(host)
+    if ping_ok:
+        results.append(_ok("Relay Matrix Scan", "Device Availability -- Ping",
+                           config_ref, f"{host} reachable"))
+    else:
+        results.append(_warn("Relay Matrix Scan", "Device Availability -- Ping",
+                             config_ref,
+                             f"Reason:\n{ping_detail} (ICMP may be blocked -- "
+                             "Telnet may still succeed)"))
+
+    try:
+        relay.connect()
+    except Exception as e:
+        reason = _classify_relay_error(e)
+        results.append(_fail("Relay Matrix Scan", "Device Availability -- Connect + Auth",
+                             config_ref, f"Reason:\n{reason}"))
+        results.append(_fail("Relay Matrix Scan", "Scan aborted", config_ref,
+                             "Reason:\nDevice not available -- channel scan was not started"))
+        return results
+
+    results.append(_ok("Relay Matrix Scan", "Device Availability -- Connect + Auth",
+                       config_ref, f"Connected and authenticated to {driver} at "
+                       f"{host}:{port} (user='{user}')"))
+
+    # Full channel scan -- ON, READ, OFF per channel ------------------------------
+    try:
+        for ch in range(1, num_channels + 1):
+            try:
+                relay.close(ch)              # ON
+                state = relay.read(ch)       # READ
+                relay.open(ch)                # OFF
+                if state:
+                    results.append(_ok("Relay Matrix Scan", f"Relay {ch}", config_ref,
+                                       "ON -> READ -> OFF  OK  (READ reported ON)"))
+                else:
+                    results.append(_warn("Relay Matrix Scan", f"Relay {ch}", config_ref,
+                                         "ON -> READ -> OFF sent, but READ reported OFF "
+                                         "-- verify wiring/relay bank"))
+            except Exception as e:
+                results.append(_fail("Relay Matrix Scan", f"Relay {ch}", config_ref,
+                                     f"Reason:\n{_classify_relay_error(e)}"))
+            finally:
+                try:
+                    relay.open(ch)   # leave each channel in the safe state
+                except Exception:
+                    pass
+    finally:
+        try:
+            relay.disconnect()
+        except Exception as e:
+            results.append(_warn("Relay Matrix Scan", "Disconnect", config_ref, str(e)))
 
     return results
 
@@ -895,15 +1173,69 @@ def preflight_check():
 
 
 # =============================================================================
+# 0. Main Test -- real commissioning run via HardwareManager / TestExecutor
+# =============================================================================
+
+def run_main_test():
+    """
+    Real commissioning run: loads config/settings.py + config/devices.py,
+    builds HardwareManager, and executes the configured test sequence via
+    TestExecutor / ResultManager (same path as main.py).
+    """
+    print("RUNNING MAIN TEST")
+
+    from test_control.hardware_manager import HardwareManager
+    from test_control.test_executor import TestExecutor
+    from test_control.result_manager import ResultManager
+    from utils.errors import HardwareInitError
+
+    # Production relay is the Numato Ethernet module -- RELAY_CONFIG (serial)
+    # is kept only for diagnostics via menu options 5/6/7.
+    smu_name, smu_cfg   = next(iter(dev_cfg.SMU_ASSIGNMENTS.items()))
+    dmm_name, dmm_cfg   = next(iter(dev_cfg.DMM_CONFIGS.items()))
+    daq_name, daq_cfg   = next(iter(dev_cfg.DAQ_CONFIGS.items()))
+    relay_cfg           = dev_cfg.RELAY_ETH_CONFIG
+    relay_name          = relay_cfg.get("name", "RELAY")
+
+    print("\nSelected Hardware\n")
+    print(f"SMU:\n  {smu_name}\n  {smu_cfg.get('resource', '')}\n")
+    print(f"DMM:\n  {dmm_name}\n  {dmm_cfg.get('resource', '')}\n")
+    print(f"Relay:\n  {relay_name}\n  {relay_cfg.get('ip', '')}\n")
+    print(f"DAQ:\n  {daq_name}\n  {daq_cfg.get('resource', '')}\n")
+
+    hw = HardwareManager(Settings, relay_cfg=relay_cfg)
+
+    try:
+        hw.connect_all()
+    except HardwareInitError as e:
+        print(f"[FAIL] Hardware initialization failed: {e}")
+        return
+
+    try:
+        result_mgr = ResultManager(settings=Settings)
+        executor   = TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)
+
+        with result_mgr:
+            result = executor.run()
+
+        result_mgr.generate_report(result.run_id)
+        print(result.summary())
+    finally:
+        hw.disconnect_all()
+
+
+# =============================================================================
 # Menu
 # =============================================================================
 
 MENU = [
+    ("Run Main Test",                 run_main_test),
     ("Test SMU (PSU)",                test_smu),
     ("Test DMM",                      test_dmm),
     ("Test DAQ",                      test_daq),
     ("Test Relay -- Serial",          test_relay_serial),
     ("Test Relay -- Ethernet",        test_relay_eth),
+    ("Test Relay -- Ethernet Matrix Scan", test_relay_matrix_scan),
     ("Test Electronic Load",          test_electronic_load),
     ("Test Sensors (NTC)",            test_sensors),
     ("Test Safety Monitor",           test_safety_monitor),
@@ -967,9 +1299,14 @@ def main():
         return
 
     label, fn = MENU[idx]
-    if fn is None:
+    if fn is run_main_test:
+        print(f"\n{'-' * 60}")
+        print(f"  {label}")
+        print(f"{'-' * 60}")
+        fn()
+    elif fn is None:
         all_results = list(config_results)
-        for lbl, f in MENU[:-1]:
+        for lbl, f in MENU[1:-1]:
             all_results.extend(run_section(lbl, f))
         print_summary(all_results)
     else:

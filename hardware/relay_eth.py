@@ -26,12 +26,13 @@ Configuration keys (from config/devices.py RELAY_ETH_CONFIG):
     type          "ethernet"
     driver        "RELAY32ETHRL00"  (informational label)
     name          human-readable label, e.g. "MAIN_MATRIX_ETH"
-    ip            IP address string, e.g. "192.168.1.50"
+    ip            IP address string, e.g. "169.254.1.1"
     port          TCP port integer, default 23
-    user          Telnet username, default "admin"
+    username      Telnet username, default "admin"  ("user" also accepted for compat)
     password      Telnet password, default "admin"
     timeout       float seconds for socket operations, default 5.0
-    num_channels  integer, default 8
+    num_channels  integer, default 8  -- 32 for the real Numato 32-ch module
+    channel_count alias for num_channels (checked first if both are present)
 
 Extension notes:
     If Numato releases a module with a different login prompt, adjust
@@ -60,13 +61,13 @@ class EthernetRelay(RelayBase):
 
     def __init__(self, cfg: dict):
         name = cfg.get("name", "ETH_RELAY")
-        num_channels = cfg.get("num_channels", 8)
+        num_channels = cfg.get("channel_count", cfg.get("num_channels", 8))
         super().__init__(name, num_channels)
 
         self._driver   = cfg.get("driver", "RELAY32ETHRL00")
         self._host     = cfg.get("ip", "")
         self._port     = int(cfg.get("port", self.DEFAULT_PORT))
-        self._user     = cfg.get("user", self.DEFAULT_USER)
+        self._user     = cfg.get("username", cfg.get("user", self.DEFAULT_USER))
         self._password = cfg.get("password", self.DEFAULT_PASSWORD)
         self._timeout  = float(cfg.get("timeout", 5.0))
         self._sock: socket.socket | None = None
@@ -137,24 +138,52 @@ class EthernetRelay(RelayBase):
     def open(self, channel: int):
         """De-energize relay: "relay off N"."""
         self._validate_channel(channel)
-        self._send_cmd(f"relay off {self._ch_str(channel)}")
+        try:
+            self._send_cmd(f"relay off {self._ch_str(channel)}")
+        except NIPXITimeoutError as e:
+            raise NIPXITimeoutError(
+                f"Device reachable but relay command timeout "
+                f"(relay off {channel})"
+            ) from e
         self.log.debug("Relay open ch%d (%s)", channel, self._ch_str(channel))
 
     def close(self, channel: int):
         """Energize relay: "relay on N"."""
         self._validate_channel(channel)
-        self._send_cmd(f"relay on {self._ch_str(channel)}")
+        try:
+            self._send_cmd(f"relay on {self._ch_str(channel)}")
+        except NIPXITimeoutError as e:
+            raise NIPXITimeoutError(
+                f"Device reachable but relay command timeout "
+                f"(relay on {channel})"
+            ) from e
         self.log.debug("Relay close ch%d (%s)", channel, self._ch_str(channel))
 
     def query(self, channel: int) -> bool:
         """Return True if relay is closed. Uses "relay read N" command."""
         self._validate_channel(channel)
-        self._send_raw(f"relay read {self._ch_str(channel)}\r\n".encode())
-        response = self._read_until(b">")
+        try:
+            self._send_raw(f"relay read {self._ch_str(channel)}\r\n".encode())
+            response = self._read_until(b">")
+        except NIPXITimeoutError as e:
+            raise NIPXITimeoutError(
+                f"Device reachable but relay command timeout "
+                f"(relay read {channel})"
+            ) from e
         # Response contains the echoed command + "on\r\n>" or "off\r\n>"
-        # Strip everything after the last prompt marker and look for "on"
+        # Strip everything after the last prompt marker and look for "on"/"off"
         text = re.split(rb"[>&]", response)[0].decode(errors="replace").lower()
-        return "on" in text
+        if "on" in text:
+            return True
+        if "off" in text:
+            return False
+        raise RelayError(
+            f"Relay read returned invalid response for channel {channel}: {text.strip()!r}"
+        )
+
+    def read(self, channel: int) -> bool:
+        """Alias for query() -- matches the manufacturer's "relay read N" naming."""
+        return self.query(channel)
 
     def open_all(self):
         """

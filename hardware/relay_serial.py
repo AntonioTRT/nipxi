@@ -64,6 +64,15 @@ class SerialRelay(RelayBase):
     def connect(self):
         self.log.info("Opening serial relay %s on %s @ %d baud",
                       self.name, self._port, self._baud)
+        if self._uses_placeholder_protocol():
+            self.log.warning(
+                "Serial communication works, but protocol commands are not "
+                "implemented because production hardware is Ethernet. "
+                "(relay %s -- fill in RELAY_CONFIG command_open/close/query "
+                "from the controller datasheet if Serial is ever promoted "
+                "to production.)",
+                self.name,
+            )
         try:
             import serial as _serial
         except ImportError as e:
@@ -128,6 +137,14 @@ class SerialRelay(RelayBase):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _uses_placeholder_protocol(self) -> bool:
+        """True if RELAY_CONFIG still has the default OPEN/CLOSE/QUERY strings."""
+        return (
+            self._cmd_open == "OPEN {ch}\r\n"
+            and self._cmd_close == "CLOSE {ch}\r\n"
+            and self._cmd_query == "QUERY {ch}\r\n"
+        )
 
     def _send_cmd(self, cmd: str, expect_reply: bool = False) -> str:
         if self._serial is None or not self._serial.is_open:
