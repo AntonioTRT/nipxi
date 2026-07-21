@@ -115,9 +115,24 @@ def main():
         log.error("Unexpected error: %s", e, exc_info=True)
         sys.exit(1)
 
-    # --- 5. Shutdown -------------------------------------------------------
+    # --- 5. Shutdown ---------------------------------------------------------
+    # Always attempted, no matter how the try block above exits (normal
+    # completion, KeyboardInterrupt, any other exception) -- Python's
+    # finally always runs. disconnect_all() itself never raises by design
+    # (every step is individually caught and logged), but this is wrapped
+    # defensively anyway so a shutdown failure is never silently lost or
+    # allowed to replace/mask the exception already propagating -- see
+    # docs/architecture.md "Emergency Shutdown Strategy".
     finally:
-        hw.disconnect_all()
+        try:
+            hw.disconnect_all()
+        except Exception as shutdown_err:
+            log.critical(
+                "Hardware shutdown during exit failed: %s. Hardware may still "
+                "be energized -- physically disconnect power if this cannot "
+                "be resolved immediately.", shutdown_err, exc_info=True,
+            )
+            sys.exit(1)
 
 
 if __name__ == "__main__":

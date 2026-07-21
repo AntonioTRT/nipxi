@@ -166,6 +166,15 @@ Ordered by priority. Items marked [MUST] are required before first hardware run.
   (Numato reference script) are dead/reference-only code -- neither is imported or
   wired into `RelayFactory`; `NumatoRelayMatrix` is the single enforcement point for
   Numato relay state changes
+- [DONE] Emergency Shutdown Strategy implemented end-to-end (design principle:
+  unknown relay state = unsafe state): startup forces+verifies all-off
+  (`HardwareManager.connect_all()`, aborts startup on failure), any relay
+  verification/communication failure triggers `NumatoRelayMatrix._emergency_all_off()`
+  before the exception propagates, `SafetyMonitor.emergency_stop()` and
+  `HardwareManager.disconnect_all()` log CRITICAL (not just a warning) if their
+  own force-off fails, and an `atexit`-registered backstop in `HardwareManager`
+  covers exit paths that bypass the normal `finally:` shutdown. See
+  `docs/architecture.md` Section 6d.
 - [DONE] `data/storage.py` — StorageBackend ABC, DataStorage (SQLite + CSV), query()
 - [DONE] `utils/validators.py` — validate_settings() with proper if/raise
 - [DONE] `utils/errors.py` — NIPXITimeoutError, full exception hierarchy

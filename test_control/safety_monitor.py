@@ -52,7 +52,13 @@ class SafetyMonitor:
         """
         Execute emergency stop sequence:
           1. Disable SMU output
-          2. Open all relays
+          2. Open all relays (force OFF + verify -- see
+             docs/architecture.md "Emergency Shutdown Strategy". The relay
+             driver has already made its own internal emergency-shutdown
+             attempt by the time open_all() can still raise here -- see
+             NumatoRelayMatrix.verify_all()/_emergency_all_off() -- so a
+             failure at this point is a second failed attempt and is logged
+             as CRITICAL.)
         Mirrors the 'Safe shutdown' node in the VI flowchart.
         """
         self.log.error("EMERGENCY STOP: %s", reason)
@@ -63,5 +69,9 @@ class SafetyMonitor:
         try:
             relay_matrix.open_all()
         except Exception as e:
-            self.log.error("Relay open-all failed during e-stop: %s", e)
+            self.log.critical(
+                "Relay open-all FAILED during e-stop: %s. Hardware may still be "
+                "energized -- physically disconnect power if this cannot be "
+                "resolved immediately.", e,
+            )
         self.log.warning("Emergency stop complete.")

@@ -1733,7 +1733,16 @@ def run_main_test():
         result_mgr.generate_report(result.run_id)
         print(result.summary())
     finally:
-        hw.disconnect_all()
+        # Always attempted (Python's finally always runs, including on
+        # KeyboardInterrupt/any exception above) -- see docs/architecture.md
+        # "Emergency Shutdown Strategy". Wrapped defensively so a shutdown
+        # failure is reported clearly instead of silently lost.
+        try:
+            hw.disconnect_all()
+        except Exception as shutdown_err:
+            print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+            print("           Hardware may still be energized -- "
+                  "physically disconnect power if this cannot be resolved immediately.")
 
 
 # =============================================================================

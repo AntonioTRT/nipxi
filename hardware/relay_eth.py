@@ -108,6 +108,51 @@ Telnet layer guarantees:
       every write in the public open()/close() path is verified against a
       subsequent relay read/readall before the call returns.
 
+=====================================================================
+Emergency Shutdown Strategy
+=====================================================================
+Design principle: an unknown relay state is an unsafe state. Therefore,
+whenever this driver cannot POSITIVELY CONFIRM the relay bank is in the
+state it is supposed to be in, its reflex is to force every relay off and
+verify that, rather than propagate an exception while leaving hardware in
+whatever state it happened to be in. FAIL SAFE, never fail-and-leave-
+energized.
+
+This is implemented at the lowest level that can still communicate with
+the hardware, so it applies uniformly no matter which higher-level call
+triggered the failure:
+
+  - verify_single()/verify_all() mismatch (the relay didn't reach the
+    state we just commanded, or the bank doesn't match what we expect) --
+    _emergency_all_off() is attempted BEFORE the RelayStateVerificationError
+    is raised; its outcome (succeeded / failed) is appended to the message.
+  - _call_with_reconnect() terminal failure (communication error and the
+    one permitted reconnect attempt also fails, or the retried command
+    fails again after a successful reconnect) -- same _emergency_all_off()
+    attempt before the RelayError propagates.
+  - Authentication failure during a reconnect attempt -- covered by the
+    same _call_with_reconnect() path above; a failure during the VERY
+    FIRST connect() (no prior session) has nothing to force off yet, so no
+    emergency attempt is meaningful there.
+
+_emergency_all_off() is a single, non-recursive, best-effort attempt
+(native "relay writeall 00.../relay readall", called directly, never
+through write_all()/read_all()/verify_all()) -- it can never itself trigger
+another emergency attempt. It NEVER raises a normal exception; it returns
+True/False so the ORIGINAL failure is always what the caller sees, now
+annotated with whether hardware was actually made safe. If the emergency
+attempt also fails (most commonly: no working connection at all), that is
+logged as CRITICAL, explicitly stating hardware may still be energized --
+there is no way to force relay state from software with zero communication
+path, and this is reported honestly rather than silently swallowed.
+
+This driver-level reflex is the innermost layer of a multi-layer strategy;
+the outer layers (startup safe-state enforcement, application-exit
+protection, and BatteryTestSequence/SafetyMonitor's own emergency_stop())
+are documented in docs/architecture.md's "Emergency Shutdown Strategy"
+section and test_control/hardware_manager.py / test_control/
+safety_monitor.py.
+
 Configuration keys (from config/devices.py NUMATO_RELAY_MATRIX_CONFIG --
 the config dict itself, and its "name" field, are unaffected by this class
 being renamed; "type": "ethernet" is the RelayFactory dispatch key and is
@@ -453,7 +498,12 @@ class NumatoRelayMatrix(RelayBase):
     def verify_single(self, relay_number: int, expected_state: bool):
         """
         Individual verification per spec: uses "relay read <n>" (not readall).
-        Raises RelayStateVerificationError and stops on mismatch.
+        Raises RelayStateVerificationError and stops on mismatch -- but
+        FIRST attempts an emergency all-off (see _emergency_all_off() /
+        the module docstring's "Emergency Shutdown Strategy" section),
+        since a mismatch here means the bank is in an unknown/unexpected
+        state. The original mismatch is always what gets raised; the
+        emergency attempt's own outcome is appended to the message.
         """
         actual = self.read_relay(relay_number)
         if actual != expected_state:
@@ -461,10 +511,15 @@ class NumatoRelayMatrix(RelayBase):
                 "Verification: FAIL  Relay: %d  Expected: %s  Actual: %s",
                 relay_number, "ON" if expected_state else "OFF", "ON" if actual else "OFF",
             )
+            shutdown_ok = self._emergency_all_off(
+                f"relay {relay_number} verification mismatch (expected "
+                f"{'ON' if expected_state else 'OFF'}, got {'ON' if actual else 'OFF'})"
+            )
             raise RelayStateVerificationError(
                 f"Relay {relay_number} verification FAILED: expected "
                 f"{'ON' if expected_state else 'OFF'}, got {'ON' if actual else 'OFF'}. "
-                f"Execution stopped."
+                f"Execution stopped. Emergency shutdown "
+                f"{'succeeded -- all relays forced OFF and confirmed.' if shutdown_ok else 'FAILED -- hardware may still be energized. Physically disconnect power.'}"
             )
 
     def verify_all(self, expected_mask: int):
@@ -472,7 +527,10 @@ class NumatoRelayMatrix(RelayBase):
         Global verification per spec: uses "relay readall". Detects
         unexpected relay states and multiple relays active simultaneously
         in a single round trip. Raises RelayStateVerificationError and
-        stops on mismatch.
+        stops on mismatch -- but FIRST attempts an emergency all-off (see
+        _emergency_all_off() / the module docstring's "Emergency Shutdown
+        Strategy" section). The original mismatch is always what gets
+        raised; the emergency attempt's own outcome is appended.
         """
         mask = self.read_all()
         if mask != expected_mask:
@@ -482,11 +540,16 @@ class NumatoRelayMatrix(RelayBase):
                 "Active channels: %s",
                 digits, expected_mask, digits, mask, self._mask_to_channels(mask),
             )
+            shutdown_ok = self._emergency_all_off(
+                f"relay bank verification mismatch (expected mask "
+                f"0x{expected_mask:0{digits}X}, got 0x{mask:0{digits}X})"
+            )
             raise RelayStateVerificationError(
                 f"Relay bank verification FAILED: expected mask "
                 f"0x{expected_mask:0{digits}X} (active: {self._mask_to_channels(expected_mask)}), "
                 f"got 0x{mask:0{digits}X} (active: {self._mask_to_channels(mask)}). "
-                f"Execution stopped."
+                f"Execution stopped. Emergency shutdown "
+                f"{'succeeded -- all relays forced OFF and confirmed.' if shutdown_ok else 'FAILED -- hardware may still be energized. Physically disconnect power.'}"
             )
 
     # ------------------------------------------------------------------
@@ -584,6 +647,15 @@ class NumatoRelayMatrix(RelayBase):
         in open()/close() is always independently re-verified by a
         subsequent hardware readback regardless of whether a reconnect
         happened in between.
+
+        If BOTH the retry and the reconnect itself fail, this is a terminal
+        communication breakdown -- see the module docstring's "Emergency
+        Shutdown Strategy" section. An emergency all-off is attempted before
+        the exception propagates (best-effort: with no working connection,
+        it will usually also fail, which is logged as CRITICAL rather than
+        silently swallowed -- there is no way to force hardware off in
+        software with no communication path, so this is reported honestly
+        instead of pretending otherwise).
         """
         try:
             return fn(*args)
@@ -595,11 +667,65 @@ class NumatoRelayMatrix(RelayBase):
             try:
                 self.connect()
             except Exception as reconnect_err:
+                self._emergency_all_off(
+                    f"communication failure and automatic reconnect both failed "
+                    f"({e}; reconnect: {reconnect_err})"
+                )
                 raise RelayError(
                     f"Automatic reconnect failed after communication error "
                     f"({e}): {reconnect_err}"
                 ) from e
-            return fn(*args)   # retry exactly once; propagate any further failure
+            try:
+                return fn(*args)   # retry exactly once
+            except (RelayError, NIPXITimeoutError) as retry_err:
+                self._emergency_all_off(
+                    f"communication failure persisted after reconnect: {retry_err}"
+                )
+                raise
+
+    def _emergency_all_off(self, reason: str) -> bool:
+        """
+        Single, non-recursive, best-effort attempt to force every relay off
+        and confirm it -- the FAIL SAFE reflex used whenever any relay
+        operation fails in a way that could leave the bank in an unknown or
+        energized state (see the module docstring's "Emergency Shutdown
+        Strategy" section). Never raises a normal RelayStateVerificationError
+        itself -- returns True/False so the caller can always still raise
+        the ORIGINAL failure, now annotated with whether this emergency
+        attempt also succeeded.
+
+        Uses the lowest-level transport call (_send_and_capture) directly,
+        NOT write_all()/read_all()/verify_all() -- this is what makes it
+        safe to call from inside verify_all()/verify_single()/
+        _call_with_reconnect() without any risk of recursion.
+        """
+        self.log.critical("EMERGENCY RELAY SHUTDOWN triggered: %s -- forcing all relays OFF", reason)
+        try:
+            hexstr = format(0, f"0{self._hex_digits()}X")
+            self._send_and_capture(f"relay writeall {hexstr}")
+            response = self._send_and_capture("relay readall")
+            mask = self._parse_readall_response(response)
+        except Exception as e:
+            self.log.critical(
+                "EMERGENCY SHUTDOWN FAILED: could not force/verify relays OFF "
+                "after (%s): %s. Hardware may still be energized -- "
+                "physically disconnect power if this cannot be resolved immediately.",
+                reason, e,
+            )
+            return False
+
+        if mask != 0:
+            self.log.critical(
+                "EMERGENCY SHUTDOWN FAILED: relays not confirmed OFF after forced "
+                "shutdown (mask=0x%0*X active=%s). Reason for shutdown: %s. "
+                "Hardware may still be energized -- physically disconnect power "
+                "if this cannot be resolved immediately.",
+                self._hex_digits(), mask, self._mask_to_channels(mask), reason,
+            )
+            return False
+
+        self.log.warning("Emergency relay shutdown succeeded: all relays confirmed OFF.")
+        return True
 
     def _send_and_capture(self, cmd: str) -> bytes:
         """

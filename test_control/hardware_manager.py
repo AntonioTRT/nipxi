@@ -37,6 +37,7 @@ Adding a new device:
   4. Call disconnect() in disconnect_all() (before dependencies).
 """
 
+import atexit
 import logging
 
 from config.settings import Settings
@@ -111,6 +112,18 @@ class HardwareManager:
             detail = f"Port: {relay_cfg.get('port', '')}"
         self.log.info("Selected Relay: %s  %s", relay_class, detail)
 
+        # Application-exit safety net (see docs/architecture.md "Emergency
+        # Shutdown Strategy"): registered once, here, so it exists even if
+        # connect_all() only partially succeeds. This is a SECOND, independent
+        # attempt at "all relays OFF on exit" -- it does not replace
+        # disconnect_all()'s own try/finally-driven call, which is the
+        # primary path; this catches process-exit paths that bypass it
+        # (an exception during interpreter shutdown, os._exit() elsewhere,
+        # etc). No-ops if the relay was never connected or already safely
+        # disconnected. Cannot catch SIGKILL / hard process kill -- nothing
+        # in userspace can.
+        atexit.register(self._atexit_relay_shutdown)
+
     # ------------------------------------------------------------------
     # Public device accessors
     # ------------------------------------------------------------------
@@ -147,6 +160,13 @@ class HardwareManager:
         If any connection fails, disconnect whatever was already connected
         so the system does not end up in a partial state.
 
+        Startup safety (see docs/architecture.md "Emergency Shutdown
+        Strategy"): immediately after the relay connects, ALL relays are
+        forced OFF and verified OFF before this method returns -- the
+        framework must never start operating from an unknown relay state.
+        If that force-off/verify fails, startup aborts (same rollback path
+        as any other connect() failure) rather than proceeding.
+
         Raises:
             HardwareInitError: wraps the underlying driver exception with context.
         """
@@ -166,6 +186,13 @@ class HardwareManager:
 
             self._relay.connect()
             connected.append(self._relay)
+
+            # Startup safety: guarantee a known, verified all-off baseline
+            # before any relay operation is ever requested. Abort startup
+            # (via the except block below, same as any other failure here)
+            # if this cannot be confirmed.
+            self._relay.open_all()
+            self.log.info("Startup safety: all relays forced OFF and verified.")
 
         except Exception as e:
             self.log.error("Hardware init failed: %s", e)
@@ -198,12 +225,20 @@ class HardwareManager:
             except Exception as e:
                 self.log.warning("SMU output_disable failed during shutdown: %s", e)
 
-        # 2. Open all relays -- physically disconnect all batteries
+        # 2. Open all relays -- physically disconnect all batteries. By the
+        #    time this raises, the driver has already made its own internal
+        #    emergency-shutdown attempt (see NumatoRelayMatrix.verify_all()/
+        #    _emergency_all_off()) -- a failure here is therefore already a
+        #    second failed attempt and is logged as CRITICAL, not a warning.
         if self._relay.connected:
             try:
                 self._relay.open_all()
             except Exception as e:
-                self.log.warning("relay.open_all() failed during shutdown: %s", e)
+                self.log.critical(
+                    "relay.open_all() failed during shutdown: %s. Hardware may "
+                    "still be energized -- physically disconnect power if this "
+                    "cannot be resolved immediately.", e,
+                )
 
         # 3. Disconnect relay, DMM (if present), SMU, DAQ (reverse of connect order)
         devices = [self._relay]
@@ -218,6 +253,31 @@ class HardwareManager:
                 self.log.warning("disconnect() failed for %s: %s", dev.name, e)
 
         self.log.info("All hardware disconnected.")
+
+    def _atexit_relay_shutdown(self):
+        """
+        Registered via atexit() in __init__ -- a second, independent safety
+        net for "all relays OFF on exit" alongside disconnect_all(). Covers
+        process-exit paths that bypass a try/finally around disconnect_all()
+        (an exception during interpreter shutdown, os._exit() called
+        elsewhere, etc). No-ops if the relay was never connected or has
+        already been safely disconnected (the normal case -- this is a
+        backstop, not the primary path).
+
+        Never raises -- atexit callbacks must not raise; an exception here
+        would be printed by Python and could prevent other registered atexit
+        handlers from running. Logs CRITICAL on failure instead.
+        """
+        try:
+            if self._relay.connected:
+                self.log.warning("atexit: forcing all relays OFF as a final safety net.")
+                self._relay.open_all()
+        except Exception as e:
+            self.log.critical(
+                "atexit emergency relay shutdown FAILED: %s. Hardware may still "
+                "be energized -- physically disconnect power if this cannot be "
+                "resolved immediately.", e,
+            )
 
     def health_check(self) -> dict:
         """

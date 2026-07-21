@@ -742,6 +742,33 @@ RAW: 00000001  MASK: 0x00000001  ACTIVE: [1]
 
 **How to see the conversation yourself:** every login step is logged at DEBUG level -- raw RX chunks, detected prompts, TX sent (username and password in cleartext -- these are lab default credentials; see the caveat in `_login()`'s docstring if credentials are ever changed to something sensitive), IAC negotiation replies, final response, and PASS/FAIL classification. Run any relay test in `test.py` (they all wrap themselves in `_numato_relay_debug_logging()`, which re-enables this output since test.py silences logging by default) and read the `[RELAY LOG]`-prefixed lines. `_classify_relay_error()` was also fixed to never collapse a failure down to a bare "Authentication failed" -- the full underlying diagnostic is always appended after it.
 
+### 9.4d Emergency Shutdown Strategy
+
+**Design principle: an unknown relay state is an unsafe state.** When in doubt, force all relays OFF and verify. FAIL SAFE, never fail-and-leave-energized. This is enforced in layers:
+
+| Layer | What | Where |
+|-------|------|-------|
+| 1. Startup safe-state enforcement | `relay.open_all()` (force OFF + verify) runs immediately after the relay connects, before `connect_all()` returns. Abort startup (`HardwareInitError`) if it fails. | `HardwareManager.connect_all()` |
+| 2. Runtime failure behavior | Any `RelayStateVerificationError`, communication failure surviving the one automatic reconnect, Telnet timeout, readback/parser failure -- `_emergency_all_off()` is attempted BEFORE the exception propagates. | `NumatoRelayMatrix.verify_single()`/`verify_all()`/`_call_with_reconnect()` |
+| 3. Emergency stop | On any `SafetyViolationError`/`RelayError` during a battery test, SMU output disabled then `relay.open_all()` called. | `BatteryTestSequence.run()` -> `SafetyMonitor.emergency_stop()` |
+| 4. Application exit protection | `disconnect_all()` (disable SMU -> `relay.open_all()` -> disconnect everything) runs in every `finally:` block around the test loop (normal completion, `KeyboardInterrupt`, any exception), plus an independent `atexit`-registered backstop for exit paths that bypass it. | `main.py`/`test.py` `finally:` + `HardwareManager.disconnect_all()` / `_atexit_relay_shutdown()` |
+
+If an emergency shutdown attempt itself fails (most commonly: no working connection left to force anything through), that is logged as **CRITICAL** with explicit "hardware may still be energized -- physically disconnect power" wording, never silently swallowed -- but the original exception that triggered it is still what propagates.
+
+**Guarantees:**
+
+- Program starts with all relays OFF, or does not start.
+- Relay changes always go through safety verification (Section 9.4a).
+- Any relay failure forces all relays OFF.
+- Any safety violation forces all relays OFF.
+- Any unhandled exception attempts to force all relays OFF.
+- Application exit attempts to force all relays OFF.
+- The framework never *intentionally* leaves relays energized after termination.
+
+**Known limitation:** nothing in userspace -- this codebase included -- can catch `SIGKILL` / a hard process kill. That is an OS-level guarantee no software can provide.
+
+See `docs/architecture.md` Section 6d for the full design writeup and a table mapping each guarantee to its enforcing code.
+
 ### 9.5 Adding a new relay type
 
 1. Create `hardware/relay_<type>.py` that subclasses `RelayBase`:

@@ -376,6 +376,44 @@ Both report Relay Number / Expected State / Actual State / Cause on the first fa
 
 **Diagnostics added, always available:** every login step is logged at DEBUG level -- raw RX chunks, detected prompts, TX sent (username and password, in cleartext, since these are lab default credentials -- see the caveat in `_login()`'s docstring if credentials are ever changed to something sensitive), IAC negotiation replies, final response, and PASS/FAIL classification. `test.py`'s `_numato_relay_debug_logging()` context manager re-enables this output (test.py silences all logging by default) and wraps every relay-touching test menu item, so this transcript is always available, not just during dedicated relay tests. `_classify_relay_error()` was also fixed to never collapse a failure down to a bare "Authentication failed" -- the full underlying diagnostic is always appended.
 
+### 6d. Emergency Shutdown Strategy
+
+**Design principle:** an unknown relay state is an unsafe state. When in doubt, force all relays OFF and verify. FAIL SAFE, never fail-and-leave-energized.
+
+This is enforced in layers, from the moment the application starts to the moment it exits:
+
+**1. Startup safe-state enforcement.** `HardwareManager.connect_all()` calls `relay.open_all()` (force OFF + verify) immediately after the relay connects, before `connect_all()` returns -- the framework never starts operating from an unknown relay state. If this fails, startup aborts via the same rollback path as any other `connect()` failure (`HardwareInitError`, already-connected devices are disconnected). Guarantee: **program starts with all relays OFF, or does not start.**
+
+**2. Runtime failure behavior (driver level, `hardware/relay_eth.py::NumatoRelayMatrix`).** Every relay state change already goes through the mandatory all-off -> verify -> activate -> verify sequence (Section 6a). On top of that, any of the following triggers an immediate, best-effort `_emergency_all_off()` (force every relay off, verify, log the outcome) BEFORE the exception propagates -- see the module docstring's "Emergency Shutdown Strategy" section for the full list and `_emergency_all_off()`'s implementation:
+   - `RelayStateVerificationError` (a commanded relay didn't reach the expected state, or the bank doesn't match expectations)
+   - `RelayError` / communication failure that survives the one permitted automatic reconnect-and-retry
+   - Telnet timeout, readback failure, parser failure, unexpected firmware response (all surface as `RelayError`/`NIPXITimeoutError`, covered by the same paths above)
+
+   If the emergency shutdown itself also fails (typically: no working connection at all, so there is no way to force anything from software), that is logged as **CRITICAL** with explicit "hardware may still be energized -- physically disconnect power" wording -- never silently swallowed. Either way, the ORIGINAL exception is still what propagates; the emergency outcome is appended to its message.
+
+**3. Emergency stop (test-workflow level).** `test_control/safety_monitor.py::SafetyMonitor.emergency_stop()` -- called by `BatteryTestSequence.run()` on any `SafetyViolationError` or `RelayError` (which `RelayStateVerificationError` subclasses) -- disables the SMU output then calls `relay.open_all()`. By the time this can still raise, the driver has already made its own internal emergency attempt (layer 2), so a failure here is logged as **CRITICAL**, not a warning.
+
+**4. Application exit protection.** `HardwareManager.disconnect_all()` is the primary shutdown path: disable SMU output -> `relay.open_all()` (force OFF + verify; failure logged CRITICAL, same reasoning as layer 3) -> disconnect every device. It is called from:
+   - `main.py`'s `finally:` block (runs on normal completion, `KeyboardInterrupt`, and any other exception -- Python's `finally` always executes), itself wrapped so a shutdown failure is logged critically instead of silently masking whatever was propagating;
+   - `test.py`'s `run_main_test()` `finally:` block, same reasoning;
+   - `HardwareManager.__exit__` for any caller using it as a context manager.
+
+   A second, independent safety net is registered via `atexit.register()` in `HardwareManager.__init__()` (`_atexit_relay_shutdown()`): it no-ops if the relay was already safely disconnected (the normal case), but catches process-exit paths that bypass the `try/finally` above (an exception during interpreter shutdown, `os._exit()` called elsewhere, etc). **Known limitation:** nothing in userspace can catch `SIGKILL` / a hard process kill -- this is a fundamental OS-level limitation, not a gap in this implementation.
+
+**5. Relay cleanup manager -- where this is centralized.** `HardwareManager` is the single place responsible for making hardware safe on both ends of the application lifecycle (`connect_all()` for startup, `disconnect_all()` + the `atexit` hook for shutdown) -- not scattered across `main.py`, `test.py`, and the battery-test workflow independently. Those callers all route through the same `HardwareManager`/`NumatoRelayMatrix` methods; `SafetyMonitor.emergency_stop()` is the one exception, and it also just calls `relay.open_all()`, the same underlying operation.
+
+**Guarantees confirmed by this design:**
+
+| Guarantee | Enforced by |
+|-----------|-------------|
+| Program starts with all relays OFF | `HardwareManager.connect_all()` (layer 1) |
+| Relay changes always go through safety verification | `NumatoRelayMatrix.open()`/`close()` (Section 6a) |
+| Any relay failure forces all relays OFF | `NumatoRelayMatrix._emergency_all_off()` (layer 2) |
+| Any safety violation forces all relays OFF | `SafetyMonitor.emergency_stop()` (layer 3) |
+| Any unhandled exception attempts to force all relays OFF | `main.py`/`test.py` `finally:` blocks -> `HardwareManager.disconnect_all()` (layer 4) |
+| Application exit attempts to force all relays OFF | `disconnect_all()` (primary) + `atexit` hook (backstop) (layer 4) |
+| Never *intentionally* leaves relays energized after termination | All of the above; hard process kill (`SIGKILL`) is the one case no userspace code can intercept |
+
 ---
 
 ## 7. StorageBackend Interface (MiniSQL path)
