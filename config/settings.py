@@ -56,16 +56,26 @@ class Settings:
     ZERO_CURRENT_THRESHOLD_A = 0.01  # A - "current is zero" threshold for relay safety
 
     # -------------------------------------------------------------------------
-    # PXI rack  (edit slot numbers to match your chassis)
+    # PXI rack -- simulation mode only. VISA resource strings (slot numbers)
+    # live in config/devices.py (SMU_ASSIGNMENTS / DAQ_CONFIG / DMM_CONFIG)
+    # ONLY -- that is their single source of truth. They used to be
+    # duplicated here as PXI_RESOURCE_DAQ/DMM/SMU1/SMU2; those were removed
+    # because HardwareManager was reading them instead of config/devices.py,
+    # silently diverging from it. Edit config/devices.py to change a slot.
     # -------------------------------------------------------------------------
-    PXI_RESOURCE_DAQ   = "PXI1Slot2"   # NI 6363 DAQ
-    PXI_RESOURCE_DMM   = "PXI1Slot3"   # NI 4065 DMM
-    PXI_RESOURCE_SMU1  = "PXI1Slot4"   # NI 4140 or 4139 SMU
-    PXI_RESOURCE_SMU2  = "PXI1Slot5"   # NI 4130 SMU (optional second unit)
     PXI_SIMULATE       = False          # True = NI VISA simulation mode (no hardware)
 
     # -------------------------------------------------------------------------
-    # Relay matrix  (COM port - not NI, custom controller)
+    # Numato Relay Matrix (Numato Lab 32 Channel Ethernet Relay Module) -- PRODUCTION
+    # Single source of truth for relay count. config/devices.py
+    # NUMATO_RELAY_MATRIX_CONFIG reads this value (never hardcode 32
+    # elsewhere -- e.g. in RelayEthernetTest).
+    # -------------------------------------------------------------------------
+    RELAY_COUNT = 32
+
+    # -------------------------------------------------------------------------
+    # Relay matrix  (COM port - not NI, custom controller) -- diagnostic only,
+    # NOT the production relay path (see RELAY_COUNT / NUMATO_RELAY_MATRIX_CONFIG above).
     # -------------------------------------------------------------------------
     RELAY_COM_PORT    = "COM3"          # Serial port of relay matrix controller
     RELAY_BAUD_RATE   = 9600

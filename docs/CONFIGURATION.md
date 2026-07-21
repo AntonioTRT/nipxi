@@ -69,28 +69,35 @@ These are safety hard limits. The system raises `SafetyViolationError` if any is
 |-----------|---------|------|-------------|
 | `ZERO_CURRENT_THRESHOLD_A` | `0.01` | float (A) | Current considered zero for relay-switch safety |
 
-### PXI hardware
-
-Find VISA resource strings in **NI-MAX** (Measurement & Automation Explorer).
+### PXI hardware (simulation mode only)
 
 | Parameter | Default | Type | Description |
 |-----------|---------|------|-------------|
-| `PXI_RESOURCE_DAQ` | `"PXI1Slot2"` | str | NI 6363 DAQ VISA resource |
-| `PXI_RESOURCE_DMM` | `"PXI1Slot3"` | str | NI 4065 DMM VISA resource |
-| `PXI_RESOURCE_SMU1` | `"PXI1Slot4"` | str | Primary SMU VISA resource |
-| `PXI_RESOURCE_SMU2` | `"PXI1Slot5"` | str | Optional second SMU |
 | `PXI_SIMULATE` | `False` | bool | NI simulation mode (no hardware needed) |
 
 Setting `PXI_SIMULATE = True` lets NI drivers run in simulation mode — useful for software development without access to the PXI rack. Results will be dummy values.
 
-### Serial relay
+> **Changed:** VISA resource strings (`PXI_RESOURCE_DAQ`/`PXI_RESOURCE_DMM`/`PXI_RESOURCE_SMU1`/
+> `PXI_RESOURCE_SMU2`) used to live here and were read directly by `HardwareManager`, duplicating
+> the same values already in `config/devices.py`'s `SMU_ASSIGNMENTS`/`DAQ_CONFIG`/`DMM_CONFIG`.
+> They have been removed from `Settings` -- **`config/devices.py` is now the only place VISA
+> resource strings are set** (see the `config/devices.py` section below). Find your actual VISA
+> resource strings in **NI-MAX** (Measurement & Automation Explorer), then edit `config/devices.py`.
+
+### Ethernet relay (production)
+
+| Parameter | Default | Type | Description |
+|-----------|---------|------|-------------|
+| `RELAY_COUNT` | `32` | int | Single source of truth for the Numato relay count. Flows into `NUMATO_RELAY_MATRIX_CONFIG["channel_count"]` in `config/devices.py` -- update here, not in the driver or any relay test, and never hardcode `32` elsewhere. |
+
+### Serial relay (diagnostic only -- NOT production)
 
 | Parameter | Default | Type | Description |
 |-----------|---------|------|-------------|
 | `RELAY_COM_PORT` | `"COM3"` | str | Windows COM port of the relay controller |
 | `RELAY_BAUD_RATE` | `9600` | int | Serial baud rate |
 | `RELAY_TIMEOUT_S` | `2.0` | float (s) | Serial read timeout |
-| `RELAY_NUM_CHANNELS` | `8` | int | Number of relay channels |
+| `RELAY_NUM_CHANNELS` | `8` | int | Number of relay channels (serial diagnostic path only) |
 
 ### DAQ channel lists
 
@@ -183,7 +190,9 @@ DMM_CONFIG = {
 }
 ```
 
-### RELAY_CONFIG (serial)
+### RELAY_CONFIG (serial -- diagnostic only, NOT production)
+
+`RELAY_CONFIG` / `SerialRelay` (COM13) is used only for bench diagnostics via `test.py`. It is never selected by `main.py` or by `test.py`'s "Run Main Test" -- production relay control always goes through `NUMATO_RELAY_MATRIX_CONFIG` / `NumatoRelayMatrix` below.
 
 ```python
 RELAY_CONFIG = {
@@ -202,23 +211,28 @@ RELAY_CONFIG = {
 
 The query response is checked for `"ON"`, `"CLOSED"`, or `"1"` to determine closed state. Adjust `SerialRelay.query()` in `hardware/relay_serial.py` if your controller uses a different response format.
 
-### RELAY_ETH_CONFIG (Ethernet)
+### NUMATO_RELAY_MATRIX_CONFIG (Ethernet -- PRODUCTION)
+
+`NUMATO_RELAY_MATRIX_CONFIG` / `NumatoRelayMatrix` (Numato Lab 32-Channel Ethernet Relay Module) is the production relay control path: `main.py -> HardwareManager -> RelayFactory -> NumatoRelayMatrix -> Numato Relay`. `NumatoRelayMatrix.close(ch)`/`open(ch)` enforce a mandatory all-off -> verify -> activate -> verify safety sequence -- see [architecture.md section 6a](architecture.md#6a-mandatory-relay-safety-sequence).
+
+Validated settings (confirmed reachable -- ping, web interface, Telnet login, and relay command/readback all work):
 
 ```python
-RELAY_ETH_CONFIG = {
-    "type":         "ethernet",
-    "driver":       "RELAY32ETHRL00",
-    "name":         "MAIN_MATRIX_ETH",
-    "ip":           "192.168.1.50",   # REQUIRED: set to actual relay IP
-    "port":         23,               # Numato default Telnet port
-    "user":         "admin",          # default Numato credentials
-    "password":     "admin",
-    "timeout":      5.0,
-    "num_channels": 8,
+NUMATO_RELAY_MATRIX_CONFIG = {
+    "type":          "ethernet",
+    "driver":        "RELAY32ETHRL00",
+    "name":          "MAIN_MATRIX_ETH",
+    "ip":            "169.254.1.1",   # validated -- Numato factory link-local IP
+    "port":          23,              # validated -- Numato default Telnet port
+    "username":      "admin",         # validated Telnet credentials
+    "password":      "admin",         # validated Telnet credentials
+    "timeout":       5.0,
+    "num_channels":  32,              # physical relay count on the 32-ch module
+    "channel_count": 32,
 }
 ```
 
-To find the relay IP: connect it to a network switch and check your router's DHCP table, or use a network scanner. The factory default is usually `169.254.1.1` on link-local.
+If the relay is later moved to a routed/DHCP network instead of a direct link-local connection, find its new IP via your router's DHCP table or a network scanner and update `ip` accordingly.
 
 ---
 
@@ -237,19 +251,27 @@ Example resource names:
 | 3 | NI 4065 DMM | `PXI1Slot3` |
 | 4 | NI 4140 SMU | `PXI1Slot4` |
 
-Update `config/settings.py` `PXI_RESOURCE_*` accordingly.
+Update `config/devices.py` (`SMU_ASSIGNMENTS`/`DAQ_CONFIG`/`DMM_CONFIG` `"resource"` fields) accordingly -- not `config/settings.py`.
 
 ---
 
 ## Validating configuration
 
-Run the test framework and choose "Test Configuration":
+Two separate checks, both gate `test.py`'s menu automatically (`preflight_check()`) and can also be run individually:
 
 ```bash
 python test.py
-# Choose: 9 (Test Configuration)
+# Choose: "Test Configuration"           -- validate_settings(): Settings values (voltages,
+#                                            currents, timeouts, RELAY_COUNT, ...)
+# Choose: "Startup Device Validation"    -- validate_devices(): config/devices.py (every device
+#                                            can be instantiated, required fields present, no
+#                                            duplicate names/resources/IPs/COM ports/relay
+#                                            identifiers, relay count consistency, factory type)
 ```
 
-This runs `validate_settings()` and checks every required parameter. Fix any FAIL items before hardware testing.
+Fix any FAIL items before hardware testing -- `main.py` runs the equivalent of both checks at
+startup (`validate_settings()` then `validate_devices_or_raise()`) and exits before touching any
+hardware if either fails. See `docs/architecture.md` Section 8.3 and README.md Section 17.2 for
+the full list of device-level checks.
 
 Configuration is also validated automatically at startup by `main.py`.

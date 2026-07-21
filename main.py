@@ -29,8 +29,9 @@ import sys
 from config.settings import Settings
 from config import devices as dev_cfg
 from data.logger import setup as setup_logging
-from utils.errors import HardwareInitError, ValidationError
+from utils.errors import HardwareInitError, ValidationError, DeviceConfigError
 from utils.validators import validate_settings
+from utils.device_validator import validate_devices_or_raise
 from test_control.hardware_manager import HardwareManager
 from test_control.test_executor import TestExecutor
 from test_control.result_manager import ResultManager
@@ -57,11 +58,23 @@ def main():
     log = logging.getLogger("nipxi.main")
     log.info("NIPXI %s starting.", Settings.VERSION)
 
-    # --- 2. Configuration validation ---------------------------------------
+    # --- 2. Configuration validation -----------------------------------------
+    # Settings first (voltages/currents/timeouts), then every configured
+    # device in config/devices.py (existence, required fields, duplicate
+    # addresses/ports/names, relay count consistency, factory type). Both
+    # run before any hardware communication is attempted -- a bad
+    # configuration must fail here, not surface as a confusing connect()
+    # error deep inside HardwareManager.
     try:
         validate_settings(Settings)
     except ValidationError as e:
         log.error("Configuration error: %s", e)
+        sys.exit(1)
+
+    try:
+        validate_devices_or_raise(dev_cfg)
+    except DeviceConfigError as e:
+        log.error("%s", e)
         sys.exit(1)
 
     if args.dry_run:
@@ -69,9 +82,9 @@ def main():
         return
 
     # --- 3. Hardware -------------------------------------------------------
-    # Production relay is the Numato Ethernet module -- RELAY_CONFIG (serial)
-    # is kept only for diagnostics via test.py options 5/6/7.
-    hw = HardwareManager(Settings, relay_cfg=dev_cfg.RELAY_ETH_CONFIG)
+    # Production relay is the Numato Relay Matrix (Ethernet) -- RELAY_CONFIG
+    # (serial) is kept only for bench diagnostics via test.py.
+    hw = HardwareManager(Settings, relay_cfg=dev_cfg.NUMATO_RELAY_MATRIX_CONFIG)
 
     try:
         hw.connect_all()

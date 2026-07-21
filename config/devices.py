@@ -3,6 +3,20 @@ Device-level configuration and channel mapping.
 Maps physical hardware to logical battery channels.
 """
 
+import os
+import sys
+
+# -- ensure the nipxi/ package root is importable ----------------------------
+# Needed when this file is run/opened directly (e.g. via an IDE "Run" button):
+# Python puts this file's own directory (nipxi/config/) on sys.path in that
+# case, not nipxi/ itself, so "from config.settings import Settings" below
+# would otherwise fail with "No module named 'config'". main.py and test.py
+# already do the equivalent for themselves as real entry points; this file
+# is not an entry point, but is resilient to being invoked like one anyway.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config.settings import Settings
+
 # Battery channel definitions
 # Key: channel index (1-based), Value: metadata dict
 BATTERY_CHANNELS = {
@@ -63,11 +77,14 @@ RELAY_CONFIG = {
     "command_query": "QUERY {ch}\r\n",
 }
 
-# Relay matrix -- Ethernet (Numato Lab 32 Channel Ethernet Relay Module)
-# Set "type": "ethernet" to use EthernetRelay instead of SerialRelay.
-# RelayFactory.create(RELAY_ETH_CONFIG) will return an EthernetRelay instance.
+# Numato Relay Matrix -- Ethernet (Numato Lab 32 Channel Ethernet Relay Module)
+# Set "type": "ethernet" to use NumatoRelayMatrix instead of SerialRelay.
+# RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG) will return a NumatoRelayMatrix
+# instance ("ethernet" names the transport interface, same as "serial" does --
+# the concrete driver is specifically for this Numato hardware, not a generic
+# vendor-neutral Ethernet relay).
 # Reference protocol: utils/ethernet_relay_python.py (manufacturer example).
-RELAY_ETH_CONFIG = {
+NUMATO_RELAY_MATRIX_CONFIG = {
     "type":         "ethernet",
     "driver":       "RELAY32ETHRL00",
     "name":         "MAIN_MATRIX_ETH",
@@ -77,9 +94,14 @@ RELAY_ETH_CONFIG = {
     "user":         "admin",            # legacy alias, kept for compat -- same value
     "password":     "admin",
     "timeout":      5.0,
-    "num_channels":  32,                # physical relay count on the 32-ch module
-    "channel_count": 32,                # alias -- same value, used by the matrix scan test
+    # Settings.RELAY_COUNT is the single source of truth for relay count --
+    # never hardcode 32 here or in any relay test.
+    "num_channels":  Settings.RELAY_COUNT,
+    "channel_count": Settings.RELAY_COUNT,  # alias -- same value, used by the matrix scan test
 }
+
+# Backward-compat alias -- this dict was previously named RELAY_ETH_CONFIG.
+RELAY_ETH_CONFIG = NUMATO_RELAY_MATRIX_CONFIG
 
 # =============================================================================
 # Device enumeration -- name -> config, same model as SMU_ASSIGNMENTS.
@@ -100,6 +122,14 @@ RELAY_SERIAL_CONFIGS = {
     RELAY_CONFIG["name"]: RELAY_CONFIG,
 }
 
-RELAY_ETH_CONFIGS = {
-    RELAY_ETH_CONFIG["name"]: RELAY_ETH_CONFIG,
+# Every Numato Relay Matrix device, name -> config. Hardware Discovery,
+# startup device validation, RelayEthernetTest, and every test_relay_*()
+# function all iterate this dict -- add a second Numato unit here (a new
+# "type": "ethernet" entry with its own "name"/"ip") and every one of those
+# automatically covers it too, with no per-device code anywhere.
+NUMATO_RELAY_MATRIX_CONFIGS = {
+    NUMATO_RELAY_MATRIX_CONFIG["name"]: NUMATO_RELAY_MATRIX_CONFIG,
 }
+
+# Backward-compat alias -- this dict was previously named RELAY_ETH_CONFIGS.
+RELAY_ETH_CONFIGS = NUMATO_RELAY_MATRIX_CONFIGS

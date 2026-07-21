@@ -1,11 +1,22 @@
 """
-SMU (Source Measure Unit) interface placeholder.
-Covers NI 4140, 4139, 4130 cards used for charge and discharge.
+SMU (Source Measure Unit) driver. Covers NI 4140, 4139, 4130 cards used as
+the PSU for battery charge and discharge (there is no separate PSU hardware
+or config in this project -- the SMU is the PSU).
 
-TODO: Implement using `nidcpower` (NI-DCPower Python bindings).
+connect()/disconnect()/identify() are real (NI-DCPower session open/close +
+instrument_model query) -- this is the connectivity/identification surface
+exercised by Hardware Discovery. Charge/discharge/measure functionality
+(set_charge_mode, set_discharge_mode, output_enable/disable, measure) is
+still a TODO placeholder; implementing it is a separate, later step.
+
+Constructed from a config/devices.py SMU_ASSIGNMENTS[...] dict -- the same
+config dict HardwareManager and Hardware Discovery both read, so there is
+one source of truth for the resource string (config/devices.py, not
+config/settings.py).
 """
 
 from hardware.base import HardwareBase
+from utils.errors import SMUError
 
 
 class SMU(HardwareBase):
@@ -14,6 +25,7 @@ class SMU(HardwareBase):
 
     Typical workflow:
         smu.connect()
+        smu.identify()          # connectivity/discovery only
         smu.set_charge_mode(current_a=0.5, voltage_limit_v=4.2)
         smu.output_enable()
         ... measure loop ...
@@ -25,20 +37,53 @@ class SMU(HardwareBase):
         smu.disconnect()
     """
 
-    def __init__(self, resource: str):
+    def __init__(self, cfg: dict):
+        resource = cfg.get("resource", "")
         super().__init__(f"SMU_{resource}")
         self.resource = resource
-        self._session = None
+        self._model    = cfg.get("model", "NI-SMU")
+        self._simulate = bool(cfg.get("simulate", False))
+        self._session  = None
 
     def connect(self):
         self.log.info("Opening SMU session: %s", self.resource)
-        # TODO: import nidcpower; self._session = nidcpower.Session(self.resource)
+        try:
+            import nidcpower
+        except ImportError as e:
+            raise SMUError(
+                "Library 'nidcpower' is not installed. Run: pip install nidcpower"
+            ) from e
+        try:
+            options = {"simulate": True} if self._simulate else {}
+            self._session = nidcpower.Session(resource_name=self.resource, options=options)
+        except Exception as e:
+            raise SMUError(f"SMU {self.resource} failed to open session: {e}") from e
         self.connected = True
+        self.log.info("SMU session open: %s", self.resource)
 
     def disconnect(self):
-        # TODO: self._session.close()
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception as e:
+                self.log.warning("SMU session close failed for %s: %s", self.resource, e)
+            self._session = None
         self.connected = False
         self.log.info("SMU session closed: %s", self.resource)
+
+    def identify(self) -> str:
+        """
+        Identification only -- the connectivity/discovery surface. Does not
+        enable output, configure charge/discharge mode, or source anything.
+        """
+        if self._session is None:
+            raise SMUError(f"SMU {self.resource} is not connected")
+        return self._session.instrument_model
+
+    # ------------------------------------------------------------------
+    # Charge/discharge functionality -- TODO, not implemented yet.
+    # Out of scope for connectivity/discovery work; see docs/TODO.md.
+    # ------------------------------------------------------------------
 
     def set_charge_mode(self, current_a: float, voltage_limit_v: float):
         """Configure CC-CV charge. Call before output_enable()."""

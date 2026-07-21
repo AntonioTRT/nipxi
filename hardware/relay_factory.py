@@ -2,10 +2,10 @@
 Relay factory.
 
 Usage:
-    from config.devices import RELAY_CONFIG
+    from config.devices import NUMATO_RELAY_MATRIX_CONFIG
     from hardware.relay_factory import RelayFactory
 
-    relay = RelayFactory.create(RELAY_CONFIG)
+    relay = RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)
     relay.connect()
     relay.close(1)   # energize channel 1
     relay.open(1)    # de-energize channel 1
@@ -14,10 +14,19 @@ Usage:
 
 The factory reads the "type" key from the config dict and returns the
 matching RelayBase subclass. Callers never import concrete relay classes.
+This is config-driven and generic: ANY config dict with "type": "ethernet"
+gets the same NumatoRelayMatrix driver and the same behavior (login
+handling, safety sequence, logging) -- there is no per-device special
+casing anywhere in this factory or in the driver it dispatches to.
 
 Supported types:
-    "serial"   -- SerialRelay   (hardware/relay_serial.py)
-    "ethernet" -- EthernetRelay (hardware/relay_eth.py)
+    "serial"   -- SerialRelay       (hardware/relay_serial.py) -- diagnostic only
+    "ethernet" -- NumatoRelayMatrix (hardware/relay_eth.py)    -- PRODUCTION
+                  ("ethernet" names the transport interface, same as
+                  "serial" does -- it is not a generic/vendor-neutral
+                  driver; the concrete class is specifically the Numato
+                  Relay Matrix driver. "EthernetRelay" is kept as a
+                  backward-compat alias for NumatoRelayMatrix.)
 
 Adding a new relay type:
     1. Create hardware/relay_<type>.py inheriting RelayBase
@@ -34,11 +43,16 @@ from utils.errors import ValidationError
 # optional dependency (e.g. pyserial) is not installed.
 _DRIVERS = {
     "serial":   ("hardware.relay_serial", "SerialRelay"),
-    "ethernet": ("hardware.relay_eth",    "EthernetRelay"),
+    "ethernet": ("hardware.relay_eth",    "NumatoRelayMatrix"),
 }
 
 
 class RelayFactory:
+    @staticmethod
+    def supported_types() -> list:
+        """Public accessor for the registered 'type' strings (for startup validation)."""
+        return sorted(_DRIVERS)
+
     @staticmethod
     def create(cfg: dict) -> RelayBase:
         """

@@ -11,7 +11,7 @@ from config.settings import Settings
 from test_control.charge_cycle import ChargeCycle
 from test_control.discharge_cycle import DischargeCycle
 from test_control.safety_monitor import SafetyMonitor
-from utils.errors import SafetyViolationError
+from utils.errors import SafetyViolationError, RelayError
 
 
 class BatteryTestSequence:
@@ -55,9 +55,9 @@ class BatteryTestSequence:
                 self.log.error("Channel %d: current not zero - skipping relay switch.", ch)
                 continue
 
-            self.relay.close(ch)
-
             try:
+                self.relay.close(ch)
+
                 # Charge step first (standardizes SOC per protocol recommendation)
                 self.charge.run(ch, self.data)
 
@@ -73,8 +73,21 @@ class BatteryTestSequence:
             except SafetyViolationError as e:
                 self.log.error("Safety violation on channel %d: %s", ch, e)
                 self.safety.emergency_stop(self.smu, self.relay, str(e))
-                break
-            finally:
+                raise
+
+            except RelayError as e:
+                # Includes RelayStateVerificationError -- a relay that did not
+                # verifiably reach its commanded state is a safety fault, not a
+                # retryable condition. Do not touch the relay again on this
+                # channel: emergency_stop() re-attempts an all-off (and swallows
+                # any further relay failure internally), then execution stops --
+                # it must never fall through to open(ch) below or to the next
+                # channel.
+                self.log.error("Relay verification fault on channel %d: %s", ch, e)
+                self.safety.emergency_stop(self.smu, self.relay, str(e))
+                raise
+
+            else:
                 self.relay.open(ch)
 
         self.log.info("Test sequence complete.")

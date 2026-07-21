@@ -13,8 +13,9 @@ This design means adding a new relay type (e.g. USB-HID or Modbus) only requires
 No caller code changes.
 
 Supported relay types (as of this revision):
-  "serial"   -- SerialRelay   (hardware/relay_serial.py)
-  "ethernet" -- EthernetRelay (hardware/relay_eth.py, Numato RELAY32ETHRL00)
+  "serial"   -- SerialRelay       (hardware/relay_serial.py) -- diagnostic only
+  "ethernet" -- NumatoRelayMatrix (hardware/relay_eth.py, Numato RELAY32ETHRL00) --
+                PRODUCTION. "EthernetRelay" is kept as a backward-compat alias.
 
 Relay convention (electrical):
   close(channel) -- energizes the coil, makes the contact, current can flow

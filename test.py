@@ -12,6 +12,7 @@ Usage:
     python test.py
 """
 
+import contextlib
 import logging
 import os
 import sys
@@ -133,18 +134,10 @@ def test_configuration():
     """
     results = []
 
-    # -- PXI resource strings -------------------------------------------------
-    for name, value in [("PXI_RESOURCE_DAQ",  Settings.PXI_RESOURCE_DAQ),
-                        ("PXI_RESOURCE_DMM",  Settings.PXI_RESOURCE_DMM),
-                        ("PXI_RESOURCE_SMU1", Settings.PXI_RESOURCE_SMU1)]:
-        ref = f"config/settings.py -> {name}"
-        if not value:
-            results.append(_fail("Configuration", name, ref, f"{name} is empty"))
-        elif not value.startswith("PXI"):
-            results.append(_warn("Configuration", name, ref,
-                                 f"'{value}' does not look like a PXI resource string"))
-        else:
-            results.append(_ok("Configuration", name, ref, value))
+    # PXI resource strings are validated below, from config/devices.py
+    # (SMU_ASSIGNMENTS/DAQ_CONFIG/DMM_CONFIG) -- that is their single source
+    # of truth; config/settings.py no longer duplicates them (see the
+    # "SMU / DAQ / DMM configs" block further down).
 
     # -- Relay COM port --------------------------------------------------------
     ref = "config/settings.py -> RELAY_COM_PORT"
@@ -177,7 +170,9 @@ def test_configuration():
             results.append(_ok("Configuration", "BATTERY_CHANNELS", ref,
                                f"{len(actual)} channels defined (1-{actual[-1]})"))
 
-    # -- SMU / DAQ / DMM configs ----------------------------------------------
+    # -- SMU / DAQ / DMM configs (config/devices.py is the single source of
+    #    truth for these VISA resource strings -- config/settings.py does
+    #    not duplicate them) --------------------------------------------------
     for name, cfg in [("SMU_ASSIGNMENTS", dev_cfg.SMU_ASSIGNMENTS.get("SMU1", {})),
                       ("DAQ_CONFIG",      dev_cfg.DAQ_CONFIG),
                       ("DMM_CONFIG",      dev_cfg.DMM_CONFIG)]:
@@ -185,6 +180,9 @@ def test_configuration():
         res = cfg.get("resource")
         if not res:
             results.append(_fail("Configuration", name, ref, "Missing 'resource' key"))
+        elif not res.startswith("PXI"):
+            results.append(_warn("Configuration", name, ref,
+                                 f"'{res}' does not look like a PXI resource string"))
         else:
             results.append(_ok("Configuration", name, ref,
                                f"{res} / {cfg.get('model', '?')}"))
@@ -220,20 +218,239 @@ def test_configuration():
 
 
 # =============================================================================
+# 1b. Hardware Discovery -- config-driven connectivity + identification only
+# =============================================================================
+#
+# This is a hardware PRESENCE test, not a measurement test, not a battery
+# workflow test, not an accuracy test. For every device found in
+# config/devices.py it validates only:
+#   - the device exists in config/devices.py                (enumeration)
+#   - the device was discovered correctly                    (this loop)
+#   - the driver loaded correctly                             (import / factory)
+#   - the communication channel opened correctly              (connect)
+#   - the instrument responds correctly                       (self-test / login)
+#   - instrument identification succeeds                      (identity query)
+#
+# All devices come from config/devices.py's enumeration dicts -- nothing is
+# hardcoded here (no resource strings, no IPs, no COM ports). Adding or
+# removing a device there changes what this test covers with no code change.
+#
+# No outputs are enabled, no voltage/current is sourced, and no channel is
+# measured anywhere in this section -- that is deliberately out of scope
+# until instrument functionality is implemented.
+
+def _identify_smu(name: str, cfg: dict):
+    """
+    SMU/PSU presence check (the NI SMU is this project's PSU -- there is no
+    separate PSU hardware/config; see MENU label "Test SMU (PSU)").
+
+    Uses hardware.smu.SMU -- the SAME production driver class HardwareManager
+    constructs -- so discovery and the real battery-test path never diverge.
+    connect() + identify() only. Never calls output_enable(),
+    set_charge_mode(), set_discharge_mode(), or sources any voltage/current.
+    """
+    resource = cfg.get("resource", "")
+    model    = cfg.get("model", "NI-SMU")
+    ref      = f"config/devices.py -> SMU_ASSIGNMENTS[{name!r}] ({resource} / {model})"
+
+    from hardware.smu import SMU
+    smu = SMU(cfg)
+    try:
+        smu.connect()
+        identity = smu.identify()
+        return _ok("Hardware Discovery", f"SMU/PSU: {name}", ref,
+                   f"Communication established. Identified: {identity}")
+    except Exception as e:
+        desc = getattr(e, "description", str(e))
+        return _fail("Hardware Discovery", f"SMU/PSU: {name}", ref,
+                     f"[ERROR] SMU not detected\nReason: {desc}")
+    finally:
+        try:
+            smu.disconnect()
+        except Exception:
+            pass
+
+
+def _identify_dmm(name: str, cfg: dict):
+    """
+    DMM presence check: connect() + identify() only, via hardware.dmm.DMM --
+    the same production driver class used everywhere else. Never triggers
+    or reads a measurement.
+    """
+    resource = cfg.get("resource", "")
+    model    = cfg.get("model", "NI-4065")
+    ref      = f"config/devices.py -> DMM_CONFIGS[{name!r}] ({resource} / {model})"
+
+    from hardware.dmm import DMM
+    dmm = DMM(cfg)
+    try:
+        dmm.connect()
+        identity = dmm.identify()
+        return _ok("Hardware Discovery", f"DMM: {name}", ref,
+                   f"Communication established. Identified: {identity}")
+    except Exception as e:
+        desc = getattr(e, "description", str(e))
+        return _fail("Hardware Discovery", f"DMM: {name}", ref,
+                     f"[ERROR] DMM not detected\nReason: {desc}")
+    finally:
+        try:
+            dmm.disconnect()
+        except Exception:
+            pass
+
+
+def _identify_daq(name: str, cfg: dict):
+    """
+    DAQ presence check: connect() + identify() only, via hardware.daq.DAQ --
+    the same production driver class HardwareManager constructs. Never
+    creates a task, configures a channel, or reads any analog input;
+    identify() runs the device's own built-in self-test.
+    """
+    resource = cfg.get("resource", "")
+    model    = cfg.get("model", "NI-6363")
+    ref      = f"config/devices.py -> DAQ_CONFIGS[{name!r}] ({resource} / {model})"
+
+    from hardware.daq import DAQ
+    daq = DAQ(cfg)
+    try:
+        daq.connect()
+        identity = daq.identify()
+        return _ok("Hardware Discovery", f"DAQ: {name}", ref,
+                   f"Communication established. Identified: {identity}  "
+                   f"(self-test passed, no channel read performed)")
+    except Exception as e:
+        return _fail("Hardware Discovery", f"DAQ: {name}", ref,
+                     f"[ERROR] DAQ not detected or self-test failed\nReason: {e}")
+    finally:
+        try:
+            daq.disconnect()
+        except Exception:
+            pass
+
+
+def _identify_relay_eth(name: str, cfg: dict):
+    """
+    Numato Relay Matrix presence check: TCP connect + Telnet login + the
+    driver's own connection-verification "relay readall"
+    (hardware/relay_eth.py NumatoRelayMatrix.connect()). This is read-only --
+    connect() never writes to any relay, so no channel is energized or
+    de-energized by this check. Applies to every device configured under
+    NUMATO_RELAY_MATRIX_CONFIGS -- this function is not specific to any one
+    device name.
+    """
+    host   = cfg.get("ip", "")
+    port   = cfg.get("port", 23)
+    driver = cfg.get("driver", "RELAY32ETHRL00")
+    ref    = f"config/devices.py -> NUMATO_RELAY_MATRIX_CONFIGS[{name!r}] ({driver} / {host}:{port})"
+
+    try:
+        from hardware.relay_factory import RelayFactory
+        relay = RelayFactory.create(cfg)
+    except Exception as e:
+        return _fail("Hardware Discovery", f"Numato Relay Matrix: {name}", ref,
+                     f"Import / factory error: {e}")
+
+    try:
+        relay.connect()
+    except Exception as e:
+        return _fail("Hardware Discovery", f"Numato Relay Matrix: {name}", ref,
+                     f"[ERROR] Relay not detected\nReason: {_classify_relay_error(e)}")
+
+    try:
+        relay.disconnect()
+    except Exception:
+        pass
+
+    return _ok("Hardware Discovery", f"Numato Relay Matrix: {name}", ref,
+               f"Communication established. Identified: {driver} at {host}:{port} "
+               f"(TCP + Telnet login + readall verification all succeeded)")
+
+
+def _identify_relay_serial(name: str, cfg: dict):
+    """
+    Serial relay presence check: RelayFactory.create(cfg) -> SerialRelay --
+    the same production driver class -- then connect()/disconnect(). Numato-
+    style identity commands do not apply to this diagnostic path (no relay
+    protocol is invented here) -- port-open success is the pass criterion.
+    """
+    port = cfg.get("port", Settings.RELAY_COM_PORT)
+    baud = cfg.get("baud_rate", Settings.RELAY_BAUD_RATE)
+    ref  = f"config/devices.py -> RELAY_SERIAL_CONFIGS[{name!r}] ({port} / {baud} baud)"
+
+    from hardware.relay_factory import RelayFactory
+    relay = RelayFactory.create(cfg)
+    try:
+        relay.connect()
+        return _ok("Hardware Discovery", f"Relay (Serial): {name}", ref,
+                   f"Communication channel opened: {port} @ {baud} baud "
+                   f"(diagnostic path -- no identity command available)")
+    except Exception as e:
+        return _fail("Hardware Discovery", f"Relay (Serial): {name}", ref,
+                     f"[ERROR] Relay not detected\nReason: {e}")
+    finally:
+        try:
+            relay.disconnect()
+        except Exception:
+            pass
+
+
+# name -> (config dict, identify function). Config-driven: adding/removing a
+# device dict entry here changes exactly what gets covered -- no other code
+# needs to change, and no instrument/address/port is hardcoded.
+_DISCOVERY_TARGETS = [
+    ("SMU / PSU",        dev_cfg.SMU_ASSIGNMENTS,      _identify_smu),
+    ("DMM",              dev_cfg.DMM_CONFIGS,          _identify_dmm),
+    ("DAQ",              dev_cfg.DAQ_CONFIGS,          _identify_daq),
+    ("Numato Relay Matrix (Ethernet)", dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, _identify_relay_eth),
+    ("Relay (Serial)",   dev_cfg.RELAY_SERIAL_CONFIGS, _identify_relay_serial),
+]
+
+
+def test_hardware_discovery():
+    """
+    Generic device discovery + connectivity test, driven entirely by
+    config/devices.py. For every device of every configured type: create
+    the driver, connect, identify, report PASS/FAIL with full reason.
+
+    This is NOT a measurement test, NOT a battery workflow test, and NOT an
+    instrument-accuracy test -- see the module comment above this section.
+
+    Runs entirely inside _numato_relay_debug_logging() so that any Numato
+    Relay Matrix device's full Telnet conversation (RX/TX, prompt detection,
+    IAC negotiation) is visible if its connect() fails -- see
+    hardware/relay_eth.py's "Authentication debugging" module docstring
+    section. Harmless no-op verbosity for the non-relay device types.
+    """
+    results = []
+    with _numato_relay_debug_logging():
+        for label, devices, identify_fn in _DISCOVERY_TARGETS:
+            if not devices:
+                results.append(_warn("Hardware Discovery", label, "config/devices.py",
+                                     "No devices configured for this type -- skipped"))
+                continue
+            for name, cfg in devices.items():
+                results.append(identify_fn(name, cfg))
+    return results
+
+
+# =============================================================================
 # 2. SMU / PSU
 # =============================================================================
 
 def test_smu():
     """
     Step 1: Import hardware.smu.SMU and verify interface.
-    Step 2: Connect to real SMU via nidcpower (if library present).
+    Step 2: connect() + identify() via the SAME production SMU driver class
+    used by HardwareManager and Hardware Discovery -- no direct nidcpower
+    calls here, so this test can never drift from what production actually
+    does.
     """
     name, cfg = _select_device(dev_cfg.SMU_ASSIGNMENTS, "SMUs")
     if cfg is None:
         return []
     _print_device_config(name, cfg)
 
-    resource   = cfg.get("resource", Settings.PXI_RESOURCE_SMU1)
+    resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-SMU")
     config_ref = f"{resource} / {model}"
     results    = []
@@ -242,8 +459,8 @@ def test_smu():
     ref_mod = "hardware/smu.py"
     try:
         from hardware.smu import SMU
-        smu = SMU(resource)
-        required_methods = ["connect", "disconnect", "set_charge_mode",
+        smu = SMU(cfg)
+        required_methods = ["connect", "disconnect", "identify", "set_charge_mode",
                             "set_discharge_mode", "output_enable", "output_disable",
                             "measure"]
         missing = [m for m in required_methods if not callable(getattr(smu, m, None))]
@@ -252,28 +469,16 @@ def test_smu():
                                  f"Missing methods: {missing}"))
         else:
             results.append(_ok("SMU", "SMU module", ref_mod,
-                               f"hardware.smu.SMU interface OK (placeholder - nidcpower not wired in yet)"))
+                               "hardware.smu.SMU interface OK (connect/identify implemented; "
+                               "charge/discharge/measure still placeholders)"))
     except Exception as e:
         results.append(_fail("SMU", "SMU module", ref_mod, f"Import error: {e}"))
-
-    # Step 2: hardware library connection -------------------------------------
-    try:
-        import nidcpower
-    except ImportError:
-        results.append(_fail("SMU", name, config_ref,
-                             "[ERROR] SMU not detected\n"
-                             f"Configuration : {name}\n"
-                             f"Interface     : VISA / NI-DCPower\n"
-                             f"Expected      : {resource} ({model})\n"
-                             "Reason        : Library 'nidcpower' not installed\n"
-                             "Fix           : pip install nidcpower"))
         return results
 
+    # Step 2: real connectivity + identification via the SMU driver class -----
     try:
-        session  = nidcpower.Session(resource_name=resource,
-                                     simulate=Settings.PXI_SIMULATE)
-        model_id = session.instrument_model
-        session.close()
+        smu.connect()
+        model_id = smu.identify()
         results.append(_ok("SMU", name, config_ref, f"Detected: {model_id}"))
     except Exception as e:
         desc = getattr(e, "description", str(e))
@@ -283,6 +488,11 @@ def test_smu():
                              f"Interface     : VISA / NI-DCPower\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {desc}"))
+    finally:
+        try:
+            smu.disconnect()
+        except Exception:
+            pass
 
     return results
 
@@ -293,42 +503,41 @@ def test_smu():
 
 def test_dmm():
     """
-    No hardware/dmm.py module yet -- tests nidmm library connection directly.
-    Reports missing module as a WARNING (not FAIL) since DMM driver is not yet written.
+    Step 1: Import hardware.dmm.DMM and verify interface.
+    Step 2: connect() + identify() via the SAME production DMM driver class
+    used by Hardware Discovery -- no direct nidmm calls here.
     """
     name, cfg = _select_device(dev_cfg.DMM_CONFIGS, "DMMs")
     if cfg is None:
         return []
     _print_device_config(name, cfg)
 
-    resource   = cfg.get("resource", Settings.PXI_RESOURCE_DMM)
+    resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-4065")
     config_ref = f"{resource} / {model}"
     results    = []
 
-    # Note: hardware/dmm.py does not exist yet
-    results.append(_warn("DMM", "DMM module",
-                         "hardware/dmm.py",
-                         "No hardware/dmm.py driver exists yet -- "
-                         "testing nidmm library directly"))
-
+    # Step 1: hardware.dmm module import + interface ---------------------------
+    ref_mod = "hardware/dmm.py"
     try:
-        import nidmm
-    except ImportError:
-        results.append(_fail("DMM", name, config_ref,
-                             "[ERROR] DMM not detected\n"
-                             f"Configuration : {name}\n"
-                             f"Interface     : VISA / NI-DMM\n"
-                             f"Expected      : {resource} ({model})\n"
-                             "Reason        : Library 'nidmm' not installed\n"
-                             "Fix           : pip install nidmm"))
+        from hardware.dmm import DMM
+        dmm = DMM(cfg)
+        required_methods = ["connect", "disconnect", "identify"]
+        missing = [m for m in required_methods if not callable(getattr(dmm, m, None))]
+        if missing:
+            results.append(_fail("DMM", "DMM module", ref_mod,
+                                 f"Missing methods: {missing}"))
+        else:
+            results.append(_ok("DMM", "DMM module", ref_mod,
+                               "hardware.dmm.DMM interface OK"))
+    except Exception as e:
+        results.append(_fail("DMM", "DMM module", ref_mod, f"Import error: {e}"))
         return results
 
+    # Step 2: real connectivity + identification via the DMM driver class -----
     try:
-        session  = nidmm.Session(resource_name=resource,
-                                 simulate=Settings.PXI_SIMULATE)
-        model_id = session.instrument_model
-        session.close()
+        dmm.connect()
+        model_id = dmm.identify()
         results.append(_ok("DMM", name, config_ref, f"Detected: {model_id}"))
     except Exception as e:
         desc = getattr(e, "description", str(e))
@@ -338,6 +547,11 @@ def test_dmm():
                              f"Interface     : VISA / NI-DMM\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {desc}"))
+    finally:
+        try:
+            dmm.disconnect()
+        except Exception:
+            pass
 
     return results
 
@@ -349,14 +563,20 @@ def test_dmm():
 def test_daq():
     """
     Step 1: Import hardware.daq.DAQ and verify interface.
-    Step 2: Connect to real DAQ via nidaqmx (if library present).
+    Step 2: connect() + identify() via the SAME production DAQ driver class
+    used by HardwareManager and Hardware Discovery -- no direct nidaqmx
+    calls for this part.
+    Step 3: deep channel read (beyond connectivity/identification -- this
+    is the one part of this test that goes past what hardware.daq.DAQ
+    currently implements, since read_channel() is still a TODO placeholder;
+    it uses nidaqmx directly until that method is implemented).
     """
     name, cfg = _select_device(dev_cfg.DAQ_CONFIGS, "DAQs")
     if cfg is None:
         return []
     _print_device_config(name, cfg)
 
-    resource   = cfg.get("resource", Settings.PXI_RESOURCE_DAQ)
+    resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-6363")
     config_ref = f"{resource} / {model}"
     test_ch    = dev_cfg.BATTERY_CHANNELS[1]["daq_voltage_ch"]
@@ -366,8 +586,8 @@ def test_daq():
     ref_mod = "hardware/daq.py"
     try:
         from hardware.daq import DAQ
-        daq = DAQ(resource)
-        required = ["connect", "disconnect", "read_channel",
+        daq = DAQ(cfg)
+        required = ["connect", "disconnect", "identify", "read_channel",
                     "read_all_batteries", "verify_zero_current"]
         missing = [m for m in required if not callable(getattr(daq, m, None))]
         if missing:
@@ -375,59 +595,52 @@ def test_daq():
                                  f"Missing methods: {missing}"))
         else:
             results.append(_ok("DAQ", "DAQ module", ref_mod,
-                               "hardware.daq.DAQ interface OK (placeholder - nidaqmx not wired in yet)"))
+                               "hardware.daq.DAQ interface OK (connect/identify implemented; "
+                               "channel read still a placeholder)"))
     except Exception as e:
         results.append(_fail("DAQ", "DAQ module", ref_mod, f"Import error: {e}"))
+        return results
 
-    # Step 2: hardware library connection -------------------------------------
+    # Step 2: real connectivity + identification via the DAQ driver class -----
     try:
-        import nidaqmx
-        import nidaqmx.system
-        import nidaqmx.errors
-    except ImportError:
+        daq.connect()
+        product_type = daq.identify()
+        results.append(_ok("DAQ", name, config_ref, f"Detected: {product_type}"))
+    except Exception as e:
         results.append(_fail("DAQ", name, config_ref,
-                             "[ERROR] DAQ not detected\n"
+                             f"[ERROR] DAQ not detected\n"
                              f"Configuration : {name}\n"
                              f"Interface     : NI-DAQmx\n"
                              f"Expected      : {resource} ({model})\n"
-                             "Reason        : Library 'nidaqmx' not installed\n"
-                             "Fix           : pip install nidaqmx"))
+                             f"Reason        : {e}"))
         return results
 
+    # Step 3: deep channel read -- goes beyond DAQ.read_channel() (still a
+    # TODO placeholder), so this uses nidaqmx directly for now.
     try:
-        system      = nidaqmx.system.System.local()
-        dev_names   = [d.name for d in system.devices]
-        if not dev_names:
-            results.append(_fail("DAQ", name, config_ref,
-                                 f"[ERROR] DAQ not detected\n"
-                                 f"Configuration : {name}\n"
-                                 f"Interface     : NI-DAQmx\n"
-                                 f"Expected      : {resource} ({model})\n"
-                                 "Reason        : No NI-DAQmx devices found on this system"))
-            return results
-    except Exception as e:
-        results.append(_fail("DAQ", name, config_ref,
-                             f"NI-DAQmx system query failed: {e}"))
-        return results
-
-    try:
+        import nidaqmx
+        import nidaqmx.errors
         with nidaqmx.Task() as task:
             v_range = cfg.get("voltage_range_v", 5.0)
             task.ai_channels.add_ai_voltage_chan(test_ch,
                                                  min_val=-v_range, max_val=v_range)
             val = task.read()
-        results.append(_ok("DAQ", name, config_ref,
-                           f"Channel {test_ch} read: {val:.4f} V  "
-                           f"(devices: {dev_names})"))
+        results.append(_ok("DAQ", f"{name} channel read", config_ref,
+                           f"Channel {test_ch} read: {val:.4f} V"))
     except nidaqmx.errors.DaqError as e:
-        results.append(_fail("DAQ", name, config_ref,
+        results.append(_fail("DAQ", f"{name} channel read", config_ref,
                              f"[ERROR] DAQ channel read failed\n"
                              f"Configuration : {name}\n"
                              f"Channel       : {test_ch}\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {e}"))
     except Exception as e:
-        results.append(_fail("DAQ", name, config_ref, str(e)))
+        results.append(_fail("DAQ", f"{name} channel read", config_ref, str(e)))
+    finally:
+        try:
+            daq.disconnect()
+        except Exception:
+            pass
 
     return results
 
@@ -524,8 +737,41 @@ def test_relay_serial():
 
 
 # =============================================================================
-# 5b. Relay -- Ethernet (Numato RELAY32ETHRL00) -- shared diagnostics helpers
+# 5b. Numato Relay Matrix (Ethernet, RELAY32ETHRL00) -- shared diagnostics
+#     helpers. Config-driven / generic: none of these reference a specific
+#     device name -- they operate on whatever cfg dict is passed in, so
+#     every improvement here automatically applies to every entry under
+#     config/devices.py NUMATO_RELAY_MATRIX_CONFIGS, present or future.
 # =============================================================================
+
+@contextlib.contextmanager
+def _numato_relay_debug_logging():
+    """
+    Temporarily re-enables hardware/relay_eth.py's logger at DEBUG level for
+    the duration of the wrapped block -- test.py silences ALL logging at
+    import time (see the top of this file), which is why the driver's
+    detailed Telnet transcript (RX/TX, prompt detection, IAC negotiation --
+    see hardware/relay_eth.py's "Authentication debugging" module docstring
+    section) was never visible from any of the menu items below until now.
+
+    Wrap any code that calls RelayFactory.create(cfg).connect() (or
+    equivalent) on a Numato Relay Matrix device in this context manager to
+    see the full conversation. Applies uniformly to every device -- there
+    is nothing here tied to a specific config/devices.py entry.
+    """
+    prev_disable_level = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
+    hw_logger = logging.getLogger("nipxi.hw")
+    hw_logger.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("    [RELAY LOG] %(name)s: %(message)s"))
+    hw_logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        hw_logger.removeHandler(handler)
+        logging.disable(prev_disable_level)
+
 
 def _ping_host(host: str, timeout_s: float = 1.0):
     """
@@ -572,30 +818,37 @@ def _check_web_interface(host: str, port: int = 80, timeout_s: float = 2.0):
 def _classify_relay_error(e: Exception) -> str:
     """
     Map a raw relay exception to one of the standardized, actionable
-    diagnostic reasons requested for commissioning: network / auth /
-    protocol / timeout.
+    diagnostic categories requested for commissioning: network / auth /
+    protocol / timeout. NEVER collapses the detail down to a bare label --
+    the full exception text (including hardware/relay_eth.py::_login()'s
+    expected-vs-received diagnostic) is always appended after the category,
+    so "Authentication failed" is never shown on its own. Enable
+    _numato_relay_debug_logging() around the call site for the full
+    RX/TX Telnet transcript in addition to this summary.
     """
     msg = str(e)
-    if "Login failed" in msg or "Timeout during login" in msg:
-        return "Authentication failed"
+    if "Login rejected" in msg or "Timeout during login" in msg:
+        return f"Authentication failed -- {msg}"
     if "invalid response" in msg:
-        return f"Relay read returned invalid response ({msg.splitlines()[-1]})"
+        return f"Relay read returned invalid response -- {msg}"
     if "command timeout" in msg:
-        return f"Device reachable but relay command timeout ({msg.splitlines()[-1]})"
+        return f"Device reachable but relay command timeout -- {msg}"
     if "not reachable" in msg or "refused" in msg.lower() or "timeout" in msg.lower():
-        return f"Device unreachable ({msg.splitlines()[-1]})"
-    return msg.splitlines()[-1] if msg else "Unknown error"
+        return f"Device unreachable -- {msg}"
+    return msg if msg else "Unknown error"
 
 
-def test_relay_eth():
+def test_relay_numato_matrix():
     """
     Real commissioning test for the Numato Lab 32-Channel Ethernet Relay
-    Module (hardware/relay_eth.py via RelayFactory).
+    Module, i.e. the Numato Relay Matrix (hardware/relay_eth.py via
+    RelayFactory). Applies to whichever device is selected from
+    NUMATO_RELAY_MATRIX_CONFIGS -- nothing here is specific to one name.
 
     Step 1: Verify factory + module interface (RelayBase subclass, all methods present).
     Step 2: Ping the configured IP -- network-layer reachability, before any TCP/Telnet attempt.
     Step 3: Check the relay's web interface (HTTP) -- confirms the unit is alive on the LAN.
-    Step 4: Connect (TCP) + authenticate (Telnet login from RELAY_ETH_CONFIG) -- reported
+    Step 4: Connect (TCP) + authenticate (Telnet login from NUMATO_RELAY_MATRIX_CONFIG) -- reported
             as two distinct steps so auth failures are never confused with network failures.
     Step 5: Relay 1 command protocol -- READ, ON, OFF (each command and its response
             reported independently).
@@ -605,9 +858,11 @@ def test_relay_eth():
     not stop later steps from being attempted where it is safe to do so. Failure
     reasons are classified (network / authentication / protocol / timeout) via
     _classify_relay_error() so commissioning engineers get an actionable diagnosis
-    instead of a bare exception.
+    instead of a bare exception -- and the full Telnet conversation (RX/TX, prompt
+    detection, IAC negotiation) is visible via _numato_relay_debug_logging(), which
+    wraps this entire test, in case the summary reason isn't enough on its own.
     """
-    name, cfg = _select_device(dev_cfg.RELAY_ETH_CONFIGS, "Ethernet Relays")
+    name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
     if cfg is None:
         return []
     _print_device_config(name, cfg)
@@ -619,44 +874,52 @@ def test_relay_eth():
     config_ref = f"config/devices.py -> {name} ({driver} / {host}:{port})"
     results    = []
 
+    with _numato_relay_debug_logging():
+        results.extend(_run_relay_numato_matrix_test(cfg, name, host, port, driver, user, config_ref))
+    return results
+
+
+def _run_relay_numato_matrix_test(cfg, name, host, port, driver, user, config_ref):
+    results = []
+
     # Step 1: factory + interface check  -- offline, no hardware ---------------
     try:
         from hardware.relay_factory import RelayFactory
         from hardware.relay import RelayBase
         relay = RelayFactory.create(cfg)
         if not isinstance(relay, RelayBase):
-            results.append(_fail("Relay Ethernet", "Factory", config_ref,
+            results.append(_fail("Numato Relay Matrix", "Factory", config_ref,
                                  "RelayFactory did not return a RelayBase instance"))
             return results
         required = ["connect", "disconnect", "open", "close", "open_all",
                     "close_all", "query"]
         missing = [m for m in required if not callable(getattr(relay, m, None))]
         if missing:
-            results.append(_fail("Relay Ethernet", "Interface", config_ref,
+            results.append(_fail("Numato Relay Matrix", "Interface", config_ref,
                                  f"Missing methods: {missing}"))
             return results
-        results.append(_ok("Relay Ethernet", "Driver interface", config_ref,
-                           f"RelayFactory -> EthernetRelay OK  ({driver} / {name})"))
+        results.append(_ok("Numato Relay Matrix", "Driver interface", config_ref,
+                           f"RelayFactory -> NumatoRelayMatrix OK  ({driver} / {name})"))
     except Exception as e:
-        results.append(_fail("Relay Ethernet", "Factory", config_ref,
+        results.append(_fail("Numato Relay Matrix", "Factory", config_ref,
                              f"Import / factory error: {e}"))
         return results
 
     # Step 2: ping -- network layer, before attempting TCP/Telnet ---------------
     ping_ok, ping_detail = _ping_host(host)
     if ping_ok:
-        results.append(_ok("Relay Ethernet", "Ping", config_ref, f"{host} reachable"))
+        results.append(_ok("Numato Relay Matrix", "Ping", config_ref, f"{host} reachable"))
     else:
-        results.append(_warn("Relay Ethernet", "Ping", config_ref,
+        results.append(_warn("Numato Relay Matrix", "Ping", config_ref,
                              f"Reason:\n{ping_detail} "
                              "(ICMP may be blocked -- Telnet may still succeed)"))
 
     # Step 3: web interface reachability -----------------------------------------
     web_ok, web_detail = _check_web_interface(host)
     if web_ok:
-        results.append(_ok("Relay Ethernet", "Web Interface", config_ref, web_detail))
+        results.append(_ok("Numato Relay Matrix", "Web Interface", config_ref, web_detail))
     else:
-        results.append(_warn("Relay Ethernet", "Web Interface", config_ref,
+        results.append(_warn("Numato Relay Matrix", "Web Interface", config_ref,
                              f"Reason:\n{web_detail}"))
 
     # Step 4: connection + authentication ----------------------------------------
@@ -666,21 +929,21 @@ def test_relay_eth():
         relay.connect()
     except Exception as e:
         reason = _classify_relay_error(e)
-        if reason == "Authentication failed":
-            results.append(_ok("Relay Ethernet", "Ethernet Connection", config_ref,
+        if reason.startswith("Authentication failed"):
+            results.append(_ok("Numato Relay Matrix", "Ethernet Connection", config_ref,
                                f"TCP connected to {driver} at {host}:{port}"))
-            results.append(_fail("Relay Ethernet", "Authentication", config_ref,
+            results.append(_fail("Numato Relay Matrix", "Authentication", config_ref,
                                  f"Reason:\n{reason} (user='{user}')"))
         else:
-            results.append(_fail("Relay Ethernet", "Ethernet Connection", config_ref,
+            results.append(_fail("Numato Relay Matrix", "Ethernet Connection", config_ref,
                                  f"Reason:\n{reason}"))
-            results.append(_fail("Relay Ethernet", "Authentication", config_ref,
+            results.append(_fail("Numato Relay Matrix", "Authentication", config_ref,
                                  "Reason:\nNot attempted -- connection failed"))
         return results
 
-    results.append(_ok("Relay Ethernet", "Ethernet Connection", config_ref,
+    results.append(_ok("Numato Relay Matrix", "Ethernet Connection", config_ref,
                        f"TCP connected to {driver} at {host}:{port}"))
-    results.append(_ok("Relay Ethernet", "Authentication", config_ref,
+    results.append(_ok("Numato Relay Matrix", "Authentication", config_ref,
                        f"Telnet login OK (user='{user}')"))
 
     # Step 5: relay 1 command protocol -- READ, ON, OFF --------------------------
@@ -689,35 +952,35 @@ def test_relay_eth():
 
     try:
         state = relay.read(test_ch)   # "relay read 1"
-        results.append(_ok("Relay Ethernet", f"Relay {test_ch} READ", config_ref,
+        results.append(_ok("Numato Relay Matrix", f"Relay {test_ch} READ", config_ref,
                            f"relay read {test_ch} -> {'ON' if state else 'OFF'}"))
     except Exception as e:
-        results.append(_fail("Relay Ethernet", f"Relay {test_ch} READ", config_ref,
+        results.append(_fail("Numato Relay Matrix", f"Relay {test_ch} READ", config_ref,
                              f"Reason:\n{_classify_relay_error(e)}"))
 
     try:
         relay.close(test_ch)          # "relay on 1"
-        results.append(_ok("Relay Ethernet", f"Relay {test_ch} ON", config_ref,
+        results.append(_ok("Numato Relay Matrix", f"Relay {test_ch} ON", config_ref,
                            f"relay on {test_ch} sent OK"))
     except Exception as e:
-        results.append(_fail("Relay Ethernet", f"Relay {test_ch} ON", config_ref,
+        results.append(_fail("Numato Relay Matrix", f"Relay {test_ch} ON", config_ref,
                              f"Reason:\n{_classify_relay_error(e)}"))
 
     try:
         relay.open(test_ch)           # "relay off 1"
-        results.append(_ok("Relay Ethernet", f"Relay {test_ch} OFF", config_ref,
+        results.append(_ok("Numato Relay Matrix", f"Relay {test_ch} OFF", config_ref,
                            f"relay off {test_ch} sent OK"))
     except Exception as e:
-        results.append(_fail("Relay Ethernet", f"Relay {test_ch} OFF", config_ref,
+        results.append(_fail("Numato Relay Matrix", f"Relay {test_ch} OFF", config_ref,
                              f"Reason:\n{_classify_relay_error(e)}"))
 
     # Step 6: disconnect ----------------------------------------------------------
     try:
         relay.disconnect()
-        results.append(_ok("Relay Ethernet", "Disconnect", config_ref,
+        results.append(_ok("Numato Relay Matrix", "Disconnect", config_ref,
                            f"Disconnected from {host}:{port}"))
     except Exception as e:
-        results.append(_warn("Relay Ethernet", "Disconnect", config_ref, str(e)))
+        results.append(_warn("Numato Relay Matrix", "Disconnect", config_ref, str(e)))
 
     return results
 
@@ -729,18 +992,19 @@ def test_relay_eth():
 def test_relay_matrix_scan():
     """
     Commissioning test: exercises every configured channel of the Numato
-    Ethernet relay module -- ON, READ, OFF -- one connection for the whole scan.
+    Relay Matrix module -- ON, READ, OFF -- one connection for the whole scan.
 
     Before scanning, device availability is verified (ping + connect/auth) --
     the scan itself only starts once the device is confirmed reachable and
-    authenticated.
+    authenticated. Runs inside _numato_relay_debug_logging() so the full
+    Telnet conversation is visible if connect()/auth fails.
 
-    Channel count comes from config/devices.py RELAY_ETH_CONFIG["channel_count"]
+    Channel count comes from config/devices.py NUMATO_RELAY_MATRIX_CONFIG["channel_count"]
     (falls back to "num_channels" for compat -- never hardcoded). A failure on
     any single channel is recorded as FAIL and the scan continues to the
     remaining channels -- it never aborts early.
     """
-    name, cfg = _select_device(dev_cfg.RELAY_ETH_CONFIGS, "Ethernet Relays")
+    name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
     if cfg is None:
         return []
     _print_device_config(name, cfg)
@@ -751,8 +1015,13 @@ def test_relay_matrix_scan():
     user         = cfg.get("username", cfg.get("user", ""))
     num_channels = cfg.get("channel_count", cfg.get("num_channels", 8))
     config_ref   = f"config/devices.py -> {name} ({driver} / {host}:{port}, {num_channels} ch)"
-    results      = []
 
+    with _numato_relay_debug_logging():
+        return _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref)
+
+
+def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref):
+    results = []
     try:
         from hardware.relay_factory import RelayFactory
         relay = RelayFactory.create(cfg)
@@ -813,6 +1082,221 @@ def test_relay_matrix_scan():
             relay.disconnect()
         except Exception as e:
             results.append(_warn("Relay Matrix Scan", "Disconnect", config_ref, str(e)))
+
+    return results
+
+
+# =============================================================================
+# 5d. RelayEthernetTest -- native Numato primitives, independent of the
+#     public 1-based open()/close() API (see 5e for that layer's self-test)
+# =============================================================================
+
+def test_relay_ethernet_test():
+    """
+    RelayEthernetTest: validates the native Numato command primitives
+    directly -- write(relay_number, state), read_all(), write_all(),
+    verify_all() -- using Numato's own 0-based relay numbering, independent
+    of the higher-level 1-based open()/close() API that
+    test_relay_safety_selftest() exercises.
+
+    Purpose: validate, before relay usage is integrated into higher-level
+    battery test workflows --
+        - Telnet communication
+        - Numato native command handling (on/off/read/readall/writeall)
+        - Relay state verification (individual + bulk)
+        - Safe relay sequencing
+        - Driver architecture
+        - Hardware operation
+
+    Relay count comes from configuration (NUMATO_RELAY_MATRIX_CONFIG channel_count,
+    itself sourced from Settings.RELAY_COUNT) -- never hardcoded here.
+
+    Sequence per relay_index in range(RELAY_COUNT):
+        write_all(OFF) -> read_all() -> verify all OFF
+        write(relay_index, ON) -> read_all() -> verify relay_index ON, rest OFF
+        write_all(OFF) -> read_all() -> verify all OFF
+
+    Fails immediately on any mismatch -- does not continue to the remaining
+    relays once one has failed.
+    """
+    name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
+    if cfg is None:
+        return []
+    _print_device_config(name, cfg)
+
+    host        = cfg.get("ip", "")
+    port        = cfg.get("port", 23)
+    driver      = cfg.get("driver", "RELAY32ETHRL00")
+    relay_count = cfg.get("channel_count", cfg.get("num_channels", Settings.RELAY_COUNT))
+    config_ref  = f"config/devices.py -> {name} ({driver} / {host}:{port}, RELAY_COUNT={relay_count})"
+    results     = []
+
+    try:
+        from hardware.relay_factory import RelayFactory
+        relay = RelayFactory.create(cfg)
+    except Exception as e:
+        return [_fail("RelayEthernetTest", "Factory", config_ref,
+                      f"Import / factory error: {e}")]
+
+    with _numato_relay_debug_logging():
+        try:
+            relay.connect()
+        except Exception as e:
+            return [_fail("RelayEthernetTest", "Connect + Auth", config_ref,
+                          f"Reason:\n{_classify_relay_error(e)}\n"
+                          f"Test aborted -- device not available.")]
+
+        results.append(_ok("RelayEthernetTest", "Connect + Auth", config_ref,
+                           f"Connected and authenticated to {driver} at {host}:{port}"))
+
+        stopped_early = False
+        for relay_index in range(relay_count):
+            print(f"\n  -- Relay index {relay_index}/{relay_count - 1} (native 0-based) --")
+            try:
+                relay.write_all(0)
+                relay.verify_all(0)
+
+                relay.write(relay_index, True)
+                relay.verify_all(1 << relay_index)
+
+                relay.write_all(0)
+                relay.verify_all(0)
+
+                results.append(_ok(
+                    "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
+                    "write_all(OFF) -> verify -> write(ON) -> verify -> "
+                    "write_all(OFF) -> verify  PASS"
+                ))
+            except Exception as e:
+                results.append(_fail(
+                    "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
+                    f"Relay Number    : {relay_index}\n"
+                    f"Expected State  : see sequence step that failed above\n"
+                    f"Actual State    : verification failed (see cause)\n"
+                    f"Cause           : {e}"
+                ))
+                stopped_early = True
+                break   # fail immediately -- do not continue to remaining relays
+
+        if stopped_early:
+            results.append(_fail("RelayEthernetTest", "Test aborted", config_ref,
+                                 "Stopped at first failure -- remaining relays not tested"))
+
+        try:
+            relay.disconnect()
+        except Exception as e:
+            results.append(_warn("RelayEthernetTest", "Disconnect", config_ref, str(e)))
+
+    return results
+
+
+# =============================================================================
+# 5e. Relay -- Ethernet mandatory safety self-test (channels 1-32)
+# =============================================================================
+
+def test_relay_safety_selftest():
+    """
+    Validates the mandatory relay safety sequence (hardware/relay_eth.py
+    NumatoRelayMatrix.close()/open()) against every configured channel,
+    individually, in order:
+
+        For relay N = 1 .. num_channels:
+            OFF ALL
+            VERIFY OFF                  (relay.close(N) does this internally)
+            ON relay N
+            VERIFY relay N ON, all others OFF
+        Then: OFF ALL / VERIFY OFF
+
+    STOPS IMMEDIATELY on the first failure of any kind -- connection error,
+    timeout, readback mismatch, unexpected active relay, parser error, or
+    verification failure. It does NOT continue to remaining channels, so a
+    partial PASS list plus one FAIL entry means the scan was cut short there
+    by design, not that the untested channels are known-good.
+
+    Every relay operation is logged in detail (requested relay, command
+    sent, raw readback, decoded mask, decoded active channels, PASS/FAIL)
+    via hardware.relay_eth's own logger, which test.py normally silences
+    (logging.disable at import time) -- this test temporarily re-enables it
+    to stdout for the duration of the run so the audit trail in requirement
+    4 is visible, then restores the previous logging state.
+
+    NOTE: the exact byte format of the Numato "relay readall" response has
+    been CONFIRMED against the physical unit -- a live 32-channel matrix
+    scan (see test_relay_matrix_scan()) passed end-to-end and the decoded
+    ACTIVE channel list matched the physically observed relay state at
+    every step. If a firmware update ever changes this format,
+    hardware/relay_eth.py::_parse_readall_response() is the one place to fix it.
+    """
+    name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
+    if cfg is None:
+        return []
+    _print_device_config(name, cfg)
+
+    host         = cfg.get("ip", "")
+    port         = cfg.get("port", 23)
+    driver       = cfg.get("driver", "RELAY32ETHRL00")
+    num_channels = cfg.get("channel_count", cfg.get("num_channels", 8))
+    config_ref   = f"config/devices.py -> {name} ({driver} / {host}:{port}, {num_channels} ch)"
+    results      = []
+
+    try:
+        from hardware.relay_factory import RelayFactory
+        relay = RelayFactory.create(cfg)
+    except Exception as e:
+        return [_fail("Relay Safety Self-Test", "Factory", config_ref,
+                      f"Import / factory error: {e}")]
+
+    # test.py silences all logging at import time, but the detailed per-command
+    # audit trail (requested relay / command sent / readback / verification)
+    # is the whole point of this test -- _numato_relay_debug_logging()
+    # re-enables it (DEBUG level, includes the Telnet login transcript too).
+    with _numato_relay_debug_logging():
+        try:
+            relay.connect()
+        except Exception as e:
+            return [_fail("Relay Safety Self-Test", "Connect + Auth", config_ref,
+                          f"Reason:\n{_classify_relay_error(e)}\n"
+                          f"Self-test aborted -- device not available.")]
+
+        results.append(_ok("Relay Safety Self-Test", "Connect + Auth", config_ref,
+                           f"Connected and authenticated to {driver} at {host}:{port}"))
+
+        stopped_early = False
+        for ch in range(1, num_channels + 1):
+            print(f"\n  -- Relay {ch}/{num_channels} --")
+            try:
+                relay.close(ch)   # OFF ALL -> VERIFY OFF -> ON ch -> VERIFY ch-only-ON
+                results.append(_ok("Relay Safety Self-Test", f"Relay {ch}", config_ref,
+                                   f"OFF ALL -> VERIFY OFF -> ON {ch} -> VERIFY {ch} only  PASS"))
+                relay.open(ch)    # OFF ALL -> VERIFY OFF, restore safe state before next channel
+            except Exception as e:
+                results.append(_fail(
+                    "Relay Safety Self-Test", f"Relay {ch}", config_ref,
+                    f"Relay Number    : {ch}\n"
+                    f"Expected State  : ONLY relay {ch} ON, all others OFF\n"
+                    f"Actual State    : verification failed (see cause)\n"
+                    f"Cause           : {e}"
+                ))
+                stopped_early = True
+                break   # STOP IMMEDIATELY -- do not continue to remaining channels
+
+        if stopped_early:
+            results.append(_fail("Relay Safety Self-Test", "Self-test aborted", config_ref,
+                                 "Stopped at first failure -- remaining channels not tested"))
+        else:
+            # Final OFF ALL / VERIFY OFF after relay 32 (or the highest configured channel)
+            try:
+                relay.open_all()
+                results.append(_ok("Relay Safety Self-Test", "Final OFF ALL", config_ref,
+                                   "All relays forced OFF and verified OFF after full sweep"))
+            except Exception as e:
+                results.append(_fail("Relay Safety Self-Test", "Final OFF ALL", config_ref,
+                                     f"Cause: {e}"))
+
+        try:
+            relay.disconnect()
+        except Exception as e:
+            results.append(_warn("Relay Safety Self-Test", "Disconnect", config_ref, str(e)))
 
     return results
 
@@ -1158,8 +1642,36 @@ def print_summary(all_results):
 # Pre-flight
 # =============================================================================
 
+def test_device_validation():
+    """
+    Startup device validation (utils/device_validator.py): every configured
+    device in config/devices.py can be instantiated, required fields are
+    present, no duplicate names/VISA resources/IP addresses/COM ports/relay
+    identifiers exist, relay count is consistent (num_channels ==
+    channel_count == Settings.RELAY_COUNT), and every relay 'type' is
+    registered in RelayFactory.
+
+    Construction only -- no connect() is called, no hardware communication
+    is attempted. This runs first in preflight_check(), before the menu (and
+    therefore before Hardware Discovery or any other test) is shown.
+    """
+    from utils.device_validator import validate_devices
+    ref = "utils/device_validator.py -> validate_devices(config.devices)"
+    errors = validate_devices(dev_cfg)
+    if not errors:
+        return [_ok("Device Validation", "config/devices.py", ref,
+                    "All configured devices passed startup validation")]
+    return [_fail("Device Validation", "config/devices.py", ref, e) for e in errors]
+
+
 def preflight_check():
-    results  = test_configuration()
+    """
+    Runs before the menu is shown, gating it exactly like test_configuration()
+    already did: Settings-level validation (test_configuration) PLUS
+    device-level validation (test_device_validation) -- both before any
+    hardware communication, and before Hardware Discovery or any other test.
+    """
+    results  = test_configuration() + test_device_validation()
     failures = [r for r in results if r.status == Status.FAIL]
     warnings = [r for r in results if r.status == Status.WARNING]
     if not failures and not warnings:
@@ -1194,7 +1706,7 @@ def run_main_test():
     smu_name, smu_cfg   = next(iter(dev_cfg.SMU_ASSIGNMENTS.items()))
     dmm_name, dmm_cfg   = next(iter(dev_cfg.DMM_CONFIGS.items()))
     daq_name, daq_cfg   = next(iter(dev_cfg.DAQ_CONFIGS.items()))
-    relay_cfg           = dev_cfg.RELAY_ETH_CONFIG
+    relay_cfg           = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
     relay_name          = relay_cfg.get("name", "RELAY")
 
     print("\nSelected Hardware\n")
@@ -1230,12 +1742,16 @@ def run_main_test():
 
 MENU = [
     ("Run Main Test",                 run_main_test),
+    ("Startup Device Validation (config/devices.py -- no hardware I/O)", test_device_validation),
+    ("Hardware Discovery (connectivity + identification, config-driven)", test_hardware_discovery),
     ("Test SMU (PSU)",                test_smu),
     ("Test DMM",                      test_dmm),
     ("Test DAQ",                      test_daq),
     ("Test Relay -- Serial",          test_relay_serial),
-    ("Test Relay -- Ethernet",        test_relay_eth),
+    ("Test Relay -- Numato Relay Matrix (Ethernet)", test_relay_numato_matrix),
     ("Test Relay -- Ethernet Matrix Scan", test_relay_matrix_scan),
+    ("Test Relay -- RelayEthernetTest (native primitives, stop on first failure)", test_relay_ethernet_test),
+    ("Test Relay -- Safety Self-Test (1-32, stop on first failure)", test_relay_safety_selftest),
     ("Test Electronic Load",          test_electronic_load),
     ("Test Sensors (NTC)",            test_sensors),
     ("Test Safety Monitor",           test_safety_monitor),

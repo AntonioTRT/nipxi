@@ -16,7 +16,7 @@ Usage:
     from data.storage import DataStorage
     from config.settings import Settings
 
-    hw      = HardwareManager(Settings, relay_cfg=RELAY_ETH_CONFIG)  # production: Ethernet
+    hw      = HardwareManager(Settings, relay_cfg=NUMATO_RELAY_MATRIX_CONFIG)  # production
     storage = DataStorage(settings=Settings)
 
     executor = TestExecutor(hw=hw, storage=storage, settings=Settings)
@@ -38,7 +38,7 @@ from test_control.battery_test import BatteryTestSequence
 from test_control.charge_cycle import ChargeCycle
 from test_control.discharge_cycle import DischargeCycle
 from test_control.safety_monitor import SafetyMonitor
-from utils.errors import SafetyViolationError, HardwareInitError
+from utils.errors import SafetyViolationError, HardwareInitError, RelayError
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +162,14 @@ class TestExecutor:
             result.aborted = True
             result.error   = str(e)
             self.log.error("Test aborted: safety violation -- %s", e)
+
+        except RelayError as e:
+            # Includes RelayStateVerificationError. Emergency stop was already
+            # triggered inside BatteryTestSequence -- this is a safety fault,
+            # never a condition the executor retries or continues past.
+            result.aborted = True
+            result.error   = str(e)
+            self.log.error("Test aborted: relay verification fault -- %s", e)
 
         except HardwareInitError as e:
             result.aborted = True

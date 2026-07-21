@@ -15,7 +15,7 @@ Usage:
     from config.settings import Settings
     from config import devices as dev_cfg
 
-    hw = HardwareManager(Settings, relay_cfg=dev_cfg.RELAY_ETH_CONFIG)  # production: Ethernet
+    hw = HardwareManager(Settings, relay_cfg=dev_cfg.NUMATO_RELAY_MATRIX_CONFIG)  # production
 
     with hw:                        # calls connect_all() / disconnect_all()
         smu   = hw.smu
@@ -40,8 +40,10 @@ Adding a new device:
 import logging
 
 from config.settings import Settings
+from config import devices as dev_cfg
 from hardware.smu import SMU
 from hardware.daq import DAQ
+from hardware.dmm import DMM
 from hardware.relay_factory import RelayFactory
 from utils.errors import HardwareInitError
 
@@ -58,15 +60,34 @@ class HardwareManager:
     before closing the connection -- ensures batteries are disconnected on any exit.
     """
 
-    def __init__(self, settings: Settings, relay_cfg: dict):
+    def __init__(self, settings: Settings, relay_cfg: dict,
+                 smu_cfg: dict = None, daq_cfg: dict = None, dmm_cfg: dict = None):
         """
         Build hardware driver objects from configuration.
 
+        config/devices.py is the single source of truth for every device's
+        resource string / address -- config/settings.py no longer duplicates
+        it (see the removed PXI_RESOURCE_* constants in docs/CONFIGURATION.md's
+        changelog note). smu_cfg/daq_cfg/dmm_cfg default to the first entry of
+        config/devices.py's SMU_ASSIGNMENTS/DAQ_CONFIGS/DMM_CONFIGS so existing
+        callers (main.py, test.py) do not need to change, but callers that
+        manage multiple SMUs/DAQs may pass a specific device's cfg dict
+        explicitly.
+
         Args:
-            settings:   Settings class (class-level attributes, not instance).
-            relay_cfg:  RELAY_ETH_CONFIG (production -- Numato Ethernet relay) or
-                        RELAY_CONFIG (serial, diagnostics only) from config/devices.py.
-                        The factory reads cfg["type"] to select the correct driver.
+            settings:  Settings class (class-level attributes, not instance).
+            relay_cfg: NUMATO_RELAY_MATRIX_CONFIG (production -- Numato Relay
+                       Matrix, Ethernet) or RELAY_CONFIG (serial, diagnostics
+                       only) from config/devices.py. The factory reads
+                       cfg["type"] to select the correct driver.
+            smu_cfg:   A config/devices.py SMU_ASSIGNMENTS[...] dict. Defaults to
+                       the first configured SMU.
+            daq_cfg:   config/devices.py DAQ_CONFIG (or a DAQ_CONFIGS[...] entry).
+                       Defaults to DAQ_CONFIG.
+            dmm_cfg:   config/devices.py DMM_CONFIG (or a DMM_CONFIGS[...] entry).
+                       Optional -- the DMM is not required for charge/discharge
+                       cycling (independent voltage verification only). Defaults
+                       to None (no DMM constructed) unless explicitly passed.
 
         Raises:
             HardwareInitError: if required config keys are missing.
@@ -74,10 +95,14 @@ class HardwareManager:
         self.s = settings
         self.log = logging.getLogger("nipxi.hw_manager")
 
+        smu_cfg = smu_cfg or next(iter(dev_cfg.SMU_ASSIGNMENTS.values()))
+        daq_cfg = daq_cfg or dev_cfg.DAQ_CONFIG
+
         # Build driver objects (no hardware communication yet)
-        self._smu   = SMU(settings.PXI_RESOURCE_SMU1)
-        self._daq   = DAQ(settings.PXI_RESOURCE_DAQ)
+        self._smu   = SMU(smu_cfg)
+        self._daq   = DAQ(daq_cfg)
         self._relay = RelayFactory.create(relay_cfg)
+        self._dmm   = DMM(dmm_cfg) if dmm_cfg else None
 
         relay_class = self._relay.__class__.__name__
         if relay_cfg.get("type", "serial").lower() == "ethernet":
@@ -85,9 +110,6 @@ class HardwareManager:
         else:
             detail = f"Port: {relay_cfg.get('port', '')}"
         self.log.info("Selected Relay: %s  %s", relay_class, detail)
-
-        # DMM is optional: used for independent voltage verification, not required for cycling
-        self._dmm = None
 
     # ------------------------------------------------------------------
     # Public device accessors
@@ -107,6 +129,11 @@ class HardwareManager:
     def relay(self):
         """Relay matrix driver (RelayBase -- serial or Ethernet)."""
         return self._relay
+
+    @property
+    def dmm(self):
+        """DMM driver (independent voltage verification), or None if not configured."""
+        return self._dmm
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -132,6 +159,10 @@ class HardwareManager:
 
             self._smu.connect()
             connected.append(self._smu)
+
+            if self._dmm is not None:
+                self._dmm.connect()
+                connected.append(self._dmm)
 
             self._relay.connect()
             connected.append(self._relay)
@@ -174,8 +205,12 @@ class HardwareManager:
             except Exception as e:
                 self.log.warning("relay.open_all() failed during shutdown: %s", e)
 
-        # 3. Disconnect relay, SMU, DAQ (reverse of connect order)
-        for dev in (self._relay, self._smu, self._daq):
+        # 3. Disconnect relay, DMM (if present), SMU, DAQ (reverse of connect order)
+        devices = [self._relay]
+        if self._dmm is not None:
+            devices.append(self._dmm)
+        devices += [self._smu, self._daq]
+        for dev in devices:
             try:
                 if dev.connected:
                     dev.disconnect()
@@ -196,7 +231,11 @@ class HardwareManager:
         """
         results = {}
 
-        for dev in (self._smu, self._daq, self._relay):
+        devices = (self._smu, self._daq, self._relay)
+        if self._dmm is not None:
+            devices += (self._dmm,)
+
+        for dev in devices:
             key = dev.name
             if not dev.connected:
                 results[key] = {"ok": False, "detail": "not connected"}
@@ -222,9 +261,10 @@ class HardwareManager:
         self.disconnect_all()
 
     def __repr__(self):
+        dmm_state = f" dmm={self._dmm.connected}" if self._dmm is not None else ""
         return (
             f"<HardwareManager "
             f"smu={self._smu.connected} "
-            f"daq={self._daq.connected} "
+            f"daq={self._daq.connected}{dmm_state} "
             f"relay={self._relay.connected}>"
         )

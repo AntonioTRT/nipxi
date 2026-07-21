@@ -24,6 +24,7 @@ This sub-repository is self-contained and independent from the main BLOAST proje
 14. [Development Workflow](#14-development-workflow)
 15. [MiniSQL Integration Path](#15-minisql-integration-path)
 16. [Troubleshooting](#16-troubleshooting)
+17. [Hardware Abstraction Architecture & Device Onboarding](#17-hardware-abstraction-architecture--device-onboarding)
 
 ---
 
@@ -54,12 +55,15 @@ See [docs/TODO.md](docs/TODO.md) for the complete checklist.
                 |              Host PC / Control System            |
                 |                                                  |
                 |  main.py  (thin orchestration)                   |
+                |    +-- validate_settings()                       |
+                |    +-- validate_devices_or_raise()  <- startup   |
+                |    |                                   device gate|
                 |    +-- HardwareManager  (device lifecycle)       |
                 |    +-- TestExecutor     (runs the test sequence) |
                 |    +-- ResultManager    (storage + reports)      |
                 +-------------------+------------------------------+
                                     |
-                     NI-VISA / nidaqmx / nidcpower
+                     NI-VISA / nidaqmx / nidcpower / nidmm
                                     |
                 +-------------------v------------------------------+
                 |                PXI Chassis                       |
@@ -73,9 +77,9 @@ See [docs/TODO.md](docs/TODO.md) for the complete checklist.
                     |
        +------------v-------------+
        |  Relay Matrix            |
-       |  Serial: NI 2569 / COM   |
-       |  Ethernet: RELAY32ETHRL00|
-       |  8 channels, multiplexed |
+       |  Ethernet: Numato 32-ch  |  <- PRODUCTION
+       |  Serial:   COM13         |  <- diagnostic only
+       |  32 channels, interlocked|
        +------------+-------------+
                     |
        +------------v-----------------------------------------+
@@ -87,10 +91,15 @@ See [docs/TODO.md](docs/TODO.md) for the complete checklist.
        +------------------------------------------------------+
 ```
 
+**config/devices.py is the single source of truth for every device's resource string / address** -- SMU slot, DAQ slot, DMM slot, relay IP, relay COM port. Nothing else duplicates it (see Section 17 for the full pipeline and how HardwareManager/Hardware Discovery both read from it).
+
 **Control flow (per test run):**
 
 ```
-Initialize hardware
+main.py:
+  validate_settings(Settings)          -- fail-fast on bad config values
+  validate_devices_or_raise(dev_cfg)   -- fail-fast on bad device config (Section 17)
+  HardwareManager(...).connect_all()   -- construct + connect every device
 For each active channel:
   1. Read current -- must be < 0.01 A before switching relay
   2. Close relay channel N   (connects battery to SMU)
@@ -119,23 +128,30 @@ nipxi/
 |-- .gitignore
 |
 |-- config/
-|   |-- settings.py             All tunable parameters (voltages, currents, paths, ports).
-|   +-- devices.py              Channel mapping, PXI slot assignments, relay config.
+|   |-- settings.py             Tunable parameters (voltages, currents, timeouts, RELAY_COUNT).
+|   |                           Does NOT hold device resource strings/addresses -- see devices.py.
+|   +-- devices.py              SINGLE SOURCE OF TRUTH for every device: PXI slots, relay IP/
+|                                COM port, channel mapping. See Section 17.
 |
 |-- hardware/                   One class per physical device. All inherit HardwareBase.
 |   |-- base.py                 Abstract base: connect(), disconnect(), context manager.
 |   |-- relay.py                RelayBase abstract class (open/close/query interface).
-|   |-- relay_serial.py         Serial relay driver (ASCII text protocol over COM port).
-|   |-- relay_eth.py            Ethernet relay driver (Numato RELAY32ETHRL00 via TCP).
-|   |-- relay_factory.py        Factory: RelayFactory.create(cfg) -> RelayBase.
-|   |-- relay_matrix.py         Legacy relay driver (kept for backward compat).
-|   |-- smu.py                  SMU driver stub (nidcpower -- TODO: implement).
-|   |-- daq.py                  DAQ driver stub (nidaqmx -- TODO: implement).
+|   |-- relay_serial.py         Serial relay driver (COM13) -- diagnostic only, NOT production.
+|   |-- relay_eth.py            PRODUCTION relay driver: Numato 32-ch Ethernet relay via TCP.
+|   |                           Enforces mandatory all-off->verify->activate->verify sequence.
+|   |-- relay_factory.py        Factory: RelayFactory.create(cfg) -> RelayBase (serial/ethernet).
+|   |-- relay_matrix.py         Dead/legacy code -- not imported or wired into RelayFactory.
+|   |-- smu.py                  SMU (PSU) driver: real connect()/identify(); charge/discharge/
+|   |                           measure still placeholders (see docs/TODO.md).
+|   |-- daq.py                  DAQ driver: real connect()/identify() (device enumeration +
+|   |                           self-test); channel read still a placeholder.
+|   |-- dmm.py                  DMM driver: real connect()/identify().
 |   |-- pxi_rack.py             PXI chassis enumeration stub.
 |   +-- temperature.py          NTC thermistor voltage-to-Celsius conversion.
 |
 |-- test_control/               Test sequence logic, no hardware knowledge.
 |   |-- hardware_manager.py     Device lifecycle (connect_all/disconnect_all/health_check).
+|   |                           Constructs SMU/DAQ/DMM/Relay from config/devices.py.
 |   |-- test_executor.py        Runs the test, returns TestRunResult.
 |   |-- result_manager.py       Storage + reporting. MiniSQL integration point.
 |   |-- battery_test.py         Per-channel charge+discharge sequence.
@@ -151,7 +167,9 @@ nipxi/
 |
 |-- utils/
 |   |-- errors.py               Exception hierarchy (NIPXIError -> RelayError, etc.).
-|   |-- validators.py           Config and input validation functions.
+|   |-- validators.py           Settings-level validation (validate_settings()).
+|   |-- device_validator.py     Device-level startup validation (validate_devices_or_raise()) --
+|   |                           see Section 17. Never touches hardware, construction only.
 |   |-- constants.py            Project-wide constants.
 |   |-- helpers.py              Utility functions.
 |   +-- ethernet_relay_python.py  Numato reference script (read-only, not imported).
@@ -166,16 +184,29 @@ nipxi/
 
 ## 4. Supported Hardware
 
-| Role | Model | Interface | Library |
-|------|-------|-----------|---------|
-| PXI Chassis | NI PXI-1042 (or compatible) | NI-VISA | — |
-| DAQ | NI 6363 (Slot 2) | NI-DAQmx | `nidaqmx` |
-| DMM | NI 4065 (Slot 3) | NI-DMM | `nidmm` |
-| SMU (primary) | NI 4140 or 4139 (Slot 4) | NI-DCPower | `nidcpower` |
-| SMU (optional) | NI 4130 (Slot 5) | NI-DCPower | `nidcpower` |
-| Relay (serial) | Any ASCII-command relay via COM | pyserial | `pyserial` |
-| Relay (Ethernet) | Numato RELAY32ETHRL00 | TCP/Telnet | stdlib `socket` |
-| Battery Hub PCB | BLOSS Hub Rev A | — | — |
+| Role | Model | Interface | Library | Driver |
+|------|-------|-----------|---------|--------|
+| PXI Chassis | NI PXI-1042 (or compatible) | NI-VISA | — | `hardware/pxi_rack.py` (stub) |
+| DAQ | NI 6363 (Slot 2) | NI-DAQmx | `nidaqmx` | `hardware/daq.py::DAQ` (connect/identify real; channel read still TODO) |
+| DMM | NI 4065 (Slot 3) | NI-DMM | `nidmm` | `hardware/dmm.py::DMM` (connect/identify real) |
+| SMU / PSU (primary) | NI 4140 or 4139 (Slot 4) | NI-DCPower | `nidcpower` | `hardware/smu.py::SMU` (connect/identify real; charge/discharge/measure still TODO) |
+| SMU (optional) | NI 4130 (Slot 5) | NI-DCPower | `nidcpower` | same `SMU` class, second `SMU_ASSIGNMENTS` entry |
+| Relay (Ethernet) | **Numato Lab 32-Channel Ethernet Relay Module (RELAY32ETHRL00) — PRODUCTION** | TCP/Telnet | stdlib `socket` | `hardware/relay_eth.py::NumatoRelayMatrix` |
+| Relay (serial, COM13) | Diagnostic only — NOT the production control path | pyserial | `pyserial` | `hardware/relay_serial.py::SerialRelay` |
+| Battery Hub PCB | BLOSS Hub Rev A | — | — | — |
+
+**Production relay hardware (validated):** Numato Lab 32 Channel Ethernet Relay Module, reachable over Ethernet/Telnet — ping, web interface, Telnet login, relay commands, and relay state readback have all been confirmed working. Validated settings:
+
+| Setting | Value |
+|---------|-------|
+| IP address | `169.254.1.1` |
+| Port | `23` |
+| Username | `admin` |
+| Password | `admin` |
+
+Production architecture path: `main.py -> HardwareManager -> RelayFactory -> NumatoRelayMatrix -> Numato Relay`.
+
+Serial COM13 (`hardware/relay_serial.py` / `RELAY_CONFIG`) exists only for bench diagnostics and is never selected by `main.py` or `test.py`'s "Run Main Test" — see [Section 9](#9-relay-architecture) and [docs/architecture.md](docs/architecture.md).
 
 **BLOSS Hub PCB specs:**
 - 8x Li-ion channels, JST BM8 connectors
@@ -238,8 +269,9 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # 4. Edit configuration (mandatory before first run)
-#    config/settings.py  -- set RELAY_COM_PORT, PXI_RESOURCE_* to match your hardware
-#    config/devices.py   -- set relay command strings, confirm channel wiring
+#    config/settings.py  -- voltages/currents/timeouts/RELAY_COUNT only
+#    config/devices.py   -- PXI slots, relay IP/COM port, channel wiring
+#                           (single source of truth for every device address)
 
 # 5. Run the test framework to verify hardware
 python test.py
@@ -252,12 +284,12 @@ python main.py --dry-run           # no hardware, config validation only
 
 **First-time checklist:**
 
-- [ ] Set `RELAY_COM_PORT` in `config/settings.py` to your COM port (e.g. `"COM4"`)
-- [ ] Set `PXI_RESOURCE_DAQ`, `PXI_RESOURCE_DMM`, `PXI_RESOURCE_SMU1` to match NI-MAX
-- [ ] Set `RELAY_ETH_CONFIG["ip"]` in `config/devices.py` if using Ethernet relay
-- [ ] Fill in `command_open/close/query` in `config/devices.py` RELAY_CONFIG for serial relay
+- [ ] Set `SMU_ASSIGNMENTS`/`DAQ_CONFIG`/`DMM_CONFIG` resource strings in `config/devices.py` to match NI-MAX
+- [ ] Set `NUMATO_RELAY_MATRIX_CONFIG["ip"]` in `config/devices.py` if using Ethernet relay
+- [ ] Fill in `command_open/close/query` in `config/devices.py` RELAY_CONFIG for serial relay (diagnostic only)
 - [ ] Confirm `BATTERY_CHANNELS` channel numbers match your physical wiring
-- [ ] Run `python test.py` and choose "Test Configuration" to validate settings
+- [ ] Run `python test.py` and choose "Test Configuration" (Settings) and "Startup Device Validation" (config/devices.py)
+- [ ] Run `python test.py` and choose "Hardware Discovery" to confirm every configured device connects and identifies
 
 ---
 
@@ -299,17 +331,18 @@ Global parameters for the test system. Class-level attributes on `Settings`.
 > **Note:** `DISCHARGE_CUTOFF_V` (3.0 V) is currently below `BAT_VOLTAGE_MIN` (3.5 V).
 > Verify which limit applies to your battery chemistry and update accordingly.
 
-**PXI hardware:**
+**PXI hardware (simulation mode only -- resource strings live in `config/devices.py`, see 7.2):**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `PXI_RESOURCE_DAQ` | `"PXI1Slot2"` | NI 6363 VISA resource string |
-| `PXI_RESOURCE_DMM` | `"PXI1Slot3"` | NI 4065 VISA resource string |
-| `PXI_RESOURCE_SMU1` | `"PXI1Slot4"` | NI SMU VISA resource string |
 | `PXI_SIMULATE` | `False` | Set `True` for NI simulation mode (no hardware) |
 
-> Find your actual VISA resource strings in **NI-MAX** (Measurement & Automation Explorer):
-> Start -> NI MAX -> Devices and Interfaces -> expand PXI Chassis.
+> **Changed:** `PXI_RESOURCE_DAQ`/`PXI_RESOURCE_DMM`/`PXI_RESOURCE_SMU1`/`PXI_RESOURCE_SMU2` used to
+> live here and were read directly by `HardwareManager`, duplicating the same values already in
+> `config/devices.py`'s `SMU_ASSIGNMENTS`/`DAQ_CONFIG`/`DMM_CONFIG`. They have been removed --
+> `config/devices.py` is now the only place VISA resource strings are set. Find your actual VISA
+> resource strings in **NI-MAX** (Measurement & Automation Explorer): Start -> NI MAX -> Devices
+> and Interfaces -> expand PXI Chassis, then edit `config/devices.py`.
 
 **Serial relay:**
 
@@ -321,9 +354,40 @@ Global parameters for the test system. Class-level attributes on `Settings`.
 
 ### 7.2 `config/devices.py`
 
-Physical channel mapping and device assignments.
+Physical channel mapping and device assignments. **This file is the single source of truth for every device's resource string / address** -- PXI slot, relay IP, relay COM port. See Section 17 for the full config -> Factory -> HardwareManager pipeline.
 
-**Serial relay configuration:**
+**PXI hardware configuration (SMU/PSU, DAQ, DMM):**
+
+```python
+SMU_ASSIGNMENTS = {
+    "SMU1": {
+        "type":     "PXIe",
+        "resource": "PXI1Slot4",    # update to match NI-MAX -- SMU/PSU (no separate PSU config)
+        "model":    "NI-4140",
+        "channels": list(range(1, 9)),
+    }
+}
+
+DAQ_CONFIG = {
+    "type":     "PXIe",
+    "resource": "PXI1Slot2",        # update to match NI-MAX
+    "model":    "NI-6363",
+    "sample_rate_hz": 1.0,
+    "voltage_range_v": 5.0,
+}
+
+DMM_CONFIG = {
+    "type":     "PXIe",
+    "resource": "PXI1Slot3",        # update to match NI-MAX
+    "model":    "NI-4065",
+    "function": "DC_VOLTS",
+    "range_v":  10.0,
+}
+```
+
+`hardware/smu.py::SMU`, `hardware/daq.py::DAQ`, and `hardware/dmm.py::DMM` are each constructed directly from one of these dicts (`SMU(cfg)`/`DAQ(cfg)`/`DMM(cfg)`) -- there is exactly one driver class per type, so (unlike relay) no factory/type-dispatch is needed; construction from the config dict already IS the "factory step" for these types.
+
+**Serial relay configuration (diagnostic only):**
 
 ```python
 RELAY_CONFIG = {
@@ -340,19 +404,20 @@ RELAY_CONFIG = {
 }
 ```
 
-**Ethernet relay configuration (Numato RELAY32ETHRL00):**
+**Ethernet relay configuration (Numato Lab 32-Channel Ethernet Relay Module -- PRODUCTION):**
 
 ```python
-RELAY_ETH_CONFIG = {
-    "type":         "ethernet",
-    "driver":       "RELAY32ETHRL00",
-    "name":         "MAIN_MATRIX_ETH",
-    "ip":           "192.168.1.50",  # update to your relay IP address
-    "port":         23,              # default Numato Telnet port
-    "user":         "admin",
-    "password":     "admin",
-    "timeout":      5.0,
-    "num_channels": 8,
+NUMATO_RELAY_MATRIX_CONFIG = {
+    "type":          "ethernet",
+    "driver":        "RELAY32ETHRL00",
+    "name":          "MAIN_MATRIX_ETH",
+    "ip":            "169.254.1.1",   # validated -- update if your relay's IP differs
+    "port":          23,              # default Numato Telnet port
+    "username":      "admin",
+    "password":      "admin",
+    "timeout":       5.0,
+    "num_channels":  Settings.RELAY_COUNT,   # single source of truth -- never hardcode 32
+    "channel_count": Settings.RELAY_COUNT,
 }
 ```
 
@@ -387,23 +452,59 @@ Update these channel strings to match your actual PCB connector-to-DAQ wiring.
 python test.py
 ```
 
-**Menu (12 sections):**
+**Menu:**
 
 ```
-  1. Test SMU (PSU)              -- nidcpower session + hardware.smu.SMU interface
-  2. Test DMM                    -- nidmm session
-  3. Test DAQ                    -- nidaqmx device + channel read
-  4. Test Relay -- Serial        -- SerialRelay factory + COM port open
-  5. Test Relay -- Ethernet      -- EthernetRelay factory + TCP login + open/close/query
-  6. Test Electronic Load        -- stub (future)
-  7. Test Sensors (NTC)          -- NTC conversion math + TemperatureSensor class
-  8. Test Safety Monitor         -- SafetyMonitor logic (all limits + relay guard)
-  9. Test Configuration          -- validate_settings() + all config values
- 10. Test Database Layer         -- DataStorage write/query/CSV (temp dir, no real data)
- 11. Test MiniSQL (hooks)        -- StorageBackend interface + stubs
- 12. Run All Tests               -- all of the above in sequence
+  1. Run Main Test                -- full commissioning run via HardwareManager/TestExecutor
+  2. Startup Device Validation    -- config/devices.py only, construction-only, no hardware I/O --
+                                     see Section 17.2. Runs automatically before the menu too.
+  3. Hardware Discovery           -- config-driven connectivity + identification only, every
+                                     device type (SMU/PSU, DMM, DAQ, Relay Eth, Relay Serial) --
+                                     see Section 8.1, NOT a measurement/battery/accuracy test
+  4. Test SMU (PSU)               -- hardware.smu.SMU connect()/identify() (real, via nidcpower)
+  5. Test DMM                     -- hardware.dmm.DMM connect()/identify() (real, via nidmm)
+  6. Test DAQ                     -- hardware.daq.DAQ connect()/identify() + deep channel read
+  7. Test Relay -- Serial         -- SerialRelay factory + COM port open
+  8. Test Relay -- Numato Relay Matrix (Ethernet) -- NumatoRelayMatrix factory + TCP login + open/close/query
+  9. Test Relay -- Ethernet Matrix Scan   -- exercises every configured channel in one connection
+ 10. Test Relay -- RelayEthernetTest      -- native Numato primitives, stop on first failure
+ 11. Test Relay -- Safety Self-Test       -- public 1-based API, channels 1-32, stop on first failure
+ 12. Test Electronic Load        -- stub (future)
+ 13. Test Sensors (NTC)          -- NTC conversion math + TemperatureSensor class
+ 14. Test Safety Monitor         -- SafetyMonitor logic (all limits + relay guard)
+ 15. Test Configuration          -- validate_settings() + all Settings values
+ 16. Test Database Layer         -- DataStorage write/query/CSV (temp dir, no real data)
+ 17. Test MiniSQL (hooks)        -- StorageBackend interface + stubs
+ 18. Run All Tests               -- all of the above (except Run Main Test) in sequence
   0. Exit
 ```
+
+### 8.1 Hardware Discovery (`test_hardware_discovery()`)
+
+A hardware **presence** test, not a measurement test, not a battery-workflow test, and not an instrument-accuracy test. For every device found in `config/devices.py` it validates only:
+
+- the device exists in `config/devices.py` (enumeration)
+- the device was discovered correctly
+- the driver loaded correctly (import / factory)
+- the communication channel opened correctly (connect)
+- the instrument responds correctly (self-test / login)
+- instrument identification succeeds (identity query)
+
+**Config-driven only** -- it iterates `SMU_ASSIGNMENTS`, `DMM_CONFIGS`, `DAQ_CONFIGS`, `NUMATO_RELAY_MATRIX_CONFIGS`, and `RELAY_SERIAL_CONFIGS` from `config/devices.py`; nothing is hardcoded (no resource strings, IPs, or COM ports), so adding or removing a device there changes coverage automatically with no code change.
+
+**Uses the same production driver classes as HardwareManager -- no duplicated connection logic, no instrument-specific communication code of its own.** Every `_identify_*()` helper in `test.py` does exactly `driver = DriverClass(cfg); driver.connect(); driver.identify(); driver.disconnect()` and nothing else -- it never imports `nidcpower`/`nidmm`/`nidaqmx`/`pyserial` directly. `test_smu()`/`test_dmm()`/`test_daq()` (the deeper per-device menu tests) call the same driver classes for their connect/identify step too, so there is exactly one connect()/identify() implementation per device type, not two:
+
+| Type | Driver class | Connect | Identify | Never does |
+|------|--------------|---------|----------|-------------|
+| SMU / PSU | `hardware.smu.SMU` | `smu.connect()` (nidcpower session, inside the driver) | `smu.identify()` -> `instrument_model` | `output_enable()`, `set_charge_mode()`, source V/I |
+| DMM | `hardware.dmm.DMM` | `dmm.connect()` (nidmm session, inside the driver) | `dmm.identify()` -> `instrument_model` | trigger/read a measurement |
+| DAQ | `hardware.daq.DAQ` | `daq.connect()` (NI-DAQmx device enumeration, inside the driver) | `daq.identify()` -> `product_type` + `self_test_device()` | create a task, read any channel |
+| Relay (Ethernet) | `hardware.relay_eth.NumatoRelayMatrix` (via `RelayFactory`) | `relay.connect()` (TCP + Telnet login) | the driver's own post-login `relay readall` verification | write to any relay channel (`connect()` is read-only) |
+| Relay (Serial) | `hardware.relay_serial.SerialRelay` (via `RelayFactory`) | `relay.connect()` (opens the COM port) | *(no identity command -- no custom protocol is invented; port-open success is the pass criterion)* | send any relay command |
+
+Note: there is no separate PSU hardware/config in this project -- the NI SMU is the PSU (see the "Test SMU (PSU)" menu label), so the SMU/PSU row above covers both.
+
+`RelayEthernetTest` (menu item 10) and Hardware Discovery's Ethernet-relay row both go through `RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)`, i.e. the same `NumatoRelayMatrix` instance type -- they never diverge onto a second relay implementation.
 
 **Result format:**
 
@@ -411,15 +512,15 @@ Each test step prints:
 
 ```
   [PASS] Device or component name
-         Config : config/devices.py -> RELAY_ETH_CONFIG (RELAY32ETHRL00 / 192.168.1.50:23)
-         Detail : Connected to RELAY32ETHRL00 at 192.168.1.50:23
+         Config : config/devices.py -> NUMATO_RELAY_MATRIX_CONFIG (RELAY32ETHRL00 / 169.254.1.1:23)
+         Detail : Connected to RELAY32ETHRL00 at 169.254.1.1:23
 ```
 
 or on failure:
 
 ```
-  [FAIL] RELAY_ETH_01
-         Config : config/devices.py -> RELAY_ETH_CONFIG (RELAY32ETHRL00 / 192.168.1.50:23)
+  [FAIL] MAIN_MATRIX_ETH
+         Config : config/devices.py -> NUMATO_RELAY_MATRIX_CONFIG (RELAY32ETHRL00 / 169.254.1.1:23)
          [ERROR]
          Relay controller not reachable
 
@@ -427,54 +528,61 @@ or on failure:
          RELAY32ETHRL00
 
          Host:
-         192.168.1.50
+         169.254.1.1
 
          Reason:
          Connection timeout
 ```
 
 **Pre-flight check:**  
-`test.py` always runs `test_configuration()` before showing the menu. If any configuration value is FAIL (not just WARNING), the menu is blocked and you must fix `config/settings.py` or `config/devices.py` first.
+`test.py` always runs `test_configuration()` (Settings) AND `test_device_validation()` (config/devices.py) before showing the menu (`preflight_check()`). If any result is FAIL (not just WARNING), the menu is blocked and you must fix `config/settings.py` or `config/devices.py` first -- this is Section 17.2's Startup Validation, gating the menu, not just informational.
 
-**Recommended commissioning sequence:**
+**Recommended commissioning sequence** (also the enforced execution order -- see Section 17.4):
 
 ```
-1. python test.py  -> choose 9 (Test Configuration)  -- verify all config passes
-2.                 -> choose 8 (Test Safety Monitor)  -- verifies safety logic offline
-3.                 -> choose 7 (Test Sensors)         -- verifies NTC math
-4.                 -> choose 10 (Test Database)       -- verifies storage offline
-5.                 -> choose 4 or 5 (Relay)           -- first hardware test
-6.                 -> choose 1, 2, 3 (SMU/DMM/DAQ)   -- PXI hardware tests
-7.                 -> choose 12 (Run All Tests)        -- full pass
+1. python test.py                          -- Startup Validation + Test Configuration run
+                                               automatically before the menu is even shown
+2.  -> choose 2 (Startup Device Validation) -- re-run explicitly / inspect in isolation
+3.  -> choose 3 (Hardware Discovery)        -- connectivity + identification, every device
+4.  -> choose 10 (RelayEthernetTest)        -- native relay primitives, before any relay use
+5.  -> choose 13 (Test Safety Monitor)      -- verifies safety logic offline
+6.  -> choose 12 (Test Sensors)             -- verifies NTC math
+7.  -> choose 16 (Test Database)            -- verifies storage offline
+8.  -> choose 4, 5, 6 (SMU/DMM/DAQ)         -- deeper per-device PXI hardware tests
+9.  -> choose 18 (Run All Tests)            -- full pass
+10. -> choose 1 (Run Main Test)             -- battery test workflow, once everything above passes
 ```
 
 ---
 
 ## 9. Relay Architecture
 
-The relay system uses a factory pattern. The rest of the application never imports a concrete relay class — it calls `RelayFactory.create(cfg)` and receives a `RelayBase` object.
+The relay system uses a factory pattern. The rest of the application never imports a concrete relay class — it calls `RelayFactory.create(cfg)` and receives a `RelayBase` object. `config/devices.py` is the single source of truth for device discovery: `NUMATO_RELAY_MATRIX_CONFIG`/`NUMATO_RELAY_MATRIX_CONFIGS`, `DAQ_CONFIG`/`DAQ_CONFIGS`, `SMU_ASSIGNMENTS`, and `DMM_CONFIG`/`DMM_CONFIGS` are all enumerated the same way, so `test.py` and any future device type never need code changes to be discovered — only a new entry in `config/devices.py`.
+
+**Production hardware is the Numato Lab 32-Channel Ethernet Relay Module over Ethernet/Telnet** (`hardware/relay_eth.py::NumatoRelayMatrix`, `NUMATO_RELAY_MATRIX_CONFIG`). The serial COM13 path (`hardware/relay_serial.py::SerialRelay`, `RELAY_CONFIG`) is diagnostic-only and is not the production control path — see [Section 4](#4-supported-hardware).
+
+**Naming:** the driver class and config dicts were previously named `EthernetRelay`/`RELAY_ETH_CONFIG`/`RELAY_ETH_CONFIGS` — generic names that didn't make clear this is specifically Numato hardware, not a vendor-neutral Ethernet relay. They are now `NumatoRelayMatrix`/`NUMATO_RELAY_MATRIX_CONFIG`/`NUMATO_RELAY_MATRIX_CONFIGS`; the old names are kept as backward-compat aliases (`EthernetRelay = NumatoRelayMatrix`, etc. — see `hardware/relay_eth.py` and `config/devices.py`) so nothing that references them by the old name breaks. `"type": "ethernet"` (the `RelayFactory` dispatch key) is unchanged -- it names the transport interface, the same way `"serial"` does, not a vendor.
 
 ### 9.1 Unified interface
 
 ```python
-from config.devices import RELAY_CONFIG          # or RELAY_ETH_CONFIG
+from config.devices import NUMATO_RELAY_MATRIX_CONFIG       # production: Ethernet
 from hardware.relay_factory import RelayFactory
 
-relay = RelayFactory.create(RELAY_CONFIG)
+relay = RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)
 
 relay.connect()
 
-relay.close(1)          # energize relay channel 1 (connects battery 1 to SMU)
+relay.close(1)          # energize relay channel 1 -- runs the full safety sequence (see 9.4a)
 relay.open(1)           # de-energize relay channel 1 (disconnects battery 1)
-relay.open_all()        # safe state: all batteries disconnected
-relay.close_all()       # connect all batteries simultaneously
+relay.open_all()        # safe state: all batteries disconnected, verified
 
 state = relay.query(1)  # True = contact closed (battery connected)
 
 relay.disconnect()      # open_all() then close socket / serial port
 ```
 
-The same four lines work whether `cfg["type"]` is `"serial"` or `"ethernet"`.
+`NumatoRelayMatrix.close_all()` deliberately raises `RelayError` rather than energizing every channel — under the mandatory safety sequence (9.4a), only one relay may ever be active at a time, so "connect all batteries simultaneously" is never a valid operation on the production relay.
 
 ### 9.2 Selecting relay type
 
@@ -495,7 +603,7 @@ Or pass either config object to the factory:
 relay = RelayFactory.create(dev_cfg.RELAY_CONFIG)
 
 # Ethernet
-relay = RelayFactory.create(dev_cfg.RELAY_ETH_CONFIG)
+relay = RelayFactory.create(dev_cfg.NUMATO_RELAY_MATRIX_CONFIG)
 ```
 
 ### 9.3 Serial relay (ASCII protocol)
@@ -532,12 +640,14 @@ The `query` command expects a response containing `"ON"`, `"CLOSED"`, or `"1"` f
 3. Wait for "Password: " -> send password\r\n
 4. Wait for "successfully" -> login confirmed
 5. Wait for ">" -> ready for commands
-6. "relay on N\r\n"   -> close relay N  (wait for ">")
-7. "relay off N\r\n"  -> open relay N   (wait for ">")
-8. "relay read N\r\n" -> returns "on" or "off" before ">"
+6. "relay on N\r\n"       -> energize relay N   (wait for ">")
+7. "relay off N\r\n"      -> de-energize relay N (wait for ">")
+8. "relay read N\r\n"     -> returns "on" or "off" before ">"
+9. "relay writeall 00000000\r\n" -> force every relay off in one command
+10. "relay readall\r\n"    -> returns a hex bitmask of every relay's state
 ```
 
-Channel addressing (1-based in API, 0-based Numato addressing):
+Channel addressing (1-based in the public API, 0-based Numato native addressing):
 
 | API channel | Numato address |
 |-------------|---------------|
@@ -549,6 +659,88 @@ Channel addressing (1-based in API, 0-based Numato addressing):
 | 12 | `"B"` |
 | ... | ... |
 | 32 | `"V"` |
+
+**Two API layers.** No custom protocol is invented -- everything is built directly on Numato's own command set ([module docs](https://numato.com/docs/32-channel-ethernet-relay-module/), [readall/writeall reference](https://numato.com/kb/understanding-readallwriteall-commands-for-relay-modules/)):
+
+- **Native primitives** (Numato's own 0-based numbering, relay 0 = first relay): `write(relay_number, state)` ("relay on/off N"), `read_relay(relay_number)` ("relay read N"), `write_all(mask)` ("relay writeall <hex>"), `read_all() -> mask` ("relay readall"), `verify_single(relay_number, expected_state)` (individual verification via `relay read`), `verify_all(expected_mask)` (bulk verification via `relay readall`), `reset()` (native "reset" -- reboots the module; maintenance only, not part of the safety sequence, never called from the battery test path).
+- **Public `RelayBase` API** (1-based, matches `BATTERY_CHANNELS`/`ACTIVE_CHANNELS` elsewhere): `open(channel)`, `close(channel)`, `query(channel)`/`read(channel)`, `open_all()`, `close_all()`. `open()`/`close()` are the only methods that ever change relay state, and are implemented entirely on top of the native primitives above.
+
+`RELAY_COUNT` (in `config/settings.py`, default `32`) is the single source of truth for the relay count and flows into `NUMATO_RELAY_MATRIX_CONFIG["channel_count"]` in `config/devices.py` -- it is never hardcoded in the driver or in any relay test.
+
+**Telnet layer guarantees:** every command waits for the `">"` prompt and is checked for an `"invalid"` rejection from the firmware (command acknowledgement validation); every native read/write goes through one automatic reconnect-and-retry if the connection drops or times out (bounded to a single attempt, never a retry loop -- safe because every Numato command is idempotent and every safety-critical write is always independently re-verified by hardware readback afterward); `connect()` itself issues one `relay readall` immediately after login as a connection-verification handshake. A successful command send is never treated as success on its own -- see 9.4a.
+
+### 9.4a Mandatory relay safety sequence (interlock)
+
+`NumatoRelayMatrix.close(channel)` and `NumatoRelayMatrix.open(channel)` are the **only** entry points that ever change relay state, and both route through the same mandatory sequence — the requested relay is never activated directly:
+
+```
+1. Turn OFF all relays          write_all(0)        -> "relay writeall 00000000"
+2. Read back, verify ALL OFF    verify_all(0)        -> "relay readall"
+      -> if any relay is still active: raise RelayStateVerificationError, STOP
+3. Turn ON the requested relay  write(n, True)        -> "relay on N"     [close() only]
+4. Individual verification      verify_single(n, ON)  -> "relay read N"
+      -> if the requested relay did not turn on: raise RelayStateVerificationError, STOP
+5. Bulk verification            verify_all(1<<n)      -> "relay readall"
+      -> if any OTHER relay is unexpectedly active: raise RelayStateVerificationError, STOP
+6. Continue only if both verifications succeeded
+```
+
+The governing philosophy is **WRITE -> READ BACK -> VERIFY -> CONTINUE**, never **WRITE -> ASSUME SUCCESS**. `open(channel)`'s target state *is* all-off, so step 2's verification is also its final verification — there is no separate activation step. `close()` verifies twice: once individually (`relay read N`, per the individual-verification requirement) and once against the whole bank (`relay readall`, which alone can catch an unrelated relay unexpectedly energized).
+
+`NumatoRelayMatrix` is the single authority for relay state control on the production path. Developers must not bypass this sequence with raw commands (`_send_raw`, `_send_and_capture`, `writeall`, `relay on/off`) from outside `hardware/relay_eth.py` — every relay state change must go through `open()`/`close()`/`open_all()` (or, for driver-internal/test-harness use only, the native `write()`/`write_all()` primitives, which are themselves always paired with `verify_single()`/`verify_all()`). Any future relay driver (`hardware/relay_<type>.py`, see 9.5) must preserve the same write→read-back→verify guarantee before being used in production.
+
+**Failure policy — no warning-only mode.** Each of the following is a SAFETY FAULT, not a retryable condition:
+
+- `RelayStateVerificationError` (readback mismatch, multiple relays active, unexpected relay state)
+- Telnet/TCP timeout (`NIPXITimeoutError`)
+- Communication failure / connection loss (`RelayError`)
+- Invalid or unparseable relay state transition
+
+Any of these must raise an exception and propagate: `test_control/battery_test.py::BatteryTestSequence.run()` catches `RelayError` (which `RelayStateVerificationError` subclasses) alongside `SafetyViolationError`, calls `SafetyMonitor.emergency_stop()`, and re-raises — it never falls through to another relay command on that channel or continues to the next channel. `test_control/test_executor.py::TestExecutor.run()` catches the same exception at the top level and marks the whole run `aborted`. No component is permitted to log a warning and continue past a relay verification failure.
+
+### 9.4b Relay validation tests
+
+Two `test.py` menu items validate the relay driver at its two API layers, both config-driven (`RELAY_COUNT`, never hardcoded) and both stopping immediately on the first failure:
+
+**"Test Relay -- RelayEthernetTest (native primitives, stop on first failure)"** (`test_relay_ethernet_test()`) exercises the native Numato primitives directly, using Numato's own 0-based relay numbering -- this is the lower-level validation target, meant to be run *before* relay usage is integrated into higher-level battery workflows:
+
+```
+For relay_index in range(RELAY_COUNT):
+    write_all(0)          -> read_all() -> verify all OFF
+    write(relay_index, True) -> read_all() -> verify relay_index ON, all others OFF
+    write_all(0)          -> read_all() -> verify all OFF
+```
+
+**"Test Relay -- Safety Self-Test (1-32, stop on first failure)"** (`test_relay_safety_selftest()`) exercises the mandatory sequence through the public 1-based API instead:
+
+```
+For relay N = 1 .. num_channels:
+    OFF ALL
+    VERIFY OFF
+    ON relay N
+    VERIFY relay N ON, all others OFF
+Then: OFF ALL / VERIFY OFF
+```
+
+Both stop immediately on the first failure of any kind (connection error, timeout, readback mismatch, unexpected active relay, parser error, verification failure) and report Relay Number / Expected State / Actual State / Cause — neither continues to the remaining channels once one has failed. For the duration of the run both also re-enable `hardware/relay_eth.py`'s per-command logging (normally silenced by `test.py`) so every command shows its raw readback, decoded mask, and decoded active-channel list, e.g.:
+
+```
+RAW: 00000001  MASK: 0x00000001  ACTIVE: [1]
+```
+
+**Confirmed against the physical Numato unit:** a live run of the matrix scan (all 32 channels, ON -> READ -> OFF) and Hardware Discovery both passed end-to-end — login/authentication, the `relay readall` hex-bitmask parsing in `hardware/relay_eth.py::_parse_readall_response()`, and per-channel verification all matched the physically observed relay state. See Section 9.4c for the authentication root cause this run uncovered and fixed.
+
+### 9.4c Authentication debugging (root cause confirmed and fixed)
+
+**Symptom:** the framework reported "Authentication failed" connecting to the Numato Relay Matrix, while a manual Telnet session to the same IP/port/credentials succeeded. Ping, the web UI, and manual Telnet login were all independently confirmed working beforehand, narrowing the problem to the driver's own login sequence.
+
+**Root cause (confirmed by a live run against the physical unit):** the firmware sends a Telnet IAC option-negotiation request ("IAC DO 45", RFC 854) mid-handshake. A real Telnet client (used for the successful manual login) always auto-answers this; the previous implementation had zero IAC handling and never replied — exactly the "manual Telnet works, raw socket doesn't" symptom class.
+
+**Fix:** `hardware/relay_eth.py::NumatoRelayMatrix._handle_iac()` scans every inbound chunk for IAC sequences, strips them from the text stream, and answers with a blanket decline (IAC DONT/WONT). Confirmed in the live transcript: the server proceeded normally immediately after receiving the decline.
+
+**Secondary finding, same investigation:** the real login prompt is "User Name: ", not "login:" -- the previous exact-match implementation (copied from Numato's own reference script) only happened to still work because the word "login" incidentally appears in the banner's instructional sentence. `_login()` now matches case-insensitively against known-plausible prompt words (`_read_until_any()`) and treats the `>` command prompt as the authoritative success signal, both confirmed correct live.
+
+**How to see the conversation yourself:** every login step is logged at DEBUG level -- raw RX chunks, detected prompts, TX sent (username and password in cleartext -- these are lab default credentials; see the caveat in `_login()`'s docstring if credentials are ever changed to something sensitive), IAC negotiation replies, final response, and PASS/FAIL classification. Run any relay test in `test.py` (they all wrap themselves in `_numato_relay_debug_logging()`, which re-enables this output since test.py silences logging by default) and read the `[RELAY LOG]`-prefixed lines. `_classify_relay_error()` was also fixed to never collapse a failure down to a bare "Authentication failed" -- the full underlying diagnostic is always appended after it.
 
 ### 9.5 Adding a new relay type
 
@@ -574,7 +766,7 @@ class ModbusRelay(RelayBase):
 ```python
 _DRIVERS = {
     "serial":   ("hardware.relay_serial", "SerialRelay"),
-    "ethernet": ("hardware.relay_eth",    "EthernetRelay"),
+    "ethernet": ("hardware.relay_eth",    "NumatoRelayMatrix"),
     "modbus":   ("hardware.relay_modbus", "ModbusRelay"),   # <-- add this line
 }
 ```
@@ -676,13 +868,16 @@ Row format (list of dicts):
 | Overcurrent | `BAT_CURRENT_MAX` = 1.0 A |
 | Overtemperature | `BAT_TEMP_MAX_C` = 45.0 degC |
 | Relay switch | current must be < `ZERO_CURRENT_THRESHOLD_A` = 0.01 A |
+| Relay verification | any `RelayError` (incl. `RelayStateVerificationError`), Telnet/TCP timeout, or comms failure -- see [Section 9.4a](#9.4a-mandatory-relay-safety-sequence) |
 
 **Emergency stop sequence:**
 
 ```
 1. smu.output_disable()    -- cut SMU output immediately
-2. relay_matrix.open_all() -- disconnect all batteries
+2. relay.open_all()        -- disconnect all batteries (force-off + verify)
 ```
+
+**Relay verification failures are safety faults, never warnings.** `BatteryTestSequence.run()` catches `RelayError` alongside `SafetyViolationError`, calls `emergency_stop()`, and re-raises immediately -- it never attempts another relay command on that channel or continues to the next one. `TestExecutor.run()` catches the same exception and marks the whole run `aborted`. No component is permitted to log a warning and continue past a relay verification failure. See [Section 9.4a](#9.4a-mandatory-relay-safety-sequence) for the full sequence.
 
 **Usage example:**
 
@@ -714,11 +909,17 @@ All exceptions inherit from `NIPXIError`:
 NIPXIError
 +-- HardwareInitError     -- device failed to initialize
 +-- RelayError            -- relay communication failure
+|     +-- RelayStateVerificationError  -- readback did not match commanded state
+|                                          (always fatal -- see Section 9.4a)
 +-- DAQError              -- DAQ read/write failure
 +-- SMUError              -- SMU communication or compliance failure
++-- DMMError              -- DMM communication failure
 +-- SafetyViolationError  -- safety limit exceeded (triggers e-stop)
 +-- NIPXITimeoutError     -- test step exceeded allowed duration
 +-- ValidationError       -- config or input validation failed
+      +-- DeviceConfigError  -- config/devices.py failed startup validation
+                                (see Section 17.2) -- raised before any
+                                hardware communication is attempted
 ```
 
 **Example: catching specific errors:**
@@ -786,7 +987,7 @@ from config.settings import Settings
 from config import devices as dev_cfg
 
 # Create the manager (no connection yet)
-hw = HardwareManager(Settings, relay_cfg=dev_cfg.RELAY_CONFIG)
+hw = HardwareManager(Settings, relay_cfg=dev_cfg.NUMATO_RELAY_MATRIX_CONFIG)  # production: Ethernet
 
 # Connect all devices in the correct order
 with hw:                          # calls connect_all() on enter, disconnect_all() on exit
@@ -857,7 +1058,7 @@ from config import devices as dev_cfg
 relay = RelayFactory.create(dev_cfg.RELAY_CONFIG)
 
 # Ethernet relay (Numato RELAY32ETHRL00)
-relay = RelayFactory.create(dev_cfg.RELAY_ETH_CONFIG)
+relay = RelayFactory.create(dev_cfg.NUMATO_RELAY_MATRIX_CONFIG)
 
 # Both use the same API:
 relay.connect()
@@ -944,13 +1145,13 @@ Steps:
 
 ```bash
 # Configuration only (offline, no hardware required)
-python test.py   # choose 9
+python test.py   # choose 15 (Test Configuration) or 2 (Startup Device Validation)
 
 # Safety monitor (offline)
-python test.py   # choose 8
+python test.py   # choose 14 (Test Safety Monitor)
 
 # Full test pass
-python test.py   # choose 12
+python test.py   # choose 18 (Run All Tests)
 ```
 
 ### 13.3 Adding a new test section
@@ -1046,7 +1247,7 @@ No changes needed in `BatteryTestSequence`, `ChargeCycle`, or `DischargeCycle` �
 Test the swap with:
 
 ```bash
-python test.py   # choose 11 (Test MiniSQL hooks)
+python test.py   # choose 17 (Test MiniSQL hooks)
 ```
 
 ---
@@ -1079,7 +1280,7 @@ your battery chemistry: if cells should not be discharged below 3.5 V, raise
 `DISCHARGE_CUTOFF_V` to 3.5 V. If 3.0 V is intentional, update `BAT_VOLTAGE_MIN`.
 
 **Pre-flight blocks with FAIL**  
-Run "Test Configuration" (option 9) to see the specific failing parameter.
+Run "Test Configuration" or "Startup Device Validation" to see the specific failing parameter -- `preflight_check()` prints the failing item's name before blocking the menu either way.
 
 **Windows console encoding error**  
 If you see `UnicodeEncodeError` on Windows, set the console to UTF-8:
@@ -1087,6 +1288,91 @@ If you see `UnicodeEncodeError` on Windows, set the console to UTF-8:
 chcp 65001
 ```
 or set the environment variable: `PYTHONUTF8=1`
+
+---
+
+## 17. Hardware Abstraction Architecture & Device Onboarding
+
+### 17.1 The pipeline
+
+```
+config/devices.py
+     |
+     v
+Factory                    (RelayFactory for relay; direct construction
+     |                       SMU(cfg)/DAQ(cfg)/DMM(cfg) for single-implementation types)
+     v
+HardwareManager             (device lifecycle: connect_all/disconnect_all/health_check)
+     |
+     v
+Device Drivers               (hardware/smu.py, daq.py, dmm.py, relay_eth.py, relay_serial.py)
+     |
+     v
+Hardware Discovery Test      (test_hardware_discovery() -- connectivity + identification only)
+     |
+     v
+Functional Hardware Tests    (test_smu/test_dmm/test_daq/test_relay_* -- deeper per-device checks)
+     |
+     v
+Battery Test Workflows       (BatteryTestSequence / TestExecutor -- charge/discharge cycling)
+```
+
+`config/devices.py` is the single source of truth for every device's resource string / address (PXI slot, relay IP, relay COM port). `config/settings.py` holds tunable *behavior* parameters (voltages, currents, timeouts, `RELAY_COUNT`) and simulation mode (`PXI_SIMULATE`) -- it does not hold device addresses.
+
+**Why relay has a `Factory` class but SMU/DAQ/DMM do not:** the relay role has two real implementations (`SerialRelay`, `NumatoRelayMatrix`) selected dynamically by `cfg["type"]`, so `RelayFactory.create(cfg)` genuinely dispatches. SMU, DAQ, and DMM each have exactly one driver class -- there is nothing to dispatch between, so `SMU(cfg)`/`DAQ(cfg)`/`DMM(cfg)` direct construction from a `config/devices.py` dict already fulfills the "config -> Factory -> driver" step without an extra indirection layer. This is a deliberate choice, not a gap: adding a second SMU/DAQ/DMM implementation would be the point at which a real factory becomes justified, exactly like relay.
+
+### 17.2 Startup device validation (`utils/device_validator.py`)
+
+`validate_devices_or_raise(dev_cfg)` runs in `main.py` immediately after `validate_settings()` and before `HardwareManager` is constructed -- and in `test.py`'s `preflight_check()`, before the menu is shown (so it also runs before Hardware Discovery or any other test). It never calls `connect()` -- construction only, no hardware I/O -- and it collects **every** problem before reporting, rather than stopping at the first one:
+
+1. Load `config/devices.py` (the caller already imported it -- this is the function's argument).
+2. Verify every configured device can be instantiated (`SMU(cfg)`/`DAQ(cfg)`/`DMM(cfg)`/`RelayFactory.create(cfg)` -- construction, not connect).
+3. Validate required configuration fields per type (`resource` for SMU/DMM/DAQ; `ip`/`port`/`channel_count` for Ethernet relay; `port` for serial relay).
+4. Validate no duplicate device names exist (across every configured device, any type).
+5. Validate no duplicate VISA resources exist (SMU/DMM/DAQ share the same PXI bus).
+6. Validate no duplicate IP addresses exist (Ethernet relays).
+7. Validate no duplicate COM ports exist (serial relays).
+8. Validate no duplicate relay identifiers exist (`BATTERY_CHANNELS[...]["relay_address"]`).
+9. Validate relay count consistency (`num_channels == channel_count == Settings.RELAY_COUNT`, and every `relay_address` is in range).
+10. Validate every relay `"type"` is registered in `RelayFactory` (`RelayFactory.supported_types()`).
+11. Report all of the above at once via `DeviceConfigError` -- `main.py` and `test.py` both fail (exit / block the menu) before any hardware communication is attempted.
+
+```python
+from config import devices as dev_cfg
+from utils.device_validator import validate_devices_or_raise
+
+validate_devices_or_raise(dev_cfg)   # raises DeviceConfigError listing every problem, or returns
+```
+
+### 17.3 Adding a new instrument (config/devices.py only)
+
+For a device type that already has a driver class (a second SMU, DAQ, or DMM):
+
+1. Add an entry to `SMU_ASSIGNMENTS` / `DAQ_CONFIGS` / `DMM_CONFIGS` in `config/devices.py` with a unique name, `resource`, and `model`.
+2. Nothing else changes -- `test_hardware_discovery()`, `test_device_validation()`, and `preflight_check()` all pick it up automatically (they iterate these dicts, never a hardcoded list).
+3. Run `python test.py` -> "Startup Device Validation" then "Hardware Discovery" to confirm it.
+
+For a genuinely new device *type* (e.g. an electronic load), follow the existing pattern:
+
+1. `hardware/<type>.py`: a class inheriting `HardwareBase`, constructed from a `config/devices.py`-shaped dict, implementing `connect()`/`disconnect()`/`identify()` at minimum.
+2. `config/devices.py`: a `<TYPE>_CONFIG` dict plus a `<TYPE>_CONFIGS = {name: cfg}` enumeration dict (matching `DMM_CONFIGS`'s shape).
+3. `utils/device_validator.py`: add the new enumeration dict to `_build_registry()` and, if it has multiple possible implementations, a factory + a `_check_factory_type()` branch (otherwise direct construction is enough, per 17.1).
+4. `test.py`: add `("<Type>", dev_cfg.<TYPE>_CONFIGS, _identify_<type>)` to `_DISCOVERY_TARGETS` -- Hardware Discovery covers it with no other change.
+5. Optionally wire it into `HardwareManager` if it participates in the battery test workflow (relay/SMU/DAQ do; DMM is intentionally optional, matching its role as independent verification only).
+
+### 17.4 Test execution order
+
+```
+1. Startup Validation         validate_settings() + validate_devices_or_raise()
+                               (main.py at startup; test.py's preflight_check() before the menu)
+2. Hardware Discovery          test_hardware_discovery() -- connectivity + identification, every type
+3. RelayEthernetTest            test_relay_ethernet_test() -- native relay primitives validated
+                               before any relay use in a functional test
+4. Functional Hardware Tests    test_smu / test_dmm / test_daq / test_relay_* / Safety Self-Test
+5. Battery Test Workflows       BatteryTestSequence / TestExecutor (Run Main Test / main.py)
+```
+
+Each stage assumes the previous one passed. `test.py`'s menu enforces stage 1 structurally (it gates the whole menu); stages 2-5 are independently selectable menu items so any stage can be re-run in isolation, but running them out of order on unvalidated/unverified hardware is not recommended.
 
 ---
 
