@@ -57,7 +57,9 @@ the bottom, with a pointer to where the real documentation lives
   -- pre-existing, not introduced by the cancellation feature, but surfaced
   by its review. See `docs/architecture.md` Section 13.7/17.
 - [ ] Add the same cancellation checkpoint to `test.py::test_relay_safety_selftest()`
-  -- the only one of the three relay-scan-style loops without one.
+  -- the only one of the three relay-scan-style loops without one. Now reached
+  from "Test Numato Relay Matrix (Ethernet)" -> Functional Validation, not a
+  top-level menu item, but the function and gap are unchanged.
 - [ ] Fix the adjacent `continue`-after-charge gap in `BatteryTestSequence.run()`
   (skips both `relay.open(ch)` and `emergency_stop()`) before real DAQ
   acquisition replaces the current always-zero-current stub -- currently
@@ -145,9 +147,17 @@ here -- this is an index, not a changelog.
   Section 14, `docs/CONFIGURATION.md`.
 - **Hardware Discovery + device selection workflow** -- grouped by category
   from `PXI_SLOTS`, identity-vs-configured-model comparison, N/A reporting
-  for driver-less categories, `_discover_and_select()` reachability-scan
-  picker reused across SMU/DMM/DAQ/Temperature Module/relay tests. See
-  `docs/architecture.md` Section 8.2/8.2a.
+  for driver-less categories, shared `_run_hardware_category()` select-device
+  -> Identity Validation / Functional Validation (future) workflow reused
+  across SMU/DMM/DAQ/Temperature Module/Numato Relay Matrix/PXI Relay Matrix.
+  See `docs/architecture.md` Section 8.2/8.2a/8.2b.
+- **Identity vs Functional Validation menu simplification** -- the operator
+  menu was narrowed to the current hardware bring-up scope (identification +
+  readiness, safe to do remotely over RDP); the Electronic Load stub, MiniSQL
+  hooks stub, bench-only serial relay test, and three flat Numato relay
+  commissioning menu items were removed from `MENU` (code kept, still
+  reachable directly or via each category's Functional Validation submenu).
+  See `docs/architecture.md` Section 8.2a/8.2b, README.md Section 8.1a/8.1b.
 - **Safe Cancellation Architecture** -- `CancellationToken`/
   `OperationCancelledError`/`StopReason`, checkpoints in charge/discharge
   cycles, `BatteryTestSequence`, relay scan tests, SIGINT wiring in

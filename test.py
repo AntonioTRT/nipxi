@@ -133,6 +133,83 @@ def _discover_and_select(label: str, devices: dict, identify_fn):
     return name, devices[name], discovery_results
 
 
+def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn=None):
+    """
+    Shared bring-up workflow for every hardware category (SMU, DMM, DAQ,
+    Temperature Module, Numato Relay Matrix, PXI Relay Matrix):
+
+        1. List every device configured for this category in config/devices.py.
+        2. Operator selects ONE device.
+        3. Second-level menu: [1] Identity Validation  [2] Functional
+           Validation (future)  [0] Back.
+
+    Identity Validation always calls identify_fn(name, cfg) -- the SAME
+    function Hardware Discovery uses, so this menu path can never drift from
+    what Hardware Discovery reports. It never enables outputs, sources
+    voltage/current, or closes relays (see identify_fn implementations).
+
+    Functional Validation calls functional_fn(name, cfg) if one is provided
+    for this category; otherwise it reports "not yet implemented" -- a
+    deliberate placeholder, not a fake PASS (see docs/architecture.md,
+    "Identity Validation vs Functional Validation").
+
+    Selecting a device only ever touches that one device -- no other SMU,
+    DMM, DAQ, Temperature Module, or relay is read or written by this
+    function.
+    """
+    if not devices:
+        print(f"\n  (no {label} devices configured in config/devices.py)")
+        return []
+
+    names = list(devices.keys())
+    while True:
+        print(f"\n{label}\n")
+        for i, name in enumerate(names, 1):
+            print(f"[{i}] {name}")
+        print("0. Back")
+        try:
+            raw = input("\nSelect device: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return []
+        if raw == "0" or raw == "":
+            return []
+        try:
+            idx = int(raw) - 1
+            if idx < 0 or idx >= len(names):
+                raise ValueError()
+        except ValueError:
+            print("Invalid choice.")
+            continue
+        name = names[idx]
+        cfg = devices[name]
+        break
+
+    while True:
+        print(f"\n{name}\n")
+        print("[1] Identity Validation")
+        print("[2] Functional Validation (future)")
+        print("[0] Back")
+        try:
+            raw = input("\nChoice: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return []
+        if raw == "0" or raw == "":
+            return []
+        if raw == "1":
+            _print_device_config(name, cfg)
+            return [identify_fn(name, cfg)]
+        if raw == "2":
+            if functional_fn is None:
+                print("\n  Functional Validation not yet implemented for this "
+                      "hardware category.")
+                return []
+            _print_device_config(name, cfg)
+            return functional_fn(name, cfg)
+        print("Invalid choice.")
+
+
 def _print_device_config(name: str, cfg: dict):
     """Print the effective configuration of the device under test."""
     print(f"\n{'-' * 60}")
@@ -533,6 +610,22 @@ def _identify_relay_serial(name: str, cfg: dict):
             pass
 
 
+def _identify_switch(name: str, cfg: dict):
+    """
+    PXI-resident switch/relay card (PXI_SLOTS[11], category="switch")
+    presence check. Reported honestly as N/A -- no niswitch-based driver
+    exists in this codebase (see PXI_SLOTS[11]'s validation_notes), so this
+    never fakes a real identity query against it.
+    """
+    slot = cfg.get("slot")
+    resource = cfg.get("resource", "")
+    model = cfg.get("model", "")
+    note = cfg.get("validation_notes", "No driver class implemented for this category.")
+    ref = f"config/devices.py -> PXI_SLOTS[{slot!r}] ({resource} / {model})"
+    return _warn("Hardware Discovery", f"Switch/Relay (PXI): {name}", ref,
+                 f"Not applicable -- no niswitch-based driver exists in this codebase.\n{note}")
+
+
 def _pxi_slots_by_category(category: str) -> dict:
     """
     PXI_SLOTS entries of the given category, keyed by nickname, in slot-
@@ -630,14 +723,8 @@ def test_hardware_discovery():
             _print_group_header("Switch/Relay (PXI)")
             for name, cfg in switch_devices.items():
                 _print_device_line(name, cfg)
-                slot = cfg.get("slot")
-                note = cfg.get("validation_notes", "No driver class implemented for this category.")
                 print("N/A -- no driver implemented\n")
-                results.append(_warn(
-                    "Hardware Discovery", f"Switch/Relay (PXI): {name}",
-                    f"config/devices.py -> PXI_SLOTS[{slot!r}]",
-                    f"Not applicable -- no niswitch-based driver exists in this codebase.\n{note}",
-                ))
+                results.append(_identify_switch(name, cfg))
 
         for label, devices, identify_fn in _NON_PXI_TARGETS:
             _print_group_header(label)
@@ -675,77 +762,18 @@ def test_hardware_discovery():
 
 def test_smu():
     """
-    Step 1: Import hardware.smu.SMU and verify interface.
-    Step 2: connect() + identify() via the SAME production SMU driver class
-    used by HardwareManager and Hardware Discovery -- no direct nidcpower
-    calls here, so this test can never drift from what production actually
-    does. identify() itself is COMMAND (run the instrument's built-in
-    self-test) -> READBACK (result code/message) -> VERIFY (code == 0) --
-    never a bare "the API call didn't throw" (see hardware/smu.py's module
-    docstring, "Verification philosophy"). Real sourcing verification
-    (source a current/voltage and measure it back) is intentionally NOT
-    done here -- SMU.set_charge_mode()/output_enable()/measure() are still
-    placeholders (see docs/TODO.md); testing around a stub would be a fake
-    PASS, exactly what this philosophy exists to avoid.
-
-    Steps 1/2 below: show every configured SMU (config/devices.py::PXI_SLOTS,
-    category="smu") with a live reachability check, then select ONE to run
-    the full module-interface + connect/identify test against -- selecting
-    here never touches any other SMU, DMM, DAQ, or relay.
+    Menu entry for the SMU hardware category. Lists every configured SMU
+    (config/devices.py::PXI_SLOTS, category="smu"), then routes to Identity
+    Validation (_identify_smu -- interface check + connect() + identify()
+    only) via the shared _run_hardware_category() workflow. No Functional
+    Validation is implemented yet -- SMU.set_charge_mode()/output_enable()/
+    measure() are still placeholders (see docs/TODO.md); testing around a
+    stub would be a fake PASS, exactly what this project's testing
+    philosophy exists to avoid, so the menu reports "not yet implemented"
+    instead.
     """
     devices = _pxi_slots_by_category("smu")
-    name, cfg, results = _discover_and_select("SMU", devices, _identify_smu)
-    if cfg is None:
-        return results
-    _print_device_config(name, cfg)
-
-    resource   = cfg.get("resource", "")
-    model      = cfg.get("model", "NI-SMU")
-    config_ref = f"{resource} / {model}"
-
-    # Step 1: hardware.smu module import + interface ---------------------------
-    ref_mod = "hardware/smu.py"
-    try:
-        from hardware.smu import SMU
-        smu = SMU(cfg)
-        required_methods = ["connect", "disconnect", "identify", "set_charge_mode",
-                            "set_discharge_mode", "output_enable", "output_disable",
-                            "measure"]
-        missing = [m for m in required_methods if not callable(getattr(smu, m, None))]
-        if missing:
-            results.append(_fail("SMU", "SMU module", ref_mod,
-                                 f"Missing methods: {missing}"))
-        else:
-            results.append(_ok("SMU", "SMU module", ref_mod,
-                               "hardware.smu.SMU interface OK (connect/identify implemented; "
-                               "charge/discharge/measure still placeholders)"))
-    except Exception as e:
-        results.append(_fail("SMU", "SMU module", ref_mod, f"Import error: {e}"))
-        return results
-
-    # Step 2: connect() + identify() -- identify() runs and verifies a real
-    # instrument self-test internally (command -> readback -> verify), it
-    # is not a bare identity string query. See hardware/smu.py.
-    try:
-        smu.connect()
-        model_id = smu.identify()
-        results.append(_ok("SMU", name, config_ref,
-                           f"Self-test PASSED. Detected: {model_id}"))
-    except Exception as e:
-        desc = getattr(e, "description", str(e))
-        results.append(_fail("SMU", name, config_ref,
-                             f"[ERROR] SMU not detected or self-test failed\n"
-                             f"Configuration : {name}\n"
-                             f"Interface     : VISA / NI-DCPower\n"
-                             f"Expected      : {resource} ({model})\n"
-                             f"Reason        : {desc}"))
-    finally:
-        try:
-            smu.disconnect()
-        except Exception:
-            pass
-
-    return results
+    return _run_hardware_category("SMU", devices, _identify_smu)
 
 
 # =============================================================================
@@ -754,77 +782,55 @@ def test_smu():
 
 def test_dmm():
     """
-    Step 1: Import hardware.dmm.DMM and verify interface.
-    Step 2: connect() + identify() via the SAME production DMM driver class
-    used by Hardware Discovery -- identify() runs and verifies a real
-    instrument self-test internally (command -> readback -> verify), not a
-    bare identity string query. See hardware/dmm.py's module docstring.
-    Step 3: a REAL DC voltage measurement (DMM.measure_dc_voltage()) --
-    command (configure + trigger) -> readback (measured value) -> verify
-    (finite, within the configured range) -> PASS/FAIL. Unlike SMU sourcing,
-    a DMM measurement is passive (it only observes), so this is safe to run
-    unconditionally and is real verification, not a stub-backed fake PASS.
-
-    Steps 1/2 below: show every configured DMM (config/devices.py::PXI_SLOTS,
-    category="dmm") with a live reachability check, then select ONE to run
-    the full test against -- selecting here never touches any other DMM,
-    SMU, DAQ, or relay.
+    Menu entry for the DMM hardware category. Lists every configured DMM
+    (config/devices.py::PXI_SLOTS, category="dmm"), then routes to either
+    Identity Validation (_identify_dmm -- interface check + connect() +
+    identify(), never a measurement) or Functional Validation
+    (_functional_dmm -- a real DC voltage measurement), via the shared
+    _run_hardware_category() workflow. See docs/architecture.md, "Identity
+    Validation vs Functional Validation".
     """
     devices = _pxi_slots_by_category("dmm")
-    name, cfg, results = _discover_and_select("DMM", devices, _identify_dmm)
-    if cfg is None:
-        return results
-    _print_device_config(name, cfg)
+    return _run_hardware_category("DMM", devices, _identify_dmm, _functional_dmm)
 
+
+def _functional_dmm(name: str, cfg: dict):
+    """
+    Functional Validation for one DMM: a REAL DC voltage measurement
+    (DMM.measure_dc_voltage()) -- command (configure + trigger) -> readback
+    (measured value) -> verify (finite, within the configured range) ->
+    PASS/FAIL. Unlike SMU sourcing, a DMM measurement is passive (it only
+    observes), so this is safe to run unconditionally and is real
+    verification, not a stub-backed fake PASS. Deliberately does NOT repeat
+    the interface/identity checks -- those are Identity Validation's job
+    (_identify_dmm), run separately.
+    """
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-4065")
     range_v    = cfg.get("range_v", 10.0)
     config_ref = f"{resource} / {model}"
+    results    = []
 
-    # Step 1: hardware.dmm module import + interface ---------------------------
-    ref_mod = "hardware/dmm.py"
-    try:
-        from hardware.dmm import DMM
-        dmm = DMM(cfg)
-        required_methods = ["connect", "disconnect", "identify", "measure_dc_voltage"]
-        missing = [m for m in required_methods if not callable(getattr(dmm, m, None))]
-        if missing:
-            results.append(_fail("DMM", "DMM module", ref_mod,
-                                 f"Missing methods: {missing}"))
-        else:
-            results.append(_ok("DMM", "DMM module", ref_mod,
-                               "hardware.dmm.DMM interface OK"))
-    except Exception as e:
-        results.append(_fail("DMM", "DMM module", ref_mod, f"Import error: {e}"))
-        return results
-
-    # Step 2: connect() + identify() (real self-test, see above) --------------
+    from hardware.dmm import DMM
+    dmm = DMM(cfg)
     try:
         dmm.connect()
-        model_id = dmm.identify()
-        results.append(_ok("DMM", name, config_ref,
-                           f"Self-test PASSED. Detected: {model_id}"))
     except Exception as e:
         desc = getattr(e, "description", str(e))
-        results.append(_fail("DMM", name, config_ref,
-                             f"[ERROR] DMM not detected or self-test failed\n"
+        results.append(_fail("DMM Functional", name, config_ref,
+                             f"[ERROR] DMM not detected or connect failed\n"
                              f"Configuration : {name}\n"
                              f"Interface     : VISA / NI-DMM\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {desc}"))
-        try:
-            dmm.disconnect()
-        except Exception:
-            pass
         return results
 
-    # Step 3: real DC voltage measurement + range verification ----------------
     try:
         value = dmm.measure_dc_voltage()
-        results.append(_ok("DMM", f"{name} DC volts measurement", config_ref,
+        results.append(_ok("DMM Functional", f"{name} DC volts measurement", config_ref,
                            f"Measured {value:.6f} V (within configured range +/-{range_v} V)"))
     except Exception as e:
-        results.append(_fail("DMM", f"{name} DC volts measurement", config_ref,
+        results.append(_fail("DMM Functional", f"{name} DC volts measurement", config_ref,
                              f"[ERROR] DMM measurement failed verification\n"
                              f"Configuration : {name}\n"
                              f"Expected range: +/-{range_v} V\n"
@@ -844,79 +850,54 @@ def test_dmm():
 
 def test_daq():
     """
-    Step 1: Import hardware.daq.DAQ and verify interface.
-    Step 2: connect() + identify() via the SAME production DAQ driver class
-    used by HardwareManager and Hardware Discovery -- no direct nidaqmx
-    calls for this part.
-    Step 3: deep channel read (beyond connectivity/identification -- this
-    is the one part of this test that goes past what hardware.daq.DAQ
-    currently implements, since read_channel() is still a TODO placeholder;
-    it uses nidaqmx directly until that method is implemented). COMMAND
+    Menu entry for the DAQ hardware category. Lists every configured DAQ
+    (config/devices.py::PXI_SLOTS, category="daq"), then routes to either
+    Identity Validation (_identify_daq -- interface check + connect() +
+    identify(), never a channel read) or Functional Validation
+    (_functional_daq -- a real channel read), via the shared
+    _run_hardware_category() workflow. See docs/architecture.md, "Identity
+    Validation vs Functional Validation".
+    """
+    devices = _pxi_slots_by_category("daq")
+    return _run_hardware_category("DAQ", devices, _identify_daq, _functional_daq)
+
+
+def _functional_daq(name: str, cfg: dict):
+    """
+    Functional Validation for one DAQ: a deep channel read -- goes beyond
+    connectivity/identification, using nidaqmx directly since
+    hardware.daq.DAQ.read_channel() is still a TODO placeholder. COMMAND
     (configure + read the channel) -> READBACK (the value) -> VERIFY
     (finite, within the configured +/-voltage_range_v ADC range) -> PASS/
     FAIL -- a NaN, an out-of-range, or a stuck reading is a FAIL, not "the
-    read call didn't throw."
+    read call didn't throw." Deliberately does NOT repeat the
+    interface/identity checks -- those are Identity Validation's job
+    (_identify_daq), run separately.
 
-    Steps 1/2 below: show every configured DAQ (config/devices.py::PXI_SLOTS,
-    category="daq") with a live reachability check, then select ONE to run
-    the full test against -- selecting here never touches any other DAQ,
-    SMU, DMM, or relay. Step 3's channel read assumes the wiring documented
-    in BATTERY_CHANNELS (MAIN_DAQ) -- if EXPANSION_DAQ/PRECISION_DAQ is
-    selected instead, the channel string may not correspond to a real
-    battery signal on that card; this is a pre-existing assumption in Step 3,
-    not something this selection change introduces.
+    Assumes the wiring documented in BATTERY_CHANNELS (MAIN_DAQ) -- if
+    EXPANSION_DAQ/PRECISION_DAQ is selected instead, the channel string may
+    not correspond to a real battery signal on that card; this is a
+    pre-existing assumption, not something this refactor introduces.
     """
-    devices = _pxi_slots_by_category("daq")
-    name, cfg, results = _discover_and_select("DAQ", devices, _identify_daq)
-    if cfg is None:
-        return results
-    _print_device_config(name, cfg)
-
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-6363")
     config_ref = f"{resource} / {model}"
     test_ch    = dev_cfg.BATTERY_CHANNELS[1]["daq_voltage_ch"]
+    results    = []
 
-    # Step 1: hardware.daq module import + interface ---------------------------
-    ref_mod = "hardware/daq.py"
-    try:
-        from hardware.daq import DAQ
-        daq = DAQ(cfg)
-        required = ["connect", "disconnect", "identify", "read_channel",
-                    "read_all_batteries", "verify_zero_current"]
-        missing = [m for m in required if not callable(getattr(daq, m, None))]
-        if missing:
-            results.append(_fail("DAQ", "DAQ module", ref_mod,
-                                 f"Missing methods: {missing}"))
-        else:
-            results.append(_ok("DAQ", "DAQ module", ref_mod,
-                               "hardware.daq.DAQ interface OK (connect/identify implemented; "
-                               "channel read still a placeholder)"))
-    except Exception as e:
-        results.append(_fail("DAQ", "DAQ module", ref_mod, f"Import error: {e}"))
-        return results
-
-    # Step 2: real connectivity + identification via the DAQ driver class -----
+    from hardware.daq import DAQ
+    daq = DAQ(cfg)
     try:
         daq.connect()
-        product_type = daq.identify()
-        results.append(_ok("DAQ", name, config_ref, f"Detected: {product_type}"))
     except Exception as e:
-        results.append(_fail("DAQ", name, config_ref,
-                             f"[ERROR] DAQ not detected\n"
+        results.append(_fail("DAQ Functional", name, config_ref,
+                             f"[ERROR] DAQ not detected or connect failed\n"
                              f"Configuration : {name}\n"
                              f"Interface     : NI-DAQmx\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {e}"))
         return results
 
-    # Step 3: deep channel read -- goes beyond DAQ.read_channel() (still a
-    # TODO placeholder), so this uses nidaqmx directly for now. COMMAND
-    # (configure + read the channel) -> READBACK (val) -> VERIFY (finite,
-    # within the configured ADC range) -> PASS/FAIL -- a value is only
-    # reported PASS once it has actually been checked, never on "the read
-    # call didn't throw" alone (a NaN, an out-of-range, or a stuck/floating
-    # reading would previously have still shown as PASS).
     try:
         import math
         import nidaqmx
@@ -928,31 +909,31 @@ def test_daq():
             val = task.read()
 
         if not math.isfinite(val):
-            results.append(_fail("DAQ", f"{name} channel read", config_ref,
+            results.append(_fail("DAQ Functional", f"{name} channel read", config_ref,
                                  f"[ERROR] DAQ channel read FAILED verification\n"
                                  f"Configuration : {name}\n"
                                  f"Channel       : {test_ch}\n"
                                  f"Reason        : reading is not a finite number ({val!r})"))
         elif abs(val) > v_range * 1.05:   # allow the ADC's own overrange headroom
-            results.append(_fail("DAQ", f"{name} channel read", config_ref,
+            results.append(_fail("DAQ Functional", f"{name} channel read", config_ref,
                                  f"[ERROR] DAQ channel read FAILED verification\n"
                                  f"Configuration : {name}\n"
                                  f"Channel       : {test_ch}\n"
                                  f"Reason        : {val:.4f} V is outside the configured "
                                  f"+/-{v_range} V range"))
         else:
-            results.append(_ok("DAQ", f"{name} channel read", config_ref,
+            results.append(_ok("DAQ Functional", f"{name} channel read", config_ref,
                                f"Channel {test_ch} read: {val:.4f} V -- verified within "
                                f"configured +/-{v_range} V range"))
     except nidaqmx.errors.DaqError as e:
-        results.append(_fail("DAQ", f"{name} channel read", config_ref,
+        results.append(_fail("DAQ Functional", f"{name} channel read", config_ref,
                              f"[ERROR] DAQ channel read failed\n"
                              f"Configuration : {name}\n"
                              f"Channel       : {test_ch}\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {e}"))
     except Exception as e:
-        results.append(_fail("DAQ", f"{name} channel read", config_ref, str(e)))
+        results.append(_fail("DAQ Functional", f"{name} channel read", config_ref, str(e)))
     finally:
         try:
             daq.disconnect()
@@ -968,76 +949,20 @@ def test_daq():
 
 def test_temperature_module():
     """
-    Presence/identity check for the PXIe-4353 temperature module
-    (config/devices.py::PXI_SLOTS[15], category="temperature") -- NOT the
-    same thing as "Test Sensors (NTC)" (test_sensors(), which exercises
-    hardware/temperature.py's pure NTC-thermistor math offline, with no
-    hardware I/O at all). This test is real hardware, no math.
+    Menu entry for the Temperature Module hardware category (PXIe-4353,
+    config/devices.py::PXI_SLOTS, category="temperature"). Routes to
+    Identity Validation (_identify_temperature -- presence/identity only,
+    via the shared _run_hardware_category() workflow. No Functional
+    Validation is implemented yet -- no thermocouple/RTD channel read
+    driver exists (see PXI_SLOTS[15]'s validation_notes and docs/TODO.md),
+    so the menu reports "not yet implemented" instead of faking one.
 
-    Step 1: Import hardware.daq.DAQ and verify interface -- reused
-            deliberately: NI-4353 is an NI-DAQmx-family device (universal
-            thermocouple/RTD input module), so the same driver class that
-            talks to the 6363/6368/6365 DAQ cards also talks to this one.
-    Step 2: connect() + identify() -- presence/identity only. No
-            thermocouple/RTD channel is configured or read -- that would
-            need a new driver (see PXI_SLOTS[15]'s validation_notes and
-            docs/TODO.md); faking it here would be exactly the "COMMAND and
-            assume success" pattern this project's testing philosophy
-            exists to avoid.
-
-    Steps 1/2 below: show every configured temperature module
-    (config/devices.py::PXI_SLOTS, category="temperature") with a live
-    reachability check, then select ONE to run the interface+identity check
-    against -- selecting here never touches any SMU, DMM, DAQ, or relay.
+    NOT the same thing as "Test Sensors (NTC)" (test_sensors(), which
+    exercises hardware/temperature.py's pure NTC-thermistor math offline,
+    with no hardware I/O at all). This is real hardware, no math.
     """
     devices = _pxi_slots_by_category("temperature")
-    name, cfg, results = _discover_and_select("Temperature Module", devices, _identify_temperature)
-    if cfg is None:
-        return results
-    _print_device_config(name, cfg)
-
-    resource   = cfg.get("resource", "")
-    model      = cfg.get("model", "PXIe-4353")
-    config_ref = f"{resource} / {model}"
-
-    # Step 1: hardware.daq module import + interface (reused -- see docstring) -
-    ref_mod = "hardware/daq.py"
-    try:
-        from hardware.daq import DAQ
-        daq = DAQ(cfg)
-        required = ["connect", "disconnect", "identify"]
-        missing = [m for m in required if not callable(getattr(daq, m, None))]
-        if missing:
-            results.append(_fail("Temperature Module", "DAQ module", ref_mod,
-                                 f"Missing methods: {missing}"))
-        else:
-            results.append(_ok("Temperature Module", "DAQ module", ref_mod,
-                               "hardware.daq.DAQ interface OK (reused for this NI-DAQmx-family "
-                               "device -- no TC/RTD channel read implemented)"))
-    except Exception as e:
-        results.append(_fail("Temperature Module", "DAQ module", ref_mod, f"Import error: {e}"))
-        return results
-
-    # Step 2: connect() + identify() -- presence/identity only ----------------
-    try:
-        daq.connect()
-        identity = daq.identify()
-        results.append(_ok("Temperature Module", name, config_ref,
-                           f"Self-test PASSED. Detected: {identity}"))
-    except Exception as e:
-        results.append(_fail("Temperature Module", name, config_ref,
-                             f"[ERROR] Temperature module not detected or self-test failed\n"
-                             f"Configuration : {name}\n"
-                             f"Interface     : NI-DAQmx\n"
-                             f"Expected      : {resource} ({model})\n"
-                             f"Reason        : {e}"))
-    finally:
-        try:
-            daq.disconnect()
-        except Exception:
-            pass
-
-    return results
+    return _run_hardware_category("Temperature Module", devices, _identify_temperature)
 
 
 # =============================================================================
@@ -1237,12 +1162,16 @@ def _classify_relay_error(e: Exception) -> str:
     return msg if msg else "Unknown error"
 
 
-def test_relay_numato_matrix():
+def test_relay_numato_matrix(name=None, cfg=None):
     """
     Real commissioning test for the Numato Lab 32-Channel Ethernet Relay
     Module, i.e. the Numato Relay Matrix (hardware/relay_eth.py via
     RelayFactory). Applies to whichever device is selected from
     NUMATO_RELAY_MATRIX_CONFIGS -- nothing here is specific to one name.
+    This is Functional Validation (it energizes relay 1) -- see
+    _functional_relay_numato(), which routes here from the shared
+    hardware-category menu; called with no arguments it falls back to its
+    own device picker for standalone use.
 
     Step 1: Verify factory + module interface (RelayBase subclass, all methods present).
     Step 2: Ping the configured IP -- network-layer reachability, before any TCP/Telnet attempt.
@@ -1260,15 +1189,13 @@ def test_relay_numato_matrix():
     instead of a bare exception -- and the full Telnet conversation (RX/TX, prompt
     detection, IAC negotiation) is visible via _numato_relay_debug_logging(), which
     wraps this entire test, in case the summary reason isn't enough on its own.
-
-    Steps 1/2 below: show every configured Numato Relay Matrix device with a
-    live reachability check, then select ONE to run the full test against --
-    selecting here never touches any other relay, SMU, DMM, or DAQ.
     """
-    name, cfg, results = _discover_and_select(
-        "Numato Relay Matrix", dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, _identify_relay_eth)
+    results = []
     if cfg is None:
-        return results
+        name, cfg, results = _discover_and_select(
+            "Numato Relay Matrix", dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, _identify_relay_eth)
+        if cfg is None:
+            return results
     _print_device_config(name, cfg)
 
     host       = cfg.get("ip", "")
@@ -1392,10 +1319,14 @@ def _run_relay_numato_matrix_test(cfg, name, host, port, driver, user, config_re
 # 5c. Relay -- Ethernet full matrix scan (commissioning)
 # =============================================================================
 
-def test_relay_matrix_scan():
+def test_relay_matrix_scan(name=None, cfg=None):
     """
     Commissioning test: exercises every configured channel of the Numato
     Relay Matrix module -- ON, READ, OFF -- one connection for the whole scan.
+    This is Functional Validation (it energizes every relay channel in turn)
+    -- see _functional_relay_numato(), which routes here from the shared
+    hardware-category menu; called with no arguments it falls back to its
+    own device picker for standalone use.
 
     Before scanning, device availability is verified (ping + connect/auth) --
     the scan itself only starts once the device is confirmed reachable and
@@ -1407,9 +1338,10 @@ def test_relay_matrix_scan():
     any single channel is recorded as FAIL and the scan continues to the
     remaining channels -- it never aborts early.
     """
-    name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
     if cfg is None:
-        return []
+        name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
+        if cfg is None:
+            return []
     _print_device_config(name, cfg)
 
     host         = cfg.get("ip", "")
@@ -1525,13 +1457,16 @@ def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_r
 #     public 1-based open()/close() API (see 5e for that layer's self-test)
 # =============================================================================
 
-def test_relay_ethernet_test():
+def test_relay_ethernet_test(name=None, cfg=None):
     """
     RelayEthernetTest: validates the native Numato command primitives
     directly -- write(relay_number, state), read_all(), write_all(),
     verify_all() -- using Numato's own 0-based relay numbering, independent
     of the higher-level 1-based open()/close() API that
-    test_relay_safety_selftest() exercises.
+    test_relay_safety_selftest() exercises. This is Functional Validation
+    (it energizes every relay in turn) -- see _functional_relay_numato(),
+    which routes here from the shared hardware-category menu; called with
+    no arguments it falls back to its own device picker for standalone use.
 
     Purpose: validate, before relay usage is integrated into higher-level
     battery test workflows --
@@ -1553,9 +1488,10 @@ def test_relay_ethernet_test():
     Fails immediately on any mismatch -- does not continue to the remaining
     relays once one has failed.
     """
-    name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
     if cfg is None:
-        return []
+        name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
+        if cfg is None:
+            return []
     _print_device_config(name, cfg)
 
     host        = cfg.get("ip", "")
@@ -1660,8 +1596,13 @@ def test_relay_ethernet_test():
 # 5e. Relay -- Ethernet mandatory safety self-test (channels 1-32)
 # =============================================================================
 
-def test_relay_safety_selftest():
+def test_relay_safety_selftest(name=None, cfg=None):
     """
+    This is Functional Validation (it energizes every relay channel in
+    turn) -- see _functional_relay_numato(), which routes here from the
+    shared hardware-category menu; called with no arguments it falls back
+    to its own device picker for standalone use.
+
     Validates the mandatory relay safety sequence (hardware/relay_eth.py
     NumatoRelayMatrix.close()/open()) against every configured channel,
     individually, in order:
@@ -1693,9 +1634,10 @@ def test_relay_safety_selftest():
     every step. If a firmware update ever changes this format,
     hardware/relay_eth.py::_parse_readall_response() is the one place to fix it.
     """
-    name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
     if cfg is None:
-        return []
+        name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
+        if cfg is None:
+            return []
     _print_device_config(name, cfg)
 
     host         = cfg.get("ip", "")
@@ -1765,6 +1707,82 @@ def test_relay_safety_selftest():
             results.append(_warn("Relay Safety Self-Test", "Disconnect", config_ref, str(e)))
 
     return results
+
+
+# =============================================================================
+# 5f. Numato Relay Matrix -- hardware-category menu entry (Identity +
+#     Functional Validation), reusing the tests above
+# =============================================================================
+
+def test_relay_numato():
+    """
+    Menu entry for the Numato Relay Matrix hardware category. Lists every
+    configured Numato Relay Matrix device (config/devices.py::
+    NUMATO_RELAY_MATRIX_CONFIGS), then routes to Identity Validation
+    (_identify_relay_eth -- TCP connect + Telnet login + readall only, never
+    energizes a relay) or Functional Validation (_functional_relay_numato --
+    a submenu of the existing relay-energizing tests below), via the shared
+    _run_hardware_category() workflow.
+    """
+    return _run_hardware_category("Numato Relay Matrix (Ethernet)",
+                                   dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS,
+                                   _identify_relay_eth, _functional_relay_numato)
+
+
+def _functional_relay_numato(name: str, cfg: dict):
+    """
+    Functional Validation submenu for one Numato Relay Matrix device --
+    groups the existing, already-implemented relay-energizing tests (each
+    closes/opens real relay channels) under one menu entry instead of
+    exposing them as separate top-level menu items. Every option here
+    changes hardware state -- none of this belongs in Identity Validation.
+    """
+    options = [
+        ("Relay 1 quick check (READ / ON / OFF)",        test_relay_numato_matrix),
+        ("Matrix Scan (ON -> READ -> OFF, every channel)", test_relay_matrix_scan),
+        ("RelayEthernetTest (native 0-based primitives)", test_relay_ethernet_test),
+        ("Safety Self-Test (1..N, stop on first failure)", test_relay_safety_selftest),
+    ]
+    print(f"\n{name} -- Functional Validation\n")
+    for i, (label, _fn) in enumerate(options, 1):
+        print(f"[{i}] {label}")
+    print("0. Back")
+    try:
+        raw = input("\nChoice: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return []
+    if raw == "0" or raw == "":
+        return []
+    try:
+        idx = int(raw) - 1
+        if idx < 0 or idx >= len(options):
+            raise ValueError()
+    except ValueError:
+        print("Invalid choice.")
+        return []
+    _, fn = options[idx]
+    return fn(name, cfg)
+
+
+# =============================================================================
+# 5g. PXI Relay Matrix -- hardware-category menu entry (Identity Validation
+#     only; no niswitch-based driver exists in this codebase)
+# =============================================================================
+
+def test_pxi_relay_matrix():
+    """
+    Menu entry for the PXI-resident switch/relay card (PXI_SLOTS[11],
+    category="switch", nickname CHASSIS_RELAY_MATRIX -- physically present
+    in the rack, but NOT the active relay driver; see PXI_SLOTS[11]'s
+    validation_notes). Routes to Identity Validation (_identify_switch --
+    always reports N/A, since no niswitch-based driver exists) via the
+    shared _run_hardware_category() workflow. No Functional Validation is
+    implemented -- there is nothing to validate functionally without a
+    driver.
+    """
+    devices = _pxi_slots_by_category("switch")
+    return _run_hardware_category("PXI Relay Matrix", devices, _identify_switch)
 
 
 # =============================================================================
@@ -2371,19 +2389,14 @@ MENU = [
     ("Test SMU (PSU)",                test_smu),
     ("Test DMM",                      test_dmm),
     ("Test DAQ",                      test_daq),
-    ("Test Temperature Module (PXIe-4353, presence/identity only)", test_temperature_module),
-    ("Test Relay -- Serial",          test_relay_serial),
-    ("Test Relay -- Numato Relay Matrix (Ethernet)", test_relay_numato_matrix),
-    ("Test Relay -- Ethernet Matrix Scan", test_relay_matrix_scan),
-    ("Test Relay -- RelayEthernetTest (native primitives, stop on first failure)", test_relay_ethernet_test),
-    ("Test Relay -- Safety Self-Test (1-32, stop on first failure)", test_relay_safety_selftest),
-    ("Test Electronic Load",          test_electronic_load),
+    ("Test Temperature Module",       test_temperature_module),
+    ("Test Numato Relay Matrix (Ethernet)", test_relay_numato),
+    ("Test PXI Relay Matrix",         test_pxi_relay_matrix),
     ("Test Sensors (NTC)",            test_sensors),
     ("Test Safety Monitor",           test_safety_monitor),
     ("Test Configuration",            test_configuration),
     ("Test SQLite (foundation)",      test_sqlite),
     ("Test Database Layer",           test_database),
-    ("Test MiniSQL (hooks)",          test_minisql),
     ("Run All Tests",                 None),
 ]
 

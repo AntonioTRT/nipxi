@@ -355,7 +355,7 @@ Every step logs: requested relay, command sent, raw readback, decoded mask, deco
 
 ### 6b. Relay validation tests
 
-Two `test.py` menu items validate the two layers above, both `RELAY_COUNT`-driven (never hardcoded) and both stopping immediately on the first failure:
+Two functions validate the two layers above, both `RELAY_COUNT`-driven (never hardcoded) and both stopping immediately on the first failure. Both are Functional Validation (Section 8.2b) -- reached from "Test Numato Relay Matrix (Ethernet)" -> Functional Validation in the menu, not separate top-level menu items:
 
 ```
 "RelayEthernetTest" (native layer, 0-based):
@@ -503,39 +503,50 @@ Categories with no driver class in this codebase are reported **N/A**, never fak
 
 It uses the SAME production driver classes as `HardwareManager` and the deeper `test_smu()`/`test_dmm()`/`test_daq()`/`test_temperature_module()` tests -- every `_identify_*()` helper is exactly `driver = DriverClass(cfg); driver.connect(); driver.identify(); driver.disconnect()`, never a direct `nidcpower`/`nidmm`/`nidaqmx`/`pyserial` call. `_identify_temperature()` deliberately reuses `hardware.daq.DAQ` rather than inventing a new driver class -- NI-4353 is an NI-DAQmx-family device, so the same generic device-enumeration + self-test call works, with no channel acquisition attempted. `test_relay_ethernet_test()` and Hardware Discovery's Ethernet-relay check both go through `RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)`, i.e. the same `NumatoRelayMatrix` instance type. A failure on one device never stops discovery of the rest (each `_identify_*()` catches its own exceptions and returns a result), and a full PASS/WARNING/FAIL summary is always produced (`print_summary()`).
 
-### 8.2a Device Selection Workflow (bring-up focused)
+### 8.2a Device Selection Workflow -- Identity vs Functional Validation
 
-`test_smu()`, `test_dmm()`, `test_daq()`, `test_temperature_module()`, `test_relay_serial()`, and `test_relay_numato_matrix()` all follow the same three-step pattern via one shared helper, `test.py::_discover_and_select(label, devices, identify_fn)`:
+**The current bring-up goal is hardware identification and readiness validation, not functional testing** -- confidence that the correct devices are detected, reachable, and ready, before any lab visit. `test_smu()`, `test_dmm()`, `test_daq()`, `test_temperature_module()`, `test_relay_numato()`, and `test_pxi_relay_matrix()` all follow the same pattern via one shared helper, `test.py::_run_hardware_category(label, devices, identify_fn, functional_fn=None)`:
 
 ```
-Step 1/2: show every configured device of THIS category (from PXI_SLOTS, or the
-          relay dict) with a live reachability check -- the SAME identify_fn
-          Hardware Discovery itself uses, so the two can never disagree:
+Step 1: list every configured device of THIS category (from PXI_SLOTS, or the
+        Numato Relay Matrix dict):
 
-    SMU Devices Found
+    SMU
 
     [1] PRIMARY_SMU
-        Slot 5
-        PXIe-4141
-        PASS
     [2] HIGH_POWER_SMU
-        Slot 6
-        PXIe-4139
-        FAIL
-    0. Cancel
+    [3] AUX_SMU_1
+    [4] AUX_SMU_2
+    0. Back
 
-Step 3:   prompt "Select device:" -- any listed device, PASS or not (an
-          operator may deliberately want to select a failing one to
-          investigate further)
+    Select device:
 
-Step 4:   the existing, unmodified functional test body (module-interface
-          check + connect/identify [+ DMM's real measurement / DAQ's deep
-          channel read]) runs on ONLY the selected device.
+Step 2: second-level menu, for the ONE device just selected:
+
+    PRIMARY_SMU
+
+    [1] Identity Validation
+    [2] Functional Validation (future)
+    [0] Back
 ```
 
-**Selecting one device never touches any other device, of that category or any other.** This was verified directly (not assumed): selecting `PRIMARY_SMU` from the SMU picker runs the SMU interface check and connect/identify against `PRIMARY_SMU` only -- `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` are not reconnected a second time. Cancelling (`0`) returns the reachability-scan results that were already gathered in Step 1/2 -- that data is never lost even if no device is ultimately selected.
+**Identity Validation** always calls `identify_fn(name, cfg)` -- the SAME function Hardware Discovery itself uses, so the two paths can never disagree. It opens a driver session, verifies the configured resource exists, verifies communication, reads device identity/model/serial where supported, verifies the detected model matches `config/devices.py`, and confirms the device is ready for the next validation stage -- and it never enables an output, sources voltage/current, closes a relay, or performs any other state-changing action (Section 10, Instrument Verification Philosophy, still applies in full).
 
-`_discover_and_select()` is the one new abstraction this workflow introduces, and it is a thin wrapper reusing existing pieces (`identify_fn` from Hardware Discovery, `TestResult`/`_ok`/`_warn`/`_fail` from the existing result model) -- not a second inventory framework or a parallel config source.
+**Functional Validation** calls `functional_fn(name, cfg)` if the category has one implemented (`_functional_dmm()` -- a real DC voltage measurement; `_functional_daq()` -- a real deep channel read; `_functional_relay_numato()` -- a submenu of the existing relay-energizing tests, Section 8.2b); otherwise the menu reports "Functional Validation not yet implemented for this hardware category" rather than faking a PASS (SMU sourcing and the Temperature Module's TC/RTD read have no implementation yet; the PXI Relay Matrix has no driver at all).
+
+**Selecting one device never touches any other device, of that category or any other.** Selecting `PRIMARY_SMU` runs Identity/Functional Validation against `PRIMARY_SMU` only -- `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` are untouched.
+
+`_run_hardware_category()` is the one shared abstraction this workflow introduces, reusing existing pieces (`identify_fn`/`functional_fn`, `TestResult`/`_ok`/`_warn`/`_fail` from the existing result model) -- not a second inventory framework or a parallel config source. It replaces the earlier `_discover_and_select()` picker, which combined a live reachability scan with running the full (identity + functional) test body in one step -- that mixing of identity and functional concerns is exactly what this workflow now separates.
+
+### 8.2b Functional Validation (existing tests, relocated not deleted)
+
+Functional Validation is intentionally a separate, later phase from Identity Validation (see Section 8.2a) -- but existing, already-implemented functional tests are kept, not deleted, and reached from their category's Functional Validation option instead of being separate top-level menu items:
+
+- **DMM -> Functional Validation** (`_functional_dmm()`): a real DC voltage measurement (`DMM.measure_dc_voltage()`), verified finite and within the configured range.
+- **DAQ -> Functional Validation** (`_functional_daq()`): a real deep channel read (`nidaqmx` directly, since `DAQ.read_channel()` is still a placeholder), verified finite and within the configured ADC range.
+- **Numato Relay Matrix -> Functional Validation** (`_functional_relay_numato()`): a submenu of `test_relay_numato_matrix()` (relay-1 quick check), `test_relay_matrix_scan()` (full channel scan), `test_relay_ethernet_test()` (native-primitive test), and `test_relay_safety_selftest()` (mandatory-sequence self-test) -- each of these four functions still accepts no arguments for standalone/scripted use, and now also accepts an optional preselected `(name, cfg)` so the submenu can route to them without prompting for the device twice.
+
+`test_relay_serial()` (bench-only serial relay) and the GPIB/MiniSQL stubs (`test_electronic_load()`, `test_minisql()`) are no longer in the operator-facing `MENU` list -- out of scope for the current NIPXI bring-up stage (Section 4/17 of README.md) -- but their code is unchanged and still importable directly from `test.py`.
 
 ### 8.3 Startup device validation (`utils/device_validator.py`)
 
@@ -545,7 +556,7 @@ Runs before any hardware communication -- `main.py` calls `validate_devices_or_r
 
 A new instance of an existing type (second SMU/DAQ/DMM/temperature module) in an existing PXI slot: add an entry to `config/devices.py`'s `PXI_SLOTS` (with a unique nickname, `category`, `driver_family`, `role`, `enabled` flag) -- `SMU_ASSIGNMENTS`/`DAQ_CONFIGS`/`DMM_CONFIGS` are derived from it automatically (see Section 14.2), so Hardware Discovery, the device-selection workflow (Section 8.2a), device validation, and preflight all pick it up with no further code change.
 
-A genuinely new device type: `hardware/<type>.py` (a `HardwareBase` subclass, constructed from a config dict, with `connect()`/`disconnect()`/`identify()`), a `<TYPE>_CONFIG`/`<TYPE>_CONFIGS` pair in `config/devices.py`, a registry entry in `utils/device_validator.py::_build_registry()`, and a `_DISCOVERY_TARGETS` entry in `test.py`. See README.md Section 17.3 for the full walkthrough.
+A genuinely new device type: `hardware/<type>.py` (a `HardwareBase` subclass, constructed from a config dict, with `connect()`/`disconnect()`/`identify()`), a `<TYPE>_CONFIG`/`<TYPE>_CONFIGS` pair in `config/devices.py`, a registry entry in `utils/device_validator.py::_build_registry()`, and either a `_PXI_CATEGORY_TARGETS` entry (PXI-slot devices) or a `_NON_PXI_TARGETS` entry (Ethernet/serial-style devices) in `test.py`, plus a `test_<type>()` menu function built on `_run_hardware_category()` (Section 8.2a) to expose it as its own hardware category. See README.md Section 17.3 for the full walkthrough.
 
 ### 8.5 Test execution order
 

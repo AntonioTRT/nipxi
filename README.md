@@ -132,7 +132,9 @@ Save final data, generate report
 ```
 nipxi/
 |-- main.py                     Entry point. Parses args, validates config, starts test.
-|-- test.py                     Interactive test framework (20 menu items -- see Section 8).
+|-- test.py                     Interactive test framework (15 menu items; hardware categories
+|                                use a shared select-device -> Identity/Functional Validation
+|                                workflow -- see Section 8).
 |-- requirements.txt
 |-- .gitignore
 |
@@ -494,25 +496,31 @@ python test.py
   2. Startup Device Validation    -- config/devices.py only, construction-only, no hardware I/O --
                                      see Section 17.2. Runs automatically before the menu too.
   3. Hardware Discovery           -- config-driven connectivity + identification only, every
-                                     device type (SMU/PSU, DMM, DAQ, Relay Eth, Relay Serial) --
+                                     device type (SMU/PSU, DMM, DAQ, Numato Relay, PXI switch) --
                                      see Section 8.1, NOT a measurement/battery/accuracy test
-  4. Test SMU (PSU)               -- hardware.smu.SMU connect()/identify() (real, via nidcpower)
-  5. Test DMM                     -- hardware.dmm.DMM connect()/identify() (real, via nidmm)
-  6. Test DAQ                     -- hardware.daq.DAQ connect()/identify() + deep channel read
-  7. Test Relay -- Serial         -- SerialRelay factory + COM port open
-  8. Test Relay -- Numato Relay Matrix (Ethernet) -- NumatoRelayMatrix factory + TCP login + open/close/query
-  9. Test Relay -- Ethernet Matrix Scan   -- exercises every configured channel in one connection
- 10. Test Relay -- RelayEthernetTest      -- native Numato primitives, stop on first failure
- 11. Test Relay -- Safety Self-Test       -- public 1-based API, channels 1-32, stop on first failure
- 12. Test Electronic Load        -- stub (future)
- 13. Test Sensors (NTC)          -- NTC conversion math + TemperatureSensor class
- 14. Test Safety Monitor         -- SafetyMonitor logic (all limits + relay guard)
- 15. Test Configuration          -- validate_settings() + all Settings values
- 16. Test Database Layer         -- DataStorage write/query/CSV (temp dir, no real data)
- 17. Test MiniSQL (hooks)        -- StorageBackend interface + stubs
- 18. Run All Tests               -- all of the above (except Run Main Test) in sequence
+  4. Test SMU (PSU)               -- select device -> Identity Validation / Functional (future)
+  5. Test DMM                     -- select device -> Identity Validation / Functional Validation
+  6. Test DAQ                     -- select device -> Identity Validation / Functional Validation
+  7. Test Temperature Module      -- select device -> Identity Validation / Functional (future)
+  8. Test Numato Relay Matrix (Ethernet) -- select device -> Identity Validation / Functional Validation
+  9. Test PXI Relay Matrix        -- select device -> Identity Validation (reports N/A -- no driver)
+ 10. Test Sensors (NTC)           -- NTC conversion math + TemperatureSensor class
+ 11. Test Safety Monitor          -- SafetyMonitor logic (all limits + relay guard)
+ 12. Test Configuration           -- validate_settings() + all Settings values
+ 13. Test SQLite (foundation)     -- create_database/initialize_schema/insert/get_last_record
+ 14. Test Database Layer          -- DataStorage write/query/CSV (temp dir, no real data)
+ 15. Run All Tests                -- all of the above (except Run Main Test) in sequence
   0. Exit
 ```
+
+Every hardware-category item (4-9) uses the same two-level workflow, described in
+Section 8.1a: pick a configured device, then pick **Identity Validation** or
+**Functional Validation (future)** for that device only. Menu items previously
+exposed for a demo Electronic Load, MiniSQL hooks, the bench-only serial relay,
+and three separate flat Numato relay commissioning tests have been removed from
+the operator-facing menu (the underlying code is unchanged and still reachable
+from `test.py` -- see Section 8.1b) -- they were out of scope for hardware
+bring-up and identification.
 
 ### 8.1 Hardware Discovery (`test_hardware_discovery()`)
 
@@ -563,28 +571,49 @@ Note: there is no separate PSU hardware/config in this project -- the NI SMU is 
 
 `RelayEthernetTest` and Hardware Discovery's Ethernet-relay row both go through `RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)`, i.e. the same `NumatoRelayMatrix` instance type -- they never diverge onto a second relay implementation.
 
-### 8.1a Device Selection Workflow (bring-up)
+### 8.1a Device Selection Workflow -- Identity vs Functional Validation
 
-`Test SMU`, `Test DMM`, `Test DAQ`, `Test Temperature Module`, `Test Relay -- Serial`, and `Test Relay -- Numato Relay Matrix` all show a live reachability scan of every configured device in that category **before** asking which one to test -- unlike a blind picker, you see PASS/WARNING/FAIL for each device first:
+**The current bring-up goal is hardware identification and readiness, not functional testing.** Every hardware-category menu item (SMU, DMM, DAQ, Temperature Module, Numato Relay Matrix, PXI Relay Matrix) is driven by one shared helper, `test.py::_run_hardware_category()`, so the workflow is identical everywhere and never duplicated per category:
 
 ```
-SMU Devices Found
+1. List every device configured for this category in config/devices.py:
 
-[1] PRIMARY_SMU
-    Slot 5
-    PXIe-4141
-    PASS
-[2] HIGH_POWER_SMU
-    Slot 6
-    PXIe-4139
-    FAIL
+    SMU
 
-0. Cancel
+    [1] PRIMARY_SMU
+    [2] HIGH_POWER_SMU
+    [3] AUX_SMU_1
+    [4] AUX_SMU_2
+    0. Back
 
-Select device:
+    Select device:
+
+2. Second-level menu, for the ONE device just selected:
+
+    PRIMARY_SMU
+
+    [1] Identity Validation
+    [2] Functional Validation (future)
+    [0] Back
+
+    Choice:
 ```
 
-Selecting a device runs the existing, unmodified functional test (module-interface check + connect/identify, plus DMM's real measurement or DAQ's deep channel read where applicable) on **only** that device -- selecting `PRIMARY_SMU` never touches `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2`, and selecting a DMM never touches any SMU, DAQ, or relay. Cancelling still returns the reachability scan's results, so that data is never lost. One shared helper (`test.py::_discover_and_select()`) implements this for every category above -- not a separate tool or a second config source, just a picker upgrade reusing the same `_identify_*()` functions Hardware Discovery already uses.
+Selecting a device only ever touches that one device -- selecting `PRIMARY_SMU` never reads or writes `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2`, and selecting a DMM never touches any SMU, DAQ, or relay.
+
+**Identity Validation** (`_identify_smu()`/`_identify_dmm()`/`_identify_daq()`/`_identify_temperature()`/`_identify_relay_eth()`/`_identify_switch()` -- the SAME functions Hardware Discovery uses, so this menu path can never drift from what Hardware Discovery reports) opens a driver session, verifies the configured resource exists, verifies communication, reads device identity/model/serial where supported, verifies the detected model matches `config/devices.py`, and confirms the device is ready for the next validation stage. It **never** enables an output, sources voltage/current, closes a relay, or performs any other state-changing action -- see Section 19 (Instrument Verification Philosophy). A PASS here means: *the device is present, correctly identified, reachable, and ready for the next validation stage* -- exactly what's needed to validate hardware bring-up remotely over RDP before going to the lab.
+
+**Functional Validation** is intentionally a separate, later phase (see Section 8.1b) -- it is the only path that ever changes hardware state (a DMM/DAQ real measurement, or a Numato relay energizing a channel). Where no functional test exists yet (SMU sourcing, Temperature Module TC/RTD read, PXI Relay Matrix -- no driver at all), the menu reports "Functional Validation not yet implemented for this hardware category" rather than faking a PASS.
+
+### 8.1b Functional Validation (existing tests, kept but relocated)
+
+Functional Validation is not mixed into Identity Validation, but existing, already-implemented functional tests are kept and reachable from the Functional Validation option of their category, rather than deleted or left as flat top-level menu items:
+
+- **DMM -> Functional Validation**: `_functional_dmm()` -- a real DC voltage measurement (`DMM.measure_dc_voltage()`), verified finite and within the configured range.
+- **DAQ -> Functional Validation**: `_functional_daq()` -- a real deep channel read (`nidaqmx` directly, since `DAQ.read_channel()` is still a placeholder), verified finite and within the configured ADC range.
+- **Numato Relay Matrix -> Functional Validation**: `_functional_relay_numato()` -- a submenu of the existing relay-energizing tests (`test_relay_numato_matrix()` relay-1 quick check, `test_relay_matrix_scan()` full channel scan, `test_relay_ethernet_test()` native-primitive test, `test_relay_safety_selftest()` mandatory-sequence self-test), each of which can still be called standalone (no arguments) for scripted/CI use.
+
+The bench-only serial relay (`test_relay_serial()`) and the GPIB/MiniSQL stubs (`test_electronic_load()`, `test_minisql()`) are no longer in the operator-facing menu (out of scope for the current NIPXI bring-up stage -- see Section 4/15), but their code is unchanged and importable directly from `test.py` if needed later.
 
 **Result format:**
 
@@ -625,14 +654,19 @@ or on failure:
 2.  -> choose 2  (Startup Device Validation) -- re-run explicitly / inspect in isolation
 3.  -> choose 3  (Hardware Discovery)        -- connectivity + identification, every device,
                                                  grouped by category (Section 8.1)
-4.  -> choose 11 (RelayEthernetTest)         -- native relay primitives, before any relay use
-5.  -> choose 15 (Test Safety Monitor)       -- verifies safety logic offline
-6.  -> choose 14 (Test Sensors)              -- verifies NTC math
-7.  -> choose 18 (Test Database)             -- verifies storage offline
-8.  -> choose 4, 5, 6, 7 (SMU/DMM/DAQ/Temperature Module) -- deeper per-device PXI hardware
-                                                              tests, each with its own
-                                                              device-selection scan (Section 8.1a)
-9.  -> choose 20 (Run All Tests)             -- full pass
+4.  -> choose 4-9 (SMU/DMM/DAQ/Temperature Module/Numato Relay/PXI Relay Matrix) --
+                                                 for each: select device -> Identity
+                                                 Validation (Section 8.1a). This is the
+                                                 remote/RDP bring-up stage -- confidence the
+                                                 correct devices are present and reachable,
+                                                 before any lab visit.
+5.  -> choose 11 (Test Safety Monitor)       -- verifies safety logic offline
+6.  -> choose 10 (Test Sensors)              -- verifies NTC math
+7.  -> choose 13, 14 (Test SQLite / Test Database) -- verifies storage offline
+8.  -> choose 15 (Run All Tests)             -- full pass
+9.  -> in the lab: choose 5, 6, 8 (DMM/DAQ/Numato Relay) -> Functional Validation
+                                                 (Section 8.1b) -- the first hardware state
+                                                 changes (measurements, relay energizing)
 10. -> choose 1  (Run Main Test)             -- battery test workflow, once everything above
                                                  passes -- Ctrl+C cancels safely (Section 20)
 ```
@@ -786,9 +820,9 @@ Any of these must raise an exception and propagate: `test_control/battery_test.p
 
 ### 9.4b Relay validation tests
 
-Two `test.py` menu items validate the relay driver at its two API layers, both config-driven (`RELAY_COUNT`, never hardcoded) and both stopping immediately on the first failure:
+Two functions validate the relay driver at its two API layers, both config-driven (`RELAY_COUNT`, never hardcoded) and both stopping immediately on the first failure. Both are Functional Validation (they energize real relay channels), reached from `test.py`'s "Test Numato Relay Matrix (Ethernet)" menu item -> Functional Validation submenu (Section 8.1b) -- not separate top-level menu items:
 
-**"Test Relay -- RelayEthernetTest (native primitives, stop on first failure)"** (`test_relay_ethernet_test()`) exercises the native Numato primitives directly, using Numato's own 0-based relay numbering -- this is the lower-level validation target, meant to be run *before* relay usage is integrated into higher-level battery workflows:
+**RelayEthernetTest (native primitives, stop on first failure)** (`test_relay_ethernet_test()`) exercises the native Numato primitives directly, using Numato's own 0-based relay numbering -- this is the lower-level validation target, meant to be run *before* relay usage is integrated into higher-level battery workflows:
 
 ```
 For relay_index in range(RELAY_COUNT):
@@ -797,7 +831,7 @@ For relay_index in range(RELAY_COUNT):
     write_all(0)          -> read_all() -> verify all OFF
 ```
 
-**"Test Relay -- Safety Self-Test (1-32, stop on first failure)"** (`test_relay_safety_selftest()`) exercises the mandatory sequence through the public 1-based API instead:
+**Safety Self-Test (1-32, stop on first failure)** (`test_relay_safety_selftest()`) exercises the mandatory sequence through the public 1-based API instead:
 
 ```
 For relay N = 1 .. num_channels:
@@ -1275,13 +1309,13 @@ Steps:
 
 ```bash
 # Configuration only (offline, no hardware required)
-python test.py   # choose 16 (Test Configuration) or 2 (Startup Device Validation)
+python test.py   # choose 12 (Test Configuration) or 2 (Startup Device Validation)
 
 # Safety monitor (offline)
-python test.py   # choose 15 (Test Safety Monitor)
+python test.py   # choose 11 (Test Safety Monitor)
 
 # Full test pass
-python test.py   # choose 20 (Run All Tests)
+python test.py   # choose 15 (Run All Tests)
 ```
 
 ### 13.3 Adding a new test section
@@ -1374,10 +1408,10 @@ storage = MiniSQLStorage(cfg=MINISQL_CONFIG)
 
 No changes needed in `BatteryTestSequence`, `ChargeCycle`, or `DischargeCycle` — they all receive `storage` by injection and call only `storage.record()`.
 
-Test the swap with:
+Test the swap with `test_minisql()` in `test.py` -- kept and unchanged, but no longer an operator-facing menu item (it is a stub for future MiniSQL hooks, out of scope for the current hardware bring-up menu -- see Section 8.1b):
 
 ```bash
-python test.py   # choose 19 (Test MiniSQL hooks)
+python -c "from test import test_minisql; [r.print_detail() for r in test_minisql()]"
 ```
 
 ---
@@ -1444,7 +1478,15 @@ Device Drivers               (hardware/smu.py, daq.py, dmm.py, relay_eth.py, rel
 Hardware Discovery Test      (test_hardware_discovery() -- connectivity + identification only)
      |
      v
-Functional Hardware Tests    (test_smu/test_dmm/test_daq/test_relay_* -- deeper per-device checks)
+Identity Validation          (test_smu/test_dmm/test_daq/test_temperature_module/
+                               test_relay_numato/test_pxi_relay_matrix -> select device ->
+                               Identity Validation -- remote/RDP bring-up, never changes
+                               hardware state)
+     |
+     v
+Functional Validation        (same menu items -> Functional Validation -- DMM measurement,
+                               DAQ channel read, Numato relay energizing; lab-only, requires
+                               physical access)
      |
      v
 Battery Test Workflows       (BatteryTestSequence / TestExecutor -- charge/discharge cycling)
@@ -1490,7 +1532,7 @@ For a genuinely new device *type* (e.g. an electronic load), follow the existing
 1. `hardware/<type>.py`: a class inheriting `HardwareBase`, constructed from a `config/devices.py`-shaped dict, implementing `connect()`/`disconnect()`/`identify()` at minimum.
 2. `config/devices.py`: a `<TYPE>_CONFIG` dict plus a `<TYPE>_CONFIGS = {name: cfg}` enumeration dict (matching `DMM_CONFIGS`'s shape).
 3. `utils/device_validator.py`: add the new enumeration dict to `_build_registry()` and, if it has multiple possible implementations, a factory + a `_check_factory_type()` branch (otherwise direct construction is enough, per 17.1).
-4. `test.py`: add `("<Type>", dev_cfg.<TYPE>_CONFIGS, _identify_<type>)` to `_DISCOVERY_TARGETS` -- Hardware Discovery covers it with no other change.
+4. `test.py`: add `(category, "<Label>", _identify_<type>)` to `_PXI_CATEGORY_TARGETS` (PXI-slot devices) or a `(label, cfg_dict, _identify_<type>)` tuple to `_NON_PXI_TARGETS` (Ethernet/serial-style devices) -- Hardware Discovery covers it with no other change. Add a `test_<type>()` menu entry calling the shared `_run_hardware_category()` helper (Section 8.1a) to expose it as its own hardware category in the menu.
 5. Optionally wire it into `HardwareManager` if it participates in the battery test workflow (relay/SMU/DAQ do; DMM is intentionally optional, matching its role as independent verification only).
 
 ### 17.4 Test execution order
@@ -1499,13 +1541,16 @@ For a genuinely new device *type* (e.g. an electronic load), follow the existing
 1. Startup Validation         validate_settings() + validate_devices_or_raise()
                                (main.py at startup; test.py's preflight_check() before the menu)
 2. Hardware Discovery          test_hardware_discovery() -- connectivity + identification, every type
-3. RelayEthernetTest            test_relay_ethernet_test() -- native relay primitives validated
-                               before any relay use in a functional test
-4. Functional Hardware Tests    test_smu / test_dmm / test_daq / test_relay_* / Safety Self-Test
+3. Identity Validation          test_smu / test_dmm / test_daq / test_temperature_module /
+                               test_relay_numato / test_pxi_relay_matrix -> Identity Validation --
+                               remote/RDP bring-up stage, never changes hardware state
+4. Functional Validation        same menu items -> Functional Validation -- DMM measurement, DAQ
+                               channel read, Numato relay energizing (RelayEthernetTest / Safety
+                               Self-Test / Matrix Scan) -- lab-only, requires physical access
 5. Battery Test Workflows       BatteryTestSequence / TestExecutor (Run Main Test / main.py)
 ```
 
-Each stage assumes the previous one passed. `test.py`'s menu enforces stage 1 structurally (it gates the whole menu); stages 2-5 are independently selectable menu items so any stage can be re-run in isolation, but running them out of order on unvalidated/unverified hardware is not recommended.
+Each stage assumes the previous one passed. `test.py`'s menu enforces stage 1 structurally (it gates the whole menu); stages 2-5 are independently selectable menu items so any stage can be re-run in isolation, but running them out of order on unvalidated/unverified hardware is not recommended. Stages 1-3 are the current bring-up focus (hardware identification and readiness, safe to do remotely over RDP); stage 4 requires physical lab access since it changes hardware state.
 
 ---
 
@@ -1540,7 +1585,7 @@ Full design writeup: `docs/architecture.md` Section 9. Future database/recovery 
 | DMM | Instrument built-in self-test | Self-test result code + message | Code indicates success, else `DMMError` (`hardware/dmm.py::DMM.identify()`) |
 | DMM | Configure + trigger a DC volts measurement | The measured value | Finite and within the configured range, +5% overrange margin (`DMM.measure_dc_voltage()`) |
 | DAQ | Instrument built-in self-test | `self_test_device()` (raises on failure) | No exception raised (`hardware/daq.py::DAQ.identify()`) |
-| DAQ | Configure + read one analog channel | The read value | Finite and within the configured `voltage_range_v`, +5% overrange margin (`test.py::test_daq()` Step 3) |
+| DAQ | Configure + read one analog channel | The read value | Finite and within the configured `voltage_range_v`, +5% overrange margin (`test.py::_functional_daq()`) |
 
 **What is deliberately NOT verified yet:** SMU sourcing (`set_charge_mode`/`output_enable`/`measure`) is still a placeholder (`docs/TODO.md`) -- testing "source a current and measure it back" around a stub that returns a fixed value would be a fake PASS, exactly what this philosophy exists to prevent. Self-test is the strongest verification available for the SMU until real sourcing exists.
 
