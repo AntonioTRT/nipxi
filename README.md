@@ -25,6 +25,8 @@ This sub-repository is self-contained and independent from the main BLOAST proje
 15. [MiniSQL Integration Path](#15-minisql-integration-path)
 16. [Troubleshooting](#16-troubleshooting)
 17. [Hardware Abstraction Architecture & Device Onboarding](#17-hardware-abstraction-architecture--device-onboarding)
+18. [System Modes](#18-system-modes)
+19. [Instrument Verification Philosophy](#19-instrument-verification-philosophy)
 
 ---
 
@@ -421,9 +423,27 @@ NUMATO_RELAY_MATRIX_CONFIG = {
 }
 ```
 
+**Battery type catalog** (`BATTERY_CONFIGS` -- physical battery specs, independent of which channel a battery occupies; foundation for the future `data/battery_repository.py`, see `docs/DATABASE_ROADMAP.md`; **not yet wired into `safety_monitor.py`/`charge_cycle.py`**, which still use the single global `BAT_VOLTAGE_MAX`/etc. from `config/settings.py` for every channel):
+
+```python
+BATTERY_CONFIGS = {
+    "GENERIC_LIION_18650": {
+        "chemistry":               "Li-ion",
+        "form_factor":             "18650",
+        "nominal_voltage_v":       3.7,
+        "voltage_max_v":           4.2,
+        "voltage_min_v":           3.0,
+        "capacity_ah":             2.5,
+        "max_charge_current_a":    1.25,
+        "max_discharge_current_a": 2.5,
+        "max_temp_c":              45.0,
+    },
+}
+```
+
 **Battery channel map:**
 
-Each channel entry maps a logical battery index (1-8) to its physical wiring:
+Each channel entry maps a logical battery index (1-8) to its physical wiring, plus which `BATTERY_CONFIGS` entry is currently installed there:
 
 ```python
 BATTERY_CHANNELS = {
@@ -433,12 +453,13 @@ BATTERY_CHANNELS = {
         "daq_current_ch":  "Dev1/ai8",  # analog input for current (via shunt)
         "daq_ntc_ch":      "Dev1/ai16", # analog input for NTC thermistor voltage
         "fuse_rating_a":   2.0,
+        "battery_type":    "GENERIC_LIION_18650",  # key into BATTERY_CONFIGS
     },
     # channels 2-8 follow the same pattern
 }
 ```
 
-Update these channel strings to match your actual PCB connector-to-DAQ wiring.
+Update these channel strings to match your actual PCB connector-to-DAQ wiring, and `battery_type` whenever a different battery is installed in a channel -- `utils/device_validator.py` validates it references a real `BATTERY_CONFIGS` key at startup.
 
 ---
 
@@ -900,9 +921,22 @@ Row format (list of dicts):
 **Emergency stop sequence:**
 
 ```
-1. smu.output_disable()    -- cut SMU output immediately
-2. relay.open_all()        -- disconnect all batteries (force-off + verify)
+1. smu.emergency_output_off(reason)  -- PMU output OFF, verified (never raises)
+2. relay.open_all()                  -- disconnect all batteries (force-off + verify)
 ```
+
+**PMU (SMU) is safety-critical.** "PMU" and "SMU" are the same thing in this project
+(`hardware/smu.py`). Any error during charge/discharge -- comms failure, timeout,
+verification failure, safety violation, or any unhandled exception -- forces:
+`PMU Output OFF -> Verify Output OFF -> Raise -> Abort`, never continue. Startup
+forces and verifies PMU output OFF before any battery operation is allowed; shutdown
+(normal, emergency, or e-stop) does the same. `BATTERY_CONFIGS` describes battery
+capability/recommended ranges only -- it is never the sole authority for the current
+operating limit, which is always the most conservative value across Battery/PMU/DAQ/
+Safety/Test limits. See `docs/architecture.md` Sections 11-12 for the full philosophy,
+the worked limit-resolution example, and the planned (documentation-only)
+`LimitResolver` concept. DAQ has no equivalent shutdown behavior yet -- it remains
+measurement-only for now, by design.
 
 **Relay verification failures are safety faults, never warnings.** `BatteryTestSequence.run()` catches `RelayError` alongside `SafetyViolationError`, calls `emergency_stop()`, and re-raises immediately -- it never attempts another relay command on that channel or continues to the next one. `TestExecutor.run()` catches the same exception and marks the whole run `aborted`. No component is permitted to log a warning and continue past a relay verification failure. See [Section 9.4a](#9.4a-mandatory-relay-safety-sequence) for the full sequence.
 
@@ -1400,6 +1434,45 @@ For a genuinely new device *type* (e.g. an electronic load), follow the existing
 ```
 
 Each stage assumes the previous one passed. `test.py`'s menu enforces stage 1 structurally (it gates the whole menu); stages 2-5 are independently selectable menu items so any stage can be re-run in isolation, but running them out of order on unvalidated/unverified hardware is not recommended.
+
+---
+
+## 18. System Modes
+
+**Problem this solves:** `HardwareManager` used to try to initialize every production device unconditionally, so laptop development without the PXI chassis attached failed on things like `DAQ 'PXI1Slot2' not found` even for work that had nothing to do with the DAQ. `config/system_mode.py` fixes this with three formal modes.
+
+| Mode | Purpose | Missing-hardware behavior |
+|------|---------|---------------------------|
+| `DEVELOPMENT` (default) | Laptop/software work, UI, database, architecture, simulation | Logged as a **warning**; startup continues |
+| `VALIDATION` | Hardware integration, driver validation | Logged as an **error** ("test failure"); framework still launches |
+| `PRODUCTION` | Real battery cycling | **Aborts startup** (`HardwareInitError`) -- unchanged from before this feature |
+
+Set in `config/settings.py`: `SYSTEM_MODE = "DEVELOPMENT"`. Validated at startup like any other Settings value.
+
+**Not relaxed by mode, ever:** if the relay driver connects but its startup force-off/verify can't be confirmed, that's still fatal in every mode -- missing hardware is tolerated, hardware in an unverifiable state never is (see Section 9.4d, "Emergency Shutdown Strategy").
+
+**Also mode-driven:** database location (`data_output/development|validation|production/nipxi*.db` -- see `docs/DATABASE_ROADMAP.md`), a recovery-enabled config hook (no recovery engine exists yet), and simulation extension points (`hardware/simulated.py` -- foundations only, not wired into `HardwareManager`/`RelayFactory` yet).
+
+Full design writeup: `docs/architecture.md` Section 9. Future database/recovery architecture: `docs/DATABASE_ROADMAP.md`.
+
+---
+
+## 19. Instrument Verification Philosophy
+
+**Never COMMAND and assume success. Always COMMAND -> READ BACK -> VERIFY -> PASS.** A test that merely calls an API and reports PASS because nothing raised gives false confidence -- exactly the "just execute an API call and report PASS" pattern this section exists to rule out. This is the Numato Relay Matrix's mandatory safety sequence (Section 9.4a: never activate a relay without forcing and verifying a baseline first) applied to every other instrument driver.
+
+| Device | Command | Readback | Verify |
+|--------|---------|----------|--------|
+| Relay | `relay on/off <n>` | `relay read <n>` + `relay readall` | Commanded state matches, all others unaffected (unchanged -- this is what the others now mirror) |
+| SMU | Instrument built-in self-test | Self-test result code + message | Code indicates success, else `SMUError` (`hardware/smu.py::SMU.identify()`) |
+| DMM | Instrument built-in self-test | Self-test result code + message | Code indicates success, else `DMMError` (`hardware/dmm.py::DMM.identify()`) |
+| DMM | Configure + trigger a DC volts measurement | The measured value | Finite and within the configured range, +5% overrange margin (`DMM.measure_dc_voltage()`) |
+| DAQ | Instrument built-in self-test | `self_test_device()` (raises on failure) | No exception raised (`hardware/daq.py::DAQ.identify()`) |
+| DAQ | Configure + read one analog channel | The read value | Finite and within the configured `voltage_range_v`, +5% overrange margin (`test.py::test_daq()` Step 3) |
+
+**What is deliberately NOT verified yet:** SMU sourcing (`set_charge_mode`/`output_enable`/`measure`) is still a placeholder (`docs/TODO.md`) -- testing "source a current and measure it back" around a stub that returns a fixed value would be a fake PASS, exactly what this philosophy exists to prevent. Self-test is the strongest verification available for the SMU until real sourcing exists.
+
+Full design writeup, including why Hardware Discovery needed no code changes to inherit this: `docs/architecture.md` Section 10.
 
 ---
 

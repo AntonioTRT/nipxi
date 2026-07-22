@@ -16,6 +16,17 @@ All values are class-level attributes on `Settings`. Access them as `Settings.PA
 | `PROJECT_NAME` | `"NIPXI Battery Test System"` | str | Display name |
 | `VERSION` | `"0.1.0"` | str | Software version |
 
+### System mode
+
+See `config/system_mode.py` and `docs/architecture.md` Section 9 for the full design.
+
+| Parameter | Default | Type | Description |
+|-----------|---------|------|-------------|
+| `SYSTEM_MODE` | `"DEVELOPMENT"` | str | `"DEVELOPMENT"` \| `"VALIDATION"` \| `"PRODUCTION"`. Controls hardware startup strictness, database location, and (future) recovery. Validated at startup -- an unrecognized value is a `ValidationError`. |
+| `RECOVERY_ENABLED_OVERRIDE` | `None` | bool \| None | `None` = use the active mode's default (see `config/system_mode.py` `MODE_POLICIES`). Set `True`/`False` to override regardless of mode. No recovery engine exists yet -- see `docs/DATABASE_ROADMAP.md` -- this is only the configuration hook. |
+
+**DEVELOPMENT** (the default): hardware optional, a missing device warns and startup continues. **VALIDATION**: a missing device is reported as an error but the framework still launches. **PRODUCTION**: any missing device aborts startup (`HardwareInitError`) -- this was the *only* behavior before `SYSTEM_MODE` existed.
+
 ### Channel count
 
 | Parameter | Default | Type | Description |
@@ -119,12 +130,14 @@ The default assumes a single NI 6363 at `Dev1`. Update if your DAQ resource name
 
 ### Data storage
 
-| Parameter | Default | Type | Description |
-|-----------|---------|------|-------------|
-| `DATA_DIR` | `"data_output"` | str | Root output directory |
-| `DATABASE_FILE` | `"data_output/nipxi.db"` | str | SQLite database path |
-| `CSV_DIR` | `"data_output/csv"` | str | Per-channel CSV output directory |
-| `REPORT_DIR` | `"data_output/reports"` | str | Generated reports directory |
+**Mode-separated** (driven by `SYSTEM_MODE` above -- see `docs/DATABASE_ROADMAP.md` Section 1): each mode gets its own subdirectory and database file so DEVELOPMENT experiments can never collide with VALIDATION or PRODUCTION data.
+
+| Parameter | Value (DEVELOPMENT, default) | Value (VALIDATION) | Value (PRODUCTION) | Type | Description |
+|-----------|-------------------------------|---------------------|----------------------|------|-------------|
+| `DATA_DIR` | `"data_output/development"` | `"data_output/validation"` | `"data_output/production"` | str | Root output directory for the active mode |
+| `DATABASE_FILE` | `"data_output/development/nipxi_dev.db"` | `".../nipxi_validation.db"` | `".../nipxi.db"` | str | SQLite database path |
+| `CSV_DIR` | `"data_output/development/csv"` | `".../csv"` | `".../csv"` | str | Per-channel CSV output directory |
+| `REPORT_DIR` | `"data_output/development/reports"` | `".../reports"` | `".../reports"` | str | Generated reports directory |
 
 ---
 
@@ -132,9 +145,29 @@ The default assumes a single NI 6363 at `Dev1`. Update if your DAQ resource name
 
 Physical device mapping. Update to match your hardware wiring.
 
+### BATTERY_CONFIGS
+
+Battery type/model catalog -- physical battery specs (chemistry, capacity, voltage/current/temperature limits), independent of which channel a battery currently occupies. Foundation for the future `data/battery_repository.py` (see `docs/DATABASE_ROADMAP.md` Section 2). **Not wired into `safety_monitor.py`/`charge_cycle.py`/`discharge_cycle.py` yet** -- those still read the single global `BAT_VOLTAGE_MAX`/`BAT_VOLTAGE_MIN`/`BAT_CURRENT_MAX`/`BAT_TEMP_MAX_C` from `config/settings.py` for every channel regardless of what's actually installed there.
+
+```python
+BATTERY_CONFIGS = {
+    "GENERIC_LIION_18650": {
+        "chemistry":               "Li-ion",
+        "form_factor":             "18650",
+        "nominal_voltage_v":       3.7,
+        "voltage_max_v":           4.2,
+        "voltage_min_v":           3.0,
+        "capacity_ah":             2.5,
+        "max_charge_current_a":    1.25,   # 0.5C
+        "max_discharge_current_a": 2.5,    # 1C
+        "max_temp_c":              45.0,
+    },
+}
+```
+
 ### BATTERY_CHANNELS
 
-Maps logical channel index (1-8) to physical wiring:
+Maps logical channel index (1-8) to physical wiring, plus which `BATTERY_CONFIGS` entry is currently installed:
 
 ```python
 BATTERY_CHANNELS = {
@@ -144,11 +177,14 @@ BATTERY_CHANNELS = {
         "daq_current_ch":  "Dev1/ai8",  # analog input for current (via shunt resistor)
         "daq_ntc_ch":      "Dev1/ai16", # analog input for NTC thermistor divider output
         "fuse_rating_a":   2.0,         # polyfuse rating (for documentation)
+        "battery_type":    "GENERIC_LIION_18650",  # key into BATTERY_CONFIGS
         "enabled":         True,
     },
     # ... channels 2-8
 }
 ```
+
+`utils/device_validator.py` validates every `battery_type` at startup: it must reference a key that actually exists in `BATTERY_CONFIGS`, catching a typo/rename before it surfaces as a confusing `KeyError` later.
 
 **Important:** Verify that `relay_address` matches the physical relay wiring on the BLOSS Hub PCB. Mismatch will connect the wrong battery to the SMU.
 

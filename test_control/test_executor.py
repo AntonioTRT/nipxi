@@ -38,7 +38,10 @@ from test_control.battery_test import BatteryTestSequence
 from test_control.charge_cycle import ChargeCycle
 from test_control.discharge_cycle import DischargeCycle
 from test_control.safety_monitor import SafetyMonitor
-from utils.errors import SafetyViolationError, HardwareInitError, RelayError
+from utils.errors import (
+    SafetyViolationError, HardwareInitError, RelayError, OperationCancelledError,
+)
+from utils.stop_reason import StopReason
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,7 @@ class TestRunResult:
     channel_results: list = field(default_factory=list)
     aborted: bool = False
     error: str = ""
+    stop_reason: str = StopReason.COMPLETED
 
     @property
     def success(self) -> bool:
@@ -81,10 +85,21 @@ class TestRunResult:
         return all(r.success for r in self.channel_results)
 
     def summary(self) -> str:
-        """One-line human-readable summary for logging."""
+        """
+        One-line human-readable summary for logging. `stop_reason`
+        (COMPLETED/FAILED/SAFETY_VIOLATION/TIMEOUT/CANCELLED -- see
+        utils/stop_reason.py) takes precedence over the old OK/PARTIAL
+        wording whenever it's not COMPLETED, so a cancelled run reads as
+        "status=CANCELLED", never "status=ABORTED"/"status=PARTIAL" --
+        stop_reason is why it stopped; passed/total is how much completed;
+        these are deliberately independent, not folded into one value.
+        """
         passed = sum(1 for r in self.channel_results if r.success)
         total = len(self.channel_results)
-        status = "OK" if self.success else ("ABORTED" if self.aborted else "PARTIAL")
+        if self.stop_reason != StopReason.COMPLETED:
+            status = self.stop_reason
+        else:
+            status = "OK" if self.success else "PARTIAL"
         return (
             f"run_id={self.run_id}  "
             f"channels={self.channels_tested}  "
@@ -133,19 +148,27 @@ class TestExecutor:
             settings=settings,
         )
 
-    def run(self, channels: list = None) -> TestRunResult:
+    def run(self, channels: list = None, token=None) -> TestRunResult:
         """
         Execute a full charge+discharge cycle on each requested channel.
 
         Args:
             channels: list of 1-based channel indices to test.
                       Defaults to settings.ACTIVE_CHANNELS.
+            token:    optional CancellationToken (see utils/cancellation.py).
+                      Passed through to BatteryTestSequence.run(), which
+                      threads it into ChargeCycle/DischargeCycle. If None,
+                      the run behaves exactly as before -- cancellation is
+                      opt-in, not a required argument.
 
         Returns:
-            TestRunResult with per-channel outcomes and run_id.
+            TestRunResult with per-channel outcomes, run_id, and stop_reason
+            (see utils/stop_reason.py -- distinguishes an operator
+            cancellation from a genuine failure).
 
         Does not raise -- all exceptions are caught and recorded in the result.
-        Callers should inspect result.success or result.channel_results.
+        Callers should inspect result.success, result.stop_reason, or
+        result.channel_results.
         """
         channels = channels or self.s.ACTIVE_CHANNELS
         run_id   = getattr(self.storage, "run_id", "unknown")
@@ -154,31 +177,46 @@ class TestExecutor:
         self.log.info("TestExecutor starting. channels=%s  run_id=%s", channels, run_id)
 
         try:
-            per_channel = self._run_sequence(channels)
+            per_channel = self._run_sequence(channels, token)
             result.channel_results = per_channel
+            result.stop_reason = StopReason.COMPLETED
+
+        except OperationCancelledError as e:
+            # Deliberate operator action (Ctrl+C -> CancellationToken), not
+            # a failure. Safe shutdown (PMU off/verified, relay open/
+            # verified) already ran inside BatteryTestSequence via
+            # safety.safe_cancel_shutdown() before this propagated here.
+            result.aborted     = True
+            result.error       = str(e)
+            result.stop_reason = StopReason.CANCELLED
+            self.log.warning("Test cancelled by operator: %s", e)
 
         except SafetyViolationError as e:
             # Emergency stop was already triggered inside BatteryTestSequence
-            result.aborted = True
-            result.error   = str(e)
+            result.aborted     = True
+            result.error       = str(e)
+            result.stop_reason = StopReason.SAFETY_VIOLATION
             self.log.error("Test aborted: safety violation -- %s", e)
 
         except RelayError as e:
             # Includes RelayStateVerificationError. Emergency stop was already
             # triggered inside BatteryTestSequence -- this is a safety fault,
             # never a condition the executor retries or continues past.
-            result.aborted = True
-            result.error   = str(e)
+            result.aborted     = True
+            result.error       = str(e)
+            result.stop_reason = StopReason.FAILED
             self.log.error("Test aborted: relay verification fault -- %s", e)
 
         except HardwareInitError as e:
-            result.aborted = True
-            result.error   = str(e)
+            result.aborted     = True
+            result.error       = str(e)
+            result.stop_reason = StopReason.FAILED
             self.log.error("Test aborted: hardware error -- %s", e)
 
         except Exception as e:
-            result.aborted = True
-            result.error   = str(e)
+            result.aborted     = True
+            result.error       = str(e)
+            result.stop_reason = StopReason.FAILED
             self.log.error("Test aborted: unexpected error -- %s", e, exc_info=True)
 
         self.log.info("TestExecutor finished. %s", result.summary())
@@ -188,7 +226,7 @@ class TestExecutor:
     # Internal
     # ------------------------------------------------------------------
 
-    def _run_sequence(self, channels: list) -> list:
+    def _run_sequence(self, channels: list, token=None) -> list:
         """
         Delegate to BatteryTestSequence and collect per-channel outcomes.
 
@@ -199,7 +237,7 @@ class TestExecutor:
         # For now, completion means run() returned without raising -- all channels done.
         # TODO: extend BatteryTestSequence to return per-channel ChannelResult objects
         #       once real hardware feedback is available.
-        self._sequence.run(channels)
+        self._sequence.run(channels, token)
 
         # Mark all as completed until the sequence returns per-channel data
         return [

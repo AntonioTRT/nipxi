@@ -24,12 +24,16 @@ Usage:
 
 import argparse
 import logging
+import signal
 import sys
 
 from config.settings import Settings
 from config import devices as dev_cfg
+from config.system_mode import get_mode_policy
 from data.logger import setup as setup_logging
+from utils.cancellation import CancellationToken
 from utils.errors import HardwareInitError, ValidationError, DeviceConfigError
+from utils.stop_reason import StopReason
 from utils.validators import validate_settings
 from utils.device_validator import validate_devices_or_raise
 from test_control.hardware_manager import HardwareManager
@@ -57,6 +61,9 @@ def main():
     setup_logging(Settings)
     log = logging.getLogger("nipxi.main")
     log.info("NIPXI %s starting.", Settings.VERSION)
+
+    mode_policy = get_mode_policy(Settings)
+    log.info("System mode: %s -- %s", mode_policy.mode.value, mode_policy.description)
 
     # --- 2. Configuration validation -----------------------------------------
     # Settings first (voltages/currents/timeouts), then every configured
@@ -92,37 +99,76 @@ def main():
         log.error("Hardware initialization failed: %s", e)
         sys.exit(1)
 
+    # In DEVELOPMENT/VALIDATION, connect_all() does not raise for a merely
+    # missing device (see config/system_mode.py) -- surface what's actually
+    # available before running anything, so a laptop run without the PXI
+    # chassis attached is obvious from the log, not a silent surprise.
+    missing = [name for name, status in hw.hardware_status.items() if not status["connected"]]
+    if missing:
+        log.warning("Proceeding with missing hardware (%s mode): %s",
+                    mode_policy.mode.value, missing)
+
     # --- 4. Run the test ---------------------------------------------------
     result_mgr = ResultManager(settings=Settings)
     executor   = TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)
 
-    try:
-        with result_mgr:
-            result = executor.run(channels=args.channels)
-
-        result_mgr.generate_report(result.run_id)
-
-        if result.success:
-            log.info("Test complete. %s", result.summary())
-        else:
-            log.warning("Test finished with issues. %s", result.summary())
-            sys.exit(2)
-
-    except KeyboardInterrupt:
-        log.warning("Test interrupted by user (Ctrl+C).")
-
-    except Exception as e:
-        log.error("Unexpected error: %s", e, exc_info=True)
-        sys.exit(1)
+    # Safe Cancellation (see docs/architecture.md "Safe Cancellation
+    # Architecture"): Ctrl+C no longer raises KeyboardInterrupt while this
+    # handler is installed -- it instead requests a cooperative, checkpoint-
+    # based cancellation via `token`. Every long-running loop underneath
+    # executor.run() (BatteryTestSequence, ChargeCycle, DischargeCycle)
+    # polls this same token and unwinds through its existing PMU-off/
+    # relay-open safety logic (see safety_monitor.py::safe_cancel_shutdown())
+    # rather than an uncontrolled interrupt landing on an arbitrary line.
+    # Restored to Python's default in the finally below so Ctrl+C at any
+    # later input() prompt (there are none after this point today, but
+    # this keeps the window of altered behavior no wider than necessary)
+    # behaves normally again.
+    token = CancellationToken(owner="main")
+    previous_sigint_handler = signal.signal(
+        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    )
 
     # --- 5. Shutdown ---------------------------------------------------------
-    # Always attempted, no matter how the try block above exits (normal
-    # completion, KeyboardInterrupt, any other exception) -- Python's
-    # finally always runs. disconnect_all() itself never raises by design
-    # (every step is individually caught and logged), but this is wrapped
-    # defensively anyway so a shutdown failure is never silently lost or
-    # allowed to replace/mask the exception already propagating -- see
-    # docs/architecture.md "Emergency Shutdown Strategy".
+    # Always attempted, no matter how the block below exits (normal
+    # completion, a cancellation, KeyboardInterrupt, any other exception) --
+    # Python's finally always runs. disconnect_all() itself never raises by
+    # design (every step is individually caught and logged), but this is
+    # wrapped defensively anyway so a shutdown failure is never silently
+    # lost or allowed to replace/mask the exception already propagating --
+    # see docs/architecture.md "Emergency Shutdown Strategy".
+    try:
+        try:
+            with result_mgr:
+                result = executor.run(channels=args.channels, token=token)
+
+            result_mgr.generate_report(result.run_id)
+
+            if result.success:
+                log.info("Test complete. %s", result.summary())
+            elif result.stop_reason == StopReason.CANCELLED:
+                # Operator action, not a failure -- distinct exit code from
+                # both success (0) and a genuine failure (1/2).
+                log.warning("Test cancelled by operator. %s", result.summary())
+                sys.exit(3)
+            else:
+                log.warning("Test finished with issues. %s", result.summary())
+                sys.exit(2)
+
+        except KeyboardInterrupt:
+            # Defensive fallback only -- should not normally fire while the
+            # SIGINT handler above is installed. Kept in case a
+            # KeyboardInterrupt is still raised from somewhere the handler
+            # doesn't cover (e.g. before it was installed).
+            log.warning("Test interrupted by user (Ctrl+C).")
+
+        except Exception as e:
+            log.error("Unexpected error: %s", e, exc_info=True)
+            sys.exit(1)
+
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+
     finally:
         try:
             hw.disconnect_all()

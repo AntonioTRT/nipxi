@@ -1,6 +1,7 @@
 """Input and configuration validation functions."""
 
 from config.settings import Settings
+from config.system_mode import parse_system_mode
 from utils.errors import ValidationError
 
 
@@ -31,6 +32,8 @@ def validate_current(current_a: float, settings: Settings):
 
 def validate_settings(settings: Settings):
     """Sanity-check the whole settings object at startup. Raises ValidationError on failure."""
+    parse_system_mode(settings.SYSTEM_MODE)  # raises ValidationError if not DEVELOPMENT/VALIDATION/PRODUCTION
+
     if settings.NUM_CHANNELS <= 0:
         raise ValidationError("NUM_CHANNELS must be > 0")
     if settings.BAT_VOLTAGE_MIN >= settings.BAT_VOLTAGE_MAX:

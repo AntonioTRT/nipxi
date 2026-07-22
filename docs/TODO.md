@@ -4,28 +4,68 @@ Ordered by priority. Items marked [MUST] are required before first hardware run.
 
 ---
 
+## Safe Cancellation Architecture (see docs/architecture.md Section 13)
+
+- [DONE] `CancellationToken`/`OperationCancelledError`/`StopReason`, checkpoints in
+  ChargeCycle/DischargeCycle/BatteryTestSequence/relay matrix scan/RelayEthernetTest,
+  SIGINT wiring in main.py/test.py, immediate relay-open-on-fault fix in
+  BatteryTestSequence.run(). Verified via mock tests + a critical architecture review
+  (docs/architecture.md Section 13.7 "Current Known Risks").
+- [ ] Close the `HardwareManager.connect_all()` gap: SIGINT handler/token installed
+  and `disconnect_all()` teardown net active before `connect_all()` runs, not after
+  (main.py and test.py::run_main_test()) — pre-existing, not introduced by this
+  feature, but surfaced by the review.
+- [ ] Add the same cancellation checkpoint to `test.py::test_relay_safety_selftest()`
+  — currently the only one of the three relay-scan-style loops without one.
+- [ ] Fix the adjacent `continue`-after-charge gap in `BatteryTestSequence.run()`
+  (skips both `relay.open(ch)` and `emergency_stop()`) before real DAQ acquisition
+  replaces the current always-zero-current stub — currently unreachable, will become
+  live once DAQ read is implemented.
+- [ ] Wire `TIMEOUT` end-to-end (ChargeCycle/DischargeCycle already return `False` on
+  timeout; `BatteryTestSequence.run()` still discards it) once per-channel
+  `ChannelResult` propagation (see TestExecutor TODO below) is implemented.
+- [ ] Persist `stop_reason` to the database/report once state persistence work begins
+  — currently only lives on the in-memory `TestRunResult`.
+
+---
+
 ## Hardware Drivers
 
+- [DONE] Instrument verification philosophy applied to SMU/DMM/DAQ, mirroring the
+  Numato Relay Matrix's command -> readback -> verify -> pass sequence (never
+  command-and-assume-success). `SMU.identify()`/`DMM.identify()` now run and
+  verify a real instrument self-test (result code + message, raise on
+  failure) instead of a bare identity query; `DMM.measure_dc_voltage()` is a
+  new real, passive DC voltage measurement (verified finite + within the
+  configured range); `test.py::test_daq()`'s deep channel read now verifies
+  the readback is finite and within the configured ADC range instead of
+  reporting PASS on any value. See `docs/architecture.md` Section 10.
+
 - [DONE] `hardware/smu.py` — `connect()`/`disconnect()`/`identify()` implemented for
-  real (opens a real `nidcpower.Session(resource_name=..., options=...)`, returns
-  `session.instrument_model`). Constructed from a `config/devices.py`
-  `SMU_ASSIGNMENTS[...]` dict, matching the relay drivers' pattern.
+  real (opens a real `nidcpower.Session(resource_name=..., options=...)`;
+  `identify()` runs a real self-test then returns `session.instrument_model`).
+  Constructed from a `config/devices.py` `SMU_ASSIGNMENTS[...]` dict, matching
+  the relay drivers' pattern.
   - [MUST] `set_charge_mode()` / `set_discharge_mode()` / `output_enable()` /
     `output_disable()` / `measure()` — still placeholders, deliberately out of
-    scope for the connectivity/discovery work done so far (see docs/architecture.md
-    Section 8)
+    scope (sourcing anything, even a small test current, is real instrument
+    functionality with real electrical consequences, not a connectivity/
+    verification check -- see docs/architecture.md Section 10, "what is
+    deliberately NOT verified yet")
 
 - [DONE] `hardware/daq.py` — `connect()`/`disconnect()`/`identify()` implemented for
   real (NI-DAQmx device enumeration + `self_test_device()`). Constructed from a
   `config/devices.py` `DAQ_CONFIG`-shaped dict.
   - [MUST] `read_channel()` / `read_all_batteries()` / `verify_zero_current()` —
     still placeholders; `test_daq()`'s "deep channel read" step uses `nidaqmx`
-    directly until these are implemented (see `test.py::test_daq()` Step 3)
+    directly until these are implemented (see `test.py::test_daq()` Step 3,
+    which now verifies the reading is finite and in-range before PASS)
 
-- [DONE] `hardware/dmm.py` — created (did not exist before). `connect()`/
-  `disconnect()`/`identify()` implemented for real (opens a real
-  `nidmm.Session`). No `measure()` yet -- nothing in the battery workflow calls
-  one; add it when DMM-based independent voltage verification is implemented.
+- [DONE] `hardware/dmm.py` — created. `connect()`/`disconnect()`/`identify()`
+  implemented for real (opens a real `nidmm.Session`; `identify()` runs a
+  real self-test). `measure_dc_voltage()` implemented for real (configure +
+  read, verified finite and within the configured `range_v`) -- unlike SMU
+  sourcing, a DMM measurement is passive and safe to exercise unconditionally.
 
 - [ ] Fill in relay serial command protocol in `config/devices.py RELAY_CONFIG`
   - Only needed if serial is ever promoted beyond bench diagnostics -- production
@@ -128,6 +168,31 @@ Ordered by priority. Items marked [MUST] are required before first hardware run.
   `config/devices.py` directly. `config/devices.py` is the single source of
   truth for every device's resource string / address.
 
+- [DONE] `BATTERY_CONFIGS` added to `config/devices.py` -- battery type/model
+  catalog (chemistry, capacity, voltage/current/temp limits), plus a
+  `"battery_type"` field on every `BATTERY_CHANNELS[i]` entry pointing to one.
+  Validated at startup (`utils/device_validator.py`). Foundation for the
+  future `data/battery_repository.py` (`docs/DATABASE_ROADMAP.md`).
+  - [ ] Wire `BATTERY_CONFIGS` into `safety_monitor.py`/`charge_cycle.py`/
+    `discharge_cycle.py` so per-battery limits actually apply instead of the
+    single global `BAT_VOLTAGE_MAX`/etc. Not done yet -- deliberately deferred,
+    same reasoning as the rest of the database roadmap.
+  - Note: `BATTERY_CONFIGS` is capabilities/recommended ranges only, never the
+    sole operational authority -- see `docs/architecture.md` Section 11
+    "Operational Limit Resolution" (planned `LimitResolver`, doc-only).
+
+- [DONE] PMU (=`hardware/smu.py::SMU`) treated as safety-critical: real
+  `output_disable()`/`verify_output_disabled()`/`emergency_output_off(reason)`
+  (never raises, logs CRITICAL on failure). Wired into
+  `charge_cycle.py`/`discharge_cycle.py` (`try/finally` around the sampling
+  loop -- closes the prior gap where an unhandled exception mid-loop never
+  disabled output), `safety_monitor.py::emergency_stop()`,
+  `hardware_manager.py` (startup safety check in both strict/lenient connect
+  paths, `disconnect_all()`, and a new `_atexit_smu_shutdown()` alongside the
+  existing relay one). See `docs/architecture.md` Section 12 "PMU Safety
+  Philosophy". DAQ shutdown behavior deliberately NOT touched -- still
+  measurement-only, per explicit instruction.
+
 - [MUST] `config/settings.py`
   - Set `RELAY_COM_PORT` to your COM port (diagnostic serial path only)
   - Confirm `BAT_VOLTAGE_MAX / MIN` against battery datasheet
@@ -184,6 +249,42 @@ Ordered by priority. Items marked [MUST] are required before first hardware run.
 - [DONE] `test_control/result_manager.py` — ResultManager: DataStorage lifecycle + MiniSQL hook
 - [DONE] `main.py` — thin orchestration: no business logic, delegates to three managers
 - [DONE] Documentation pass (README, architecture.md, CONFIGURATION.md, TODO.md)
+- [DONE] System mode architecture (`config/system_mode.py`: `SystemMode` enum,
+  `ModePolicy`, `get_mode_policy()`, `is_recovery_enabled()`). `HardwareManager
+  .connect_all()` now dispatches to `_connect_all_strict()` (PRODUCTION,
+  unchanged) or `_connect_all_lenient()` (DEVELOPMENT/VALIDATION -- missing
+  devices warn/error and startup continues; an unverifiable relay is still
+  fatal in every mode). Fixes laptop development friction (e.g. `DAQ
+  'PXI1Slot2' not found` no longer aborts startup outside PRODUCTION). See
+  `docs/architecture.md` Section 9.
+- [DONE] Database location is now mode-separated (`data_output/development
+  |validation|production/`) -- see `docs/DATABASE_ROADMAP.md`.
+- [DONE] `hardware/simulated.py` -- `SimulatedSMU`/`SimulatedDAQ`/
+  `SimulatedRelay`/`SimulatedBattery` extension-point stubs. NOT wired into
+  `HardwareManager`/`RelayFactory` yet -- foundations only, per the mode
+  architecture request.
+- [ ] Wire `hardware/simulated.py` into `HardwareManager`'s lenient connect
+  path (when `ModePolicy.allow_simulated_devices` and a real device is
+  missing) and into `RelayFactory` (`"type": "simulated"`) -- see the
+  module's docstring for the intended approach. Not done yet -- foundations
+  only were requested.
+- [ ] Cycle/state recovery engine (`docs/DATABASE_ROADMAP.md` Section 4) --
+  only the `is_recovery_enabled()` configuration hook exists; no recovery
+  logic, no `station_state` table, nothing reads the hook yet. Deliberately
+  deferred until the mode/database foundations above were in place.
+- [DONE] `data/sqlite_manager.py` -- minimal foundation: `create_database()`,
+  `initialize_schema()`, `insert_test_record()`, `get_last_record()`, one
+  `test_records` table. Verified passing on a laptop with no PXI hardware
+  attached via `test.py`'s "Test SQLite (foundation)" menu item (create/open
+  -> verify schema -> insert -> read back -> display -> PASS/FAIL). Not
+  cycle recovery, not battery cycling, not a full repository layer --
+  intentionally simple per `docs/DATABASE_ROADMAP.md` Section 1/2.
+- [ ] `battery_repository.py` / `cycle_repository.py` / `measurement_repository.py`
+  / `state_repository.py` (`docs/DATABASE_ROADMAP.md` Section 2) -- planned
+  repository split of today's single `DataStorage` class, building on
+  `sqlite_manager.py`. Not started; today's `StorageBackend` contract is
+  deliberately small enough that this can happen later without touching
+  `BatteryTestSequence`.
 - [ ] Add `--dry-run` mode: `PXI_SIMULATE = True` + relay mock, exercises logic without hardware
 - [ ] Create `flowcharts/vi_flowchart.md` (referenced in architecture.md)
 - [ ] Set up remote Git repository and update README with URL

@@ -162,6 +162,26 @@ def _check_duplicate_relay_identifiers(dev_cfg, errors: list) -> dict:
     return battery_channels
 
 
+def _check_battery_types(dev_cfg, battery_channels: dict, errors: list):
+    """
+    Every BATTERY_CHANNELS[i]["battery_type"] must reference a real key in
+    BATTERY_CONFIGS -- catches a typo'd/renamed battery type at startup
+    instead of surfacing later as a confusing KeyError deep inside future
+    battery-repository/safety-limit code that looks it up.
+    """
+    battery_configs = getattr(dev_cfg, "BATTERY_CONFIGS", {})
+    for ch_id, ch in battery_channels.items():
+        battery_type = ch.get("battery_type")
+        if not battery_type:
+            errors.append(f"BATTERY_CHANNELS[{ch_id}]: missing 'battery_type'")
+            continue
+        if battery_type not in battery_configs:
+            errors.append(
+                f"BATTERY_CHANNELS[{ch_id}]: battery_type {battery_type!r} is not "
+                f"defined in BATTERY_CONFIGS (known: {sorted(battery_configs)})"
+            )
+
+
 def _check_relay_count_consistency(dev_cfg, battery_channels: dict, errors: list):
     """
     num_channels / channel_count / Settings.RELAY_COUNT must all agree, and
@@ -215,6 +235,8 @@ def validate_devices(dev_cfg) -> list:
         - relay count consistency (num_channels == channel_count ==
           Settings.RELAY_COUNT, and every relay_address in range)
         - every relay 'type' is registered in RelayFactory
+        - every BATTERY_CHANNELS "battery_type" references a real
+          BATTERY_CONFIGS entry
     """
     errors = []
     registry = _build_registry(dev_cfg)
@@ -230,6 +252,7 @@ def validate_devices(dev_cfg) -> list:
     _check_duplicate_com_ports(registry, errors)
     battery_channels = _check_duplicate_relay_identifiers(dev_cfg, errors)
     _check_relay_count_consistency(dev_cfg, battery_channels, errors)
+    _check_battery_types(dev_cfg, battery_channels, errors)
 
     return errors
 

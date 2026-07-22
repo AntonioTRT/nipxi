@@ -443,7 +443,14 @@ def test_smu():
     Step 2: connect() + identify() via the SAME production SMU driver class
     used by HardwareManager and Hardware Discovery -- no direct nidcpower
     calls here, so this test can never drift from what production actually
-    does.
+    does. identify() itself is COMMAND (run the instrument's built-in
+    self-test) -> READBACK (result code/message) -> VERIFY (code == 0) --
+    never a bare "the API call didn't throw" (see hardware/smu.py's module
+    docstring, "Verification philosophy"). Real sourcing verification
+    (source a current/voltage and measure it back) is intentionally NOT
+    done here -- SMU.set_charge_mode()/output_enable()/measure() are still
+    placeholders (see docs/TODO.md); testing around a stub would be a fake
+    PASS, exactly what this philosophy exists to avoid.
     """
     name, cfg = _select_device(dev_cfg.SMU_ASSIGNMENTS, "SMUs")
     if cfg is None:
@@ -475,15 +482,18 @@ def test_smu():
         results.append(_fail("SMU", "SMU module", ref_mod, f"Import error: {e}"))
         return results
 
-    # Step 2: real connectivity + identification via the SMU driver class -----
+    # Step 2: connect() + identify() -- identify() runs and verifies a real
+    # instrument self-test internally (command -> readback -> verify), it
+    # is not a bare identity string query. See hardware/smu.py.
     try:
         smu.connect()
         model_id = smu.identify()
-        results.append(_ok("SMU", name, config_ref, f"Detected: {model_id}"))
+        results.append(_ok("SMU", name, config_ref,
+                           f"Self-test PASSED. Detected: {model_id}"))
     except Exception as e:
         desc = getattr(e, "description", str(e))
         results.append(_fail("SMU", name, config_ref,
-                             f"[ERROR] SMU not detected\n"
+                             f"[ERROR] SMU not detected or self-test failed\n"
                              f"Configuration : {name}\n"
                              f"Interface     : VISA / NI-DCPower\n"
                              f"Expected      : {resource} ({model})\n"
@@ -505,7 +515,14 @@ def test_dmm():
     """
     Step 1: Import hardware.dmm.DMM and verify interface.
     Step 2: connect() + identify() via the SAME production DMM driver class
-    used by Hardware Discovery -- no direct nidmm calls here.
+    used by Hardware Discovery -- identify() runs and verifies a real
+    instrument self-test internally (command -> readback -> verify), not a
+    bare identity string query. See hardware/dmm.py's module docstring.
+    Step 3: a REAL DC voltage measurement (DMM.measure_dc_voltage()) --
+    command (configure + trigger) -> readback (measured value) -> verify
+    (finite, within the configured range) -> PASS/FAIL. Unlike SMU sourcing,
+    a DMM measurement is passive (it only observes), so this is safe to run
+    unconditionally and is real verification, not a stub-backed fake PASS.
     """
     name, cfg = _select_device(dev_cfg.DMM_CONFIGS, "DMMs")
     if cfg is None:
@@ -514,6 +531,7 @@ def test_dmm():
 
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-4065")
+    range_v    = cfg.get("range_v", 10.0)
     config_ref = f"{resource} / {model}"
     results    = []
 
@@ -522,7 +540,7 @@ def test_dmm():
     try:
         from hardware.dmm import DMM
         dmm = DMM(cfg)
-        required_methods = ["connect", "disconnect", "identify"]
+        required_methods = ["connect", "disconnect", "identify", "measure_dc_voltage"]
         missing = [m for m in required_methods if not callable(getattr(dmm, m, None))]
         if missing:
             results.append(_fail("DMM", "DMM module", ref_mod,
@@ -534,19 +552,37 @@ def test_dmm():
         results.append(_fail("DMM", "DMM module", ref_mod, f"Import error: {e}"))
         return results
 
-    # Step 2: real connectivity + identification via the DMM driver class -----
+    # Step 2: connect() + identify() (real self-test, see above) --------------
     try:
         dmm.connect()
         model_id = dmm.identify()
-        results.append(_ok("DMM", name, config_ref, f"Detected: {model_id}"))
+        results.append(_ok("DMM", name, config_ref,
+                           f"Self-test PASSED. Detected: {model_id}"))
     except Exception as e:
         desc = getattr(e, "description", str(e))
         results.append(_fail("DMM", name, config_ref,
-                             f"[ERROR] DMM not detected\n"
+                             f"[ERROR] DMM not detected or self-test failed\n"
                              f"Configuration : {name}\n"
                              f"Interface     : VISA / NI-DMM\n"
                              f"Expected      : {resource} ({model})\n"
                              f"Reason        : {desc}"))
+        try:
+            dmm.disconnect()
+        except Exception:
+            pass
+        return results
+
+    # Step 3: real DC voltage measurement + range verification ----------------
+    try:
+        value = dmm.measure_dc_voltage()
+        results.append(_ok("DMM", f"{name} DC volts measurement", config_ref,
+                           f"Measured {value:.6f} V (within configured range +/-{range_v} V)"))
+    except Exception as e:
+        results.append(_fail("DMM", f"{name} DC volts measurement", config_ref,
+                             f"[ERROR] DMM measurement failed verification\n"
+                             f"Configuration : {name}\n"
+                             f"Expected range: +/-{range_v} V\n"
+                             f"Reason        : {e}"))
     finally:
         try:
             dmm.disconnect()
@@ -569,7 +605,11 @@ def test_daq():
     Step 3: deep channel read (beyond connectivity/identification -- this
     is the one part of this test that goes past what hardware.daq.DAQ
     currently implements, since read_channel() is still a TODO placeholder;
-    it uses nidaqmx directly until that method is implemented).
+    it uses nidaqmx directly until that method is implemented). COMMAND
+    (configure + read the channel) -> READBACK (the value) -> VERIFY
+    (finite, within the configured +/-voltage_range_v ADC range) -> PASS/
+    FAIL -- a NaN, an out-of-range, or a stuck reading is a FAIL, not "the
+    read call didn't throw."
     """
     name, cfg = _select_device(dev_cfg.DAQ_CONFIGS, "DAQs")
     if cfg is None:
@@ -616,17 +656,39 @@ def test_daq():
         return results
 
     # Step 3: deep channel read -- goes beyond DAQ.read_channel() (still a
-    # TODO placeholder), so this uses nidaqmx directly for now.
+    # TODO placeholder), so this uses nidaqmx directly for now. COMMAND
+    # (configure + read the channel) -> READBACK (val) -> VERIFY (finite,
+    # within the configured ADC range) -> PASS/FAIL -- a value is only
+    # reported PASS once it has actually been checked, never on "the read
+    # call didn't throw" alone (a NaN, an out-of-range, or a stuck/floating
+    # reading would previously have still shown as PASS).
     try:
+        import math
         import nidaqmx
         import nidaqmx.errors
+        v_range = cfg.get("voltage_range_v", 5.0)
         with nidaqmx.Task() as task:
-            v_range = cfg.get("voltage_range_v", 5.0)
             task.ai_channels.add_ai_voltage_chan(test_ch,
                                                  min_val=-v_range, max_val=v_range)
             val = task.read()
-        results.append(_ok("DAQ", f"{name} channel read", config_ref,
-                           f"Channel {test_ch} read: {val:.4f} V"))
+
+        if not math.isfinite(val):
+            results.append(_fail("DAQ", f"{name} channel read", config_ref,
+                                 f"[ERROR] DAQ channel read FAILED verification\n"
+                                 f"Configuration : {name}\n"
+                                 f"Channel       : {test_ch}\n"
+                                 f"Reason        : reading is not a finite number ({val!r})"))
+        elif abs(val) > v_range * 1.05:   # allow the ADC's own overrange headroom
+            results.append(_fail("DAQ", f"{name} channel read", config_ref,
+                                 f"[ERROR] DAQ channel read FAILED verification\n"
+                                 f"Configuration : {name}\n"
+                                 f"Channel       : {test_ch}\n"
+                                 f"Reason        : {val:.4f} V is outside the configured "
+                                 f"+/-{v_range} V range"))
+        else:
+            results.append(_ok("DAQ", f"{name} channel read", config_ref,
+                               f"Channel {test_ch} read: {val:.4f} V -- verified within "
+                               f"configured +/-{v_range} V range"))
     except nidaqmx.errors.DaqError as e:
         results.append(_fail("DAQ", f"{name} channel read", config_ref,
                              f"[ERROR] DAQ channel read failed\n"
@@ -1016,11 +1078,29 @@ def test_relay_matrix_scan():
     num_channels = cfg.get("channel_count", cfg.get("num_channels", 8))
     config_ref   = f"config/devices.py -> {name} ({driver} / {host}:{port}, {num_channels} ch)"
 
-    with _numato_relay_debug_logging():
-        return _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref)
+    # Safe Cancellation (see docs/architecture.md "Safe Cancellation
+    # Architecture"): same pattern as run_main_test() -- Ctrl+C requests a
+    # cooperative cancellation checked before each relay channel, rather
+    # than raising KeyboardInterrupt mid-scan.
+    import signal
+    from utils.cancellation import CancellationToken
+
+    token = CancellationToken(owner="test.py:relay_matrix_scan")
+    previous_sigint_handler = signal.signal(
+        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    )
+    print("\nPress Ctrl+C to cancel safely.\n")
+    try:
+        with _numato_relay_debug_logging():
+            return _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref, token)
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
-def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref):
+def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref, token=None):
+    from utils.cancellation import check_cancellation
+    from utils.errors import OperationCancelledError
+
     results = []
     try:
         from hardware.relay_factory import RelayFactory
@@ -1058,6 +1138,19 @@ def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_r
     # Full channel scan -- ON, READ, OFF per channel ------------------------------
     try:
         for ch in range(1, num_channels + 1):
+            # Checkpoint: before starting a new channel, never mid-channel
+            # (never between relay.close(ch)/relay.read(ch)/relay.open(ch)).
+            try:
+                check_cancellation(token)
+            except OperationCancelledError as e:
+                results.append(_warn("Relay Matrix Scan", "Cancelled by operator", config_ref,
+                                     f"Reason:\n{e}\nRemaining channels not scanned."))
+                try:
+                    relay.open_all()
+                except Exception:
+                    pass
+                break
+
             try:
                 relay.close(ch)              # ON
                 state = relay.read(ch)       # READ
@@ -1138,54 +1231,86 @@ def test_relay_ethernet_test():
         return [_fail("RelayEthernetTest", "Factory", config_ref,
                       f"Import / factory error: {e}")]
 
-    with _numato_relay_debug_logging():
-        try:
-            relay.connect()
-        except Exception as e:
-            return [_fail("RelayEthernetTest", "Connect + Auth", config_ref,
-                          f"Reason:\n{_classify_relay_error(e)}\n"
-                          f"Test aborted -- device not available.")]
+    # Safe Cancellation (see docs/architecture.md "Safe Cancellation
+    # Architecture"): same pattern as test_relay_matrix_scan() -- Ctrl+C
+    # requests a cooperative cancellation checked before each relay index,
+    # never mid-index (never between write_all(0)/write(relay_index, True)/
+    # verify_all()).
+    import signal
+    from utils.cancellation import CancellationToken, check_cancellation
+    from utils.errors import OperationCancelledError
 
-        results.append(_ok("RelayEthernetTest", "Connect + Auth", config_ref,
-                           f"Connected and authenticated to {driver} at {host}:{port}"))
+    token = CancellationToken(owner="test.py:relay_ethernet_test")
+    previous_sigint_handler = signal.signal(
+        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    )
+    print("\nPress Ctrl+C to cancel safely.\n")
 
-        stopped_early = False
-        for relay_index in range(relay_count):
-            print(f"\n  -- Relay index {relay_index}/{relay_count - 1} (native 0-based) --")
+    try:
+        with _numato_relay_debug_logging():
             try:
-                relay.write_all(0)
-                relay.verify_all(0)
-
-                relay.write(relay_index, True)
-                relay.verify_all(1 << relay_index)
-
-                relay.write_all(0)
-                relay.verify_all(0)
-
-                results.append(_ok(
-                    "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
-                    "write_all(OFF) -> verify -> write(ON) -> verify -> "
-                    "write_all(OFF) -> verify  PASS"
-                ))
+                relay.connect()
             except Exception as e:
-                results.append(_fail(
-                    "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
-                    f"Relay Number    : {relay_index}\n"
-                    f"Expected State  : see sequence step that failed above\n"
-                    f"Actual State    : verification failed (see cause)\n"
-                    f"Cause           : {e}"
-                ))
-                stopped_early = True
-                break   # fail immediately -- do not continue to remaining relays
+                return [_fail("RelayEthernetTest", "Connect + Auth", config_ref,
+                              f"Reason:\n{_classify_relay_error(e)}\n"
+                              f"Test aborted -- device not available.")]
 
-        if stopped_early:
-            results.append(_fail("RelayEthernetTest", "Test aborted", config_ref,
-                                 "Stopped at first failure -- remaining relays not tested"))
+            results.append(_ok("RelayEthernetTest", "Connect + Auth", config_ref,
+                               f"Connected and authenticated to {driver} at {host}:{port}"))
 
-        try:
-            relay.disconnect()
-        except Exception as e:
-            results.append(_warn("RelayEthernetTest", "Disconnect", config_ref, str(e)))
+            stopped_early = False
+            cancelled = False
+            for relay_index in range(relay_count):
+                try:
+                    check_cancellation(token)
+                except OperationCancelledError as e:
+                    results.append(_warn("RelayEthernetTest", "Cancelled by operator", config_ref,
+                                         f"Reason:\n{e}\nRemaining relays not tested."))
+                    try:
+                        relay.write_all(0)
+                        relay.verify_all(0)
+                    except Exception:
+                        pass
+                    cancelled = True
+                    break
+
+                print(f"\n  -- Relay index {relay_index}/{relay_count - 1} (native 0-based) --")
+                try:
+                    relay.write_all(0)
+                    relay.verify_all(0)
+
+                    relay.write(relay_index, True)
+                    relay.verify_all(1 << relay_index)
+
+                    relay.write_all(0)
+                    relay.verify_all(0)
+
+                    results.append(_ok(
+                        "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
+                        "write_all(OFF) -> verify -> write(ON) -> verify -> "
+                        "write_all(OFF) -> verify  PASS"
+                    ))
+                except Exception as e:
+                    results.append(_fail(
+                        "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
+                        f"Relay Number    : {relay_index}\n"
+                        f"Expected State  : see sequence step that failed above\n"
+                        f"Actual State    : verification failed (see cause)\n"
+                        f"Cause           : {e}"
+                    ))
+                    stopped_early = True
+                    break   # fail immediately -- do not continue to remaining relays
+
+            if stopped_early and not cancelled:
+                results.append(_fail("RelayEthernetTest", "Test aborted", config_ref,
+                                     "Stopped at first failure -- remaining relays not tested"))
+
+            try:
+                relay.disconnect()
+            except Exception as e:
+                results.append(_warn("RelayEthernetTest", "Disconnect", config_ref, str(e)))
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
     return results
 
@@ -1473,6 +1598,112 @@ def test_safety_monitor():
 
 
 # =============================================================================
+# 7b. SQLite foundation (data/sqlite_manager.py)
+# =============================================================================
+
+def test_sqlite():
+    """
+    Minimal SQLite foundation test (data/sqlite_manager.py) -- see
+    docs/DATABASE_ROADMAP.md. This is deliberately simple: one table
+    (test_records), four functions (create_database/initialize_schema/
+    insert_test_record/get_last_record). NOT cycle recovery, NOT battery
+    cycling, NOT a repository layer -- those are still on the roadmap.
+
+    Steps (each reported independently):
+        1. Create/open database
+        2. Verify schema (test_records table exists)
+        3. Insert a record
+        4. Read it back
+        5. Display the last record
+        6. Report PASS/FAIL
+
+    Uses a temporary directory -- never touches the real mode-specific
+    data_output/<mode>/ database. No hardware required -- this must pass
+    on a laptop with no PXI chassis attached (see docs/architecture.md
+    Section 9, "System Modes" -- DEVELOPMENT mode's whole point).
+    """
+    import tempfile
+    import shutil
+
+    from data.sqlite_manager import (
+        create_database, initialize_schema, insert_test_record, get_last_record,
+    )
+
+    config_ref = "data/sqlite_manager.py"
+    results = []
+    tmp_dir = tempfile.mkdtemp(prefix="nipxi_test_sqlite_")
+
+    try:
+        class _TmpSettings(Settings):
+            DATA_DIR      = tmp_dir
+            DATABASE_FILE = os.path.join(tmp_dir, "test_sqlite_manager.db")
+
+        # Step 1: create/open database
+        try:
+            conn = create_database(_TmpSettings)
+        except Exception as e:
+            results.append(_fail("SQLite", "create_database()", config_ref, str(e)))
+            return results
+        results.append(_ok("SQLite", "create_database()", config_ref,
+                           f"Database opened at {_TmpSettings.DATABASE_FILE}"))
+
+        try:
+            # Step 2: initialize + verify schema
+            try:
+                initialize_schema(conn)
+                exists = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='test_records'"
+                ).fetchone()
+                if exists is None:
+                    results.append(_fail("SQLite", "initialize_schema()", config_ref,
+                                         "test_records table not found after initialize_schema()"))
+                    return results
+                results.append(_ok("SQLite", "initialize_schema()", config_ref,
+                                   "test_records table verified present"))
+            except Exception as e:
+                results.append(_fail("SQLite", "initialize_schema()", config_ref, str(e)))
+                return results
+
+            # Step 3: insert a record
+            try:
+                row_id = insert_test_record(conn, label="laptop_dev_check", value=42.0)
+                results.append(_ok("SQLite", "insert_test_record()", config_ref,
+                                   f"Inserted row id={row_id}"))
+            except Exception as e:
+                results.append(_fail("SQLite", "insert_test_record()", config_ref, str(e)))
+                return results
+
+            # Step 4 + 5: read back and display the last record
+            try:
+                last = get_last_record(conn)
+            except Exception as e:
+                results.append(_fail("SQLite", "get_last_record()", config_ref, str(e)))
+                return results
+
+            if last is None:
+                results.append(_fail("SQLite", "get_last_record()", config_ref,
+                                     "Expected a record, got None"))
+                return results
+
+            print(f"    Last record: {last}")
+            if (last["id"] != row_id or last["label"] != "laptop_dev_check"
+                    or last["value"] != 42.0):
+                results.append(_fail("SQLite", "get_last_record()", config_ref,
+                                     f"Record mismatch: expected id={row_id} "
+                                     f"label='laptop_dev_check' value=42.0, got {last}"))
+                return results
+            results.append(_ok("SQLite", "get_last_record()", config_ref,
+                               f"Last record matches what was inserted: {last}"))
+
+        finally:
+            conn.close()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return results
+
+
+# =============================================================================
 # 8. Database layer
 # =============================================================================
 
@@ -1696,10 +1927,13 @@ def run_main_test():
     """
     print("RUNNING MAIN TEST")
 
+    import signal
     from test_control.hardware_manager import HardwareManager
     from test_control.test_executor import TestExecutor
     from test_control.result_manager import ResultManager
+    from utils.cancellation import CancellationToken
     from utils.errors import HardwareInitError
+    from utils.stop_reason import StopReason
 
     # Production relay is the Numato Ethernet module -- RELAY_CONFIG (serial)
     # is kept only for diagnostics via menu options 5/6/7.
@@ -1723,15 +1957,38 @@ def run_main_test():
         print(f"[FAIL] Hardware initialization failed: {e}")
         return
 
+    # Safe Cancellation (see docs/architecture.md "Safe Cancellation
+    # Architecture"): identical pattern to main.py -- Ctrl+C requests a
+    # cooperative, checkpoint-based cancellation instead of raising
+    # KeyboardInterrupt while this handler is installed. Restored to
+    # Python's default before returning either way.
+    token = CancellationToken(owner="test.py:run_main_test")
+    previous_sigint_handler = signal.signal(
+        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    )
+    print("\nPress Ctrl+C to cancel safely.\n")
+
     try:
-        result_mgr = ResultManager(settings=Settings)
-        executor   = TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)
+        try:
+            result_mgr = ResultManager(settings=Settings)
+            executor   = TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)
 
-        with result_mgr:
-            result = executor.run()
+            with result_mgr:
+                result = executor.run(token=token)
 
-        result_mgr.generate_report(result.run_id)
-        print(result.summary())
+            result_mgr.generate_report(result.run_id)
+            print(result.summary())
+            if result.stop_reason == StopReason.CANCELLED:
+                print("Test cancelled by operator -- hardware is in a verified safe state.")
+
+        except KeyboardInterrupt:
+            # Defensive fallback only -- should not normally fire while the
+            # SIGINT handler above is installed.
+            print("\nTest interrupted by user (Ctrl+C).")
+
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+
     finally:
         # Always attempted (Python's finally always runs, including on
         # KeyboardInterrupt/any exception above) -- see docs/architecture.md
@@ -1765,6 +2022,7 @@ MENU = [
     ("Test Sensors (NTC)",            test_sensors),
     ("Test Safety Monitor",           test_safety_monitor),
     ("Test Configuration",            test_configuration),
+    ("Test SQLite (foundation)",      test_sqlite),
     ("Test Database Layer",           test_database),
     ("Test MiniSQL (hooks)",          test_minisql),
     ("Run All Tests",                 None),

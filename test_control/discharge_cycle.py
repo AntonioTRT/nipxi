@@ -10,6 +10,7 @@ import logging
 import time
 from config.settings import Settings
 from test_control.safety_monitor import SafetyMonitor
+from utils.cancellation import check_cancellation
 from utils.errors import SafetyViolationError
 
 
@@ -21,14 +22,19 @@ class DischargeCycle:
         self.s = settings
         self.log = logging.getLogger("nipxi.discharge")
 
-    def run(self, channel: int, data_collector) -> bool:
+    def run(self, channel: int, data_collector, token=None) -> bool:
         """
         Run one complete CC discharge on `channel`.
         Calls data_collector.record(channel, sample) for each sample.
         Returns True if discharge completed normally, False on timeout.
         Raises SafetyViolationError on limit violation.
+        Raises OperationCancelledError if `token` has a cancellation
+        requested -- see charge_cycle.py::ChargeCycle.run() for the full
+        rationale (same checkpoint placement, same fail-safe reasoning).
         """
         self.log.info("Starting discharge cycle on channel %d", channel)
+
+        check_cancellation(token)
 
         self.smu.set_discharge_mode(
             current_a=self.s.DISCHARGE_CURRENT_A,
@@ -41,29 +47,40 @@ class DischargeCycle:
         t_start = time.monotonic()
         dt = 1.0 / self.s.SAMPLE_RATE_HZ
 
-        while True:
-            elapsed = time.monotonic() - t_start
-            if elapsed > self.s.DISCHARGE_TIMEOUT_S:
-                self.log.warning("Discharge timeout on channel %d", channel)
-                self.smu.output_disable()
-                return False
+        # PMU fail-safe: emergency_output_off() runs exactly once regardless
+        # of how this loop exits -- normal completion, timeout, a safety
+        # violation, a cancellation, or any unhandled exception. See
+        # hardware/smu.py module docstring and docs/architecture.md "PMU
+        # Safety Philosophy".
+        try:
+            while True:
+                check_cancellation(token)
 
-            sample = self.daq.read_all_batteries().get(channel, {})
-            v = sample.get("voltage_v", 0.0)
-            i = sample.get("current_a", 0.0)
-            t_c = None  # TODO: read from NTC
+                elapsed = time.monotonic() - t_start
+                if elapsed > self.s.DISCHARGE_TIMEOUT_S:
+                    self.log.warning("Discharge timeout on channel %d", channel)
+                    return False
 
-            status = self.safety.check(v, i, t_c)
-            if not status.safe:
-                self.smu.output_disable()
-                raise SafetyViolationError(f"Channel {channel}: {status.reason}")
+                sample = self.daq.read_all_batteries().get(channel, {})
+                v = sample.get("voltage_v", 0.0)
+                i = sample.get("current_a", 0.0)
+                t_c = None  # TODO: read from NTC
 
-            data_collector.record(channel, {"elapsed_s": elapsed, "voltage_v": v, "current_a": i, "temp_c": t_c, "phase": "discharge"})
+                status = self.safety.check(v, i, t_c)
+                if not status.safe:
+                    raise SafetyViolationError(f"Channel {channel}: {status.reason}")
 
-            # End of discharge: voltage drops to cutoff
-            if v <= self.s.DISCHARGE_CUTOFF_V:
-                self.log.info("Discharge complete on channel %d (V=%.3f)", channel, v)
-                self.smu.output_disable()
-                return True
+                data_collector.record(channel, {"elapsed_s": elapsed, "voltage_v": v, "current_a": i, "temp_c": t_c, "phase": "discharge"})
 
-            time.sleep(dt)
+                # End of discharge: voltage drops to cutoff
+                if v <= self.s.DISCHARGE_CUTOFF_V:
+                    self.log.info("Discharge complete on channel %d (V=%.3f)", channel, v)
+                    return True
+
+                time.sleep(dt)
+        finally:
+            if not self.smu.emergency_output_off(f"end of discharge cycle on channel {channel}"):
+                self.log.critical(
+                    "Channel %d: PMU output could not be verified OFF after discharge cycle.",
+                    channel,
+                )

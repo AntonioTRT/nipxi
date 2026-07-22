@@ -14,6 +14,25 @@ class Settings:
     VERSION = "0.1.0"
 
     # -------------------------------------------------------------------------
+    # System mode -- see config/system_mode.py for the full policy each mode
+    # implies (hardware startup strictness, database location, recovery,
+    # simulated devices) and docs/architecture.md "System Modes".
+    #   DEVELOPMENT -- laptop/software work, hardware optional, missing
+    #                  devices warn and startup continues.
+    #   VALIDATION  -- hardware integration/driver validation, missing
+    #                  devices reported as failures but framework still launches.
+    #   PRODUCTION  -- real battery cycling, any missing device aborts startup.
+    # -------------------------------------------------------------------------
+    SYSTEM_MODE = "DEVELOPMENT"
+
+    # Recovery hook -- NOT implemented yet (see docs/DATABASE_ROADMAP.md).
+    # None = use the active mode's default (see config/system_mode.py
+    # MODE_POLICIES); set True/False to override regardless of mode (e.g.
+    # to try VALIDATION with recovery on, since VALIDATION's default is
+    # "optionally enabled").
+    RECOVERY_ENABLED_OVERRIDE = None
+
+    # -------------------------------------------------------------------------
     # Channels
     # Number of battery channels available on the relay matrix / BLOSS Hub PCB
     # -------------------------------------------------------------------------
@@ -96,9 +115,31 @@ class Settings:
     LOG_FILE  = os.path.join("logs", "nipxi.log")
 
     # -------------------------------------------------------------------------
-    # Data storage
+    # Data storage -- mode-separated (see docs/DATABASE_ROADMAP.md). Each
+    # mode gets its own subdirectory and database file so DEVELOPMENT
+    # experiments can never collide with VALIDATION or PRODUCTION data.
+    #
+    # NOTE: the roadmap's illustrative paths were "data/dev/nipxi_dev.db"
+    # etc., but this project already has a "data/" PACKAGE directory
+    # (data/storage.py, data/logger.py, data/report.py) -- reusing "data/"
+    # as the output root too would put runtime database files inside the
+    # same directory as source code, which is confusing and risks an
+    # accidental import-path collision. This uses the existing
+    # "data_output/" root (already gitignored as generated output) with a
+    # mode subdirectory instead: data_output/development|validation/production/.
     # -------------------------------------------------------------------------
-    DATA_DIR         = "data_output"
-    DATABASE_FILE    = os.path.join(DATA_DIR, "nipxi.db")
+    _MODE_DB_SUBDIR = {
+        "DEVELOPMENT": "development",
+        "VALIDATION":  "validation",
+        "PRODUCTION":  "production",
+    }
+    _MODE_DB_NAME = {
+        "DEVELOPMENT": "nipxi_dev.db",
+        "VALIDATION":  "nipxi_validation.db",
+        "PRODUCTION":  "nipxi.db",
+    }
+
+    DATA_DIR         = os.path.join("data_output", _MODE_DB_SUBDIR.get(SYSTEM_MODE, "development"))
+    DATABASE_FILE    = os.path.join(DATA_DIR, _MODE_DB_NAME.get(SYSTEM_MODE, "nipxi_dev.db"))
     CSV_DIR          = os.path.join(DATA_DIR, "csv")
     REPORT_DIR       = os.path.join(DATA_DIR, "reports")

@@ -490,3 +490,459 @@ A genuinely new device type: `hardware/<type>.py` (a `HardwareBase` subclass, co
 4. Functional Hardware Tests   test_smu / test_dmm / test_daq / test_relay_* / Safety Self-Test
 5. Battery Test Workflows       BatteryTestSequence / TestExecutor (Run Main Test / main.py)
 ```
+
+---
+
+## 9. System Modes
+
+**Problem this solves:** `HardwareManager` used to try to initialize every production
+device unconditionally, which made laptop software development (no PXI chassis
+attached) fail on things like `DAQ 'PXI1Slot2' not found` even when the work at hand
+had nothing to do with the DAQ. `config/system_mode.py` formalizes three operating
+modes so hardware strictness (and, going forward, database location and recovery) is
+driven by ONE setting instead of scattered assumptions.
+
+### 9.1 The three modes
+
+| Mode | Purpose | Hardware startup behavior |
+|------|---------|---------------------------|
+| `DEVELOPMENT` | Daily software work, laptop development, UI/architecture/database work, simulation | Hardware optional. A missing device is logged as a **warning** and startup continues. |
+| `VALIDATION` | Hardware integration, driver validation, system testing | Real hardware preferred. A missing device is logged as an **error** ("test failure"), but the framework still launches. |
+| `PRODUCTION` | Real battery cycling | Strict. Any missing/unreachable device **aborts startup** (rollback + `HardwareInitError`), exactly as `HardwareManager.connect_all()` already did before this change. |
+
+Set via `config/settings.py`: `SYSTEM_MODE = "DEVELOPMENT"` (the default). Validated at
+startup by `utils/validators.py::validate_settings()` (an unrecognized value is a
+`ValidationError`, same as any other bad Settings value). Resolved to its `ModePolicy`
+via `config.system_mode.get_mode_policy(settings)`.
+
+### 9.2 What is -- and is NOT -- relaxed by mode
+
+`HardwareManager.connect_all()` dispatches to `_connect_all_strict()` (PRODUCTION,
+unchanged from before this feature) or `_connect_all_lenient()`
+(DEVELOPMENT/VALIDATION, new). In the lenient path, each device connects
+independently; a connection failure is recorded in `self.hardware_status` and logged
+at the mode's `hardware_failure_log_level`, but does not stop startup or roll back
+devices that already connected.
+
+**This only ever applies to a device that is missing/unreachable.** It does NOT
+relax the Emergency Shutdown Strategy (Section 6d): if the relay driver *does*
+connect but its startup force-off/verify cannot be confirmed, that is always fatal --
+in every mode, including DEVELOPMENT -- because at that point real hardware is
+attached and in an unknown state, which is exactly what "unknown relay state = unsafe
+state" exists to prevent. Missing hardware is tolerated; unverifiable hardware never is.
+
+### 9.3 Database location per mode
+
+Also driven by `SYSTEM_MODE` (see `config/settings.py` and `docs/DATABASE_ROADMAP.md`
+Section 1 for the full reasoning, including why the output root is `data_output/` and
+not `data/`):
+
+| Mode | Database |
+|------|----------|
+| DEVELOPMENT | `data_output/development/nipxi_dev.db` |
+| VALIDATION | `data_output/validation/nipxi_validation.db` |
+| PRODUCTION | `data_output/production/nipxi.db` |
+
+### 9.4 Recovery hook (not implemented)
+
+`config.system_mode.is_recovery_enabled(settings)` resolves whether cycle/state
+recovery should run -- DEVELOPMENT off, VALIDATION off-by-default-but-overridable,
+PRODUCTION on, overridable via `Settings.RECOVERY_ENABLED_OVERRIDE`. No recovery engine
+exists yet; this is only the configuration surface it will read once built. See
+`docs/DATABASE_ROADMAP.md` Section 4.
+
+### 9.5 Simulation extension points (not wired in)
+
+`hardware/simulated.py` defines `SimulatedSMU`/`SimulatedDAQ`/`SimulatedRelay`/
+`SimulatedBattery` as foundations for eventually letting `DEVELOPMENT` mode
+(`ModePolicy.allow_simulated_devices`) run without any physical hardware at all, not
+just tolerate its absence. None of them are constructed by `HardwareManager` or
+`RelayFactory` today -- see the module's docstring for exactly how that wiring is
+expected to work once it's built.
+
+---
+
+## 10. Instrument Verification Philosophy
+
+**Never COMMAND and assume success. Always COMMAND -> READ BACK -> VERIFY -> PASS.**
+A test that merely calls an API and reports PASS because nothing raised gives false
+confidence -- an instrument can answer "what model are you" (a bare identity query)
+even while its actual measurement or sourcing hardware is faulty. This is the same
+principle the Numato Relay Matrix's mandatory safety sequence already enforces
+(Section 6a: never activate a relay without forcing and verifying a baseline first,
+never trust a command send on its own) applied to every other instrument driver.
+
+| Device | Command | Readback | Verify | Where |
+|--------|---------|----------|--------|-------|
+| Relay | `relay on/off <n>` | `relay read <n>` + `relay readall` | Commanded state matches, all others unaffected | `hardware/relay_eth.py` (Section 6a) -- unchanged, this is what the others now mirror |
+| SMU | Instrument built-in self-test | Self-test result code + message | Code indicates success, else raise `SMUError` | `hardware/smu.py::SMU.identify()` |
+| DMM | Instrument built-in self-test | Self-test result code + message | Code indicates success, else raise `DMMError` | `hardware/dmm.py::DMM.identify()` |
+| DMM | Configure + trigger a DC volts measurement | The measured value | Finite (not NaN/inf) and within the configured range (+5% overrange margin) | `hardware/dmm.py::DMM.measure_dc_voltage()` |
+| DAQ | Instrument built-in self-test | `self_test_device()` (nidaqmx raises on failure) | No exception raised | `hardware/daq.py::DAQ.identify()` |
+| DAQ | Configure + read one analog channel | The read value | Finite and within the configured `voltage_range_v` (+5% overrange margin) | `test.py::test_daq()` Step 3 (not yet in the driver -- `read_channel()` is still a placeholder) |
+
+**What is deliberately NOT verified yet, and why:** SMU sourcing (`set_charge_mode`,
+`output_enable`, `measure`) is still a placeholder (`docs/TODO.md`). Testing "source a
+current and measure it back" around a stub that returns a fixed value would be a FAKE
+PASS -- exactly what this philosophy exists to prevent. Self-test is the strongest
+verification available for the SMU until real sourcing is implemented; it is real
+(a genuine hardware health check, not a bare string query) but it does not exercise
+sourcing/measurement, and the driver's docstrings say so explicitly rather than
+implying more coverage than actually exists.
+
+**Consequence for Hardware Discovery (Section 8.2):** because `identify()` itself now
+performs a real self-test for SMU/DMM (and already did for DAQ), Hardware Discovery's
+"the instrument responds correctly" / "instrument identification succeeds" criteria
+are satisfied by a real verification for every device type, not just the relay --
+with no changes needed in `test_hardware_discovery()` itself, since it already just
+calls `driver.identify()` for every device.
+
+## 11. Operational Limit Resolution (Future Architecture -- LimitResolver)
+
+**`BATTERY_CONFIGS` (`config/devices.py`) is not the sole authority for operating
+limits.** It describes battery *capabilities* and *recommended* operating ranges --
+what a given battery model can tolerate. It is deliberately not treated as the final
+word on what a test is allowed to do, because a battery's rated capability can exceed
+what the rest of the system can safely provide, and vice versa:
+
+- A battery may support a charge current the PMU (SMU) cannot actually source.
+- A PMU may be capable of sourcing more current than the battery, DAQ, or the
+  station's safety configuration should ever allow.
+
+**Rule: the effective operational limit is always the most conservative value across
+every applicable limit source.** For any given quantity (voltage, current,
+temperature, power), the system must compute the intersection of:
+
+- Battery Limits (`BATTERY_CONFIGS`) -- what the cell is rated for
+- PMU Limits -- what the SMU hardware can actually source/sink
+- DAQ Limits -- what the acquisition hardware can accurately measure
+- Safety Limits (`config/settings.py` `BAT_*` constants today) -- station-level
+  safety policy, which may be tighter than any single device's rating
+- User/Test Limits -- whatever a specific test explicitly requests
+
+...and use the smallest (safest) value. Worked example, exactly as specified:
+
+```
+Battery: Max charge current             = 3.0 A
+PMU:     Max current capability         = 2.0 A
+Safety configuration: Max allowed current = 1.5 A
+--------------------------------------------------
+Effective charge current limit          = 1.5 A   (never 3.0 A)
+```
+
+The same rule applies uniformly to Voltage, Current, Temperature, and Power --
+whichever source is most restrictive for a given quantity wins, never the battery's
+nameplate rating and never the PMU's raw hardware capability in isolation.
+
+**Planned: `LimitResolver`.** A future component (name/shape not finalized) whose sole
+job is:
+
+```
+effective_limits = LimitResolver.resolve(
+    battery_limits, pmu_limits, daq_limits, safety_limits, test_limits
+)
+```
+
+producing the single set of Effective Operational Limits that
+`charge_cycle.py`/`discharge_cycle.py` (and the future battery cycling engine) would
+actually enforce, replacing today's direct reads of `config/settings.py`'s global
+`BAT_*` constants in `safety_monitor.py`. **This section is documentation only --
+no `LimitResolver` class or module exists yet.** `BATTERY_CONFIGS` and `battery_type`
+(Section on device config in `docs/CONFIGURATION.md`) are the first input this
+resolver will eventually consume; PMU/DAQ hardware-capability limits and a
+first-class Safety Limits config are not yet modeled as data today and would need to
+be defined before `LimitResolver` itself can be implemented.
+
+## 12. PMU Safety Philosophy
+
+**"PMU" in this project is the `SMU` class (`hardware/smu.py`) -- there is no separate
+PMU/PSU hardware or config.** Everything in this section governs `hardware/smu.py`
+and its callers.
+
+**Core principle -- unknown PMU state = unsafe state**, exactly mirroring the Relay's
+Emergency Shutdown Strategy (Section 6d): when in doubt, disable PMU output and verify
+it. This rule takes precedence over continuing a test.
+
+### 12.1 PMU Failure Handling (non-negotiable)
+
+If **any** error occurs during battery charging or discharging, the PMU must
+immediately transition to a safe state:
+
+```
+PMU Output OFF -> Verify Output OFF -> Raise Exception -> Abort Operation
+```
+
+Triggering conditions include (non-exhaustive): communication failure, timeout,
+verification failure, safety violation, unexpected measurement, invalid state
+transition, recovery conflict, charge/discharge control error, and any unhandled
+exception. The framework must never leave a PMU actively sourcing or sinking current
+after an error condition of any kind -- including exceptions that were not explicitly
+anticipated by the calling code.
+
+Implementation: `hardware/smu.py::SMU.emergency_output_off(reason) -> bool` is the
+single, public, non-recursive PMU fail-safe reflex (COMMAND `output_disable()` ->
+READBACK+VERIFY `verify_output_disabled()` -> log CRITICAL and return `False` on any
+failure, else `True`; never raises itself). Callers:
+
+- `test_control/charge_cycle.py` / `discharge_cycle.py`: the sampling loop is wrapped
+  in `try/finally`, so `emergency_output_off()` runs exactly once on every exit path
+  -- normal completion, timeout, a raised `SafetyViolationError`, or any other
+  unhandled exception propagating out of the loop (e.g. a DAQ read failure). Before
+  this change, only the anticipated exit paths called `output_disable()`, and it was
+  never verified -- an unhandled exception mid-loop left the PMU state untouched.
+- `test_control/safety_monitor.py::emergency_stop()`: calls
+  `smu.emergency_output_off(reason)` instead of a bare `output_disable()` call, and
+  escalates a failed verification to CRITICAL logging (PMU may still be actively
+  sourcing/sinking current).
+
+### 12.2 PMU Startup Safe State
+
+At system startup, the PMU output must be forced OFF and verified **before any
+battery operation is allowed** -- the system must never assume a PMU starts in a safe
+state. `test_control/hardware_manager.py` calls
+`smu.emergency_output_off("startup safety check")` immediately after the SMU
+connects, in both `_connect_all_strict()` (PRODUCTION) and `_connect_all_lenient()`
+(DEVELOPMENT/VALIDATION). This check is unconditional in every mode: an SMU that
+connects but cannot be verified OFF always aborts startup (`HardwareInitError`),
+exactly mirroring the relay's startup force-off/verify rule (Section 9) -- only a
+genuinely *missing* SMU is tolerated in DEVELOPMENT/VALIDATION, never an unverifiable
+one.
+
+### 12.3 PMU Shutdown Safe State
+
+Every shutdown path disables and verifies PMU output:
+
+- Normal application shutdown -- `HardwareManager.disconnect_all()` calls
+  `smu.emergency_output_off("normal shutdown")` before disconnecting the session.
+- Emergency shutdown / safety violation -- `SafetyMonitor.emergency_stop()`
+  (Section 12.1).
+- Battery test abort -- any exception path through `charge_cycle.py`/
+  `discharge_cycle.py`'s `try/finally` (Section 12.1).
+- Process-exit safety net -- `HardwareManager._atexit_smu_shutdown()`, registered via
+  `atexit.register()` alongside the existing `_atexit_relay_shutdown()`
+  (Section 6d), catching process-exit paths that bypass a `try/finally` around
+  `disconnect_all()`.
+
+### 12.4 Design goal
+
+The future battery cycling engine must never be capable of continuing after a PMU
+fault, and must never leave a battery connected to an actively sourcing/sinking PMU
+after an error. The safest state is always: **PMU Output OFF, verified.**
+
+### 12.5 DAQ -- explicitly out of scope for now
+
+The DAQ is currently used only for measurements and does **not** get equivalent
+shutdown/fail-safe behavior in this pass -- DAQ handling is intentionally left
+unchanged. Future DAQ safety behavior (if any) should be reviewed once the final DAQ
+architecture (multi-channel measurement ownership, calibration, etc.) is established,
+not retrofitted onto the current placeholder driver.
+
+## 13. Safe Cancellation Architecture
+
+Lets an operator stop a running test safely, via Ctrl+C, without relying on an
+uncontrolled `KeyboardInterrupt` landing on an arbitrary line. This section
+describes the implementation exactly as it exists today -- Emergency Abort (a
+separate, faster, operator-typed-`ABORT` mechanism) was designed but explicitly
+**not implemented**; only Safe Cancellation exists in code.
+
+### 13.1 Components
+
+| Component | File | Role |
+|---|---|---|
+| `CancellationToken` | `utils/cancellation.py` | Single-threaded, single-severity flag. `request_cancel(reason)` (idempotent), `.requested`/`.reason`, `.check()` (raises if requested). |
+| `check_cancellation(token)` | `utils/cancellation.py` | No-op if `token is None`; otherwise `token.check()`. Every checkpoint call site uses this, not `token.check()` directly, so callers that omit a token need no special-casing. |
+| `OperationCancelledError` | `utils/errors.py` | `NIPXIError` subclass raised at a checkpoint. Not a fault -- a deliberate, expected operator action. |
+| `StopReason` | `utils/stop_reason.py` | `COMPLETED` / `FAILED` / `SAFETY_VIOLATION` / `TIMEOUT` (defined, not yet wired end-to-end) / `CANCELLED`. |
+
+No threads, no stdin listeners, no keyboard polling exist anywhere in this
+implementation -- the design deliberately stayed single-threaded (see the
+"No Emergency Abort" scoping decision that produced this feature). A
+`signal.signal(signal.SIGINT, ...)` handler, installed once per cancellable
+operation in `main.py`/`test.py`, is the only producer of `request_cancel()`
+calls today.
+
+### 13.2 Cancellation Flow
+
+```
+  Operator presses Ctrl+C
+           |
+           v
+  SIGINT handler (installed by main.py / test.py)
+           |  does NOT raise KeyboardInterrupt into running code --
+           |  only sets a flag
+           v
+  token.request_cancel("Ctrl+C")            [idempotent -- first reason wins]
+           |
+           v
+  ... hardware keeps running until the NEXT checkpoint ...
+           |
+           v
+  check_cancellation(token)  at a safe checkpoint
+           |
+           v
+  OperationCancelledError raised
+           |
+           v
+  ChargeCycle/DischargeCycle's own `finally:` (if inside a sampling loop)
+           |  smu.emergency_output_off(reason)
+           |  -> PMU output OFF, verified (or CRITICAL logged if not)
+           v
+  propagates to BatteryTestSequence.run()
+           |
+           v
+  except OperationCancelledError:
+      safety.safe_cancel_shutdown(smu, relay, reason)
+           |  smu.emergency_output_off(reason)   -- idempotent 2nd call if already off
+           |  relay.open_all()                    -- relay OPEN ALL, verified by real
+           |                                          hardware readback (relay readall)
+           v
+  raise   (original OperationCancelledError re-raised, unmodified)
+           |
+           v
+  TestExecutor.run() absorbs it:
+      result.stop_reason = CANCELLED
+      result.aborted     = True
+      (does NOT re-raise -- caller always gets a normal TestRunResult back)
+           |
+           v
+  main.py / test.py:
+      result.stop_reason == CANCELLED
+      -> logged as "cancelled by operator", never as a failure
+      -> main.py: sys.exit(3)  (distinct from 0=success, 1=init error, 2=test issues)
+           |
+           v
+  outer  finally: hw.disconnect_all()   -- always runs regardless (confirmed:
+                                            SystemExit does not skip `finally`)
+```
+
+### 13.3 Safe Checkpoints
+
+Checkpoints are placed **only between atomic hardware operations**, never
+inside one (never inside a relay activate/verify sequence, never inside a PMU
+verify sequence) -- interrupting mid-sequence would leave hardware state less
+certain, not safer.
+
+| Location | Checkpoint placement |
+|---|---|
+| `ChargeCycle.run()` | Before `set_charge_mode()`/`output_enable()` (skips entirely if already cancelled -- PMU never energized) **and** top of the sampling `while` loop |
+| `DischargeCycle.run()` | Same shape |
+| `BatteryTestSequence.run()` | First line inside the per-channel `try:` block, before `relay.close(ch)` -- deliberately *inside* the `try` so a checkpoint firing here funnels through the same `except OperationCancelledError` handler as a cancellation detected deeper inside charge/discharge |
+| `test.py::_run_relay_matrix_scan()` | Before each channel's ON/READ/OFF triplet |
+| `test.py::test_relay_ethernet_test()` | Before each relay index's 6-command native-primitive sequence |
+| `test.py::test_relay_safety_selftest()` | **Not yet wired** -- known inconsistency, see Section 13.7 |
+
+### 13.4 StopReason Model
+
+`stop_reason` and "how much completed" (`channel_results`) are deliberately
+independent fields on `TestRunResult`, not folded into one value -- a run can
+be `CANCELLED` after 2 of 8 channels passed.
+
+```
+StopReason
+  |-- COMPLETED         normal exit, no exception
+  |-- FAILED            RelayError, HardwareInitError, or any other
+  |                      unanticipated exception
+  |-- SAFETY_VIOLATION  SafetyViolationError (SafetyMonitor detected a
+  |                      limit breach -- correct system behavior, not a bug)
+  |-- TIMEOUT           defined, NOT yet wired end-to-end -- charge/discharge
+  |                      still return False on timeout but
+  |                      BatteryTestSequence.run() discards that value
+  |                      (pre-existing gap, unrelated to this feature)
+  \-- CANCELLED         OperationCancelledError (operator action, never
+                         reported as FAILED)
+```
+
+`TestRunResult.summary()` reports `stop_reason` directly whenever it is not
+`COMPLETED` (e.g. `status=CANCELLED`), instead of the older generic
+`ABORTED`/`PARTIAL` wording, so a cancelled run is never visually
+indistinguishable from a genuine failure in logs.
+
+**Known limitation (pre-existing, not introduced by this feature):**
+`TestExecutor._run_sequence()` still marks every requested channel as fully
+completed once `BatteryTestSequence.run()` returns without raising, so the
+`"PARTIAL"` branch of `summary()` is presently unreachable, and `stop_reason`
+does not yet reach the persisted database/report (`ResultManager`/
+`ReportGenerator` operate purely off per-sample DB records today, not the
+in-memory `TestRunResult`).
+
+### 13.5 Relay Immediate Fault Response
+
+Before this feature, `BatteryTestSequence.run()` only forced the relay open
+immediately for `SafetyViolationError`/`RelayError` -- any other exception
+(e.g. `DAQError`, a raw `KeyboardInterrupt` under the old handling, or any
+unanticipated failure) fell through uncaught, leaving the relay closed until
+the outer `HardwareManager.disconnect_all()` eventually ran at process
+teardown. The PMU never had this gap (`ChargeCycle`/`DischargeCycle`'s own
+`try/finally` already forced it off on any exception type).
+
+This is now closed with a new `except Exception` clause in
+`BatteryTestSequence.run()`, positioned after the specific
+`OperationCancelledError`/`SafetyViolationError`/`RelayError` clauses (so
+none of those are accidentally caught by the broader one):
+
+```python
+except Exception as e:
+    self.log.error("Unexpected error on channel %d: %s", ch, e, exc_info=True)
+    self.safety.emergency_stop(self.smu, self.relay, str(e))
+    raise
+```
+
+Any exception during a channel's charge/discharge now reaches PMU-off +
+relay-open-all, both verified, at the fault location -- not just at final
+process teardown.
+
+**Known adjacent gap (pre-existing, not fixed by this change):** a `continue`
+(not an exception) after charge, triggered when
+`is_safe_to_switch_relay()` returns `False`, still bypasses both the
+`else: self.relay.open(ch)` clause and `emergency_stop()` -- currently
+unreachable because `DAQ.read_all_batteries()` is still a stub that always
+reports zero current, but will become live once real DAQ acquisition exists.
+
+### 13.6 Timeout Audit Results (re-confirmed during this review)
+
+| Path | Bound | Where configured |
+|---|---|---|
+| Numato relay TCP (`hardware/relay_eth.py`) | ~5.0s per command (default) | `cfg["timeout"]` in `config/devices.py` |
+| nidcpower (SMU) | **Unconfigured** | No explicit timeout set anywhere in `hardware/smu.py` |
+| nidmm (DMM) | **Unconfigured** | No explicit timeout set anywhere in `hardware/dmm.py` |
+| nidaqmx (DAQ) | N/A today | `read_channel`/`read_all_batteries` are still stubs -- no real blocking call exists yet |
+| Charge/discharge sampling loop | ~1s (`SAMPLE_RATE_HZ = 1.0`) | `config/settings.py` |
+| Pre-loop stabilization sleep | ~5.0s, single unchunked `time.sleep()` | `STABILIZATION_S` in `config/settings.py` |
+
+Worst-case cancellation latency inside a charge/discharge cycle today is
+therefore approximately **STABILIZATION_S + one sample interval (~6s)** if
+cancellation lands right as a cycle's stabilization sleep begins; typically
+much faster (~1s) once sampling has started. The SMU/DMM timeout gap is
+unchanged from the prior hardware-safety audit and remains a prerequisite
+finding for real-hardware validation, not something this feature fixes.
+
+### 13.7 Current Known Risks
+
+- `HardwareManager.connect_all()` runs before the SIGINT handler/token is
+  installed and before the `try/finally: hw.disconnect_all()` net exists, in
+  both `main.py` and `test.py::run_main_test()` -- a raw `KeyboardInterrupt`
+  during connect bypasses both the internal per-device rollback (which only
+  catches `Exception`, not `BaseException`) and the outer teardown. Low
+  consequence today (no real sourcing exists yet) but should be closed before
+  `output_enable()` is implemented for real.
+- `test.py::test_relay_safety_selftest()` has no cancellation checkpoint,
+  unlike its two structural siblings -- an inconsistency against the
+  project-wide "same behavior everywhere" goal.
+- `safe_cancel_shutdown()` and the innermost `ChargeCycle`/`DischargeCycle`
+  `finally` both call `smu.emergency_output_off()` when cancellation fires
+  mid-cycle -- harmless and idempotent in software, but the real-hardware
+  behavior of a repeated `output_enabled = False` write has not been
+  empirically validated.
+- `stop_reason` is not yet persisted to the database or the generated report
+  -- it exists only on the in-memory `TestRunResult` for the duration of one
+  process run.
+- The pre-loop `STABILIZATION_S` sleep is not chunked, so cancellation
+  latency can reach ~6s in the worst case (see 13.6).
+
+### 13.8 Emergency Abort -- explicitly not implemented
+
+A separate, faster, escalating "Emergency Abort" mechanism (operator types
+`ABORT`, skips graceful per-channel completion) was designed in an earlier
+architecture discussion but **deliberately deferred**. No `ABORT` command, no
+listener thread, and no `EMERGENCY_ABORT` stop reason exist in this codebase
+today -- only Safe Cancellation, as described above.

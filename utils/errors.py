@@ -29,6 +29,17 @@ class SafetyViolationError(NIPXIError):
     """Raised when a safety limit is exceeded. Triggers emergency stop."""
 
 
+class OperationCancelledError(NIPXIError):
+    """
+    Raised when a cancellation checkpoint (see utils/cancellation.py) finds
+    that the operator has requested a stop (currently: Ctrl+C ->
+    CancellationToken.request_cancel()). This is NOT a fault -- it is a
+    deliberate, expected operator action. Callers must report it distinctly
+    from SafetyViolationError/generic failures (see the CANCELLED stop
+    reason in utils/stop_reason.py), never as a failure.
+    """
+
+
 class NIPXITimeoutError(NIPXIError):
     """Raised when a test step exceeds its allowed duration."""
 

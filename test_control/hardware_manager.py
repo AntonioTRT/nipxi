@@ -42,6 +42,7 @@ import logging
 
 from config.settings import Settings
 from config import devices as dev_cfg
+from config.system_mode import get_mode_policy
 from hardware.smu import SMU
 from hardware.daq import DAQ
 from hardware.dmm import DMM
@@ -96,6 +97,13 @@ class HardwareManager:
         self.s = settings
         self.log = logging.getLogger("nipxi.hw_manager")
 
+        self._mode_policy = get_mode_policy(settings)
+        self.hardware_status = {}   # populated by connect_all() -- see that method
+        self.log.info(
+            "System mode: %s -- %s",
+            self._mode_policy.mode.value, self._mode_policy.description,
+        )
+
         smu_cfg = smu_cfg or next(iter(dev_cfg.SMU_ASSIGNMENTS.values()))
         daq_cfg = daq_cfg or dev_cfg.DAQ_CONFIG
 
@@ -113,16 +121,17 @@ class HardwareManager:
         self.log.info("Selected Relay: %s  %s", relay_class, detail)
 
         # Application-exit safety net (see docs/architecture.md "Emergency
-        # Shutdown Strategy"): registered once, here, so it exists even if
-        # connect_all() only partially succeeds. This is a SECOND, independent
-        # attempt at "all relays OFF on exit" -- it does not replace
-        # disconnect_all()'s own try/finally-driven call, which is the
-        # primary path; this catches process-exit paths that bypass it
-        # (an exception during interpreter shutdown, os._exit() elsewhere,
-        # etc). No-ops if the relay was never connected or already safely
-        # disconnected. Cannot catch SIGKILL / hard process kill -- nothing
-        # in userspace can.
+        # Shutdown Strategy" and "PMU Shutdown Safe State"): registered once,
+        # here, so it exists even if connect_all() only partially succeeds.
+        # This is a SECOND, independent attempt at "all relays OFF / PMU
+        # output OFF on exit" -- it does not replace disconnect_all()'s own
+        # try/finally-driven call, which is the primary path; this catches
+        # process-exit paths that bypass it (an exception during interpreter
+        # shutdown, os._exit() elsewhere, etc). No-ops if a device was never
+        # connected or already safely disconnected. Cannot catch SIGKILL /
+        # hard process kill -- nothing in userspace can.
         atexit.register(self._atexit_relay_shutdown)
+        atexit.register(self._atexit_smu_shutdown)
 
     # ------------------------------------------------------------------
     # Public device accessors
@@ -154,24 +163,44 @@ class HardwareManager:
 
     def connect_all(self):
         """
-        Connect all hardware devices.
+        Connect all hardware devices. Behavior depends on the active
+        SYSTEM_MODE (config/system_mode.py) -- see docs/architecture.md
+        "System Modes":
 
-        Connect order: DAQ first (read-only, safest), then SMU, then relay.
-        If any connection fails, disconnect whatever was already connected
-        so the system does not end up in a partial state.
+          PRODUCTION (strict_hardware=True): all-or-nothing, exactly as
+          before -- any device failing to connect rolls back whatever
+          already connected and raises HardwareInitError.
 
-        Startup safety (see docs/architecture.md "Emergency Shutdown
-        Strategy"): immediately after the relay connects, ALL relays are
-        forced OFF and verified OFF before this method returns -- the
-        framework must never start operating from an unknown relay state.
-        If that force-off/verify fails, startup aborts (same rollback path
-        as any other connect() failure) rather than proceeding.
+          DEVELOPMENT / VALIDATION (strict_hardware=False): each device
+          connects independently; a missing/unreachable device is logged
+          (WARNING in DEVELOPMENT, ERROR in VALIDATION -- "test failure"
+          per the mode spec) and recorded in self.hardware_status, but
+          does NOT stop startup or roll back devices that already
+          connected. "Framework may still launch" even with hardware missing.
+
+        In EVERY mode, startup safety (see docs/architecture.md "Emergency
+        Shutdown Strategy") is unconditional: if the relay connects, ALL
+        relays are forced OFF and verified before this method returns, and
+        a FAILURE to confirm that (relay present but its state cannot be
+        verified safe) always aborts startup -- unknown relay state = unsafe
+        state is never relaxed by mode. Only a genuinely MISSING relay is
+        tolerated in DEVELOPMENT/VALIDATION.
 
         Raises:
-            HardwareInitError: wraps the underlying driver exception with context.
+            HardwareInitError: on any strict-mode failure, or if a
+            connected relay's startup force-off/verify fails (any mode).
         """
-        self.log.info("Connecting hardware...")
+        self.log.info("Connecting hardware (mode=%s)...", self._mode_policy.mode.value)
 
+        if self._mode_policy.strict_hardware:
+            self._connect_all_strict()
+        else:
+            self._connect_all_lenient()
+
+        self.log.info("Hardware connection phase complete (mode=%s).", self._mode_policy.mode.value)
+
+    def _connect_all_strict(self):
+        """PRODUCTION: all-or-nothing. See connect_all()'s docstring."""
         connected = []
         try:
             self._daq.connect()
@@ -179,6 +208,17 @@ class HardwareManager:
 
             self._smu.connect()
             connected.append(self._smu)
+
+            # PMU startup safety (see docs/architecture.md "PMU Startup Safe
+            # State"): never assume the PMU starts in a safe state. Force
+            # output OFF and verify before any battery operation is allowed,
+            # in every mode -- a failure here aborts startup exactly like an
+            # unverifiable relay does.
+            if not self._smu.emergency_output_off("startup safety check"):
+                raise HardwareInitError(
+                    "PMU startup safety check failed: output could not be verified OFF."
+                )
+            self.log.info("Startup safety: PMU output forced OFF and verified.")
 
             if self._dmm is not None:
                 self._dmm.connect()
@@ -188,9 +228,7 @@ class HardwareManager:
             connected.append(self._relay)
 
             # Startup safety: guarantee a known, verified all-off baseline
-            # before any relay operation is ever requested. Abort startup
-            # (via the except block below, same as any other failure here)
-            # if this cannot be confirmed.
+            # before any relay operation is ever requested.
             self._relay.open_all()
             self.log.info("Startup safety: all relays forced OFF and verified.")
 
@@ -206,6 +244,104 @@ class HardwareManager:
 
         self.log.info("All hardware connected.")
 
+    def _connect_all_lenient(self):
+        """
+        DEVELOPMENT/VALIDATION: each device connects independently -- a
+        missing device does not stop startup or roll back devices that
+        already connected. See connect_all()'s docstring for the one
+        exception (relay present but unverifiable is still fatal, in any mode).
+        """
+        level = self._mode_policy.hardware_failure_log_level
+        self.hardware_status = {}
+
+        def _try_connect(dev, label):
+            if dev is None:
+                return
+            try:
+                dev.connect()
+                self.hardware_status[label] = {"connected": True, "error": None}
+            except Exception as e:
+                self.log.log(
+                    level, "%s not available (%s mode, startup continues): %s",
+                    label, self._mode_policy.mode.value, e,
+                )
+                self.hardware_status[label] = {"connected": False, "error": str(e)}
+
+        _try_connect(self._daq, "DAQ")
+        _try_connect(self._smu, "SMU")
+        _try_connect(self._dmm, "DMM")
+        _try_connect(self._relay, "Relay")
+
+        # PMU startup safety is unconditional in every mode, mirroring the
+        # relay rule below -- but only meaningful if the SMU actually
+        # connected. An SMU that IS connected but whose output cannot be
+        # confirmed OFF is always fatal, regardless of mode: unknown PMU
+        # state = unsafe state is never relaxed just because we're in
+        # DEVELOPMENT/VALIDATION. See docs/architecture.md "PMU Startup Safe
+        # State".
+        if self._smu.connected:
+            if not self._smu.emergency_output_off("startup safety check"):
+                self.log.critical(
+                    "SMU connected but startup output-off/verify FAILED. "
+                    "Aborting startup regardless of mode -- an unverifiable "
+                    "PMU state is never acceptable."
+                )
+                for dev in (self._daq, self._smu, self._dmm, self._relay):
+                    if dev is not None:
+                        try:
+                            if dev.connected:
+                                dev.disconnect()
+                        except Exception:
+                            pass
+                self.hardware_status["SMU"] = {
+                    "connected": False,
+                    "error": "connected but startup output-off/verify failed",
+                }
+                raise HardwareInitError("PMU startup safety check failed.")
+            self.log.info("Startup safety: PMU output forced OFF and verified.")
+
+        # Startup safety is unconditional -- but only meaningful if the
+        # relay actually connected. A relay that IS connected but cannot be
+        # confirmed in a safe (all-off, verified) state is always fatal,
+        # regardless of mode: unknown relay state = unsafe state is never
+        # relaxed just because we're in DEVELOPMENT/VALIDATION.
+        if self._relay.connected:
+            try:
+                self._relay.open_all()
+                self.log.info("Startup safety: all relays forced OFF and verified.")
+            except Exception as e:
+                self.log.critical(
+                    "Relay connected but startup force-off/verify FAILED: %s. "
+                    "Aborting startup regardless of mode -- an unverifiable "
+                    "relay state is never acceptable.", e,
+                )
+                for dev in (self._daq, self._smu, self._dmm, self._relay):
+                    if dev is not None:
+                        try:
+                            if dev.connected:
+                                dev.disconnect()
+                        except Exception:
+                            pass
+                self.hardware_status["Relay"] = {
+                    "connected": False,
+                    "error": f"connected but startup force-off/verify failed: {e}",
+                }
+                raise HardwareInitError(f"Startup safety check failed: {e}") from e
+        else:
+            self.log.log(
+                level, "Relay not connected -- startup safe-state could not be "
+                "verified (%s mode).", self._mode_policy.mode.value,
+            )
+
+        missing = [name for name, status in self.hardware_status.items() if not status["connected"]]
+        if missing:
+            self.log.log(
+                level, "Hardware connection phase finished with missing device(s): %s "
+                "(%s mode -- startup continues).", missing, self._mode_policy.mode.value,
+            )
+        else:
+            self.log.info("All hardware connected.")
+
     def disconnect_all(self):
         """
         Disconnect all hardware in the safe shutdown order.
@@ -218,12 +354,18 @@ class HardwareManager:
         """
         self.log.info("Disconnecting hardware...")
 
-        # 1. Disable SMU output -- stop any active current flow
+        # 1. PMU output OFF, verified (see docs/architecture.md "PMU
+        #    Shutdown Safe State"). Never raises; a failure to verify is
+        #    logged as CRITICAL, not a warning -- the PMU may still be
+        #    actively sourcing/sinking current, which is the exact condition
+        #    this shutdown step exists to prevent.
         if self._smu.connected:
-            try:
-                self._smu.output_disable()
-            except Exception as e:
-                self.log.warning("SMU output_disable failed during shutdown: %s", e)
+            if not self._smu.emergency_output_off("normal shutdown"):
+                self.log.critical(
+                    "SMU output could not be verified OFF during shutdown. PMU may "
+                    "still be actively sourcing/sinking current -- physically "
+                    "disconnect power if this cannot be resolved immediately."
+                )
 
         # 2. Open all relays -- physically disconnect all batteries. By the
         #    time this raises, the driver has already made its own internal
@@ -277,6 +419,33 @@ class HardwareManager:
                 "atexit emergency relay shutdown FAILED: %s. Hardware may still "
                 "be energized -- physically disconnect power if this cannot be "
                 "resolved immediately.", e,
+            )
+
+    def _atexit_smu_shutdown(self):
+        """
+        Registered via atexit() in __init__ -- a second, independent safety
+        net for "PMU output OFF on exit" alongside disconnect_all(). Same
+        rationale as _atexit_relay_shutdown(): covers process-exit paths
+        that bypass a try/finally around disconnect_all(). No-ops if the
+        SMU was never connected or has already been safely disabled.
+
+        Never raises -- atexit callbacks must not raise. Logs CRITICAL on
+        failure instead.
+        """
+        try:
+            if self._smu.connected:
+                self.log.warning("atexit: forcing PMU output OFF as a final safety net.")
+                if not self._smu.emergency_output_off("atexit safety net"):
+                    self.log.critical(
+                        "atexit emergency PMU output-off FAILED to verify. PMU may "
+                        "still be actively sourcing/sinking current -- physically "
+                        "disconnect power if this cannot be resolved immediately."
+                    )
+        except Exception as e:
+            self.log.critical(
+                "atexit emergency PMU shutdown raised unexpectedly: %s. PMU may "
+                "still be actively sourcing/sinking current -- physically "
+                "disconnect power if this cannot be resolved immediately.", e,
             )
 
     def health_check(self) -> dict:

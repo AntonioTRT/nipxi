@@ -2,10 +2,19 @@
 DAQ driver. Covers NI 6363 for analog voltage/current/NTC acquisition.
 
 connect()/disconnect()/identify() are real (NI-DAQmx device enumeration +
-self-test) -- this is the connectivity/identification surface exercised by
-Hardware Discovery. No task is created and no channel is read here; actual
-channel acquisition (read_channel, read_all_batteries, verify_zero_current)
-is still a TODO placeholder -- a separate, later step.
+a hardware self-test). No task is created and no channel is read by
+identify() -- actual channel acquisition (read_channel, read_all_batteries,
+verify_zero_current) is still a TODO placeholder -- a separate, later step.
+
+Verification philosophy (see docs/architecture.md "Instrument Verification
+Philosophy" and hardware/relay_eth.py, which this mirrors): a bare identity
+query is not a real verification. identify() does COMMAND (run the
+device's built-in self-test, device.self_test_device()) -> READBACK
+(nidaqmx raises DaqError on failure, so a clean return IS the readback) ->
+VERIFY (no exception raised) -> return the product type. test.py's deep
+DAQ test additionally takes one real channel reading and verifies it is
+within the configured ADC range before reporting PASS -- see
+test_daq()'s "Step 3" -- never just "the read call didn't throw."
 
 Constructed from a config/devices.py DAQ_CONFIG-shaped dict -- the same
 config dict HardwareManager and Hardware Discovery both read, so there is
