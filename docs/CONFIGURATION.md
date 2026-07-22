@@ -240,10 +240,55 @@ future scaling task, not implemented.
 other two real DAQ cards in the rack) are present and individually testable
 but not wired into the active pipeline.
 
+**Known limitation:** unlike `SMU_ASSIGNMENTS` (which `HardwareManager`
+resolves by slot order, `next(iter(SMU_ASSIGNMENTS.values()))` -- nickname-
+agnostic), `DAQ_CONFIG` is looked up by the literal string `"MAIN_DAQ"`.
+Renaming `PXI_SLOTS[2]`'s `nickname` away from `"MAIN_DAQ"` raises a
+`KeyError` at `import config.devices` time -- before any test or hardware
+communication runs, since every entry point imports this module. See
+"Hardware Replacement Procedure" below.
+
 ### DMM_CONFIG / DMM_CONFIGS (derived from PXI_SLOTS, category="dmm")
 
 `DMM_CONFIG` (singular) is `DMM_CONFIGS["MAIN_DMM"]` -- currently the only
-DMM in the rack.
+DMM in the rack. Same known limitation as `DAQ_CONFIG` above: it is looked
+up by the literal nickname `"MAIN_DMM"`, not resolved by slot order.
+
+### Hardware Replacement Procedure
+
+**Goal:** replace a PXI card by editing only `PXI_SLOTS` (model, resource,
+nickname, role, etc.), with no other code or config change required.
+
+**What this already covers (PXI_SLOTS-only, verified):**
+- Changing a card's `model`/`resource` while keeping its `nickname` --
+  any category (SMU, DMM, DAQ, Temperature Module).
+- Changing a **SMU**'s `nickname` (e.g. `PRIMARY_SMU` -> `NEW_SMU`) --
+  `HardwareManager` resolves the active SMU by slot order
+  (`next(iter(SMU_ASSIGNMENTS.values()))`), never by name.
+
+**What still requires a second, explicit edit today:**
+- Changing the **DAQ** or **DMM** `nickname` away from `"MAIN_DAQ"` /
+  `"MAIN_DMM"` also requires updating the corresponding lookup in
+  `config/devices.py`:
+  ```python
+  DAQ_CONFIG = DAQ_CONFIGS["MAIN_DAQ"]   # update the key, or switch to
+  DMM_CONFIG = DMM_CONFIGS["MAIN_DMM"]   # next(iter(...)) to avoid this entirely
+  ```
+  Forgetting this raises `KeyError` at `import config.devices` time (i.e.
+  the whole application fails to start, not just one test).
+- Replacing the DAQ card (or moving it to a different chassis slot) may
+  change the NI-MAX device alias NI-MAX assigns it. `BATTERY_CHANNELS`'s
+  `daq_voltage_ch`/`daq_current_ch`/`daq_ntc_ch` hardcode this alias as the
+  literal `"Dev1"`, independent of `PXI_SLOTS[2]["resource"]` -- this is a
+  hardware/software boundary limit (NI-MAX assigns the alias; it cannot be
+  derived from a chassis slot string in software) and must be reconfirmed
+  against NI-MAX and updated by hand after any DAQ change.
+
+**Not required, but recommended to avoid stale documentation:**
+- `utils/constants.py`'s `CARD_*` block duplicates model/slot/nickname
+  information as comments/constants. It is not read by any code (verified),
+  so it cannot break anything, but it will silently go stale after a
+  hardware swap unless updated by hand alongside `PXI_SLOTS`.
 
 ### RELAY_CONFIG (serial -- diagnostic only, NOT production)
 

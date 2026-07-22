@@ -195,7 +195,7 @@ nipxi/
 
 ## 4. Supported Hardware
 
-Confirmed against the real PXI rack (NI-MAX detection) — `config/devices.py::PXI_SLOTS` is the single source of truth; this table is a snapshot for reference, not where to edit resource strings. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full per-slot metadata (role, driver family, enabled flag, validation notes).
+Confirmed against the real PXI rack (NI-MAX detection) — `config/devices.py::PXI_SLOTS` is the single source of truth; this table is a hand-maintained snapshot for reference, not generated from code, and not where to edit resource strings. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full per-slot metadata (role, driver family, enabled flag, validation notes), and its "Hardware Replacement Procedure" section (Section 17.3a here) before swapping a card — most changes need `PXI_SLOTS` only, but renaming the DAQ/DMM nickname or changing the DAQ's NI-MAX alias needs one additional edit.
 
 | Role | Model | Slot | Nickname | Interface | Library | Driver |
 |------|-------|------|----------|-----------|---------|--------|
@@ -1534,6 +1534,19 @@ For a genuinely new device *type* (e.g. an electronic load), follow the existing
 3. `utils/device_validator.py`: add the new enumeration dict to `_build_registry()` and, if it has multiple possible implementations, a factory + a `_check_factory_type()` branch (otherwise direct construction is enough, per 17.1).
 4. `test.py`: add `(category, "<Label>", _identify_<type>)` to `_PXI_CATEGORY_TARGETS` (PXI-slot devices) or a `(label, cfg_dict, _identify_<type>)` tuple to `_NON_PXI_TARGETS` (Ethernet/serial-style devices) -- Hardware Discovery covers it with no other change. Add a `test_<type>()` menu entry calling the shared `_run_hardware_category()` helper (Section 8.1a) to expose it as its own hardware category in the menu.
 5. Optionally wire it into `HardwareManager` if it participates in the battery test workflow (relay/SMU/DAQ do; DMM is intentionally optional, matching its role as independent verification only).
+
+### 17.3a Replacing an existing PXI card
+
+Full procedure and known limitations: `docs/CONFIGURATION.md` "Hardware Replacement Procedure". Summary:
+
+| Change | Requirement |
+|---|---|
+| Model/resource change only, same `nickname` (any category) | Edit `PXI_SLOTS` only |
+| SMU `nickname` change (e.g. `PRIMARY_SMU` -> a new name) | Edit `PXI_SLOTS` only -- `HardwareManager` resolves the active SMU by slot order, never by name |
+| DAQ or DMM `nickname` change away from `MAIN_DAQ`/`MAIN_DMM` | Also update `DAQ_CONFIG`/`DMM_CONFIG`'s lookup key in `config/devices.py` -- forgetting this raises `KeyError` at `import config.devices` time, before any test runs |
+| DAQ card replaced with a different NI-MAX device alias | Also reconfirm and update the `"Dev1"` literals in `BATTERY_CHANNELS` (`config/devices.py`) -- the NI-MAX alias is not derivable from a chassis slot string in software |
+
+`utils/constants.py`'s `CARD_*` block is a comment-only, unread duplicate of `PXI_SLOTS` data -- updating it is optional (nothing breaks if it's not), but it will silently drift out of sync with the real inventory after a swap if skipped.
 
 ### 17.4 Test execution order
 
