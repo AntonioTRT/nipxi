@@ -71,6 +71,68 @@ def _select_device(devices: dict, label: str):
     return name, devices[name]
 
 
+def _discover_and_select(label: str, devices: dict, identify_fn):
+    """
+    Bring-up-focused device picker: shows every configured device of this
+    category with a live reachability check BEFORE asking which one to
+    test -- unlike _select_device() above, which lists raw config with no
+    indication of whether anything actually answers.
+
+    Step 1: list configured devices (from config/devices.py -- PXI_SLOTS for
+            PXI categories, or the Numato/serial relay dicts).
+    Step 2: run identify_fn (the SAME function Hardware Discovery uses) on
+            each one, so this can never drift from what Hardware Discovery
+            itself reports.
+    Step 3: prompt for a selection -- any listed device, PASS or not, since
+            an operator may want to select a failing one to investigate.
+
+    Returns (name, cfg, discovery_results) -- discovery_results is the list
+    of TestResult objects from step 2 (always returned, even on cancel, so
+    the reachability scan itself is never lost from the test's report).
+    Returns (None, None, discovery_results) if the user cancels.
+    """
+    discovery_results = []
+    names = list(devices.keys())
+
+    print(f"\n{label} Devices Found\n")
+    if not names:
+        print(f"  (none configured for this category in config/devices.py)")
+        return None, None, discovery_results
+
+    for i, name in enumerate(names, 1):
+        cfg = devices[name]
+        result = identify_fn(name, cfg)
+        discovery_results.append(result)
+        slot = cfg.get("slot")
+        print(f"[{i}] {name}")
+        if slot is not None:
+            print(f"    Slot {slot}")
+        if cfg.get("model"):
+            print(f"    {cfg['model']}")
+        print(f"    {result.status}")
+        print()
+
+    print("0. Cancel")
+    try:
+        raw = input("\nSelect device: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return None, None, discovery_results
+
+    if raw == "0" or raw == "":
+        return None, None, discovery_results
+    try:
+        idx = int(raw) - 1
+        if idx < 0 or idx >= len(names):
+            raise ValueError()
+    except ValueError:
+        print("Invalid choice.")
+        return None, None, discovery_results
+
+    name = names[idx]
+    return name, devices[name], discovery_results
+
+
 def _print_device_config(name: str, cfg: dict):
     """Print the effective configuration of the device under test."""
     print(f"\n{'-' * 60}")
@@ -173,7 +235,7 @@ def test_configuration():
     # -- SMU / DAQ / DMM configs (config/devices.py is the single source of
     #    truth for these VISA resource strings -- config/settings.py does
     #    not duplicate them) --------------------------------------------------
-    for name, cfg in [("SMU_ASSIGNMENTS", dev_cfg.SMU_ASSIGNMENTS.get("SMU1", {})),
+    for name, cfg in [("SMU_ASSIGNMENTS", next(iter(dev_cfg.SMU_ASSIGNMENTS.values()), {})),
                       ("DAQ_CONFIG",      dev_cfg.DAQ_CONFIG),
                       ("DMM_CONFIG",      dev_cfg.DMM_CONFIG)]:
         ref = f"config/devices.py -> {name}"
@@ -239,6 +301,31 @@ def test_configuration():
 # measured anywhere in this section -- that is deliberately out of scope
 # until instrument functionality is implemented.
 
+def _compare_identity(expected_model: str, actual_identity: str) -> str | None:
+    """
+    Compare the identity string an instrument's own driver reports against
+    the model configured in config/devices.py (PXI_SLOTS). Tolerant,
+    case-insensitive substring match in either direction, since drivers
+    often format the same model slightly differently (e.g. "PXIe-4141" vs
+    "NI PXIe-4141") -- this is meant to catch a genuinely wrong/swapped
+    card, not to flag harmless formatting differences as a WARNING.
+
+    Returns None if they match (or expected_model is empty -- nothing to
+    compare against); otherwise a one-line warning message.
+    """
+    if not expected_model:
+        return None
+    exp = expected_model.lower()
+    act = actual_identity.lower()
+    if exp in act or act in exp:
+        return None
+    return (
+        f"Configured model '{expected_model}' but hardware reports "
+        f"'{actual_identity}' -- verify config/devices.py (PXI_SLOTS) "
+        f"against the physical rack."
+    )
+
+
 def _identify_smu(name: str, cfg: dict):
     """
     SMU/PSU presence check (the NI SMU is this project's PSU -- there is no
@@ -258,6 +345,10 @@ def _identify_smu(name: str, cfg: dict):
     try:
         smu.connect()
         identity = smu.identify()
+        mismatch = _compare_identity(model, identity)
+        if mismatch:
+            return _warn("Hardware Discovery", f"SMU/PSU: {name}", ref,
+                        f"Communication established. Identified: {identity}\n{mismatch}")
         return _ok("Hardware Discovery", f"SMU/PSU: {name}", ref,
                    f"Communication established. Identified: {identity}")
     except Exception as e:
@@ -286,6 +377,10 @@ def _identify_dmm(name: str, cfg: dict):
     try:
         dmm.connect()
         identity = dmm.identify()
+        mismatch = _compare_identity(model, identity)
+        if mismatch:
+            return _warn("Hardware Discovery", f"DMM: {name}", ref,
+                        f"Communication established. Identified: {identity}\n{mismatch}")
         return _ok("Hardware Discovery", f"DMM: {name}", ref,
                    f"Communication established. Identified: {identity}")
     except Exception as e:
@@ -315,12 +410,56 @@ def _identify_daq(name: str, cfg: dict):
     try:
         daq.connect()
         identity = daq.identify()
+        mismatch = _compare_identity(model, identity)
+        if mismatch:
+            return _warn("Hardware Discovery", f"DAQ: {name}", ref,
+                        f"Communication established. Identified: {identity}\n{mismatch}")
         return _ok("Hardware Discovery", f"DAQ: {name}", ref,
                    f"Communication established. Identified: {identity}  "
                    f"(self-test passed, no channel read performed)")
     except Exception as e:
         return _fail("Hardware Discovery", f"DAQ: {name}", ref,
                      f"[ERROR] DAQ not detected or self-test failed\nReason: {e}")
+    finally:
+        try:
+            daq.disconnect()
+        except Exception:
+            pass
+
+
+def _identify_temperature(name: str, cfg: dict):
+    """
+    Temperature module (PXIe-4353) presence check -- identity/presence ONLY.
+
+    NI-4353 is an NI-DAQmx-family device (universal thermocouple/RTD input
+    module), so this deliberately reuses hardware.daq.DAQ rather than
+    inventing a separate driver class: DAQ.connect()/identify() are already
+    generic NI-DAQmx device enumeration + self-test, nothing 6363-specific.
+    No thermocouple/RTD channel is configured or read here -- that would
+    require a new driver (see config/devices.py PXI_SLOTS[15]'s
+    validation_notes and docs/TODO.md); faking it here would be exactly the
+    "COMMAND and assume success" pattern this project's testing philosophy
+    exists to avoid.
+    """
+    resource = cfg.get("resource", "")
+    model    = cfg.get("model", "PXIe-4353")
+    ref      = f"config/devices.py -> PXI_SLOTS[{cfg.get('slot')!r}] ({resource} / {model})"
+
+    from hardware.daq import DAQ
+    daq = DAQ(cfg)
+    try:
+        daq.connect()
+        identity = daq.identify()
+        mismatch = _compare_identity(model, identity)
+        if mismatch:
+            return _warn("Hardware Discovery", f"Temperature Module: {name}", ref,
+                        f"Communication established. Identified: {identity}\n{mismatch}")
+        return _ok("Hardware Discovery", f"Temperature Module: {name}", ref,
+                   f"Communication established. Identified: {identity}  "
+                   f"(presence/identity only -- no TC/RTD channel read implemented)")
+    except Exception as e:
+        return _fail("Hardware Discovery", f"Temperature Module: {name}", ref,
+                     f"[ERROR] Temperature module not detected\nReason: {e}")
     finally:
         try:
             daq.disconnect()
@@ -394,13 +533,53 @@ def _identify_relay_serial(name: str, cfg: dict):
             pass
 
 
-# name -> (config dict, identify function). Config-driven: adding/removing a
-# device dict entry here changes exactly what gets covered -- no other code
-# needs to change, and no instrument/address/port is hardcoded.
-_DISCOVERY_TARGETS = [
-    ("SMU / PSU",        dev_cfg.SMU_ASSIGNMENTS,      _identify_smu),
-    ("DMM",              dev_cfg.DMM_CONFIGS,          _identify_dmm),
-    ("DAQ",              dev_cfg.DAQ_CONFIGS,          _identify_daq),
+def _pxi_slots_by_category(category: str) -> dict:
+    """
+    PXI_SLOTS entries of the given category, keyed by nickname, in slot-
+    number order. config/devices.py::PXI_SLOTS is the single source of
+    truth this reads from -- nothing here is hand-duplicated.
+    """
+    return {
+        cfg["nickname"]: cfg
+        for slot, cfg in sorted(dev_cfg.PXI_SLOTS.items())
+        if cfg["category"] == category
+    }
+
+
+def _print_group_header(label: str):
+    print(f"\n{label} Devices")
+    print("-" * (len(label) + 8))
+
+
+def _print_device_line(name: str, cfg: dict):
+    """One device's identity block in the grouped discovery report --
+    Slot / Model / Nickname, matching config/devices.py::PXI_SLOTS' own
+    fields exactly (falls back gracefully for non-PXI-slot devices, e.g.
+    Numato/serial relay or GPIB, which have no "slot")."""
+    slot = cfg.get("slot")
+    if slot is not None:
+        print(f"Slot {slot}")
+    model = cfg.get("model")
+    if model:
+        print(model)
+    print(name)
+
+
+# Category -> (display label, identify function). Config-driven: adding or
+# removing a config/devices.py::PXI_SLOTS entry changes exactly what this
+# covers -- no other code needs to change, and no resource/model is
+# hardcoded here.
+_PXI_CATEGORY_TARGETS = [
+    ("smu",         "SMU",                _identify_smu),
+    ("dmm",         "DMM",                _identify_dmm),
+    ("daq",         "DAQ",                _identify_daq),
+    ("temperature", "Temperature Module", _identify_temperature),
+]
+
+# Non-PXI-slot device groups (Ethernet/serial relay) -- kept separate from
+# PXI_SLOTS since they are not chassis-slot devices, shown in the same
+# grouped report for one consolidated view rather than a second tool.
+_NON_PXI_TARGETS = [
     ("Numato Relay Matrix (Ethernet)", dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, _identify_relay_eth),
     ("Relay (Serial)",   dev_cfg.RELAY_SERIAL_CONFIGS, _identify_relay_serial),
 ]
@@ -408,12 +587,19 @@ _DISCOVERY_TARGETS = [
 
 def test_hardware_discovery():
     """
-    Generic device discovery + connectivity test, driven entirely by
-    config/devices.py. For every device of every configured type: create
-    the driver, connect, identify, report PASS/FAIL with full reason.
+    Generic device discovery + connectivity test, grouped by category and
+    driven entirely by config/devices.py::PXI_SLOTS (plus the non-PXI-slot
+    Numato/serial relay dicts). For every configured device: create the
+    driver, connect, identify, compare identity against the configured
+    model, report PASS/WARNING/FAIL with full reason.
 
     This is NOT a measurement test, NOT a battery workflow test, and NOT an
     instrument-accuracy test -- see the module comment above this section.
+
+    Categories with no driver class in this codebase (the PXI-resident
+    switch/relay card, and any GPIB instrument) are reported as N/A rather
+    than faked -- see config/devices.py's PXI_SLOTS[11]/GPIB_INSTRUMENTS
+    validation_notes for why.
 
     Runs entirely inside _numato_relay_debug_logging() so that any Numato
     Relay Matrix device's full Telnet conversation (RX/TX, prompt detection,
@@ -423,13 +609,63 @@ def test_hardware_discovery():
     """
     results = []
     with _numato_relay_debug_logging():
-        for label, devices, identify_fn in _DISCOVERY_TARGETS:
+        for category, label, identify_fn in _PXI_CATEGORY_TARGETS:
+            devices = _pxi_slots_by_category(category)
+            _print_group_header(label)
+            if not devices:
+                results.append(_warn("Hardware Discovery", label,
+                                     "config/devices.py -> PXI_SLOTS",
+                                     "No devices configured for this category -- skipped"))
+                continue
+            for name, cfg in devices.items():
+                _print_device_line(name, cfg)
+                results.append(identify_fn(name, cfg))
+                print()
+
+        # PXI-resident switch/relay card -- present in the rack (see
+        # PXI_SLOTS[11]), but no niswitch-based driver exists in this
+        # codebase. Reported honestly as N/A, never faked as a real check.
+        switch_devices = _pxi_slots_by_category("switch")
+        if switch_devices:
+            _print_group_header("Switch/Relay (PXI)")
+            for name, cfg in switch_devices.items():
+                _print_device_line(name, cfg)
+                slot = cfg.get("slot")
+                note = cfg.get("validation_notes", "No driver class implemented for this category.")
+                print("N/A -- no driver implemented\n")
+                results.append(_warn(
+                    "Hardware Discovery", f"Switch/Relay (PXI): {name}",
+                    f"config/devices.py -> PXI_SLOTS[{slot!r}]",
+                    f"Not applicable -- no niswitch-based driver exists in this codebase.\n{note}",
+                ))
+
+        for label, devices, identify_fn in _NON_PXI_TARGETS:
+            _print_group_header(label)
             if not devices:
                 results.append(_warn("Hardware Discovery", label, "config/devices.py",
                                      "No devices configured for this type -- skipped"))
                 continue
             for name, cfg in devices.items():
+                _print_device_line(name, cfg)
                 results.append(identify_fn(name, cfg))
+                print()
+
+        # GPIB -- detected interface, unconfirmed instrument. Reported as
+        # N/A rather than attempting a fake identity query against an
+        # unknown device.
+        if dev_cfg.GPIB_INSTRUMENTS:
+            _print_group_header("GPIB")
+            for name, cfg in dev_cfg.GPIB_INSTRUMENTS.items():
+                print(cfg.get("interface", "?"))
+                print(cfg.get("model") or "(model unconfirmed)")
+                print(name)
+                print("N/A -- instrument unconfirmed\n")
+                results.append(_warn(
+                    "Hardware Discovery", f"GPIB: {name}",
+                    f"config/devices.py -> GPIB_INSTRUMENTS[{name!r}]",
+                    cfg.get("validation_notes", "No instrument model confirmed at this address."),
+                ))
+
     return results
 
 
@@ -451,16 +687,21 @@ def test_smu():
     done here -- SMU.set_charge_mode()/output_enable()/measure() are still
     placeholders (see docs/TODO.md); testing around a stub would be a fake
     PASS, exactly what this philosophy exists to avoid.
+
+    Steps 1/2 below: show every configured SMU (config/devices.py::PXI_SLOTS,
+    category="smu") with a live reachability check, then select ONE to run
+    the full module-interface + connect/identify test against -- selecting
+    here never touches any other SMU, DMM, DAQ, or relay.
     """
-    name, cfg = _select_device(dev_cfg.SMU_ASSIGNMENTS, "SMUs")
+    devices = _pxi_slots_by_category("smu")
+    name, cfg, results = _discover_and_select("SMU", devices, _identify_smu)
     if cfg is None:
-        return []
+        return results
     _print_device_config(name, cfg)
 
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-SMU")
     config_ref = f"{resource} / {model}"
-    results    = []
 
     # Step 1: hardware.smu module import + interface ---------------------------
     ref_mod = "hardware/smu.py"
@@ -523,17 +764,22 @@ def test_dmm():
     (finite, within the configured range) -> PASS/FAIL. Unlike SMU sourcing,
     a DMM measurement is passive (it only observes), so this is safe to run
     unconditionally and is real verification, not a stub-backed fake PASS.
+
+    Steps 1/2 below: show every configured DMM (config/devices.py::PXI_SLOTS,
+    category="dmm") with a live reachability check, then select ONE to run
+    the full test against -- selecting here never touches any other DMM,
+    SMU, DAQ, or relay.
     """
-    name, cfg = _select_device(dev_cfg.DMM_CONFIGS, "DMMs")
+    devices = _pxi_slots_by_category("dmm")
+    name, cfg, results = _discover_and_select("DMM", devices, _identify_dmm)
     if cfg is None:
-        return []
+        return results
     _print_device_config(name, cfg)
 
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-4065")
     range_v    = cfg.get("range_v", 10.0)
     config_ref = f"{resource} / {model}"
-    results    = []
 
     # Step 1: hardware.dmm module import + interface ---------------------------
     ref_mod = "hardware/dmm.py"
@@ -610,17 +856,26 @@ def test_daq():
     (finite, within the configured +/-voltage_range_v ADC range) -> PASS/
     FAIL -- a NaN, an out-of-range, or a stuck reading is a FAIL, not "the
     read call didn't throw."
+
+    Steps 1/2 below: show every configured DAQ (config/devices.py::PXI_SLOTS,
+    category="daq") with a live reachability check, then select ONE to run
+    the full test against -- selecting here never touches any other DAQ,
+    SMU, DMM, or relay. Step 3's channel read assumes the wiring documented
+    in BATTERY_CHANNELS (MAIN_DAQ) -- if EXPANSION_DAQ/PRECISION_DAQ is
+    selected instead, the channel string may not correspond to a real
+    battery signal on that card; this is a pre-existing assumption in Step 3,
+    not something this selection change introduces.
     """
-    name, cfg = _select_device(dev_cfg.DAQ_CONFIGS, "DAQs")
+    devices = _pxi_slots_by_category("daq")
+    name, cfg, results = _discover_and_select("DAQ", devices, _identify_daq)
     if cfg is None:
-        return []
+        return results
     _print_device_config(name, cfg)
 
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-6363")
     config_ref = f"{resource} / {model}"
     test_ch    = dev_cfg.BATTERY_CHANNELS[1]["daq_voltage_ch"]
-    results    = []
 
     # Step 1: hardware.daq module import + interface ---------------------------
     ref_mod = "hardware/daq.py"
@@ -708,6 +963,84 @@ def test_daq():
 
 
 # =============================================================================
+# 4b. Temperature Module (PXIe-4353)
+# =============================================================================
+
+def test_temperature_module():
+    """
+    Presence/identity check for the PXIe-4353 temperature module
+    (config/devices.py::PXI_SLOTS[15], category="temperature") -- NOT the
+    same thing as "Test Sensors (NTC)" (test_sensors(), which exercises
+    hardware/temperature.py's pure NTC-thermistor math offline, with no
+    hardware I/O at all). This test is real hardware, no math.
+
+    Step 1: Import hardware.daq.DAQ and verify interface -- reused
+            deliberately: NI-4353 is an NI-DAQmx-family device (universal
+            thermocouple/RTD input module), so the same driver class that
+            talks to the 6363/6368/6365 DAQ cards also talks to this one.
+    Step 2: connect() + identify() -- presence/identity only. No
+            thermocouple/RTD channel is configured or read -- that would
+            need a new driver (see PXI_SLOTS[15]'s validation_notes and
+            docs/TODO.md); faking it here would be exactly the "COMMAND and
+            assume success" pattern this project's testing philosophy
+            exists to avoid.
+
+    Steps 1/2 below: show every configured temperature module
+    (config/devices.py::PXI_SLOTS, category="temperature") with a live
+    reachability check, then select ONE to run the interface+identity check
+    against -- selecting here never touches any SMU, DMM, DAQ, or relay.
+    """
+    devices = _pxi_slots_by_category("temperature")
+    name, cfg, results = _discover_and_select("Temperature Module", devices, _identify_temperature)
+    if cfg is None:
+        return results
+    _print_device_config(name, cfg)
+
+    resource   = cfg.get("resource", "")
+    model      = cfg.get("model", "PXIe-4353")
+    config_ref = f"{resource} / {model}"
+
+    # Step 1: hardware.daq module import + interface (reused -- see docstring) -
+    ref_mod = "hardware/daq.py"
+    try:
+        from hardware.daq import DAQ
+        daq = DAQ(cfg)
+        required = ["connect", "disconnect", "identify"]
+        missing = [m for m in required if not callable(getattr(daq, m, None))]
+        if missing:
+            results.append(_fail("Temperature Module", "DAQ module", ref_mod,
+                                 f"Missing methods: {missing}"))
+        else:
+            results.append(_ok("Temperature Module", "DAQ module", ref_mod,
+                               "hardware.daq.DAQ interface OK (reused for this NI-DAQmx-family "
+                               "device -- no TC/RTD channel read implemented)"))
+    except Exception as e:
+        results.append(_fail("Temperature Module", "DAQ module", ref_mod, f"Import error: {e}"))
+        return results
+
+    # Step 2: connect() + identify() -- presence/identity only ----------------
+    try:
+        daq.connect()
+        identity = daq.identify()
+        results.append(_ok("Temperature Module", name, config_ref,
+                           f"Self-test PASSED. Detected: {identity}"))
+    except Exception as e:
+        results.append(_fail("Temperature Module", name, config_ref,
+                             f"[ERROR] Temperature module not detected or self-test failed\n"
+                             f"Configuration : {name}\n"
+                             f"Interface     : NI-DAQmx\n"
+                             f"Expected      : {resource} ({model})\n"
+                             f"Reason        : {e}"))
+    finally:
+        try:
+            daq.disconnect()
+        except Exception:
+            pass
+
+    return results
+
+
+# =============================================================================
 # 5a. Relay -- Serial
 # =============================================================================
 
@@ -721,16 +1054,20 @@ def test_relay_serial():
 
     Returns PASS once the port opens cleanly.
     Returns FAIL if pyserial is missing, the port is absent, or the open fails.
+
+    Steps 1/2 below: show every configured serial relay with a live
+    reachability check, then select ONE to run the full test against --
+    selecting here never touches any other relay, SMU, DMM, or DAQ.
     """
-    name, cfg = _select_device(dev_cfg.RELAY_SERIAL_CONFIGS, "Serial Relays")
+    name, cfg, results = _discover_and_select(
+        "Relay (Serial)", dev_cfg.RELAY_SERIAL_CONFIGS, _identify_relay_serial)
     if cfg is None:
-        return []
+        return results
     _print_device_config(name, cfg)
 
     port       = cfg.get("port", Settings.RELAY_COM_PORT)
     baud       = cfg.get("baud_rate", Settings.RELAY_BAUD_RATE)
     config_ref = f"config/devices.py -> {name} ({port} / {baud} baud)"
-    results    = []
 
     # Step 1: factory + interface check  -- offline, no hardware ---------------
     try:
@@ -923,10 +1260,15 @@ def test_relay_numato_matrix():
     instead of a bare exception -- and the full Telnet conversation (RX/TX, prompt
     detection, IAC negotiation) is visible via _numato_relay_debug_logging(), which
     wraps this entire test, in case the summary reason isn't enough on its own.
+
+    Steps 1/2 below: show every configured Numato Relay Matrix device with a
+    live reachability check, then select ONE to run the full test against --
+    selecting here never touches any other relay, SMU, DMM, or DAQ.
     """
-    name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
+    name, cfg, results = _discover_and_select(
+        "Numato Relay Matrix", dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, _identify_relay_eth)
     if cfg is None:
-        return []
+        return results
     _print_device_config(name, cfg)
 
     host       = cfg.get("ip", "")
@@ -934,7 +1276,6 @@ def test_relay_numato_matrix():
     driver     = cfg.get("driver", "RELAY32ETHRL00")
     user       = cfg.get("username", cfg.get("user", ""))
     config_ref = f"config/devices.py -> {name} ({driver} / {host}:{port})"
-    results    = []
 
     with _numato_relay_debug_logging():
         results.extend(_run_relay_numato_matrix_test(cfg, name, host, port, driver, user, config_ref))
@@ -1833,10 +2174,27 @@ def test_minisql():
 # =============================================================================
 
 def test_electronic_load():
-    """Placeholder. Extend when electronic load hardware is added."""
-    return [_warn("Electronic Load", "ELOAD_01",
-                  "Not yet configured",
-                  "No electronic load in config/devices.py -- stub only")]
+    """
+    Placeholder. config/devices.py::GPIB_INSTRUMENTS records that an
+    NI-488.2/GPIB0 interface was detected in the rack -- equipment_
+    Requirement.md documents an intended "Programmable Electronic Load"
+    and "Programmable Power Supply", and this GPIB interface is the most
+    likely connection point for one of those, but no specific instrument
+    model has been confirmed there yet, and no GPIB driver class exists in
+    this codebase. Extend once both are true.
+    """
+    results = []
+    for name, cfg in dev_cfg.GPIB_INSTRUMENTS.items():
+        results.append(_warn(
+            "Electronic Load", name,
+            f"config/devices.py -> GPIB_INSTRUMENTS[{name!r}]",
+            cfg.get("validation_notes", "No instrument model confirmed at this address."),
+        ))
+    if not results:
+        results.append(_warn("Electronic Load", "ELOAD_01",
+                             "Not yet configured",
+                             "No GPIB instrument configured in config/devices.py -- stub only"))
+    return results
 
 
 # =============================================================================
@@ -2013,6 +2371,7 @@ MENU = [
     ("Test SMU (PSU)",                test_smu),
     ("Test DMM",                      test_dmm),
     ("Test DAQ",                      test_daq),
+    ("Test Temperature Module (PXIe-4353, presence/identity only)", test_temperature_module),
     ("Test Relay -- Serial",          test_relay_serial),
     ("Test Relay -- Numato Relay Matrix (Ethernet)", test_relay_numato_matrix),
     ("Test Relay -- Ethernet Matrix Scan", test_relay_matrix_scan),

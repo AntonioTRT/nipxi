@@ -24,11 +24,19 @@
                      NI-VISA / nidaqmx / nidcpower / nidmm
                                     |
                 +-------------------v------------------------------+
-                |                PXI Chassis                       |
-                |   Slot 2: NI 6363 DAQ  (V / I / NTC voltages)  |
-                |   Slot 3: NI 4065 DMM  (precision V measurement)|
-                |   Slot 4: NI 4140 SMU  (CC-CV charge/discharge) |
-                |   Slot 5: NI 4130 SMU  (optional second unit)   |
+                |     PXI Chassis (config/devices.py::PXI_SLOTS)    |
+                |   Slot 2:  PXIe-6363  MAIN_DAQ         (active) |
+                |   Slot 3:  PXI-4065   MAIN_DMM         (active) |
+                |   Slot 5:  PXIe-4141  PRIMARY_SMU      (active) |
+                |   Slot 6:  PXIe-4139  HIGH_POWER_SMU            |
+                |   Slot 7:  PXI-4130   AUX_SMU_1                 |
+                |   Slot 8:  PXI-4130   AUX_SMU_2                 |
+                |   Slot 11: PXIe-2569  CHASSIS_RELAY_MATRIX (n/a)|
+                |   Slot 15: PXIe-4353  TEMP_MODULE (identity only)|
+                |   Slot 17: PXIe-6368  EXPANSION_DAQ             |
+                |   Slot 18: PXIe-6365  PRECISION_DAQ             |
+                |   GPIB0:   NI-488.2   unconfirmed instrument    |
+                |   See Section 14 for the full inventory table.  |
                 +---+----------------+----------------------------+
                     |                |
           pyserial or TCP        NI-VISA
@@ -67,7 +75,8 @@ main.py  (thin orchestration)
   +-- test_control/test_executor.py     TestExecutor
 
 test_control/hardware_manager.py
-  +-- config/devices.py                 SMU_ASSIGNMENTS / DAQ_CONFIG / DMM_CONFIG (default cfgs)
+  +-- config/devices.py                 SMU_ASSIGNMENTS / DAQ_CONFIG / DMM_CONFIG (default cfgs --
+  |                                      all three are DERIVED from PXI_SLOTS, see Section 14)
   +-- hardware/smu.py                   SMU(cfg)
   +-- hardware/daq.py                   DAQ(cfg)
   +-- hardware/dmm.py                   DMM(cfg)         -- optional, off by default
@@ -467,9 +476,66 @@ Relay has two real implementations (`SerialRelay`, `NumatoRelayMatrix`) selected
 
 ### 8.2 Hardware Discovery (`test_hardware_discovery()` in test.py)
 
-A hardware **presence** test -- not a measurement test, not a battery-workflow test, not an instrument-accuracy test. For every device configured in `config/devices.py` it validates: the device exists in config, was discovered, its driver loaded, its communication channel opened, the instrument responds, and identification succeeds. Config-driven only (`SMU_ASSIGNMENTS`, `DMM_CONFIGS`, `DAQ_CONFIGS`, `NUMATO_RELAY_MATRIX_CONFIGS`, `RELAY_SERIAL_CONFIGS`) -- no resource string, IP, COM port, or relay count is hardcoded anywhere in it.
+A hardware **presence** test -- not a measurement test, not a battery-workflow test, not an instrument-accuracy test. For every device configured it validates: the device exists in config, was discovered, its driver loaded, its communication channel opened, the instrument responds, identification succeeds, and (new) the identity the instrument itself reports is compared against the configured model. Config-driven only, and specifically **grouped by category from `config/devices.py::PXI_SLOTS`** (`smu`/`dmm`/`daq`/`temperature`), plus the non-PXI-slot Numato/serial relay dicts and `GPIB_INSTRUMENTS` -- no resource string, IP, COM port, or relay count is hardcoded anywhere in it. See Section 14 for what `PXI_SLOTS` actually contains.
 
-It uses the SAME production driver classes as `HardwareManager` and the deeper `test_smu()`/`test_dmm()`/`test_daq()` tests -- every `_identify_*()` helper is exactly `driver = DriverClass(cfg); driver.connect(); driver.identify(); driver.disconnect()`, never a direct `nidcpower`/`nidmm`/`nidaqmx`/`pyserial` call. `test_relay_ethernet_test()` and Hardware Discovery's Ethernet-relay check both go through `RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)`, i.e. the same `NumatoRelayMatrix` instance type. A failure on one device never stops discovery of the rest (each `_identify_*()` catches its own exceptions and returns a result), and a full PASS/FAIL summary is always produced (`print_summary()`).
+Printed output is grouped exactly by category, e.g.:
+
+```
+DMM Devices
+-----------
+Slot 3
+PXI-4065
+MAIN_DMM
+
+SMU Devices
+-----------
+Slot 5
+PXIe-4141
+PRIMARY_SMU
+...
+```
+
+followed by each device's PASS/WARNING/FAIL result (via the standard `TestResult.print_detail()` pass `run_section()` already does for every test). A device whose identity string doesn't match its configured model is reported **WARNING**, not silently accepted, via `_compare_identity()` -- a genuinely wrong/swapped card is caught, without flagging harmless formatting differences (e.g. `"PXIe-4141"` vs `"NI PXIe-4141"`) as false positives.
+
+Categories with no driver class in this codebase are reported **N/A**, never faked as a real check:
+- `switch` (`CHASSIS_RELAY_MATRIX`, PXIe-2569, slot 11) -- no `niswitch`-based driver exists; see Section 14.4.
+- `GPIB_INSTRUMENTS` -- no confirmed instrument model at that address yet.
+
+It uses the SAME production driver classes as `HardwareManager` and the deeper `test_smu()`/`test_dmm()`/`test_daq()`/`test_temperature_module()` tests -- every `_identify_*()` helper is exactly `driver = DriverClass(cfg); driver.connect(); driver.identify(); driver.disconnect()`, never a direct `nidcpower`/`nidmm`/`nidaqmx`/`pyserial` call. `_identify_temperature()` deliberately reuses `hardware.daq.DAQ` rather than inventing a new driver class -- NI-4353 is an NI-DAQmx-family device, so the same generic device-enumeration + self-test call works, with no channel acquisition attempted. `test_relay_ethernet_test()` and Hardware Discovery's Ethernet-relay check both go through `RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)`, i.e. the same `NumatoRelayMatrix` instance type. A failure on one device never stops discovery of the rest (each `_identify_*()` catches its own exceptions and returns a result), and a full PASS/WARNING/FAIL summary is always produced (`print_summary()`).
+
+### 8.2a Device Selection Workflow (bring-up focused)
+
+`test_smu()`, `test_dmm()`, `test_daq()`, `test_temperature_module()`, `test_relay_serial()`, and `test_relay_numato_matrix()` all follow the same three-step pattern via one shared helper, `test.py::_discover_and_select(label, devices, identify_fn)`:
+
+```
+Step 1/2: show every configured device of THIS category (from PXI_SLOTS, or the
+          relay dict) with a live reachability check -- the SAME identify_fn
+          Hardware Discovery itself uses, so the two can never disagree:
+
+    SMU Devices Found
+
+    [1] PRIMARY_SMU
+        Slot 5
+        PXIe-4141
+        PASS
+    [2] HIGH_POWER_SMU
+        Slot 6
+        PXIe-4139
+        FAIL
+    0. Cancel
+
+Step 3:   prompt "Select device:" -- any listed device, PASS or not (an
+          operator may deliberately want to select a failing one to
+          investigate further)
+
+Step 4:   the existing, unmodified functional test body (module-interface
+          check + connect/identify [+ DMM's real measurement / DAQ's deep
+          channel read]) runs on ONLY the selected device.
+```
+
+**Selecting one device never touches any other device, of that category or any other.** This was verified directly (not assumed): selecting `PRIMARY_SMU` from the SMU picker runs the SMU interface check and connect/identify against `PRIMARY_SMU` only -- `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` are not reconnected a second time. Cancelling (`0`) returns the reachability-scan results that were already gathered in Step 1/2 -- that data is never lost even if no device is ultimately selected.
+
+`_discover_and_select()` is the one new abstraction this workflow introduces, and it is a thin wrapper reusing existing pieces (`identify_fn` from Hardware Discovery, `TestResult`/`_ok`/`_warn`/`_fail` from the existing result model) -- not a second inventory framework or a parallel config source.
 
 ### 8.3 Startup device validation (`utils/device_validator.py`)
 
@@ -477,7 +543,7 @@ Runs before any hardware communication -- `main.py` calls `validate_devices_or_r
 
 ### 8.4 Adding a new instrument
 
-A new instance of an existing type (second SMU/DAQ/DMM): add an entry to `config/devices.py`'s `SMU_ASSIGNMENTS`/`DAQ_CONFIGS`/`DMM_CONFIGS` -- Hardware Discovery, device validation, and preflight all pick it up automatically (they iterate these dicts).
+A new instance of an existing type (second SMU/DAQ/DMM/temperature module) in an existing PXI slot: add an entry to `config/devices.py`'s `PXI_SLOTS` (with a unique nickname, `category`, `driver_family`, `role`, `enabled` flag) -- `SMU_ASSIGNMENTS`/`DAQ_CONFIGS`/`DMM_CONFIGS` are derived from it automatically (see Section 14.2), so Hardware Discovery, the device-selection workflow (Section 8.2a), device validation, and preflight all pick it up with no further code change.
 
 A genuinely new device type: `hardware/<type>.py` (a `HardwareBase` subclass, constructed from a config dict, with `connect()`/`disconnect()`/`identify()`), a `<TYPE>_CONFIG`/`<TYPE>_CONFIGS` pair in `config/devices.py`, a registry entry in `utils/device_validator.py::_build_registry()`, and a `_DISCOVERY_TARGETS` entry in `test.py`. See README.md Section 17.3 for the full walkthrough.
 
@@ -946,3 +1012,123 @@ A separate, faster, escalating "Emergency Abort" mechanism (operator types
 architecture discussion but **deliberately deferred**. No `ABORT` command, no
 listener thread, and no `EMERGENCY_ABORT` stop reason exist in this codebase
 today -- only Safe Cancellation, as described above.
+
+## 14. PXI Rack Inventory & Hardware Architecture
+
+The real PXI rack inventory (confirmed via NI-MAX detection, not assumed) is
+fully described in `config/devices.py::PXI_SLOTS` -- this section is the
+narrative summary; `PXI_SLOTS` and `docs/CONFIGURATION.md` are the
+authoritative, detailed references.
+
+### 14.1 Current inventory
+
+| Slot | Model | Nickname | Category | Driver family | Status |
+|---|---|---|---|---|---|
+| 2 | PXIe-6363 | `MAIN_DAQ` | daq | nidaqmx | Active -- the one DAQ `HardwareManager` connects |
+| 3 | PXI-4065 | `MAIN_DMM` | dmm | nidmm | Active -- only DMM in the rack |
+| 5 | PXIe-4141 | `PRIMARY_SMU` | smu | nidcpower | Active -- the one SMU `HardwareManager` connects and cycles |
+| 6 | PXIe-4139 | `HIGH_POWER_SMU` | smu | nidcpower | Present, individually testable, not assigned to a channel |
+| 7 | PXI-4130 | `AUX_SMU_1` | smu | nidcpower | Present, individually testable, not assigned to a channel |
+| 8 | PXI-4130 | `AUX_SMU_2` | smu | nidcpower | Present, individually testable, not assigned to a channel |
+| 11 | PXIe-2569 | `CHASSIS_RELAY_MATRIX` | switch | niswitch | Present, **not the active relay driver** -- see 14.4 |
+| 15 | PXIe-4353 + TB-4353/0 | `TEMP_MODULE` | temperature | nidaqmx | Present, identity/presence check only -- see 14.5 |
+| 17 | PXIe-6368 | `EXPANSION_DAQ` | daq | nidaqmx | Present, individually testable, not wired into `HardwareManager` |
+| 18 | PXIe-6365 | `PRECISION_DAQ` | daq | nidaqmx | Present, individually testable, not wired into `HardwareManager` |
+| GPIB0 | unconfirmed | `UNCONFIRMED_GPIB_INSTRUMENT` | -- | NI-488.2 | Interface detected, no instrument model confirmed -- see 14.6 |
+
+Every entry also carries a `role` (one-line intended purpose) and
+`validation_notes` (discrepancies against the original plan in
+`flowcharts/vi plan.md`, or anything not to assume without checking) -- read
+those directly in `config/devices.py` rather than duplicating them here,
+since duplicating free-text notes across two files is exactly the kind of
+drift this whole refactor exists to prevent.
+
+### 14.2 Single source of truth: `PXI_SLOTS`
+
+`PXI_SLOTS` is the only place a PXI resource string or model is
+hand-authored. `SMU_ASSIGNMENTS`, `DAQ_CONFIG`/`DAQ_CONFIGS`, and
+`DMM_CONFIG`/`DMM_CONFIGS` are **derived** from it by filtering on
+`category`, not hand-duplicated:
+
+```python
+def _slots_by_category(category):
+    return {slot: cfg for slot, cfg in PXI_SLOTS.items() if cfg["category"] == category}
+
+SMU_ASSIGNMENTS = {cfg["nickname"]: {...} for cfg in _slots_by_category("smu").values()}
+DAQ_CONFIGS     = {cfg["nickname"]: {...} for cfg in _slots_by_category("daq").values()}
+DAQ_CONFIG      = DAQ_CONFIGS["MAIN_DAQ"]
+DMM_CONFIGS     = {cfg["nickname"]: {...} for cfg in _slots_by_category("dmm").values()}
+DMM_CONFIG      = DMM_CONFIGS["MAIN_DMM"]
+```
+
+`HardwareManager` still only ever connects ONE SMU (`next(iter(SMU_ASSIGNMENTS.values()))`, which resolves to `PRIMARY_SMU` because `PXI_SLOTS` lists slot 5 before slots 6/7/8) and ONE DAQ (`DAQ_CONFIG`) for the active battery test sequence -- multi-device channel assignment (actually driving `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2`/`EXPANSION_DAQ`/`PRECISION_DAQ` for real charge/discharge) is a future scaling task, not implemented by this refactor.
+
+`GPIB_INSTRUMENTS` is a separate dict (not derived from `PXI_SLOTS`, since GPIB0 is not a chassis slot) documenting the detected NI-488.2 interface.
+
+### 14.3 Nicknames
+
+Nicknames reflect intended system role, not just the model number (`PRIMARY_SMU`, `MAIN_DMM`, `TEMP_MODULE`), per the same principle already established for the Numato relay (`MAIN_MATRIX_ETH`) and battery channels (`BAT_1`..`BAT_8`). Every driver-facing config dict is now keyed by nickname, not an arbitrary label like the old `"SMU1"` -- this changed a real call site: `test.py`'s Configuration Validation used to hardcode `dev_cfg.SMU_ASSIGNMENTS.get("SMU1", {})`, which silently returned `{}` after the rename; fixed to `next(iter(dev_cfg.SMU_ASSIGNMENTS.values()), {})`, matching how `HardwareManager` already picks the primary device.
+
+### 14.4 Current relay architecture
+
+**Numato Lab 32-Channel Ethernet Relay Module remains the only active relay driver** (`NUMATO_RELAY_MATRIX_CONFIG` / `hardware/relay_eth.py::NumatoRelayMatrix`, Section 6) -- confirmed reachable and validated end-to-end against physical hardware (Section 6b/6c).
+
+`PXIe-2569` (slot 11, chassis-resident electromechanical relay/switch module) is physically present in the rack -- the original plan (`flowcharts/vi plan.md: '2569 relay'`) anticipated this card as *the* relay matrix, but the implemented production path is the Numato Ethernet module instead. The 2569 has no driver class in this codebase (`niswitch` is a distinct NI driver package, not reused by anything here) and is not connected, tested functionally, or used anywhere in `HardwareManager`/`BatteryTestSequence`. Hardware Discovery lists it as **N/A -- no driver implemented**, never as a fake PASS/FAIL. Repurposing it (as an alternative or supplement to the Numato relay) is an open decision, tracked in `docs/TODO.md`, not something this documentation pass resolves.
+
+### 14.5 Temperature module
+
+`PXIe-4353` (slot 15, + terminal block `TB-4353` connector 0) is an NI-DAQmx-family universal thermocouple/RTD input module. Not present in the original VI plan -- a new finding from the real rack inventory, and the most likely real hardware source for the per-channel temperature reading (`t_c`) that `charge_cycle.py`/`discharge_cycle.py` currently stub as `None`. `test.py::test_temperature_module()` / `_identify_temperature()` deliberately reuse `hardware.daq.DAQ` for connect/identify (NI-4353 enumerates and self-tests the same way any other NI-DAQmx device does) -- no thermocouple/RTD channel is configured or read anywhere; that would need a new driver and is explicitly not implemented.
+
+### 14.6 GPIB
+
+An NI-488.2 interface (`GPIB0`) was detected in the rack with no specific instrument confirmed at that address. `equipment_Requirement.md` documents an intended "Programmable Electronic Load" and "Programmable Power Supply" -- GPIB0 is the most likely connection point for one of those, but this is unconfirmed. `test.py::test_electronic_load()` reports this honestly (`GPIB_INSTRUMENTS`'s `validation_notes`) rather than a generic "not configured" stub. No GPIB driver class exists in this codebase.
+
+## 15. Testing Architecture Summary
+
+Consolidates the testing-related sections above into one map of guarantees:
+
+| Concern | Where enforced | Guarantee |
+|---|---|---|
+| Hardware Discovery | Section 8.2 | Every configured device (by category, from `PXI_SLOTS`) gets a real connect+identify(+model-compare) check, never faked for categories with no driver |
+| Device verification | Section 8.2 | COMMAND -> READBACK -> VERIFY -> PASS for every device type (Section 10) -- never "the API call didn't throw" |
+| Device selection workflow | Section 8.2a | Reachability scan shown BEFORE selection, not after -- no blind picks |
+| Category-specific testing | Section 8.2a | `test_smu()`/`test_dmm()`/`test_daq()`/`test_temperature_module()`/relay tests each only ever construct/connect devices of their OWN category |
+| User-selected device testing | Section 8.2a | The functional test step operates on exactly the one device chosen -- verified directly, not assumed |
+| No automatic testing of unrelated hardware | Section 8.2a | Selecting a DMM never connects an SMU, DAQ, or relay, and vice versa |
+
+## 16. State Model
+
+The canonical vocabulary for why a run (or a single channel within one) stopped -- defined in `utils/stop_reason.py::StopReason`, deliberately kept independent from "how much completed" (`channel_results`/`success`), since a run can be `CANCELLED` after 2 of 8 channels passed.
+
+| State | Meaning | Triggered by |
+|---|---|---|
+| `COMPLETED` | Ran to natural completion | Normal exit, no exception |
+| `FAILED` | Stopped due to an unexpected error | `RelayError`, `HardwareInitError`, or any other unanticipated exception |
+| `SAFETY_VIOLATION` | Stopped because `SafetyMonitor` detected a limit breach | `SafetyViolationError` -- correct, intentional safety behavior, not a defect |
+| `TIMEOUT` | A charge/discharge cycle hit its configured deadline | Defined in `StopReason`, **not yet wired end-to-end** -- `ChargeCycle`/`DischargeCycle` already return `False` on timeout, but `BatteryTestSequence.run()` still discards that value (pre-existing gap, see Section 13.4) |
+| `CANCELLED` | Operator requested a graceful stop (Ctrl+C) | `OperationCancelledError` -- never reported as `FAILED` |
+
+`TestRunResult.stop_reason` is set exactly once per run, in `TestExecutor.run()`'s exception handling (Section 13.2's flow diagram shows the `CANCELLED` path end-to-end). `TestRunResult.summary()` prints `stop_reason` directly whenever it is not `COMPLETED`, so a log line reads `status=CANCELLED` or `status=SAFETY_VIOLATION`, never a generic `ABORTED` that would conflate the two.
+
+**Known limitation:** `stop_reason` does not yet reach the persisted database or generated report -- `ResultManager`/`ReportGenerator` operate purely off per-sample DB records today, not the in-memory `TestRunResult` (see Section 13.4 and Section 17).
+
+## 17. Known Risks
+
+Consolidated from the cancellation-architecture review (Section 13.7) and the standalone hardware-safety audit performed before real-hardware validation. Organized by category; nothing here has been fixed by a documentation pass -- these are open items, tracked in `docs/TODO.md`.
+
+**Hardware timeout characterization (blocking-call bounds):**
+- NI-DCPower (SMU) sessions have **no explicit timeout configured** anywhere in `hardware/smu.py` -- behavior relies entirely on the driver's own default, which is unconfirmed. This is also the upper bound on cancellation latency for any SMU call (Section 13.6).
+- NI-DMM sessions have the same gap -- no explicit timeout configured in `hardware/dmm.py`.
+- NI-DAQmx (DAQ) has no real blocking call yet to characterize -- `read_channel()`/`read_all_batteries()` are still stubs.
+- The Numato relay TCP/Telnet path IS bounded (~5.0s per command, `cfg["timeout"]`) -- the one instrument type with a confirmed, configured timeout.
+
+**PMU behavior under communication loss:** if the VISA/PXI link to the SMU is down, `emergency_output_off()` cannot force the hardware off -- `output_disable()` raises, is caught, logged CRITICAL ("PMU may still be actively sourcing/sinking current"), and returns `False` rather than pretending success. There is no hardware-level fail-safe confirmed for this scenario -- unverified against the real NI-4141/4139/4130 cards.
+
+**PMU behavior under power loss:** entirely a hardware question, not something software can characterize. Two specific unknowns, neither confirmed against a datasheet or bench test: (1) whether the SMU cards' output stage fails open (de-energizes) when the card itself loses power, and (2) whether the Numato relay module (typically its own separate power supply) and the PXI chassis share a power source with the host PC, which determines whether "PC power loss" implies "PMU/relay power loss" too. This is the least-characterized risk in the system.
+
+**Electrical verification limitations:**
+- PMU output verification (`verify_output_disabled()`) trusts the NI-DCPower driver's *self-reported* `session.output_enabled` state -- not an independent electrical measurement, unlike the relay's genuinely separate readback command (`relay readall`, a different query over the same Telnet channel but a distinct command/response, not just a cached property read).
+- No PMU safety logic has been exercised against real current flow -- `output_enable()`/`set_charge_mode()` are still stubs, so `emergency_output_off()` has only ever been verified turning off a session that was never actually sourcing anything.
+- Terminal-close (Windows `CTRL_CLOSE_EVENT`), Task-Manager kill, and native driver crashes all bypass every safety mechanism in this codebase (no code runs) -- this is an inherent limitation of a pure-userspace application, not something any amount of Python-level engineering closes.
+
+**Cancellation-specific risks** (see Section 13.7 for full detail, repeated here for a single consolidated risk list): the `HardwareManager.connect_all()` SIGINT/teardown gap, `test_relay_safety_selftest()`'s missing cancellation checkpoint, the harmless-but-real duplicate `emergency_output_off()` call on a mid-cycle cancellation, and the unchunked `STABILIZATION_S` sleep's ~6s worst-case cancellation latency.

@@ -27,6 +27,8 @@ This sub-repository is self-contained and independent from the main BLOAST proje
 17. [Hardware Abstraction Architecture & Device Onboarding](#17-hardware-abstraction-architecture--device-onboarding)
 18. [System Modes](#18-system-modes)
 19. [Instrument Verification Philosophy](#19-instrument-verification-philosophy)
+20. [Safe Cancellation Architecture](#20-safe-cancellation-architecture)
+21. [State Model](#21-state-model)
 
 ---
 
@@ -68,11 +70,16 @@ See [docs/TODO.md](docs/TODO.md) for the complete checklist.
                      NI-VISA / nidaqmx / nidcpower / nidmm
                                     |
                 +-------------------v------------------------------+
-                |                PXI Chassis                       |
-                |   Slot 2: NI 6363 DAQ  (voltage / current / NTC)|
-                |   Slot 3: NI 4065 DMM  (precision verification) |
-                |   Slot 4: NI 4140 SMU  (charge / discharge)     |
-                |   Slot 5: NI 4130 SMU  (optional second unit)   |
+                |   PXI Chassis (config/devices.py::PXI_SLOTS)      |
+                |   Slot 2:  PXIe-6363  MAIN_DAQ      (active)     |
+                |   Slot 3:  PXI-4065   MAIN_DMM      (active)     |
+                |   Slot 5:  PXIe-4141  PRIMARY_SMU   (active)     |
+                |   Slot 6-8, 17-18: HIGH_POWER_SMU/AUX_SMU_1/2/   |
+                |                    EXPANSION_DAQ/PRECISION_DAQ   |
+                |                    (present, not yet channel-    |
+                |                     assigned -- Section 4)       |
+                |   Slot 11: PXIe-2569  CHASSIS_RELAY_MATRIX (n/a) |
+                |   Slot 15: PXIe-4353  TEMP_MODULE (identity only)|
                 +---+----------------+-----------+----------------+
                     |                            |
               pyserial / TCP               NI-VISA
@@ -125,7 +132,7 @@ Save final data, generate report
 ```
 nipxi/
 |-- main.py                     Entry point. Parses args, validates config, starts test.
-|-- test.py                     Interactive test framework (12 test sections).
+|-- test.py                     Interactive test framework (20 menu items -- see Section 8).
 |-- requirements.txt
 |-- .gitignore
 |
@@ -186,16 +193,24 @@ nipxi/
 
 ## 4. Supported Hardware
 
-| Role | Model | Interface | Library | Driver |
-|------|-------|-----------|---------|--------|
-| PXI Chassis | NI PXI-1042 (or compatible) | NI-VISA | — | `hardware/pxi_rack.py` (stub) |
-| DAQ | NI 6363 (Slot 2) | NI-DAQmx | `nidaqmx` | `hardware/daq.py::DAQ` (connect/identify real; channel read still TODO) |
-| DMM | NI 4065 (Slot 3) | NI-DMM | `nidmm` | `hardware/dmm.py::DMM` (connect/identify real) |
-| SMU / PSU (primary) | NI 4140 or 4139 (Slot 4) | NI-DCPower | `nidcpower` | `hardware/smu.py::SMU` (connect/identify real; charge/discharge/measure still TODO) |
-| SMU (optional) | NI 4130 (Slot 5) | NI-DCPower | `nidcpower` | same `SMU` class, second `SMU_ASSIGNMENTS` entry |
-| Relay (Ethernet) | **Numato Lab 32-Channel Ethernet Relay Module (RELAY32ETHRL00) — PRODUCTION** | TCP/Telnet | stdlib `socket` | `hardware/relay_eth.py::NumatoRelayMatrix` |
-| Relay (serial, COM13) | Diagnostic only — NOT the production control path | pyserial | `pyserial` | `hardware/relay_serial.py::SerialRelay` |
-| Battery Hub PCB | BLOSS Hub Rev A | — | — | — |
+Confirmed against the real PXI rack (NI-MAX detection) — `config/devices.py::PXI_SLOTS` is the single source of truth; this table is a snapshot for reference, not where to edit resource strings. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full per-slot metadata (role, driver family, enabled flag, validation notes).
+
+| Role | Model | Slot | Nickname | Interface | Library | Driver |
+|------|-------|------|----------|-----------|---------|--------|
+| DAQ (primary) | PXIe-6363 | 2 | `MAIN_DAQ` | NI-DAQmx | `nidaqmx` | `hardware/daq.py::DAQ` (connect/identify real; channel read still TODO) |
+| DMM | PXI-4065 | 3 | `MAIN_DMM` | NI-DMM | `nidmm` | `hardware/dmm.py::DMM` (connect/identify real) |
+| SMU / PSU (primary) | PXIe-4141 | 5 | `PRIMARY_SMU` | NI-DCPower | `nidcpower` | `hardware/smu.py::SMU` (connect/identify/PMU safety real; charge/discharge/measure still TODO) — the one SMU `HardwareManager` actually drives |
+| SMU (high power, present, not yet wired to a channel) | PXIe-4139 | 6 | `HIGH_POWER_SMU` | NI-DCPower | `nidcpower` | same `SMU` class, second `SMU_ASSIGNMENTS` entry |
+| SMU (auxiliary, present, not yet wired to a channel) | PXI-4130 | 7 | `AUX_SMU_1` | NI-DCPower | `nidcpower` | same `SMU` class |
+| SMU (auxiliary, present, not yet wired to a channel) | PXI-4130 | 8 | `AUX_SMU_2` | NI-DCPower | `nidcpower` | same `SMU` class |
+| Relay/switch (present, NOT the active relay driver) | PXIe-2569 | 11 | `CHASSIS_RELAY_MATRIX` | NI-SWITCH | `niswitch` | none yet — see Numato Ethernet relay below for the actual production path |
+| Temperature module (present, not yet wired into any driver) | PXIe-4353 + TB-4353/0 | 15 | `TEMP_MODULE` | NI-DAQmx | `nidaqmx` | none yet — likely real source for the currently-stubbed per-channel `t_c` reading in `charge_cycle.py`/`discharge_cycle.py` |
+| DAQ (expansion, present, not wired into `HardwareManager`) | PXIe-6368 | 17 | `EXPANSION_DAQ` | NI-DAQmx | `nidaqmx` | same `DAQ` class, second `DAQ_CONFIGS` entry |
+| DAQ (precision, present, not wired into `HardwareManager`) | PXIe-6365 | 18 | `PRECISION_DAQ` | NI-DAQmx | `nidaqmx` | same `DAQ` class, third `DAQ_CONFIGS` entry |
+| GPIB instrument (unconfirmed) | — | GPIB0 (NI-488.2) | `UNCONFIRMED_GPIB_INSTRUMENT` | GPIB | — | none — likely candidate for the electronic load/power supply in `equipment_Requirement.md`, model not yet confirmed |
+| Relay (Ethernet) | **Numato Lab 32-Channel Ethernet Relay Module (RELAY32ETHRL00) — PRODUCTION** | — (Ethernet, not a PXI slot) | `MAIN_MATRIX_ETH` | TCP/Telnet | stdlib `socket` | `hardware/relay_eth.py::NumatoRelayMatrix` |
+| Relay (serial, COM13) | Diagnostic only — NOT the production control path | — | `MAIN_MATRIX` | pyserial | `pyserial` | `hardware/relay_serial.py::SerialRelay` |
+| Battery Hub PCB | BLOSS Hub Rev A | — | — | — | — | — |
 
 **Production relay hardware (validated):** Numato Lab 32 Channel Ethernet Relay Module, reachable over Ethernet/Telnet — ping, web interface, Telnet login, relay commands, and relay state readback have all been confirmed working. Validated settings:
 
@@ -360,34 +375,33 @@ Physical channel mapping and device assignments. **This file is the single sourc
 
 **PXI hardware configuration (SMU/PSU, DAQ, DMM):**
 
+`PXI_SLOTS` is the single source of truth for every PXI-slot resource string/
+model -- confirmed against the real rack (NI-MAX detection). `SMU_ASSIGNMENTS`/
+`DAQ_CONFIG(S)`/`DMM_CONFIG(S)` are **derived** from it by `category`; edit
+`PXI_SLOTS`, not those dicts, when hardware changes:
+
 ```python
-SMU_ASSIGNMENTS = {
-    "SMU1": {
-        "type":     "PXIe",
-        "resource": "PXI1Slot4",    # update to match NI-MAX -- SMU/PSU (no separate PSU config)
-        "model":    "NI-4140",
-        "channels": list(range(1, 9)),
-    }
+PXI_SLOTS = {
+    5: {
+        "slot": 5, "resource": "PXI1Slot5", "model": "PXIe-4141",
+        "nickname": "PRIMARY_SMU", "driver_family": "nidcpower",
+        "category": "smu", "role": "Primary SMU -- drives all 8 channels.",
+        "enabled": True, "channels": list(range(1, 9)),
+        "validation_notes": "...",
+    },
+    # ... one entry per real slot (MAIN_DAQ, MAIN_DMM, HIGH_POWER_SMU,
+    # AUX_SMU_1/2, CHASSIS_RELAY_MATRIX, TEMP_MODULE, EXPANSION_DAQ,
+    # PRECISION_DAQ) -- see config/devices.py for the full, current
+    # inventory and docs/CONFIGURATION.md for the full table.
 }
 
-DAQ_CONFIG = {
-    "type":     "PXIe",
-    "resource": "PXI1Slot2",        # update to match NI-MAX
-    "model":    "NI-6363",
-    "sample_rate_hz": 1.0,
-    "voltage_range_v": 5.0,
-}
-
-DMM_CONFIG = {
-    "type":     "PXIe",
-    "resource": "PXI1Slot3",        # update to match NI-MAX
-    "model":    "NI-4065",
-    "function": "DC_VOLTS",
-    "range_v":  10.0,
-}
+# Derived (do not hand-edit these -- edit PXI_SLOTS above instead):
+SMU_ASSIGNMENTS = { ... }   # every category="smu" slot, by nickname
+DAQ_CONFIG      = DAQ_CONFIGS["MAIN_DAQ"]
+DMM_CONFIG      = DMM_CONFIGS["MAIN_DMM"]
 ```
 
-`hardware/smu.py::SMU`, `hardware/daq.py::DAQ`, and `hardware/dmm.py::DMM` are each constructed directly from one of these dicts (`SMU(cfg)`/`DAQ(cfg)`/`DMM(cfg)`) -- there is exactly one driver class per type, so (unlike relay) no factory/type-dispatch is needed; construction from the config dict already IS the "factory step" for these types.
+`hardware/smu.py::SMU`, `hardware/daq.py::DAQ`, and `hardware/dmm.py::DMM` are each constructed directly from one of the derived dicts' entries (`SMU(cfg)`/`DAQ(cfg)`/`DMM(cfg)`) -- there is exactly one driver class per type, so (unlike relay) no factory/type-dispatch is needed; construction from the config dict already IS the "factory step" for these types. `HardwareManager` still only ever connects ONE SMU (`next(iter(SMU_ASSIGNMENTS.values()))`, currently `PRIMARY_SMU`) and ONE DAQ (`DAQ_CONFIG`) for the active battery test sequence -- the other real SMUs/DAQs in the rack are present and individually testable via `test.py`, but multi-device channel assignment is a future scaling task.
 
 **Serial relay configuration (diagnostic only):**
 
@@ -502,30 +516,75 @@ python test.py
 
 ### 8.1 Hardware Discovery (`test_hardware_discovery()`)
 
-A hardware **presence** test, not a measurement test, not a battery-workflow test, and not an instrument-accuracy test. For every device found in `config/devices.py` it validates only:
+A hardware **presence** test, not a measurement test, not a battery-workflow test, and not an instrument-accuracy test. For every device configured it validates:
 
-- the device exists in `config/devices.py` (enumeration)
+- the device exists in configuration (enumeration)
 - the device was discovered correctly
 - the driver loaded correctly (import / factory)
 - the communication channel opened correctly (connect)
 - the instrument responds correctly (self-test / login)
 - instrument identification succeeds (identity query)
+- **the identity the instrument reports matches the configured model** (new -- a mismatch is reported `WARNING`, not silently accepted)
 
-**Config-driven only** -- it iterates `SMU_ASSIGNMENTS`, `DMM_CONFIGS`, `DAQ_CONFIGS`, `NUMATO_RELAY_MATRIX_CONFIGS`, and `RELAY_SERIAL_CONFIGS` from `config/devices.py`; nothing is hardcoded (no resource strings, IPs, or COM ports), so adding or removing a device there changes coverage automatically with no code change.
+**Config-driven only, grouped by category from `config/devices.py::PXI_SLOTS`** (`smu`/`dmm`/`daq`/`temperature`), plus the non-PXI-slot Numato/serial relay dicts and `GPIB_INSTRUMENTS`; nothing is hardcoded (no resource strings, IPs, or COM ports), so adding or removing a `PXI_SLOTS` entry changes coverage automatically with no code change. Output is grouped exactly by category:
 
-**Uses the same production driver classes as HardwareManager -- no duplicated connection logic, no instrument-specific communication code of its own.** Every `_identify_*()` helper in `test.py` does exactly `driver = DriverClass(cfg); driver.connect(); driver.identify(); driver.disconnect()` and nothing else -- it never imports `nidcpower`/`nidmm`/`nidaqmx`/`pyserial` directly. `test_smu()`/`test_dmm()`/`test_daq()` (the deeper per-device menu tests) call the same driver classes for their connect/identify step too, so there is exactly one connect()/identify() implementation per device type, not two:
+```
+DMM Devices
+-----------
+Slot 3
+PXI-4065
+MAIN_DMM
+
+SMU Devices
+-----------
+Slot 5
+PXIe-4141
+PRIMARY_SMU
+
+Slot 6
+PXIe-4139
+HIGH_POWER_SMU
+```
+
+Categories with no driver class in this codebase (`CHASSIS_RELAY_MATRIX`, the PXI-resident switch/relay card; any GPIB instrument) are reported **N/A**, never faked as a real check -- see [Section 4](#4-supported-hardware).
+
+**Uses the same production driver classes as HardwareManager -- no duplicated connection logic, no instrument-specific communication code of its own.** Every `_identify_*()` helper in `test.py` does exactly `driver = DriverClass(cfg); driver.connect(); driver.identify(); driver.disconnect()` and nothing else -- it never imports `nidcpower`/`nidmm`/`nidaqmx`/`pyserial` directly. `test_smu()`/`test_dmm()`/`test_daq()`/`test_temperature_module()` (the deeper per-device menu tests) call the same driver classes for their connect/identify step too, so there is exactly one connect()/identify() implementation per device type, not two:
 
 | Type | Driver class | Connect | Identify | Never does |
 |------|--------------|---------|----------|-------------|
 | SMU / PSU | `hardware.smu.SMU` | `smu.connect()` (nidcpower session, inside the driver) | `smu.identify()` -> `instrument_model` | `output_enable()`, `set_charge_mode()`, source V/I |
 | DMM | `hardware.dmm.DMM` | `dmm.connect()` (nidmm session, inside the driver) | `dmm.identify()` -> `instrument_model` | trigger/read a measurement |
 | DAQ | `hardware.daq.DAQ` | `daq.connect()` (NI-DAQmx device enumeration, inside the driver) | `daq.identify()` -> `product_type` + `self_test_device()` | create a task, read any channel |
+| Temperature Module | `hardware.daq.DAQ` (reused -- PXIe-4353 is NI-DAQmx-family too) | same as DAQ | same as DAQ | configure/read any TC/RTD channel |
 | Relay (Ethernet) | `hardware.relay_eth.NumatoRelayMatrix` (via `RelayFactory`) | `relay.connect()` (TCP + Telnet login) | the driver's own post-login `relay readall` verification | write to any relay channel (`connect()` is read-only) |
 | Relay (Serial) | `hardware.relay_serial.SerialRelay` (via `RelayFactory`) | `relay.connect()` (opens the COM port) | *(no identity command -- no custom protocol is invented; port-open success is the pass criterion)* | send any relay command |
 
 Note: there is no separate PSU hardware/config in this project -- the NI SMU is the PSU (see the "Test SMU (PSU)" menu label), so the SMU/PSU row above covers both.
 
-`RelayEthernetTest` (menu item 10) and Hardware Discovery's Ethernet-relay row both go through `RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)`, i.e. the same `NumatoRelayMatrix` instance type -- they never diverge onto a second relay implementation.
+`RelayEthernetTest` and Hardware Discovery's Ethernet-relay row both go through `RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)`, i.e. the same `NumatoRelayMatrix` instance type -- they never diverge onto a second relay implementation.
+
+### 8.1a Device Selection Workflow (bring-up)
+
+`Test SMU`, `Test DMM`, `Test DAQ`, `Test Temperature Module`, `Test Relay -- Serial`, and `Test Relay -- Numato Relay Matrix` all show a live reachability scan of every configured device in that category **before** asking which one to test -- unlike a blind picker, you see PASS/WARNING/FAIL for each device first:
+
+```
+SMU Devices Found
+
+[1] PRIMARY_SMU
+    Slot 5
+    PXIe-4141
+    PASS
+[2] HIGH_POWER_SMU
+    Slot 6
+    PXIe-4139
+    FAIL
+
+0. Cancel
+
+Select device:
+```
+
+Selecting a device runs the existing, unmodified functional test (module-interface check + connect/identify, plus DMM's real measurement or DAQ's deep channel read where applicable) on **only** that device -- selecting `PRIMARY_SMU` never touches `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2`, and selecting a DMM never touches any SMU, DAQ, or relay. Cancelling still returns the reachability scan's results, so that data is never lost. One shared helper (`test.py::_discover_and_select()`) implements this for every category above -- not a separate tool or a second config source, just a picker upgrade reusing the same `_identify_*()` functions Hardware Discovery already uses.
 
 **Result format:**
 
@@ -563,16 +622,22 @@ or on failure:
 ```
 1. python test.py                          -- Startup Validation + Test Configuration run
                                                automatically before the menu is even shown
-2.  -> choose 2 (Startup Device Validation) -- re-run explicitly / inspect in isolation
-3.  -> choose 3 (Hardware Discovery)        -- connectivity + identification, every device
-4.  -> choose 10 (RelayEthernetTest)        -- native relay primitives, before any relay use
-5.  -> choose 13 (Test Safety Monitor)      -- verifies safety logic offline
-6.  -> choose 12 (Test Sensors)             -- verifies NTC math
-7.  -> choose 16 (Test Database)            -- verifies storage offline
-8.  -> choose 4, 5, 6 (SMU/DMM/DAQ)         -- deeper per-device PXI hardware tests
-9.  -> choose 18 (Run All Tests)            -- full pass
-10. -> choose 1 (Run Main Test)             -- battery test workflow, once everything above passes
+2.  -> choose 2  (Startup Device Validation) -- re-run explicitly / inspect in isolation
+3.  -> choose 3  (Hardware Discovery)        -- connectivity + identification, every device,
+                                                 grouped by category (Section 8.1)
+4.  -> choose 11 (RelayEthernetTest)         -- native relay primitives, before any relay use
+5.  -> choose 15 (Test Safety Monitor)       -- verifies safety logic offline
+6.  -> choose 14 (Test Sensors)              -- verifies NTC math
+7.  -> choose 18 (Test Database)             -- verifies storage offline
+8.  -> choose 4, 5, 6, 7 (SMU/DMM/DAQ/Temperature Module) -- deeper per-device PXI hardware
+                                                              tests, each with its own
+                                                              device-selection scan (Section 8.1a)
+9.  -> choose 20 (Run All Tests)             -- full pass
+10. -> choose 1  (Run Main Test)             -- battery test workflow, once everything above
+                                                 passes -- Ctrl+C cancels safely (Section 20)
 ```
+
+(Menu numbers match the current `MENU` list in `test.py` -- verify against `python test.py` if this ever drifts, since menu items are occasionally inserted.)
 
 ---
 
@@ -940,6 +1005,10 @@ measurement-only for now, by design.
 
 **Relay verification failures are safety faults, never warnings.** `BatteryTestSequence.run()` catches `RelayError` alongside `SafetyViolationError`, calls `emergency_stop()`, and re-raises immediately -- it never attempts another relay command on that channel or continues to the next one. `TestExecutor.run()` catches the same exception and marks the whole run `aborted`. No component is permitted to log a warning and continue past a relay verification failure. See [Section 9.4a](#9.4a-mandatory-relay-safety-sequence) for the full sequence.
 
+**Immediate relay-open-on-fault (any exception, not just relay/safety ones).** `BatteryTestSequence.run()` also has a generic `except Exception` clause (after the specific `OperationCancelledError`/`SafetyViolationError`/`RelayError` ones, so none of those are accidentally caught by it) that calls `emergency_stop()` for genuinely unanticipated failures too (e.g. a `DAQError`) -- before this was added, only `SafetyViolationError`/`RelayError` forced the relay open immediately, and anything else left the relay closed until the outer `HardwareManager.disconnect_all()` eventually ran at process teardown. The PMU never had this gap (`ChargeCycle`/`DischargeCycle`'s own `try/finally` already forced it off on any exception); this closed the equivalent gap for the relay. See [docs/architecture.md Section 13.5](docs/architecture.md).
+
+**Cancellation is not a failure.** Pressing Ctrl+C during `Run Main Test` requests a safe, checkpoint-based cancellation (`CancellationToken`/`OperationCancelledError`) rather than an uncontrolled `KeyboardInterrupt` -- it runs the exact same PMU-off/relay-open safety sequence as above, and is reported as `CANCELLED`, never `FAILED`. See [Section 20](#20-safe-cancellation-architecture).
+
 **Usage example:**
 
 ```python
@@ -1206,13 +1275,13 @@ Steps:
 
 ```bash
 # Configuration only (offline, no hardware required)
-python test.py   # choose 15 (Test Configuration) or 2 (Startup Device Validation)
+python test.py   # choose 16 (Test Configuration) or 2 (Startup Device Validation)
 
 # Safety monitor (offline)
-python test.py   # choose 14 (Test Safety Monitor)
+python test.py   # choose 15 (Test Safety Monitor)
 
 # Full test pass
-python test.py   # choose 18 (Run All Tests)
+python test.py   # choose 20 (Run All Tests)
 ```
 
 ### 13.3 Adding a new test section
@@ -1308,7 +1377,7 @@ No changes needed in `BatteryTestSequence`, `ChargeCycle`, or `DischargeCycle` �
 Test the swap with:
 
 ```bash
-python test.py   # choose 17 (Test MiniSQL hooks)
+python test.py   # choose 19 (Test MiniSQL hooks)
 ```
 
 ---
@@ -1323,7 +1392,10 @@ Install pyserial: `pip install pyserial`
 
 **SMU/DAQ/DMM resource not found**  
 Open NI-MAX, expand Devices and Interfaces, note the exact VISA resource string  
-(e.g. `"PXI1Slot4"` or `"Dev1"`), and update `config/settings.py`.
+(e.g. `"PXI1Slot5"`), and update the matching entry in `config/devices.py::PXI_SLOTS` --
+not `config/settings.py`, which does not hold resource strings, and not
+`SMU_ASSIGNMENTS`/`DAQ_CONFIG`/`DMM_CONFIG` directly, since those are derived
+from `PXI_SLOTS` (see [Section 4](#4-supported-hardware)).
 
 **Relay not connecting (serial)**  
 - Verify the COM port: Device Manager -> Ports (COM & LPT)
@@ -1473,6 +1545,43 @@ Full design writeup: `docs/architecture.md` Section 9. Future database/recovery 
 **What is deliberately NOT verified yet:** SMU sourcing (`set_charge_mode`/`output_enable`/`measure`) is still a placeholder (`docs/TODO.md`) -- testing "source a current and measure it back" around a stub that returns a fixed value would be a fake PASS, exactly what this philosophy exists to prevent. Self-test is the strongest verification available for the SMU until real sourcing exists.
 
 Full design writeup, including why Hardware Discovery needed no code changes to inherit this: `docs/architecture.md` Section 10.
+
+---
+
+## 20. Safe Cancellation Architecture
+
+Lets an operator stop a running test safely via Ctrl+C, without an uncontrolled `KeyboardInterrupt` landing on an arbitrary line mid-operation. Only Safe Cancellation is implemented -- a separate, faster "Emergency Abort" (operator types `ABORT`) was designed but deliberately not built; see `docs/architecture.md` Section 13.8.
+
+**Flow:**
+
+```
+Ctrl+C -> SIGINT handler (main.py/test.py) -> token.request_cancel("Ctrl+C")
+       -> next safe checkpoint -> OperationCancelledError raised
+       -> PMU output OFF, verified (ChargeCycle/DischargeCycle's own try/finally)
+       -> Relay OPEN ALL, verified (SafetyMonitor.safe_cancel_shutdown())
+       -> TestExecutor absorbs it: stop_reason = CANCELLED (never FAILED)
+       -> main.py: sys.exit(3) -- distinct from success (0) and failure (1/2)
+```
+
+**Components:** `utils/cancellation.py::CancellationToken` (single-threaded, idempotent `request_cancel()`/`check()`), `utils/errors.py::OperationCancelledError`, `utils/stop_reason.py::StopReason`. No threads, no stdin listeners, no keyboard polling -- Ctrl+C is translated to a cooperative flag by a `signal.signal(SIGINT, ...)` handler, checked at defined checkpoints, never an asynchronous interrupt.
+
+**Checkpoints exist only between atomic hardware operations** -- top of the `ChargeCycle`/`DischargeCycle` sampling loop, before each channel in `BatteryTestSequence`, before each channel in the relay matrix scan/RelayEthernetTest -- never inside a relay activate/verify sequence or a PMU verify sequence, since interrupting mid-sequence would leave hardware state less certain, not safer.
+
+Full design, the complete flow diagram, checkpoint table, and known risks (SMU/DMM timeout gaps, the `HardwareManager.connect_all()` SIGINT-installation-order gap, `test_relay_safety_selftest()`'s missing checkpoint): `docs/architecture.md` Section 13, 16, 17.
+
+## 21. State Model
+
+Every test run (and each channel within one) ends with a `stop_reason` (`utils/stop_reason.py::StopReason`), kept independent from "how much completed" -- a run can be `CANCELLED` after 2 of 8 channels passed.
+
+| State | Meaning |
+|---|---|
+| `COMPLETED` | Ran to natural completion |
+| `FAILED` | An unexpected error (`RelayError`, `HardwareInitError`, or any other unanticipated exception) |
+| `SAFETY_VIOLATION` | `SafetyMonitor` detected a limit breach -- correct, intentional behavior, not a defect |
+| `TIMEOUT` | Defined, **not yet wired end-to-end** -- a charge/discharge cycle hitting its deadline is currently discarded by `BatteryTestSequence.run()` rather than surfaced |
+| `CANCELLED` | Operator requested a graceful stop (Ctrl+C) -- never reported as `FAILED` |
+
+Full model, including the currently-unreachable `"PARTIAL"` summary branch and why `stop_reason` doesn't yet reach the database/report: `docs/architecture.md` Section 16.
 
 ---
 

@@ -188,43 +188,62 @@ BATTERY_CHANNELS = {
 
 **Important:** Verify that `relay_address` matches the physical relay wiring on the BLOSS Hub PCB. Mismatch will connect the wrong battery to the SMU.
 
-### SMU_ASSIGNMENTS
+### PXI_SLOTS -- single source of truth for the PXI chassis
 
-Maps an SMU label to its VISA resource and which channels it serves:
+`config/devices.py::PXI_SLOTS` is the one place every PXI-slot resource string/
+model is hand-authored, confirmed against the real rack (NI-MAX detection).
+`SMU_ASSIGNMENTS`/`DAQ_CONFIG(S)`/`DMM_CONFIG(S)` below are **derived** from it
+by `category` -- edit `PXI_SLOTS`, not those dicts, when hardware changes.
 
 ```python
-SMU_ASSIGNMENTS = {
-    "SMU1": {
-        "resource": "PXI1Slot4",
-        "model":    "NI-4140",
-        "channels": list(range(1, 9)),   # all 8 channels share SMU1 (multiplexed)
-    }
+PXI_SLOTS = {
+    5: {
+        "slot": 5, "resource": "PXI1Slot5", "model": "PXIe-4141",
+        "nickname": "PRIMARY_SMU", "driver_family": "nidcpower",
+        "category": "smu", "role": "...", "enabled": True,
+        "channels": list(range(1, 9)),
+        "validation_notes": "...",
+    },
+    # ... one entry per real slot -- see config/devices.py for the full,
+    # current inventory (SMUs, DAQs, DMM, plus the PXI-resident relay/switch
+    # card and temperature module that are present but not yet wired into a
+    # driver class)
 }
 ```
 
-For multi-SMU configurations (e.g. parallel testing), add `"SMU2"` with its own channel list.
+Every entry has: `slot`, `resource`, `model`, `nickname` (role-based, not just
+the model number), `driver_family`, `category` (`smu`/`daq`/`dmm`/`switch`/
+`temperature` -- used to derive the per-type dicts below), `role`, `enabled`
+(participates in the active pipeline vs. present-but-not-wired-in), and
+`validation_notes` where the real rack differs from what was originally
+planned (see `flowcharts/vi plan.md`).
 
-### DAQ_CONFIG
+Not a PXI slot: `GPIB_INSTRUMENTS` documents the separate NI-488.2/GPIB0
+interface detected in the rack -- no instrument model confirmed at that
+address yet, kept `enabled: False` until one is.
 
-```python
-DAQ_CONFIG = {
-    "resource":       "PXI1Slot2",
-    "model":          "NI-6363",
-    "sample_rate_hz": 1.0,
-    "voltage_range_v": 5.0,   # input range: set to match expected voltages
-}
-```
+### SMU_ASSIGNMENTS (derived from PXI_SLOTS, category="smu")
 
-### DMM_CONFIG
+Every SMU-category slot is listed (so Hardware Discovery / test.py can see
+and individually test each physical SMU); `HardwareManager` still only ever
+connects the FIRST entry (`next(iter(SMU_ASSIGNMENTS.values()))`) as the one
+SMU actively driving the battery test sequence -- today that resolves to
+`PRIMARY_SMU` (`PXI1Slot5`, `PXIe-4141`), since `PXI_SLOTS` lists it before
+the other three. Multi-SMU channel assignment (actually using
+`HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` for real charge/discharge) is a
+future scaling task, not implemented.
 
-```python
-DMM_CONFIG = {
-    "resource": "PXI1Slot3",
-    "model":    "NI-4065",
-    "function": "DC_VOLTS",
-    "range_v":  10.0,
-}
-```
+### DAQ_CONFIG / DAQ_CONFIGS (derived from PXI_SLOTS, category="daq")
+
+`DAQ_CONFIG` (singular) is `DAQ_CONFIGS["MAIN_DAQ"]` -- the one DAQ
+`HardwareManager` actually connects. `EXPANSION_DAQ`/`PRECISION_DAQ` (the
+other two real DAQ cards in the rack) are present and individually testable
+but not wired into the active pipeline.
+
+### DMM_CONFIG / DMM_CONFIGS (derived from PXI_SLOTS, category="dmm")
+
+`DMM_CONFIG` (singular) is `DMM_CONFIGS["MAIN_DMM"]` -- currently the only
+DMM in the rack.
 
 ### RELAY_CONFIG (serial -- diagnostic only, NOT production)
 
@@ -279,15 +298,27 @@ If the relay is later moved to a routed/DHCP network instead of a direct link-lo
 3. Expand your PXI chassis
 4. Right-click each instrument -> **Properties** -> note the **Resource Name** field
 
-Example resource names:
+Confirmed real rack inventory (see `config/devices.py::PXI_SLOTS` for the
+authoritative, current version -- this table is a snapshot, not the source
+of truth):
 
-| Slot | Instrument | Resource string |
-|------|------------|-----------------|
-| 2 | NI 6363 DAQ | `PXI1Slot2` |
-| 3 | NI 4065 DMM | `PXI1Slot3` |
-| 4 | NI 4140 SMU | `PXI1Slot4` |
+| Slot | Instrument | Resource string | Nickname |
+|------|------------|-----------------|----------|
+| 2 | PXIe-6363 | `PXI1Slot2` | `MAIN_DAQ` |
+| 3 | PXI-4065 | `PXI1Slot3` | `MAIN_DMM` |
+| 5 | PXIe-4141 | `PXI1Slot5` | `PRIMARY_SMU` |
+| 6 | PXIe-4139 | `PXI1Slot6` | `HIGH_POWER_SMU` |
+| 7 | PXI-4130 | `PXI1Slot7` | `AUX_SMU_1` |
+| 8 | PXI-4130 | `PXI1Slot8` | `AUX_SMU_2` |
+| 11 | PXIe-2569 | `PXI1Slot11` | `CHASSIS_RELAY_MATRIX` (not the active relay driver -- see below) |
+| 15 | PXIe-4353 + TB-4353/0 | `PXI1Slot15` | `TEMP_MODULE` (not yet wired into any driver) |
+| 17 | PXIe-6368 | `PXI1Slot17` | `EXPANSION_DAQ` |
+| 18 | PXIe-6365 | `PXI1Slot18` | `PRECISION_DAQ` |
+| -- | NI-488.2 | `GPIB0` | unconfirmed instrument -- see `GPIB_INSTRUMENTS` |
 
-Update `config/devices.py` (`SMU_ASSIGNMENTS`/`DAQ_CONFIG`/`DMM_CONFIG` `"resource"` fields) accordingly -- not `config/settings.py`.
+Update `config/devices.py::PXI_SLOTS` accordingly -- not `config/settings.py`,
+and not `SMU_ASSIGNMENTS`/`DAQ_CONFIG`/`DMM_CONFIG` directly (those are
+derived from `PXI_SLOTS`, see above).
 
 ---
 
