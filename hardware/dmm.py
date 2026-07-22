@@ -77,14 +77,14 @@ class DMM(HardwareBase):
         if self._session is None:
             raise DMMError(f"DMM {self.resource} is not connected")
         try:
-            code, message = self._session.self_test()
+            self._session.self_test()
         except Exception as e:
-            raise DMMError(f"DMM {self.resource} self-test failed to run: {e}") from e
-        if code != 0:
+            code = getattr(e, "code", None)
+            message = getattr(e, "message", str(e))
             raise DMMError(
                 f"DMM {self.resource} self-test FAILED: code={code} message={message!r}"
-            )
-        self.log.info("DMM %s self-test PASSED (code=%d, %s)", self.resource, code, message)
+            ) from e
+        self.log.info("DMM %s self-test PASSED", self.resource)
         return self._session.instrument_model
 
     def measure_dc_voltage(self) -> float:
