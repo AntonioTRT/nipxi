@@ -4,6 +4,7 @@ Maps physical hardware to logical battery channels.
 """
 
 import os
+import re
 import sys
 
 # -- ensure the nipxi/ package root is importable ----------------------------
@@ -95,6 +96,10 @@ PXI_SLOTS = {
                           "actually connects and cycles today.",
         "enabled":       True,
         "channels":      list(range(1, 9)),   # all 8 channels multiplexed through this SMU
+        "smu_channel":   "0",   # NI-DCPower channel name -- single-channel card, always "0"
+        "channels_per_card": 1,   # physical NI-DCPower channel count on this card -- drives
+                                  # device_display_name()'s "-Ch<n>" suffix (only shown for
+                                  # multi-channel cards, where which channel matters)
         "validation_notes": "The original VI plan (flowcharts/vi plan.md: '4140 smu') "
                              "anticipated an NI-4140 in this slot/role. Real rack "
                              "hardware is a PXIe-4141 instead -- a functionally "
@@ -121,6 +126,8 @@ PXI_SLOTS = {
                           "channel bank. Not yet assigned to any battery channel.",
         "enabled":       True,
         "channels":      [],
+        "smu_channel":   "0",   # NI-DCPower channel name -- single-channel card, always "0"
+        "channels_per_card": 1,
         "validation_notes": "Confirmed match to the original VI plan "
                              "(flowcharts/vi plan.md: '4139 smu'). Present, "
                              "connectable, and individually testable via test.py, "
@@ -140,6 +147,14 @@ PXI_SLOTS = {
                           "channel.",
         "enabled":       True,
         "channels":      [],
+        # NI-DCPower channel name -- PXI-4130 has two channels ("0", "1"); this
+        # unit's confirmed hardware wiring uses channel "1". Opening the
+        # session scoped to exactly this channel (hardware/smu.py::connect())
+        # avoids the "single channel must be specified" NI-DCPower error that
+        # an ambiguous multi-channel session raises on any repeated-capability
+        # property/method (voltage_level, output_enabled, measure(), etc.).
+        "smu_channel":   "1",
+        "channels_per_card": 2,   # physical NI-DCPower channel count on this card
         "validation_notes": "Confirmed match to one of the two identical "
                              "'4130 smu' entries in the original VI plan "
                              "(flowcharts/vi plan.md). Same scaling note as "
@@ -157,6 +172,11 @@ PXI_SLOTS = {
                           "channel.",
         "enabled":       True,
         "channels":      [],
+        # NI-DCPower channel name -- not yet confirmed on physical hardware for
+        # this unit; defaults to "0". Update to "1" here (same as AUX_SMU_1)
+        # if/when this unit's wiring is confirmed to use channel 1 instead.
+        "smu_channel":   "0",
+        "channels_per_card": 2,   # physical NI-DCPower channel count on this card
         "validation_notes": "Confirmed match to the second identical '4130 smu' "
                              "entry in the original VI plan (flowcharts/vi plan.md). "
                              "Same scaling note as AUX_SMU_1 above.",
@@ -291,10 +311,13 @@ def _slots_by_category(category: str) -> dict:
 # a future scaling task, not implemented by this config refactor.
 SMU_ASSIGNMENTS = {
     cfg["nickname"]: {
-        "type":     "PXIe",
-        "resource": cfg["resource"],
-        "model":    cfg["model"],
-        "channels": cfg.get("channels", []),
+        "type":              "PXIe",
+        "slot":              cfg["slot"],
+        "resource":          cfg["resource"],
+        "model":             cfg["model"],
+        "channels":          cfg.get("channels", []),
+        "smu_channel":       cfg.get("smu_channel", "0"),
+        "channels_per_card": cfg.get("channels_per_card", 1),
     }
     for cfg in _slots_by_category("smu").values()
 }
@@ -305,6 +328,7 @@ SMU_ASSIGNMENTS = {
 DAQ_CONFIGS = {
     cfg["nickname"]: {
         "type":            "PXIe",
+        "slot":            cfg["slot"],
         "resource":        cfg["resource"],
         "model":           cfg["model"],
         "sample_rate_hz":  cfg.get("sample_rate_hz", 1.0),
@@ -318,6 +342,7 @@ DAQ_CONFIG = DAQ_CONFIGS["MAIN_DAQ"]
 DMM_CONFIGS = {
     cfg["nickname"]: {
         "type":     "PXIe",
+        "slot":     cfg["slot"],
         "resource": cfg["resource"],
         "model":    cfg["model"],
         "function": cfg.get("function", "DC_VOLTS"),
@@ -492,3 +517,63 @@ NUMATO_RELAY_MATRIX_CONFIGS = dict(ETHERNET_DEVICES)
 
 # Backward-compat alias -- this dict was previously named RELAY_ETH_CONFIGS.
 RELAY_ETH_CONFIGS = NUMATO_RELAY_MATRIX_CONFIGS
+
+# =============================================================================
+# Operator-facing display names -- config-driven, derived from each device's
+# own cfg dict (model/slot/ip/channel), never a hand-authored string per
+# device. This is purely a presentation label for menus/logs/test output
+# (test.py) -- internal identifiers (PXI_SLOTS/SMU_ASSIGNMENTS/ETHERNET_DEVICES
+# nicknames and dict keys, "resource" strings, etc.) are completely unaffected
+# and remain exactly as used elsewhere in the codebase today.
+#
+# Examples this produces from the current inventory:
+#   PRIMARY_SMU      (PXIe-4141, slot 5)            -> "NI4141-Slot5"
+#   HIGH_POWER_SMU    (PXIe-4139, slot 6)            -> "NI4139-Slot6"
+#   AUX_SMU_1        (PXI-4130, slot 7, channel "1") -> "NI4130-Slot7-Ch1"
+#   AUX_SMU_2        (PXI-4130, slot 8, channel "0") -> "NI4130-Slot8-Ch0"
+#   MAIN_DMM         (PXI-4065, slot 3)              -> "NI4065-Slot3"
+#   TEMP_MODULE      (PXIe-4353, slot 15)            -> "NI4353-Slot15"
+#   CHASSIS_RELAY_MATRIX (PXIe-2569, slot 11)        -> "RelayMatrix-Slot11"
+#   MATRIX_NUMATO_201 (ip 169.254.1.201)             -> "Numato-169.254.1.201"
+# =============================================================================
+
+def _model_number(model: str) -> str:
+    """Strip the "PXIe-"/"PXI-" family prefix, e.g. "PXIe-4141" -> "4141".
+    Falls back to the raw model string if it doesn't match that pattern."""
+    return re.sub(r"^PXIe?-", "", model or "")
+
+
+def device_display_name(cfg: dict) -> str:
+    """
+    Build an operator-facing hardware-identifying display name from a device
+    cfg dict (a PXI_SLOTS entry, or one of SMU_ASSIGNMENTS/DAQ_CONFIGS/
+    DMM_CONFIGS/ETHERNET_DEVICES' derived dicts) -- never a hardcoded string
+    per device. Presentation only: does not affect any internal identifier
+    (dict keys, "resource"/"nickname"/"name" fields) used elsewhere.
+    """
+    ip = cfg.get("ip")
+    if ip:
+        return f"Numato-{ip}"
+
+    slot  = cfg.get("slot")
+    model = cfg.get("model")
+
+    if slot is None or not model:
+        # Not a PXI-slot device with a known model (e.g. GPIB, serial relay) --
+        # fall back to whatever identifier the caller already has.
+        return cfg.get("nickname") or cfg.get("name") or "UNKNOWN_DEVICE"
+
+    base = f"NI{_model_number(model)}-Slot{slot}"
+
+    if cfg.get("category") == "switch":
+        return f"RelayMatrix-Slot{slot}"
+
+    # "channels_per_card" is only ever present on SMU config dicts (PXI_SLOTS
+    # entries and SMU_ASSIGNMENTS, which doesn't carry "category") -- checking
+    # for the key itself (rather than category == "smu") means this works
+    # for both cfg shapes without needing "category" threaded through
+    # SMU_ASSIGNMENTS too.
+    if cfg.get("channels_per_card", 1) > 1:
+        return f"{base}-Ch{cfg.get('smu_channel', '0')}"
+
+    return base

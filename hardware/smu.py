@@ -96,10 +96,18 @@ class SMU(HardwareBase):
         self.resource = resource
         self._model    = cfg.get("model", "NI-SMU")
         self._simulate = bool(cfg.get("simulate", False))
+        # NI-DCPower channel name this instance operates on -- from
+        # config/devices.py's PXI_SLOTS[...]["smu_channel"] (via SMU_ASSIGNMENTS
+        # for HardwareManager, or the raw PXI_SLOTS entry for test.py). Single-
+        # channel cards (4141, 4139) always use "0"; multi-channel cards
+        # (4130) need this set explicitly per instance in config -- never
+        # hardcoded here, since which physical channel is wired varies per
+        # unit/installation.
+        self._channel  = cfg.get("smu_channel", "0")
         self._session  = None
 
     def connect(self):
-        self.log.info("Opening SMU session: %s", self.resource)
+        self.log.info("Opening SMU session: %s (channel %s)", self.resource, self._channel)
         try:
             import nidcpower
         except ImportError as e:
@@ -108,11 +116,23 @@ class SMU(HardwareBase):
             ) from e
         try:
             options = {"simulate": True} if self._simulate else {}
-            self._session = nidcpower.Session(resource_name=self.resource, options=options)
+            # Scoping the session to exactly one channel (from config, not
+            # hardcoded) makes every repeated-capability property/method
+            # below (voltage_level, output_enabled, measure(), etc.)
+            # unambiguous -- this is what makes the same driver code work for
+            # both single-channel (4141, 4139) and multi-channel (4130) cards.
+            # An unscoped session on a multi-channel card raises NI-DCPower
+            # error -1074118522 ("requested function only allows a single
+            # channel to be specified") the moment any such property is set.
+            self._session = nidcpower.Session(
+                resource_name=self.resource, channels=self._channel, options=options
+            )
         except Exception as e:
-            raise SMUError(f"SMU {self.resource} failed to open session: {e}") from e
+            raise SMUError(
+                f"SMU {self.resource} channel {self._channel} failed to open session: {e}"
+            ) from e
         self.connected = True
-        self.log.info("SMU session open: %s", self.resource)
+        self.log.info("SMU session open: %s (channel %s)", self.resource, self._channel)
 
     def disconnect(self):
         if self._session is not None:
@@ -276,7 +296,7 @@ class SMU(HardwareBase):
         the measured value here is reported as informational context only.
         """
         if self._session is None:
-            raise SMUError(f"SMU {self.resource} is not connected")
+            raise SMUError(f"SMU {self.resource} channel {self._channel} is not connected")
 
         import nidcpower
 
@@ -290,7 +310,8 @@ class SMU(HardwareBase):
             self._session.commit()
         except Exception as e:
             raise SMUError(
-                f"SMU {self.resource} failed to configure {voltage_v:+.3f} V: {e}"
+                f"SMU {self.resource} channel {self._channel} failed to configure "
+                f"{voltage_v:+.3f} V: {e}"
             ) from e
 
         in_compliance = None
@@ -301,7 +322,8 @@ class SMU(HardwareBase):
                 measured_v = self._session.measure(nidcpower.MeasurementTypes.VOLTAGE)
         except Exception as e:
             raise SMUError(
-                f"SMU {self.resource} failed while sourcing {voltage_v:+.3f} V: {e}"
+                f"SMU {self.resource} channel {self._channel} failed while sourcing "
+                f"{voltage_v:+.3f} V: {e}"
             ) from e
         finally:
             self.output_disable()

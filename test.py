@@ -165,7 +165,7 @@ def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn
     while True:
         print(f"\n{label}\n")
         for i, name in enumerate(names, 1):
-            print(f"[{i}] {name}")
+            print(f"[{i}] {dev_cfg.device_display_name(devices[name])}  [{name}]")
         print("0. Back")
         try:
             raw = input("\nSelect device: ").strip()
@@ -186,7 +186,7 @@ def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn
         break
 
     while True:
-        print(f"\n{name}\n")
+        print(f"\n{dev_cfg.device_display_name(cfg)}  [{name}]\n")
         print("[1] Identity Validation")
         print("[2] Functional Validation (future)")
         print("[0] Back")
@@ -215,6 +215,7 @@ def _print_device_config(name: str, cfg: dict):
     print(f"\n{'-' * 60}")
     print("  Testing Device")
     print(f"{'-' * 60}\n")
+    print(f"Device : {dev_cfg.device_display_name(cfg)}")
     print(f"Name : {name}")
     for key, value in cfg.items():
         if key == "name":
@@ -415,6 +416,7 @@ def _identify_smu(name: str, cfg: dict):
     """
     resource = cfg.get("resource", "")
     model    = cfg.get("model", "NI-SMU")
+    display  = dev_cfg.device_display_name(cfg)
     ref      = f"config/devices.py -> SMU_ASSIGNMENTS[{name!r}] ({resource} / {model})"
 
     from hardware.smu import SMU
@@ -424,13 +426,13 @@ def _identify_smu(name: str, cfg: dict):
         identity = smu.identify()
         mismatch = _compare_identity(model, identity)
         if mismatch:
-            return _warn("Hardware Discovery", f"SMU/PSU: {name}", ref,
+            return _warn("Hardware Discovery", f"SMU/PSU: {display}", ref,
                         f"Communication established. Identified: {identity}\n{mismatch}")
-        return _ok("Hardware Discovery", f"SMU/PSU: {name}", ref,
+        return _ok("Hardware Discovery", f"SMU/PSU: {display}", ref,
                    f"Communication established. Identified: {identity}")
     except Exception as e:
         desc = getattr(e, "description", str(e))
-        return _fail("Hardware Discovery", f"SMU/PSU: {name}", ref,
+        return _fail("Hardware Discovery", f"SMU/PSU: {display}", ref,
                      f"[ERROR] SMU not detected\nReason: {desc}")
     finally:
         try:
@@ -447,6 +449,7 @@ def _identify_dmm(name: str, cfg: dict):
     """
     resource = cfg.get("resource", "")
     model    = cfg.get("model", "NI-4065")
+    display  = dev_cfg.device_display_name(cfg)
     ref      = f"config/devices.py -> DMM_CONFIGS[{name!r}] ({resource} / {model})"
 
     from hardware.dmm import DMM
@@ -456,13 +459,13 @@ def _identify_dmm(name: str, cfg: dict):
         identity = dmm.identify()
         mismatch = _compare_identity(model, identity)
         if mismatch:
-            return _warn("Hardware Discovery", f"DMM: {name}", ref,
+            return _warn("Hardware Discovery", f"DMM: {display}", ref,
                         f"Communication established. Identified: {identity}\n{mismatch}")
-        return _ok("Hardware Discovery", f"DMM: {name}", ref,
+        return _ok("Hardware Discovery", f"DMM: {display}", ref,
                    f"Communication established. Identified: {identity}")
     except Exception as e:
         desc = getattr(e, "description", str(e))
-        return _fail("Hardware Discovery", f"DMM: {name}", ref,
+        return _fail("Hardware Discovery", f"DMM: {display}", ref,
                      f"[ERROR] DMM not detected\nReason: {desc}")
     finally:
         try:
@@ -480,6 +483,7 @@ def _identify_daq(name: str, cfg: dict):
     """
     resource = cfg.get("resource", "")
     model    = cfg.get("model", "NI-6363")
+    display  = dev_cfg.device_display_name(cfg)
     ref      = f"config/devices.py -> DAQ_CONFIGS[{name!r}] ({resource} / {model})"
 
     from hardware.daq import DAQ
@@ -489,13 +493,13 @@ def _identify_daq(name: str, cfg: dict):
         identity = daq.identify()
         mismatch = _compare_identity(model, identity)
         if mismatch:
-            return _warn("Hardware Discovery", f"DAQ: {name}", ref,
+            return _warn("Hardware Discovery", f"DAQ: {display}", ref,
                         f"Communication established. Identified: {identity}\n{mismatch}")
-        return _ok("Hardware Discovery", f"DAQ: {name}", ref,
+        return _ok("Hardware Discovery", f"DAQ: {display}", ref,
                    f"Communication established. Identified: {identity}  "
                    f"(self-test passed, no channel read performed)")
     except Exception as e:
-        return _fail("Hardware Discovery", f"DAQ: {name}", ref,
+        return _fail("Hardware Discovery", f"DAQ: {display}", ref,
                      f"[ERROR] DAQ not detected or self-test failed\nReason: {e}")
     finally:
         try:
@@ -520,7 +524,8 @@ def _identify_temperature(name: str, cfg: dict):
     """
     resource = cfg.get("resource", "")
     model    = cfg.get("model", "PXIe-4353")
-    ref      = f"config/devices.py -> PXI_SLOTS[{cfg.get('slot')!r}] ({resource} / {model})"
+    display  = dev_cfg.device_display_name(cfg)
+    ref      = f"config/devices.py -> PXI_SLOTS[{name!r}] ({resource} / {model})"
 
     from hardware.daq import DAQ
     daq = DAQ(cfg)
@@ -529,13 +534,13 @@ def _identify_temperature(name: str, cfg: dict):
         identity = daq.identify()
         mismatch = _compare_identity(model, identity)
         if mismatch:
-            return _warn("Hardware Discovery", f"Temperature Module: {name}", ref,
+            return _warn("Hardware Discovery", f"Temperature Module: {display}", ref,
                         f"Communication established. Identified: {identity}\n{mismatch}")
-        return _ok("Hardware Discovery", f"Temperature Module: {name}", ref,
+        return _ok("Hardware Discovery", f"Temperature Module: {display}", ref,
                    f"Communication established. Identified: {identity}  "
                    f"(presence/identity only -- no TC/RTD channel read implemented)")
     except Exception as e:
-        return _fail("Hardware Discovery", f"Temperature Module: {name}", ref,
+        return _fail("Hardware Discovery", f"Temperature Module: {display}", ref,
                      f"[ERROR] Temperature module not detected\nReason: {e}")
     finally:
         try:
@@ -554,22 +559,23 @@ def _identify_relay_eth(name: str, cfg: dict):
     NUMATO_RELAY_MATRIX_CONFIGS -- this function is not specific to any one
     device name.
     """
-    host   = cfg.get("ip", "")
-    port   = cfg.get("port", 23)
-    driver = cfg.get("driver", "RELAY32ETHRL00")
-    ref    = f"config/devices.py -> NUMATO_RELAY_MATRIX_CONFIGS[{name!r}] ({driver} / {host}:{port})"
+    host    = cfg.get("ip", "")
+    port    = cfg.get("port", 23)
+    driver  = cfg.get("driver", "RELAY32ETHRL00")
+    display = dev_cfg.device_display_name(cfg)
+    ref     = f"config/devices.py -> NUMATO_RELAY_MATRIX_CONFIGS[{name!r}] ({driver} / {host}:{port})"
 
     try:
         from hardware.relay_factory import RelayFactory
         relay = RelayFactory.create(cfg)
     except Exception as e:
-        return _fail("Hardware Discovery", f"Numato Relay Matrix: {name}", ref,
+        return _fail("Hardware Discovery", f"Numato Relay Matrix: {display}", ref,
                      f"Import / factory error: {e}")
 
     try:
         relay.connect()
     except Exception as e:
-        return _fail("Hardware Discovery", f"Numato Relay Matrix: {name}", ref,
+        return _fail("Hardware Discovery", f"Numato Relay Matrix: {display}", ref,
                      f"[ERROR] Relay not detected\nReason: {_classify_relay_error(e)}")
 
     try:
@@ -577,7 +583,7 @@ def _identify_relay_eth(name: str, cfg: dict):
     except Exception:
         pass
 
-    return _ok("Hardware Discovery", f"Numato Relay Matrix: {name}", ref,
+    return _ok("Hardware Discovery", f"Numato Relay Matrix: {display}", ref,
                f"Communication established. Identified: {driver} at {host}:{port} "
                f"(TCP + Telnet login + readall verification all succeeded)")
 
@@ -617,12 +623,12 @@ def _identify_switch(name: str, cfg: dict):
     exists in this codebase (see PXI_SLOTS[11]'s validation_notes), so this
     never fakes a real identity query against it.
     """
-    slot = cfg.get("slot")
     resource = cfg.get("resource", "")
     model = cfg.get("model", "")
+    display = dev_cfg.device_display_name(cfg)
     note = cfg.get("validation_notes", "No driver class implemented for this category.")
-    ref = f"config/devices.py -> PXI_SLOTS[{slot!r}] ({resource} / {model})"
-    return _warn("Hardware Discovery", f"Switch/Relay (PXI): {name}", ref,
+    ref = f"config/devices.py -> PXI_SLOTS[{name!r}] ({resource} / {model})"
+    return _warn("Hardware Discovery", f"Switch/Relay (PXI): {display}", ref,
                  f"Not applicable -- no niswitch-based driver exists in this codebase.\n{note}")
 
 
@@ -646,16 +652,20 @@ def _print_group_header(label: str):
 
 def _print_device_line(name: str, cfg: dict):
     """One device's identity block in the grouped discovery report --
-    Slot / Model / Nickname, matching config/devices.py::PXI_SLOTS' own
-    fields exactly (falls back gracefully for non-PXI-slot devices, e.g.
-    Numato/serial relay or GPIB, which have no "slot")."""
+    Slot / Model / display name [nickname], matching config/devices.py::
+    PXI_SLOTS' own fields exactly (falls back gracefully for non-PXI-slot
+    devices, e.g. Numato/serial relay or GPIB, which have no "slot"). The
+    display name (config/devices.py::device_display_name()) is what
+    identifies the physical hardware at a glance during rack bring-up; the
+    nickname in brackets is the internal config/devices.py identifier, kept
+    for traceability back to config."""
     slot = cfg.get("slot")
     if slot is not None:
         print(f"Slot {slot}")
     model = cfg.get("model")
     if model:
         print(model)
-    print(name)
+    print(f"{dev_cfg.device_display_name(cfg)}  [{name}]")
 
 
 # Category -> (display label, identify function). Config-driven: adding or
@@ -825,6 +835,7 @@ def _functional_smu(name: str, cfg: dict):
     """
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-SMU")
+    display    = dev_cfg.device_display_name(cfg)
     config_ref = f"{resource} / {model}"
     results    = []
 
@@ -832,7 +843,7 @@ def _functional_smu(name: str, cfg: dict):
     current_limit_a = Settings.CHARGE_CURRENT_A
     range_v         = Settings.BAT_VOLTAGE_MAX
 
-    print(f"\nSMU Functional Validation -- {name} ({config_ref})")
+    print(f"\nSMU Functional Validation -- {display} ({config_ref})")
     print(f"Validation voltage (Settings.CHARGE_VOLTAGE_V): {validation_v:.3f} V")
     print(f"Current limit (Settings.CHARGE_CURRENT_A): {current_limit_a:.3f} A")
     print("\nConnect handheld DMM to SMU output.")
@@ -840,7 +851,7 @@ def _functional_smu(name: str, cfg: dict):
         input("Press Enter when ready to begin (Ctrl+C to cancel)... ")
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled before sourcing -- output was never enabled.")
-        return [_warn("SMU Functional", name, config_ref,
+        return [_warn("SMU Functional", display, config_ref,
                       "Cancelled by operator before sourcing began")]
 
     from hardware.smu import SMU
@@ -848,13 +859,13 @@ def _functional_smu(name: str, cfg: dict):
     try:
         smu.connect()
     except Exception as e:
-        return [_fail("SMU Functional", name, config_ref,
+        return [_fail("SMU Functional", display, config_ref,
                       f"[ERROR] SMU connect failed: {e}")]
 
     # Start from a safe state -- force output off and verify before sourcing
     # anything, mirroring HardwareManager.connect_all()'s relay open_all().
     if not smu.emergency_output_off("SMU Functional Validation: pre-check safe state"):
-        results.append(_fail("SMU Functional", name, config_ref,
+        results.append(_fail("SMU Functional", display, config_ref,
                              "[ERROR] Could not verify a safe starting state -- "
                              "output disable/verify failed before sourcing began"))
         try:
@@ -877,10 +888,10 @@ def _functional_smu(name: str, cfg: dict):
             try:
                 reading = smu.source_dc_voltage_point(level_v, current_limit_a, range_v)
             except Exception as e:
-                results.append(_fail("SMU Functional", f"{name}: {step_label}", config_ref,
+                results.append(_fail("SMU Functional", f"{display}: {step_label}", config_ref,
                                      f"[ERROR] {e}"))
                 break
-            results.append(_ok("SMU Functional", f"{name}: {step_label}", config_ref,
+            results.append(_ok("SMU Functional", f"{display}: {step_label}", config_ref,
                                f"Commanded {level_v:.3f} V -- SMU-measured "
                                f"{reading['measured_v']:.6f} V (informational; "
                                f"verify against handheld DMM)"))
@@ -894,10 +905,10 @@ def _functional_smu(name: str, cfg: dict):
     finally:
         safe = smu.emergency_output_off("SMU Functional Validation complete/cancelled/failed")
         if safe:
-            results.append(_ok("SMU Functional", name, config_ref,
+            results.append(_ok("SMU Functional", display, config_ref,
                                "Output disabled and verified OFF -- SMU returned to safe state"))
         else:
-            results.append(_fail("SMU Functional", name, config_ref,
+            results.append(_fail("SMU Functional", display, config_ref,
                                  "[ERROR] Output disable could not be verified -- "
                                  "physically check the SMU output"))
         try:
@@ -958,17 +969,18 @@ def _functional_dmm(name: str, cfg: dict):
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-4065")
     range_v    = cfg.get("range_v", 10.0)
+    display    = dev_cfg.device_display_name(cfg)
     config_ref = f"{resource} / {model}"
     results    = []
 
-    print(f"\nDMM Functional Validation -- {name} ({config_ref})")
+    print(f"\nDMM Functional Validation -- {display} ({config_ref})")
     print("\nConnect a known DC source to the DMM input")
     print("(e.g. bench supply, calibrator, or other external reference).")
     try:
         input("Press Enter when ready to measure (Ctrl+C to cancel)... ")
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled before measuring.")
-        return [_warn("DMM Functional", name, config_ref,
+        return [_warn("DMM Functional", display, config_ref,
                       "Cancelled by operator before measurement began")]
 
     from hardware.dmm import DMM
@@ -977,7 +989,7 @@ def _functional_dmm(name: str, cfg: dict):
         dmm.connect()
     except Exception as e:
         desc = getattr(e, "description", str(e))
-        results.append(_fail("DMM Functional", name, config_ref,
+        results.append(_fail("DMM Functional", display, config_ref,
                              f"[ERROR] DMM not detected or connect failed\n"
                              f"Configuration : {name}\n"
                              f"Interface     : VISA / NI-DMM\n"
@@ -988,10 +1000,10 @@ def _functional_dmm(name: str, cfg: dict):
     try:
         value = dmm.measure_dc_voltage()
         print(f"\nMeasured Voltage:\n    {value:.6f} V")
-        results.append(_ok("DMM Functional", f"{name} DC volts measurement", config_ref,
+        results.append(_ok("DMM Functional", f"{display} DC volts measurement", config_ref,
                            f"Measured {value:.6f} V (within configured range +/-{range_v} V)"))
     except Exception as e:
-        results.append(_fail("DMM Functional", f"{name} DC volts measurement", config_ref,
+        results.append(_fail("DMM Functional", f"{display} DC volts measurement", config_ref,
                              f"[ERROR] DMM measurement failed verification\n"
                              f"Configuration : {name}\n"
                              f"Expected range: +/-{range_v} V\n"
@@ -2457,10 +2469,10 @@ def run_main_test():
     relay_name          = relay_cfg.get("name", "RELAY")
 
     print("\nSelected Hardware\n")
-    print(f"SMU:\n  {smu_name}\n  {smu_cfg.get('resource', '')}\n")
-    print(f"DMM:\n  {dmm_name}\n  {dmm_cfg.get('resource', '')}\n")
-    print(f"Relay:\n  {relay_name}\n  {relay_cfg.get('ip', '')}\n")
-    print(f"DAQ:\n  {daq_name}\n  {daq_cfg.get('resource', '')}\n")
+    print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}  [{smu_name}]\n  {smu_cfg.get('resource', '')}\n")
+    print(f"DMM:\n  {dev_cfg.device_display_name(dmm_cfg)}  [{dmm_name}]\n  {dmm_cfg.get('resource', '')}\n")
+    print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  [{relay_name}]\n  {relay_cfg.get('ip', '')}\n")
+    print(f"DAQ:\n  {dev_cfg.device_display_name(daq_cfg)}  [{daq_name}]\n  {daq_cfg.get('resource', '')}\n")
 
     hw = HardwareManager(Settings, relay_cfg=relay_cfg)
 
@@ -2552,6 +2564,52 @@ def run_section(label, fn):
 # Entry point
 # =============================================================================
 
+def _pause_before_main_menu():
+    """
+    Single, centralized "return to Main Menu" checkpoint -- called after
+    EVERY test/validation run (PASS, WARNING, FAIL, exception, or operator
+    cancellation all reach this same line, see _dispatch_menu_choice() below).
+    Never exits the app and never leaves the operator inside a nested menu:
+    once this returns, control is back in main()'s top-level menu loop.
+    """
+    try:
+        input("\nPress Enter to return to the Main Menu... ")
+    except (KeyboardInterrupt, EOFError):
+        print()
+
+
+def _dispatch_menu_choice(label: str, fn, config_results):
+    """
+    Run exactly one Main Menu selection, print its summary the same way it
+    always has (PASS/FAIL/WARNING reporting unchanged), then unconditionally
+    pause at "Press Enter to return to the Main Menu..." before returning --
+    regardless of whether the test PASSED, WARNED, FAILED, raised, or was
+    cancelled by the operator (Ctrl+C). This is the one place that behavior
+    is implemented, so every menu entry (Run Main Test, an individual
+    category test, or Run All Tests) gets it identically with no duplicated
+    per-entry code.
+    """
+    try:
+        if fn is run_main_test:
+            print(f"\n{'-' * 60}")
+            print(f"  {label}")
+            print(f"{'-' * 60}")
+            fn()
+        elif fn is None:
+            all_results = list(config_results)
+            for lbl, f in MENU[1:-1]:
+                all_results.extend(run_section(lbl, f))
+            print_summary(all_results)
+        else:
+            results = run_section(label, fn)
+            print_summary(results)
+    except KeyboardInterrupt:
+        print("\nCancelled by operator (Ctrl+C).")
+    except Exception as e:
+        print(f"\n[ERROR] {label} raised an unexpected exception: {e}")
+    _pause_before_main_menu()
+
+
 def main():
     print()
     print("=" * 60)
@@ -2567,43 +2625,32 @@ def main():
         print("  Fix config/ files before running hardware tests.")
         sys.exit(1)
 
-    print()
-    for i, (label, _) in enumerate(MENU, 1):
-        print(f"  {i:2}. {label}")
-    print("   0. Exit")
-    print()
+    while True:
+        print()
+        for i, (label, _) in enumerate(MENU, 1):
+            print(f"  {i:2}. {label}")
+        print("   0. Exit")
+        print()
 
-    try:
-        raw = input("Choice: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print("\nAborted.")
-        return
+        try:
+            raw = input("Choice: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            return
 
-    if raw == "0":
-        return
+        if raw == "0":
+            return
 
-    try:
-        idx = int(raw) - 1
-        if idx < 0 or idx >= len(MENU):
-            raise ValueError()
-    except ValueError:
-        print("Invalid choice.")
-        return
+        try:
+            idx = int(raw) - 1
+            if idx < 0 or idx >= len(MENU):
+                raise ValueError()
+        except ValueError:
+            print("Invalid choice.")
+            continue
 
-    label, fn = MENU[idx]
-    if fn is run_main_test:
-        print(f"\n{'-' * 60}")
-        print(f"  {label}")
-        print(f"{'-' * 60}")
-        fn()
-    elif fn is None:
-        all_results = list(config_results)
-        for lbl, f in MENU[1:-1]:
-            all_results.extend(run_section(lbl, f))
-        print_summary(all_results)
-    else:
-        results = run_section(label, fn)
-        print_summary(results)
+        label, fn = MENU[idx]
+        _dispatch_menu_choice(label, fn, config_results)
 
 
 if __name__ == "__main__":
