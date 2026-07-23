@@ -61,6 +61,16 @@ class RelayStateVerificationError(RelayError):
     """
 
 
+class SMUStateVerificationError(SMUError):
+    """
+    Raised when the SMU's actual (readback) configuration -- voltage
+    setpoint, current limit, or output-enabled state -- does not match what
+    the driver just commanded. Always fatal -- execution must stop rather
+    than proceed with an unverified/ambiguous SMU configuration. Mirrors
+    RelayStateVerificationError's role for the relay driver.
+    """
+
+
 class DeviceConfigError(ValidationError):
     """
     Raised by utils/device_validator.py when config/devices.py fails

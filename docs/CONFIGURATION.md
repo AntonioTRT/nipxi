@@ -83,6 +83,8 @@ These are safety hard limits. The system raises `SafetyViolationError` if any is
 | Parameter | Default | Type | Description |
 |-----------|---------|------|-------------|
 | `ZERO_CURRENT_THRESHOLD_A` | `0.01` | float (A) | Current considered zero for relay-switch safety |
+| `SMU_VOLTAGE_READBACK_TOLERANCE_V` | `1e-4` | float (V) | Tolerance for `hardware/smu.py::SMU._verify_config_readback()` when comparing NI-DCPower's `voltage_level` attribute readback to the commanded value after `commit()`. This is an **attribute round-trip bound** (floating-point + instrument coercion to its nearest programmable step), NOT a measurement-accuracy figure -- `voltage_level` is a stored IVI setpoint the driver echoes back, not a new ADC measurement. See docs/architecture.md Section 12.6b. |
+| `SMU_CURRENT_READBACK_TOLERANCE_A` | `1e-4` | float (A) | Same as above, for the `current_limit` attribute. |
 
 ### PXI hardware (simulation mode only)
 

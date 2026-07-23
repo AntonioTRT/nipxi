@@ -63,8 +63,9 @@ one source of truth for the resource string (config/devices.py, not
 config/settings.py).
 """
 
+from config.settings import Settings
 from hardware.base import HardwareBase
-from utils.errors import SMUError
+from utils.errors import SMUError, SMUStateVerificationError
 
 
 class SMU(HardwareBase):
@@ -263,6 +264,50 @@ class SMU(HardwareBase):
         return {"voltage_v": 0.0, "current_a": 0.0}
 
     # ------------------------------------------------------------------
+    # Configuration verification -- COMMAND -> READBACK -> VERIFY for
+    # NI-DCPower session attributes (voltage_level, current_limit,
+    # output_enabled), mirroring hardware/relay_eth.py's verify_single()/
+    # verify_all(). Used by source_dc_voltage_point() below.
+    # ------------------------------------------------------------------
+
+    def _verify_config_readback(self, label: str, expected, actual, tolerance: float = None):
+        """
+        Compare an NI-DCPower attribute readback (`actual`, read from the
+        session after commit()) against the value just commanded
+        (`expected`). Raises SMUStateVerificationError on mismatch --
+        always fatal, execution must stop rather than proceed with an
+        unverified/ambiguous SMU configuration (same policy as
+        hardware/relay_eth.py's RelayStateVerificationError).
+
+        `tolerance` is None for exact-match properties (`output_enabled`,
+        a bool). For numeric properties (`voltage_level`, `current_limit`),
+        pass a small attribute-round-trip tolerance (see
+        config/settings.py's SMU_VOLTAGE_READBACK_TOLERANCE_V /
+        SMU_CURRENT_READBACK_TOLERANCE_A) -- these attributes are stored
+        IVI properties echoed back by the driver, NOT a new ADC
+        measurement (session.measure() is the real measurement, used
+        separately in source_dc_voltage_point() below), so the tolerance
+        only needs to bound floating-point round-trip and instrument
+        coercion to its nearest programmable step -- never a measurement-
+        accuracy figure.
+        """
+        mismatch = (actual != expected) if tolerance is None else (abs(actual - expected) > tolerance)
+        if mismatch:
+            self.log.error(
+                "SMU %s channel %s: configuration verification FAILED for %s -- "
+                "expected %r, readback %r",
+                self.resource, self._channel, label, expected, actual,
+            )
+            raise SMUStateVerificationError(
+                f"SMU {self.resource} channel {self._channel}: {label} verification "
+                f"FAILED -- expected {expected!r}, readback {actual!r}. Execution stopped."
+            )
+        self.log.debug(
+            "SMU %s channel %s: %s verified (expected %r, readback %r)",
+            self.resource, self._channel, label, expected, actual,
+        )
+
+    # ------------------------------------------------------------------
     # Functional Validation -- bench-only DC voltage sourcing. Separate
     # from set_charge_mode()/set_discharge_mode()/output_enable() above
     # (which remain placeholders for real battery charge/discharge): this
@@ -280,20 +325,32 @@ class SMU(HardwareBase):
         Source a single static DC voltage point and confirm it electrically.
 
         COMMAND (configure DC_VOLTAGE output at voltage_v, current_limit_a
-        compliance, enable output) -> READBACK (query_in_compliance() +
-        measure the SMU's own voltage reading) -> VERIFY (not in current-
-        limit compliance -- a compliance hit indicates a short or
-        unexpected load, not a successful source point) -> return a dict
-        with the commanded and measured values.
+        compliance, enable output, commit()) -> READBACK + VERIFY the
+        instrument actually accepted that configuration (voltage_level,
+        current_limit, output_enabled all read back from the session and
+        compared to what was just commanded via _verify_config_readback() --
+        raises SMUStateVerificationError on any mismatch, execution stops) ->
+        READBACK (query_in_compliance() + measure the SMU's own voltage
+        reading) -> VERIFY (not in current-limit compliance -- a compliance
+        hit indicates a short or unexpected load, not a successful source
+        point) -> return a dict with the commanded and measured values.
 
         Output is always disabled again before this method returns or
-        raises -- see the `finally` block below -- regardless of whether
-        this point PASSED or FAILED. Never asserts the measured voltage
-        matches voltage_v to some tolerance: there is no project-
-        configured measurement tolerance to compare against, and the
-        operator's handheld DMM is the actual verification instrument for
-        this step (see test.py's SMU Functional Validation workflow) --
-        the measured value here is reported as informational context only.
+        raises -- see the `finally` block below -- and that disable is
+        itself verified (verify_output_disabled()), logged CRITICAL (not
+        raised -- a teardown step must never mask whatever exception is
+        already propagating) if it fails to confirm OFF.
+
+        Never asserts the MEASURED voltage matches voltage_v to some
+        tolerance -- that is a distinct question from configuration
+        verification above (the instrument accepted 4.200 V is not the same
+        claim as "the output physically settled to exactly 4.200 V", and a
+        real battery load makes the two diverge by design during CC-CV
+        charging). There is no project-configured measurement tolerance to
+        compare the physical reading against, and the operator's handheld
+        DMM is the actual verification instrument for this step (see
+        test.py's SMU Functional Validation workflow) -- the measured value
+        here is reported as informational context only.
         """
         if self._session is None:
             raise SMUError(f"SMU {self.resource} channel {self._channel} is not connected")
@@ -317,9 +374,26 @@ class SMU(HardwareBase):
         in_compliance = None
         measured_v = None
         try:
+            # Configuration verification -- READBACK + VERIFY each commanded
+            # attribute before trusting the output is in the state just
+            # requested. See _verify_config_readback()'s docstring for why
+            # the tolerance is an attribute round-trip bound, not a
+            # measurement-accuracy figure.
+            self._verify_config_readback(
+                "voltage_level", voltage_v, self._session.voltage_level,
+                tolerance=Settings.SMU_VOLTAGE_READBACK_TOLERANCE_V,
+            )
+            self._verify_config_readback(
+                "current_limit", current_limit_a, self._session.current_limit,
+                tolerance=Settings.SMU_CURRENT_READBACK_TOLERANCE_A,
+            )
+            self._verify_config_readback("output_enabled", True, self._session.output_enabled)
+
             with self._session.initiate():
                 in_compliance = self._session.query_in_compliance()
                 measured_v = self._session.measure(nidcpower.MeasurementTypes.VOLTAGE)
+        except SMUStateVerificationError:
+            raise
         except Exception as e:
             raise SMUError(
                 f"SMU {self.resource} channel {self._channel} failed while sourcing "
@@ -327,6 +401,13 @@ class SMU(HardwareBase):
             ) from e
         finally:
             self.output_disable()
+            if not self.verify_output_disabled():
+                self.log.critical(
+                    "SMU %s channel %s: output disable could not be verified OFF after "
+                    "source_dc_voltage_point() -- PMU may still be actively sourcing/"
+                    "sinking current. Physically disconnect power if this cannot be "
+                    "resolved immediately.", self.resource, self._channel,
+                )
 
         if in_compliance:
             raise SMUError(

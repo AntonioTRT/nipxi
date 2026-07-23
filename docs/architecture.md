@@ -893,16 +893,82 @@ a plain `try/except (KeyboardInterrupt, EOFError)` around each `input()` call,
 combined with the `finally` block's `emergency_output_off()`, gives the same
 safety guarantee with less machinery.
 
-The measured voltage from the SMU's own readback is reported to the operator
-as **informational context only** -- there is no project-configured
-measurement tolerance to verify it against, so no PASS/FAIL decision is made
-on it. The operator's handheld DMM is the actual verification instrument for
-this step, per the laboratory bring-up workflow (README.md Section 8.1a/8.1b).
+The **measured** voltage from the SMU's own readback (`session.measure(VOLTAGE)`,
+the physical output) is reported to the operator as **informational context
+only** -- there is no project-configured measurement tolerance to verify it
+against, so no PASS/FAIL decision is made on it. The operator's handheld DMM
+is the actual verification instrument for this step, per the laboratory
+bring-up workflow (README.md Section 8.1a/8.1b). This is a distinct question
+from **configuration** verification (Section 12.6b below), which IS a
+PASS/FAIL gate: "did the instrument accept 4.200 V as its setpoint" is
+verified programmatically; "did the physical output settle to exactly
+4.200 V" is not, and never should be equality-checked (a real battery load
+makes the two diverge by design -- see 12.6b).
 
 **Not yet covered:** discharge's current-sink behavior has no Functional
 Validation of its own yet -- this is future work (see `docs/TODO.md`), not part
 of this bench voltage-sourcing check, and no current-sink capability exists in
 `hardware/smu.py` today (`set_discharge_mode()` remains a placeholder).
+
+### 12.6b SMU configuration verification (`_verify_config_readback`)
+
+Added during SMU/PSU hardening after Hardware Bring-Up Milestone 1, applying
+the same COMMAND -> READBACK -> VERIFY -> fail-on-mismatch philosophy already
+proven in `hardware/relay_eth.py` (`verify_single()`/`verify_all()`) to the
+SMU driver. `source_dc_voltage_point()` now reads back `voltage_level`,
+`current_limit`, and `output_enabled` from the NI-DCPower session after
+`commit()` and compares each to what was just commanded
+(`SMU._verify_config_readback()`), raising `SMUStateVerificationError`
+(`utils/errors.py`, mirrors `RelayStateVerificationError`) on any mismatch --
+execution stops rather than proceeding with an unverified configuration. The
+`finally` teardown now also calls `verify_output_disabled()` after
+`output_disable()` (previously command-only at that call site), logging
+CRITICAL rather than raising if it fails to confirm OFF -- consistent with
+`emergency_output_off()`'s existing "never let a safety teardown mask the
+original exception" rule.
+
+**Tolerance rationale (`config/settings.py`
+`SMU_VOLTAGE_READBACK_TOLERANCE_V`/`SMU_CURRENT_READBACK_TOLERANCE_A`, both
+`1e-4`):** `voltage_level`/`current_limit` are NI-DCPower **attribute**
+properties -- reading them back returns the driver's stored IVI setpoint
+(an IEEE-754 double round-tripped through `commit()`), not a new ADC
+measurement. The only legitimate discrepancy sources are floating-point
+round-trip and instrument coercion to its nearest programmable step, both
+far smaller than any electrical accuracy spec -- so the tolerance is
+deliberately tight (an attribute round-trip bound), not a percentage-of-range
+"measurement accuracy" figure. A wider tolerance here would risk silently
+accepting a real failure (wrong channel, stale attribute, a value the
+instrument silently rejected/clamped). `output_enabled` is a bool -- exact
+match, no tolerance. This is separate from, and must never be confused
+with, the physical-measurement tolerance discussed above (12.6), which
+does not exist by design.
+
+**Future contract for real battery charge/discharge sourcing** (once
+`set_charge_mode()`/`set_discharge_mode()`/`output_enable()`/`measure()`
+graduate from placeholders -- see `docs/TODO.md`): they must follow the
+exact same pattern established here --
+
+- `output_enable()`/mode-setting methods must read back and verify their
+  own commanded attributes via `_verify_config_readback()`, exactly like
+  `source_dc_voltage_point()` does today, raising `SMUStateVerificationError`
+  on mismatch.
+- `measure()` must return real `session.measure(VOLTAGE)`/`session.measure(CURRENT)`
+  values (plus `output_enabled`/`query_in_compliance()` state) -- never
+  cached Python values, matching `DMM.measure_dc_voltage()`/
+  `DAQ.read_channel()`'s existing real-readback pattern.
+- **Limit enforcement stays entirely in `test_control/safety_monitor.py::check()`**,
+  fed by these real measured values exactly as `charge_cycle.py`/
+  `discharge_cycle.py` already do today (currently via `DAQ.read_all_batteries()`,
+  itself still a stub) -- `hardware/smu.py` must NOT duplicate any
+  `BAT_VOLTAGE_MAX`/`CHARGE_CURRENT_A`/`DISCHARGE_CURRENT_A` limit logic;
+  its responsibility ends at configure/verify-configure/measure/safe-state.
+- **Never assert measured voltage/current equals the commanded setpoint.**
+  `Configured Voltage = 4.200 V` / `Measured Battery Voltage = 3.700 V` mid-CC-charge
+  is normal and expected, not a fault -- the only thing that must ever be
+  equality/tolerance-checked against a commanded value is the SMU's own
+  **configuration** readback (12.6b above), never the resulting physical
+  battery measurement, which is validated only against limits (battery and
+  SMU), never against the setpoint.
 
 ### 12.6a NI-DCPower channel selection (`smu_channel`)
 

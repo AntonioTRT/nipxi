@@ -75,6 +75,24 @@ class Settings:
     ZERO_CURRENT_THRESHOLD_A = 0.01  # A - "current is zero" threshold for relay safety
 
     # -------------------------------------------------------------------------
+    # SMU configuration-readback verification (hardware/smu.py)
+    #
+    # These bound session.voltage_level/session.current_limit readback
+    # against the commanded value after commit(). NI-DCPower echoes these
+    # as stored IVI attribute properties (an IEEE-754 double round-tripped
+    # through the driver), NOT a new ADC measurement -- there is no analog
+    # conversion in this path. The only legitimate error sources are
+    # floating-point round-trip and instrument coercion to its nearest
+    # programmable step, both far smaller than any electrical accuracy
+    # spec. These are deliberately tight (attribute round-trip tolerance,
+    # NOT a measurement-accuracy/percent-of-range figure) -- a wider value
+    # here would risk masking a real failure (wrong channel, stale
+    # attribute, a command silently rejected).
+    # -------------------------------------------------------------------------
+    SMU_VOLTAGE_READBACK_TOLERANCE_V = 1e-4   # V
+    SMU_CURRENT_READBACK_TOLERANCE_A = 1e-4   # A
+
+    # -------------------------------------------------------------------------
     # PXI rack -- simulation mode only. VISA resource strings (slot numbers)
     # live in config/devices.py (SMU_ASSIGNMENTS / DAQ_CONFIG / DMM_CONFIG)
     # ONLY -- that is their single source of truth. They used to be

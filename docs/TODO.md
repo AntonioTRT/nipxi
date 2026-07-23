@@ -43,7 +43,12 @@ the bottom, with a pointer to where the real documentation lives
   implemented and real -- `SMU.source_dc_voltage_point()` (see
   docs/architecture.md Section 12.6) -- this is a separate, narrow, positive-
   voltage-only capability with no relay/battery/channel involvement, not the
-  battery charge/discharge path above.
+  battery charge/discharge path above. When this work starts, it MUST follow
+  the configuration-verification contract now documented in
+  docs/architecture.md Section 12.6b (readback+verify every commanded
+  attribute via `_verify_config_readback()`, real `measure()` readback feeding
+  `SafetyMonitor.check()`, no limit logic duplicated inside `hardware/smu.py`,
+  and never an equality check between measured and commanded voltage/current).
 - [MUST] `DAQ.read_all_batteries()`/`verify_zero_current()` -- still
   placeholders (multi-channel synchronized acquisition). `DAQ.read_channel()`
   (single-channel read) IS implemented and real now -- moved out of
@@ -152,6 +157,23 @@ Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
 
+- **SMU configuration verification (post-Milestone-1 hardening)** --
+  `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
+  `output_enabled` from the NI-DCPower session after `commit()` and verifies
+  each against what was just commanded (`SMU._verify_config_readback()`),
+  raising the new `SMUStateVerificationError` on mismatch -- the same
+  COMMAND->READBACK->VERIFY->fail-on-mismatch philosophy already proven in
+  `hardware/relay_eth.py`. The `finally` teardown now also verifies output
+  is actually OFF (`verify_output_disabled()`), not command-only. Tolerance
+  (`config/settings.py` `SMU_VOLTAGE_READBACK_TOLERANCE_V`/
+  `SMU_CURRENT_READBACK_TOLERANCE_A`) is an attribute round-trip bound, not
+  a measurement-accuracy figure -- these properties are stored IVI setpoints
+  echoed by the driver, not a new ADC measurement. Documents the contract
+  the future battery charge/discharge implementation must follow (see the
+  `[MUST]` item above and docs/architecture.md Section 12.6b) -- limit
+  enforcement stays entirely in `SafetyMonitor`, never duplicated in
+  `hardware/smu.py`, and measured values are never equality-checked against
+  commanded setpoints.
 - **Hardware Bring-Up Milestone 1 (real PXIe rack validation)** -- Hardware
   Discovery/identification, SMU Functional Validation, DMM Functional
   Validation, and both Numato Ethernet Relay Matrix units all confirmed PASS
