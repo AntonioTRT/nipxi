@@ -330,10 +330,13 @@ class SMU(HardwareBase):
         current_limit, output_enabled all read back from the session and
         compared to what was just commanded via _verify_config_readback() --
         raises SMUStateVerificationError on any mismatch, execution stops) ->
-        READBACK (query_in_compliance() + measure the SMU's own voltage
-        reading) -> VERIFY (not in current-limit compliance -- a compliance
+        READBACK (query_in_compliance() + measure the SMU's own voltage AND
+        current) -> VERIFY (not in current-limit compliance -- a compliance
         hit indicates a short or unexpected load, not a successful source
-        point) -> return a dict with the commanded and measured values.
+        point) -> return a dict with both the configuration readbacks and
+        the runtime measurements (see the return statement below for the
+        exact keys -- test.py's SMU Functional Validation workflow displays
+        all of them, clearly labeled as one or the other).
 
         Output is always disabled again before this method returns or
         raises -- see the `finally` block below -- and that disable is
@@ -341,16 +344,17 @@ class SMU(HardwareBase):
         raised -- a teardown step must never mask whatever exception is
         already propagating) if it fails to confirm OFF.
 
-        Never asserts the MEASURED voltage matches voltage_v to some
-        tolerance -- that is a distinct question from configuration
-        verification above (the instrument accepted 4.200 V is not the same
-        claim as "the output physically settled to exactly 4.200 V", and a
-        real battery load makes the two diverge by design during CC-CV
-        charging). There is no project-configured measurement tolerance to
-        compare the physical reading against, and the operator's handheld
-        DMM is the actual verification instrument for this step (see
-        test.py's SMU Functional Validation workflow) -- the measured value
-        here is reported as informational context only.
+        Never asserts the MEASURED voltage/current matches the commanded
+        setpoint to some tolerance -- that is a distinct question from
+        configuration verification above (the instrument accepted 4.200 V
+        as its setpoint is not the same claim as "the output physically
+        settled to exactly 4.200 V", and a real battery load makes the two
+        diverge by design during CC-CV charging). There is no project-
+        configured measurement tolerance to compare the physical reading
+        against, and the operator's handheld DMM is the actual verification
+        instrument for this step (see test.py's SMU Functional Validation
+        workflow) -- the measured values here are reported as informational
+        context only.
         """
         if self._session is None:
             raise SMUError(f"SMU {self.resource} channel {self._channel} is not connected")
@@ -373,25 +377,43 @@ class SMU(HardwareBase):
 
         in_compliance = None
         measured_v = None
+        measured_i = None
+        readback_v = None
+        readback_current_limit_a = None
+        readback_output_enabled = None
         try:
             # Configuration verification -- READBACK + VERIFY each commanded
             # attribute before trusting the output is in the state just
             # requested. See _verify_config_readback()'s docstring for why
             # the tolerance is an attribute round-trip bound, not a
-            # measurement-accuracy figure.
+            # measurement-accuracy figure. Values are captured once here and
+            # reused for both verification and the returned dict below, so
+            # the operator-facing display (test.py) sees exactly what was
+            # verified -- never a second, separate read.
+            readback_v = self._session.voltage_level
+            readback_current_limit_a = self._session.current_limit
+            readback_output_enabled = self._session.output_enabled
+
             self._verify_config_readback(
-                "voltage_level", voltage_v, self._session.voltage_level,
+                "voltage_level", voltage_v, readback_v,
                 tolerance=Settings.SMU_VOLTAGE_READBACK_TOLERANCE_V,
             )
             self._verify_config_readback(
-                "current_limit", current_limit_a, self._session.current_limit,
+                "current_limit", current_limit_a, readback_current_limit_a,
                 tolerance=Settings.SMU_CURRENT_READBACK_TOLERANCE_A,
             )
-            self._verify_config_readback("output_enabled", True, self._session.output_enabled)
+            self._verify_config_readback("output_enabled", True, readback_output_enabled)
 
+            # Runtime measurements -- real ADC readback of the physical output,
+            # taken once output is initiated. Distinct from the configuration
+            # readback above: these observe the actual analog signal (subject
+            # to load, compliance, and settling behavior), not a stored
+            # setpoint attribute -- see the module/method docstrings for why
+            # they are never asserted equal to the commanded values.
             with self._session.initiate():
                 in_compliance = self._session.query_in_compliance()
                 measured_v = self._session.measure(nidcpower.MeasurementTypes.VOLTAGE)
+                measured_i = self._session.measure(nidcpower.MeasurementTypes.CURRENT)
         except SMUStateVerificationError:
             raise
         except Exception as e:
@@ -417,7 +439,20 @@ class SMU(HardwareBase):
             )
 
         self.log.info(
-            "SMU %s sourced %.3f V (measured %.6f V, current limit %.3f A, not in compliance)",
-            self.resource, voltage_v, measured_v, current_limit_a,
+            "SMU %s sourced %.3f V (measured %.6f V / %.6f A, current limit %.3f A, "
+            "not in compliance)",
+            self.resource, voltage_v, measured_v, measured_i, current_limit_a,
         )
-        return {"commanded_v": voltage_v, "measured_v": measured_v}
+        return {
+            # Configuration readbacks (NI-DCPower attribute echo -- see
+            # _verify_config_readback()'s docstring).
+            "commanded_v":               voltage_v,
+            "readback_v":                readback_v,
+            "commanded_current_limit_a": current_limit_a,
+            "readback_current_limit_a":  readback_current_limit_a,
+            "output_enabled_readback":   readback_output_enabled,
+            # Runtime measurements (real ADC readback of the physical output).
+            "in_compliance": in_compliance,
+            "measured_v":    measured_v,
+            "measured_i":    measured_i,
+        }

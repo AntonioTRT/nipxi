@@ -891,9 +891,31 @@ def _functional_smu(name: str, cfg: dict):
                 results.append(_fail("SMU Functional", f"{display}: {step_label}", config_ref,
                                      f"[ERROR] {e}"))
                 break
+
+            # Configuration readbacks -- NI-DCPower attribute echo (the
+            # instrument's stored setpoint, verified internally by
+            # hardware/smu.py::SMU._verify_config_readback() before this
+            # point was ever reached; these are NOT ADC measurements).
+            print("\nConfiguration Readback (verified against commanded values):")
+            print(f"    Commanded Voltage:        {reading['commanded_v']:.3f} V")
+            print(f"    Readback Voltage Setting: {reading['readback_v']:.6f} V")
+            print(f"    Commanded Current Limit:  {reading['commanded_current_limit_a']:.3f} A")
+            print(f"    Readback Current Limit:   {reading['readback_current_limit_a']:.6f} A")
+            print(f"    Output State Readback:    {'ON' if reading['output_enabled_readback'] else 'OFF'}")
+
+            # Runtime measurements -- real ADC readback of the physical
+            # output (session.measure()), NOT compared/asserted against the
+            # commanded setpoint -- see hardware/smu.py's module docstring
+            # for why (a real load makes measured != commanded by design).
+            print("Runtime Measurement (informational; verify against handheld DMM):")
+            print(f"    Compliance State:  {'IN COMPLIANCE' if reading['in_compliance'] else 'not in compliance'}")
+            print(f"    Measured Voltage:  {reading['measured_v']:.6f} V")
+            print(f"    Measured Current:  {reading['measured_i']:.6f} A")
+
             results.append(_ok("SMU Functional", f"{display}: {step_label}", config_ref,
-                               f"Commanded {level_v:.3f} V -- SMU-measured "
-                               f"{reading['measured_v']:.6f} V (informational; "
+                               f"Commanded {level_v:.3f} V (readback {reading['readback_v']:.6f} V) -- "
+                               f"SMU-measured {reading['measured_v']:.6f} V / "
+                               f"{reading['measured_i']:.6f} A (informational; "
                                f"verify against handheld DMM)"))
             try:
                 input("Verify reading on handheld DMM, then press Enter to continue "
