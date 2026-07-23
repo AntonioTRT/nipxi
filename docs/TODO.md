@@ -149,7 +149,39 @@ the bottom, with a pointer to where the real documentation lives
 ## Completed (Summary)
 
 Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
-here -- this is an index, not a changelog.
+here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
+first real-rack hardware bring-up milestone record.
+
+- **Hardware Bring-Up Milestone 1 (real PXIe rack validation)** -- Hardware
+  Discovery/identification, SMU Functional Validation, DMM Functional
+  Validation, and both Numato Ethernet Relay Matrix units all confirmed PASS
+  against real physical hardware (not simulation). See `docs/MILESTONES.md`.
+- **`smu_channel` / `channels_per_card` (config-driven NI-DCPower channel
+  selection)** -- root-caused a real rack bring-up failure on the PXI-4130
+  (`AUX_SMU_1`/`AUX_SMU_2`, 2-channel cards): an unscoped `nidcpower.Session`
+  raised error `-1074118522` ("single channel must be specified") the moment
+  any repeated-capability property was set. Fixed by adding `smu_channel`
+  (NI-DCPower channel name) and `channels_per_card` (physical channel count)
+  to every `PXI_SLOTS` SMU entry; `hardware/smu.py::SMU.connect()` now opens
+  its session scoped to exactly the configured channel -- no hardcoded
+  channel anywhere in the driver, same code path for single- and
+  multi-channel cards. Confirmed on physical hardware: both `AUX_SMU_1` and
+  `AUX_SMU_2` are wired to channel `"1"`.
+- **Numato Ethernet relay naming/network finalization** -- both Numato units
+  renamed to `MATRIX_NUMATO_201`/`MATRIX_NUMATO_202` (named after their
+  static IP's last octet), static IPs assigned (`169.254.1.201`/`.202`, DHCP
+  disabled), replacing the old factory-default `169.254.1.1` and the interim
+  `MAIN_MATRIX_ETH`/`AUX_MATRIX_ETH_1` role-based names (kept as backward-
+  compat aliases). See `docs/CONFIGURATION.md`.
+- **Operator-facing device display names** -- `config/devices.py::
+  device_display_name()` derives a hardware-identifying label (e.g.
+  `NI4130-Slot7-Ch1`, `Numato-169.254.1.201`) from each device's own
+  model/slot/ip/channel config, shown throughout `test.py`'s menus and test
+  output alongside (not replacing) the internal nickname.
+- **`test.py` "return to Main Menu" workflow** -- every menu selection (PASS,
+  WARNING, FAIL, exception, or operator cancellation) now consistently
+  returns to the top-level Main Menu via one centralized dispatch function,
+  instead of exiting the app or leaving the operator in a nested menu.
 
 - **PXI rack inventory & `PXI_SLOTS`** -- real rack confirmed via NI-MAX
   (10 PXI-slot devices + GPIB0), single source of truth in

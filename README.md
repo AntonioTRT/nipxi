@@ -45,10 +45,17 @@ NIPXI automates capacity and calendar-aging tests on up to 8 Li-ion battery chan
 - Logs all measurements to SQLite and per-channel CSV files
 - Generates reports for the BLOAST ML pipeline
 
-**Current status:**  
+**Current status: Hardware Bring-Up Milestone 1 achieved** -- first real PXIe rack validation complete.  
 Configuration, data layer, safety monitor, relay drivers, and test framework are implemented.  
-Hardware driver methods (SMU nidcpower calls, DAQ nidaqmx calls) are stubs pending lab commissioning.  
-See [docs/TODO.md](docs/TODO.md) for the complete checklist.
+Real hardware communication is verified on the physical rack: Hardware Discovery/identification, SMU Functional
+Validation (bench DC voltage sourcing + readback), DMM Functional Validation (real voltage measurement), and
+both Numato Ethernet Relay Matrix units (`MATRIX_NUMATO_201`/`MATRIX_NUMATO_202`) all PASS against real hardware,
+not simulation.  
+Remaining stubs are scoped to the *battery* charge/discharge sourcing path only (`SMU.set_charge_mode()`/
+`output_enable()`/`measure()`, `DAQ.read_all_batteries()`) -- deliberately deferred, since sourcing current into
+a real battery channel has real electrical consequences beyond a connectivity/bench check.  
+See [docs/MILESTONES.md](docs/MILESTONES.md) for the full milestone record and [docs/TODO.md](docs/TODO.md) for
+the complete remaining-work checklist.
 
 ---
 
@@ -204,8 +211,8 @@ Confirmed against the real PXI rack (NI-MAX detection) — `config/devices.py::P
 | DMM | PXI-4065 | 3 | `MAIN_DMM` | NI-DMM | `nidmm` | `hardware/dmm.py::DMM` (connect/identify real) |
 | SMU / PSU (primary) | PXIe-4141 | 5 | `PRIMARY_SMU` | NI-DCPower | `nidcpower` | `hardware/smu.py::SMU` (connect/identify/PMU safety real; charge/discharge/measure still TODO) — the one SMU `HardwareManager` actually drives |
 | SMU (high power, present, not yet wired to a channel) | PXIe-4139 | 6 | `HIGH_POWER_SMU` | NI-DCPower | `nidcpower` | same `SMU` class, second `SMU_ASSIGNMENTS` entry |
-| SMU (auxiliary, present, not yet wired to a channel) | PXI-4130 | 7 | `AUX_SMU_1` | NI-DCPower | `nidcpower` | same `SMU` class |
-| SMU (auxiliary, present, not yet wired to a channel) | PXI-4130 | 8 | `AUX_SMU_2` | NI-DCPower | `nidcpower` | same `SMU` class |
+| SMU (auxiliary, present, not yet wired to a battery channel) | PXI-4130 | 7 | `AUX_SMU_1` | NI-DCPower | `nidcpower` | same `SMU` class -- NI-DCPower channel `"1"` (confirmed on physical hardware, see `smu_channel` below) |
+| SMU (auxiliary, present, not yet wired to a battery channel) | PXI-4130 | 8 | `AUX_SMU_2` | NI-DCPower | `nidcpower` | same `SMU` class -- NI-DCPower channel `"1"` (confirmed on physical hardware, see `smu_channel` below) |
 | Relay/switch (present, NOT the active relay driver) | PXIe-2569 | 11 | `CHASSIS_RELAY_MATRIX` | NI-SWITCH | `niswitch` | none yet — see Numato Ethernet relay below for the actual production path |
 | Temperature module (present, not yet wired into any driver) | PXIe-4353 + TB-4353/0 | 15 | `TEMP_MODULE` | NI-DAQmx | `nidaqmx` | none yet — likely real source for the currently-stubbed per-channel `t_c` reading in `charge_cycle.py`/`discharge_cycle.py` |
 | DAQ (expansion, present, not wired into `HardwareManager`) | PXIe-6368 | 17 | `EXPANSION_DAQ` | NI-DAQmx | `nidaqmx` | same `DAQ` class, second `DAQ_CONFIGS` entry |
@@ -405,6 +412,8 @@ DMM_CONFIG      = DMM_CONFIGS["MAIN_DMM"]
 ```
 
 `hardware/smu.py::SMU`, `hardware/daq.py::DAQ`, and `hardware/dmm.py::DMM` are each constructed directly from one of the derived dicts' entries (`SMU(cfg)`/`DAQ(cfg)`/`DMM(cfg)`) -- there is exactly one driver class per type, so (unlike relay) no factory/type-dispatch is needed; construction from the config dict already IS the "factory step" for these types. `HardwareManager` still only ever connects ONE SMU (`next(iter(SMU_ASSIGNMENTS.values()))`, currently `PRIMARY_SMU`) and ONE DAQ (`DAQ_CONFIG`) for the active battery test sequence -- the other real SMUs/DAQs in the rack are present and individually testable via `test.py`, but multi-device channel assignment is a future scaling task.
+
+**`smu_channel` -- config-driven NI-DCPower channel selection:** every `PXI_SLOTS` SMU entry also carries `"smu_channel"` (the NI-DCPower channel *name* string opened for that instance, e.g. `"0"`/`"1"`) and `"channels_per_card"` (the card's physical NI-DCPower channel count -- `1` for the single-channel `PRIMARY_SMU`/`HIGH_POWER_SMU`, `2` for the two-channel `AUX_SMU_1`/`AUX_SMU_2` PXI-4130 units). `hardware/smu.py::SMU.connect()` opens its `nidcpower.Session` scoped to exactly that one channel (`channels=self._channel`, read from config, never hardcoded) -- this is what lets the same driver code work for both single- and multi-channel cards, and is what fixed a real rack bring-up failure: an unscoped session on a multi-channel PXI-4130 raises NI-DCPower error `-1074118522` ("the requested function only allows a single channel to be specified") the moment any repeated-capability property (`voltage_level`, `output_enabled`, `measure()`, etc.) is set. Confirmed on physical hardware: `AUX_SMU_1` and `AUX_SMU_2` are both wired to NI-DCPower channel `"1"`.
 
 **Serial relay configuration (diagnostic only):**
 

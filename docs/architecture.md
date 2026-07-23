@@ -904,6 +904,36 @@ Validation of its own yet -- this is future work (see `docs/TODO.md`), not part
 of this bench voltage-sourcing check, and no current-sink capability exists in
 `hardware/smu.py` today (`set_discharge_mode()` remains a placeholder).
 
+### 12.6a NI-DCPower channel selection (`smu_channel`)
+
+Root-caused during the first real PXIe rack bring-up (Hardware Bring-Up
+Milestone 1, `docs/MILESTONES.md`): `AUX_SMU_1`/`AUX_SMU_2` (PXI-4130, a
+2-channel card) failed SMU Functional Validation with NI-DCPower error
+`-1074118522` ("the requested function only allows a single channel to be
+specified"), while Identity Validation on the same device passed. The cause
+was `SMU.connect()` opening `nidcpower.Session(resource_name=self.resource)`
+with no channel specified -- for a 2-channel card this implicitly opens
+**both** channels as one ambiguous session. `identify()` never surfaced the
+problem because `self_test()`/`instrument_model` are session-level (not
+channel-repeated-capability) calls; the error only appears the moment a
+channel-scoped property (`voltage_level`, `output_enabled`, `measure()`,
+etc.) is set in `source_dc_voltage_point()`. `PRIMARY_SMU`/`HIGH_POWER_SMU`
+(4141/4139, single-channel cards) never hit this, since a bare resource
+string resolves to exactly one channel on those cards.
+
+Fix: every `PXI_SLOTS` SMU entry carries two new config-driven fields --
+`smu_channel` (the NI-DCPower channel name string this instance operates on,
+e.g. `"0"`/`"1"`) and `channels_per_card` (the card's physical NI-DCPower
+channel count -- `1` for 4141/4139, `2` for the 4130 units). `SMU.connect()`
+now opens `nidcpower.Session(resource_name=self.resource, channels=self._channel,
+options=options)`, scoping the session to exactly one channel every time --
+never hardcoded in the driver, always read from config. This is what makes
+the identical driver code work for both single- and multi-channel cards.
+Confirmed on physical hardware: both `AUX_SMU_1` and `AUX_SMU_2` are wired to
+channel `"1"`. `config/devices.py::device_display_name()` also surfaces this
+in the operator-facing label (e.g. `NI4130-Slot7-Ch1`) precisely because
+which channel is active is safety/bring-up relevant, not just cosmetic.
+
 ## 13. Safe Cancellation Architecture
 
 Lets an operator stop a running test safely, via Ctrl+C, without relying on an

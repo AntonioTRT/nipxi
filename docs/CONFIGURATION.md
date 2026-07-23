@@ -245,6 +245,27 @@ the other three. Multi-SMU channel assignment (actually using
 `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` for real charge/discharge) is a
 future scaling task, not implemented.
 
+**`smu_channel` / `channels_per_card`:** every SMU entry also carries the
+NI-DCPower channel this instance opens (`smu_channel`, a channel name string
+e.g. `"0"`/`"1"`) and the card's physical NI-DCPower channel count
+(`channels_per_card` -- `1` for the single-channel `PRIMARY_SMU`/
+`HIGH_POWER_SMU`, `2` for the two-channel `AUX_SMU_1`/`AUX_SMU_2` PXI-4130
+units). `hardware/smu.py::SMU.connect()` opens its `nidcpower.Session` scoped
+to exactly this one channel -- config-driven, never hardcoded in the driver.
+This is required for multi-channel cards: an unscoped session on a 2-channel
+PXI-4130 raises NI-DCPower error `-1074118522` ("single channel must be
+specified") on any repeated-capability property/method, which is exactly
+what a real rack bring-up found and this field fixes (see
+`docs/architecture.md` Section 12.6a). Confirmed on physical hardware:
+`AUX_SMU_1` and `AUX_SMU_2` are both wired to channel `"1"`.
+
+| Nickname | Slot | Model | `smu_channel` | `channels_per_card` |
+|---|---|---|---|---|
+| `PRIMARY_SMU` | 5 | PXIe-4141 | `"0"` | 1 |
+| `HIGH_POWER_SMU` | 6 | PXIe-4139 | `"0"` | 1 |
+| `AUX_SMU_1` | 7 | PXI-4130 | `"1"` (confirmed) | 2 |
+| `AUX_SMU_2` | 8 | PXI-4130 | `"1"` (confirmed) | 2 |
+
 ### DAQ_CONFIG / DAQ_CONFIGS (derived from PXI_SLOTS, category="daq")
 
 `DAQ_CONFIG` (singular) is `DAQ_CONFIGS["MAIN_DAQ"]` -- the one DAQ
