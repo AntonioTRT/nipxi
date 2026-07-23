@@ -172,10 +172,9 @@ PXI_SLOTS = {
                           "channel.",
         "enabled":       True,
         "channels":      [],
-        # NI-DCPower channel name -- not yet confirmed on physical hardware for
-        # this unit; defaults to "0". Update to "1" here (same as AUX_SMU_1)
-        # if/when this unit's wiring is confirmed to use channel 1 instead.
-        "smu_channel":   "0",
+        # NI-DCPower channel name -- confirmed on physical hardware during
+        # rack validation: this unit is wired to channel 1, same as AUX_SMU_1.
+        "smu_channel":   "1",
         "channels_per_card": 2,   # physical NI-DCPower channel count on this card
         "validation_notes": "Confirmed match to the second identical '4130 smu' "
                              "entry in the original VI plan (flowcharts/vi plan.md). "
@@ -530,7 +529,7 @@ RELAY_ETH_CONFIGS = NUMATO_RELAY_MATRIX_CONFIGS
 #   PRIMARY_SMU      (PXIe-4141, slot 5)            -> "NI4141-Slot5"
 #   HIGH_POWER_SMU    (PXIe-4139, slot 6)            -> "NI4139-Slot6"
 #   AUX_SMU_1        (PXI-4130, slot 7, channel "1") -> "NI4130-Slot7-Ch1"
-#   AUX_SMU_2        (PXI-4130, slot 8, channel "0") -> "NI4130-Slot8-Ch0"
+#   AUX_SMU_2        (PXI-4130, slot 8, channel "1") -> "NI4130-Slot8-Ch1"
 #   MAIN_DMM         (PXI-4065, slot 3)              -> "NI4065-Slot3"
 #   TEMP_MODULE      (PXIe-4353, slot 15)            -> "NI4353-Slot15"
 #   CHASSIS_RELAY_MATRIX (PXIe-2569, slot 11)        -> "RelayMatrix-Slot11"
