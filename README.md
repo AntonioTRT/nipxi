@@ -155,7 +155,8 @@ nipxi/
 |   |-- smu.py                  SMU (PSU) driver: real connect()/identify(); charge/discharge/
 |   |                           measure still placeholders (see docs/TODO.md).
 |   |-- daq.py                  DAQ driver: real connect()/identify() (device enumeration +
-|   |                           self-test); channel read still a placeholder.
+|   |                           self-test) and real read_channel(); multi-channel
+|   |                           read_all_batteries()/verify_zero_current() still placeholders.
 |   |-- dmm.py                  DMM driver: real connect()/identify().
 |   |-- pxi_rack.py             PXI chassis enumeration stub.
 |   +-- temperature.py          NTC thermistor voltage-to-Celsius conversion.
@@ -199,7 +200,7 @@ Confirmed against the real PXI rack (NI-MAX detection) — `config/devices.py::P
 
 | Role | Model | Slot | Nickname | Interface | Library | Driver |
 |------|-------|------|----------|-----------|---------|--------|
-| DAQ (primary) | PXIe-6363 | 2 | `MAIN_DAQ` | NI-DAQmx | `nidaqmx` | `hardware/daq.py::DAQ` (connect/identify real; channel read still TODO) |
+| DAQ (primary) | PXIe-6363 | 2 | `MAIN_DAQ` | NI-DAQmx | `nidaqmx` | `hardware/daq.py::DAQ` (connect/identify/read_channel real; multi-channel read_all_batteries still TODO) |
 | DMM | PXI-4065 | 3 | `MAIN_DMM` | NI-DMM | `nidmm` | `hardware/dmm.py::DMM` (connect/identify real) |
 | SMU / PSU (primary) | PXIe-4141 | 5 | `PRIMARY_SMU` | NI-DCPower | `nidcpower` | `hardware/smu.py::SMU` (connect/identify/PMU safety real; charge/discharge/measure still TODO) — the one SMU `HardwareManager` actually drives |
 | SMU (high power, present, not yet wired to a channel) | PXIe-4139 | 6 | `HIGH_POWER_SMU` | NI-DCPower | `nidcpower` | same `SMU` class, second `SMU_ASSIGNMENTS` entry |
@@ -210,18 +211,18 @@ Confirmed against the real PXI rack (NI-MAX detection) — `config/devices.py::P
 | DAQ (expansion, present, not wired into `HardwareManager`) | PXIe-6368 | 17 | `EXPANSION_DAQ` | NI-DAQmx | `nidaqmx` | same `DAQ` class, second `DAQ_CONFIGS` entry |
 | DAQ (precision, present, not wired into `HardwareManager`) | PXIe-6365 | 18 | `PRECISION_DAQ` | NI-DAQmx | `nidaqmx` | same `DAQ` class, third `DAQ_CONFIGS` entry |
 | GPIB instrument (unconfirmed) | — | GPIB0 (NI-488.2) | `UNCONFIRMED_GPIB_INSTRUMENT` | GPIB | — | none — likely candidate for the electronic load/power supply in `equipment_Requirement.md`, model not yet confirmed |
-| Relay (Ethernet) | **Numato Lab 32-Channel Ethernet Relay Module (RELAY32ETHRL00) — PRODUCTION** | — (Ethernet, not a PXI slot) | `MAIN_MATRIX_ETH` | TCP/Telnet | stdlib `socket` | `hardware/relay_eth.py::NumatoRelayMatrix` |
+| Relay (Ethernet) | **Numato Lab 32-Channel Ethernet Relay Module (RELAY32ETHRL00) — PRODUCTION** | — (Ethernet, not a PXI slot) | `MATRIX_NUMATO_201`, `MATRIX_NUMATO_202` | TCP/Telnet | stdlib `socket` | `hardware/relay_eth.py::NumatoRelayMatrix` |
 | Relay (serial, COM13) | Diagnostic only — NOT the production control path | — | `MAIN_MATRIX` | pyserial | `pyserial` | `hardware/relay_serial.py::SerialRelay` |
 | Battery Hub PCB | BLOSS Hub Rev A | — | — | — | — | — |
 
 **Production relay hardware (validated):** Numato Lab 32 Channel Ethernet Relay Module, reachable over Ethernet/Telnet — ping, web interface, Telnet login, relay commands, and relay state readback have all been confirmed working. Validated settings:
 
-| Setting | Value |
-|---------|-------|
-| IP address | `169.254.1.1` |
-| Port | `23` |
-| Username | `admin` |
-| Password | `admin` |
+| Setting | MATRIX_NUMATO_201 | MATRIX_NUMATO_202 |
+|---------|-------------------|--------------------|
+| IP address | `169.254.1.201` (static, DHCP off) | `169.254.1.202` (static, DHCP off) |
+| Port | `23` | `23` |
+| Username | `admin` | `admin` |
+| Password | `admin` | `admin` |
 
 Production architecture path: `main.py -> HardwareManager -> RelayFactory -> NumatoRelayMatrix -> Numato Relay`.
 
@@ -422,20 +423,36 @@ RELAY_CONFIG = {
 }
 ```
 
-**Ethernet relay configuration (Numato Lab 32-Channel Ethernet Relay Module -- PRODUCTION):**
+**Ethernet relay configuration (Numato Lab 32-Channel Ethernet Relay Module -- PRODUCTION):** two units, static IPs, DHCP disabled on both (finalized NIPXI network plan). Devices are named after their static IP's last octet (`MATRIX_NUMATO_<octet>`) for easier hardware ID/troubleshooting/rack labeling. `NUMATO_RELAY_MATRIX_CONFIG`, `MAIN_MATRIX_ETH`, and `AUX_MATRIX_ETH_1` are kept as backward-compat aliases (`MAIN_MATRIX_ETH`/`NUMATO_RELAY_MATRIX_CONFIG` -> `MATRIX_NUMATO_201`, `AUX_MATRIX_ETH_1` -> `MATRIX_NUMATO_202`) for any legacy code that still imports the old names.
 
 ```python
-NUMATO_RELAY_MATRIX_CONFIG = {
-    "type":          "ethernet",
-    "driver":        "RELAY32ETHRL00",
-    "name":          "MAIN_MATRIX_ETH",
-    "ip":            "169.254.1.1",   # validated -- update if your relay's IP differs
-    "port":          23,              # default Numato Telnet port
-    "username":      "admin",
-    "password":      "admin",
-    "timeout":       5.0,
-    "num_channels":  Settings.RELAY_COUNT,   # single source of truth -- never hardcode 32
-    "channel_count": Settings.RELAY_COUNT,
+ETHERNET_DEVICES = {
+    # Numato Relay Matrix at 169.254.1.201
+    "MATRIX_NUMATO_201": {
+        "type":          "ethernet",
+        "driver":        "RELAY32ETHRL00",
+        "name":          "MATRIX_NUMATO_201",
+        "ip":            "169.254.1.201",
+        "port":          23,              # default Numato Telnet port
+        "username":      "admin",
+        "password":      "admin",
+        "timeout":       5.0,
+        "num_channels":  Settings.RELAY_COUNT,   # single source of truth -- never hardcode 32
+        "channel_count": Settings.RELAY_COUNT,
+    },
+    # Numato Relay Matrix at 169.254.1.202
+    "MATRIX_NUMATO_202": {
+        "type":          "ethernet",
+        "driver":        "RELAY32ETHRL00",
+        "name":          "MATRIX_NUMATO_202",
+        "ip":            "169.254.1.202",
+        "port":          23,
+        "username":      "admin",
+        "password":      "admin",
+        "timeout":       5.0,
+        "num_channels":  Settings.RELAY_COUNT,
+        "channel_count": Settings.RELAY_COUNT,
+    },
 }
 ```
 
@@ -603,17 +620,32 @@ Selecting a device only ever touches that one device -- selecting `PRIMARY_SMU` 
 
 **Identity Validation** (`_identify_smu()`/`_identify_dmm()`/`_identify_daq()`/`_identify_temperature()`/`_identify_relay_eth()`/`_identify_switch()` -- the SAME functions Hardware Discovery uses, so this menu path can never drift from what Hardware Discovery reports) opens a driver session, verifies the configured resource exists, verifies communication, reads device identity/model/serial where supported, verifies the detected model matches `config/devices.py`, and confirms the device is ready for the next validation stage. It **never** enables an output, sources voltage/current, closes a relay, or performs any other state-changing action -- see Section 19 (Instrument Verification Philosophy). A PASS here means: *the device is present, correctly identified, reachable, and ready for the next validation stage* -- exactly what's needed to validate hardware bring-up remotely over RDP before going to the lab.
 
-**Functional Validation** is intentionally a separate, later phase (see Section 8.1b) -- it is the only path that ever changes hardware state (a DMM/DAQ real measurement, or a Numato relay energizing a channel). Where no functional test exists yet (SMU sourcing, Temperature Module TC/RTD read, PXI Relay Matrix -- no driver at all), the menu reports "Functional Validation not yet implemented for this hardware category" rather than faking a PASS.
+**Functional Validation** is intentionally a separate, later phase (see Section 8.1b) -- it is the only path that ever changes hardware state (SMU sourcing, a DMM/DAQ real measurement, or a Numato relay energizing a channel). Where no functional test exists yet (Temperature Module TC/RTD read, PXI Relay Matrix -- no driver at all), the menu reports "Functional Validation not yet implemented for this hardware category" rather than faking a PASS.
 
-### 8.1b Functional Validation (existing tests, kept but relocated)
+**SMU and DMM Functional Validation are laboratory-only** -- the operator must be physically present at the rack (SMU: connecting a handheld DMM to the SMU output; DMM: connecting a known external DC source to the DMM input). Both print explicit on-screen instructions and pause for the operator before/at each step -- see Section 8.1b.
 
-Functional Validation is not mixed into Identity Validation, but existing, already-implemented functional tests are kept and reachable from the Functional Validation option of their category, rather than deleted or left as flat top-level menu items:
+### 8.1b Functional Validation
 
-- **DMM -> Functional Validation**: `_functional_dmm()` -- a real DC voltage measurement (`DMM.measure_dc_voltage()`), verified finite and within the configured range.
-- **DAQ -> Functional Validation**: `_functional_daq()` -- a real deep channel read (`nidaqmx` directly, since `DAQ.read_channel()` is still a placeholder), verified finite and within the configured ADC range.
+Functional Validation is not mixed into Identity Validation. Each category's Functional Validation option runs one focused check:
+
+- **SMU -> Functional Validation**: `_functional_smu()` -- verifies the SMU can source DC voltage correctly, using a sequence that reflects how the SMU is actually used in NIPXI (charging: source voltage + source current; discharging: source voltage + **sink** current -- never a negative source voltage, see the callout below), not a generic bipolar power-supply check. Laboratory-only: the operator connects a handheld DMM to the SMU output and visually confirms each step. Sequence: safe state (output forced off + verified) -> 0 V (baseline) -> charge validation voltage -> 0 V (return to baseline) -> output OFF (forced + verified again), via `hardware/smu.py::SMU.source_dc_voltage_point()`. This is NOT a battery operation -- no relay, no battery channel, no charge/discharge mode (`set_charge_mode()`/`set_discharge_mode()` remain untouched placeholders). Every step, FAIL, or operator cancellation (Ctrl+C / blank input) ends with `SMU.emergency_output_off()` -- the operator is never left with an energized output. Validation voltage/current/range are derived entirely from existing configuration (see "Configuration dependencies" below) -- no new hardcoded voltage/current constants.
+- **DMM -> Functional Validation**: `_functional_dmm()` -- verifies the DMM can acquire a DC voltage measurement. Laboratory-only: the operator connects a known external DC source (bench supply, calibrator, etc.) to the DMM input, then the DMM performs a real measurement (`DMM.measure_dc_voltage()`), verified finite and within the configured range, and the "Measured Voltage" is displayed. First-implementation scope only: no current measurement, no calibration validation, no accuracy certification, no automated metrology limits -- purely "can the DMM successfully perform a voltage measurement?"
+- **DAQ -> Functional Validation**: `_functional_daq()` -- a real deep channel read via `hardware/daq.py::DAQ.read_channel()`, verified finite and within the configured ADC range.
 - **Numato Relay Matrix -> Functional Validation**: `_functional_relay_numato()` -- a submenu of the existing relay-energizing tests (`test_relay_numato_matrix()` relay-1 quick check, `test_relay_matrix_scan()` full channel scan, `test_relay_ethernet_test()` native-primitive test, `test_relay_safety_selftest()` mandatory-sequence self-test), each of which can still be called standalone (no arguments) for scripted/CI use.
 
 The bench-only serial relay (`test_relay_serial()`) and the GPIB/MiniSQL stubs (`test_electronic_load()`, `test_minisql()`) are no longer in the operator-facing menu (out of scope for the current NIPXI bring-up stage -- see Section 4/15), but their code is unchanged and importable directly from `test.py` if needed later.
+
+**Charging/discharging architecture (why there is no negative-voltage step):** in NIPXI, charging sources voltage and sources current; discharging sources voltage and **sinks** current (the SMU acts as a current sink, not as a negative-voltage source -- see README Section 1's project overview and `hardware/smu.py::set_discharge_mode()`'s docstring, "Configure CC discharge (sink)"). The system never relies on negative-voltage sourcing for discharge. SMU Functional Validation therefore only exercises the polarity the real charge path (`set_charge_mode()`) will actually use.
+
+**Configuration dependencies (SMU Functional Validation) -- no new configuration was introduced:**
+
+| Value | Source | Why reused |
+|---|---|---|
+| Validation voltage | `Settings.CHARGE_VOLTAGE_V` (4.2 V today) | Already the project's configured real CV-phase charge target -- the same setpoint the real charge path is meant to use, more representative of production behavior than an arbitrary bench value |
+| Current limit (compliance) | `Settings.CHARGE_CURRENT_A` (0.5 A today) | Already the configured real charge current for this system |
+| Voltage source range | `Settings.BAT_VOLTAGE_MAX` (4.7 V today) | Already the station-level absolute voltage safety ceiling -- bounds the SMU's source range to the same limit the rest of the safety architecture already enforces |
+
+**DMM Functional Validation** reuses `DMM_CONFIGS[...]["range_v"]` (already derived from `PXI_SLOTS`) for its finite/in-range sanity check -- no separate constant.
 
 **Result format:**
 
@@ -621,15 +653,15 @@ Each test step prints:
 
 ```
   [PASS] Device or component name
-         Config : config/devices.py -> NUMATO_RELAY_MATRIX_CONFIG (RELAY32ETHRL00 / 169.254.1.1:23)
-         Detail : Connected to RELAY32ETHRL00 at 169.254.1.1:23
+         Config : config/devices.py -> ETHERNET_DEVICES["MATRIX_NUMATO_201"] (RELAY32ETHRL00 / 169.254.1.201:23)
+         Detail : Connected to RELAY32ETHRL00 at 169.254.1.201:23
 ```
 
 or on failure:
 
 ```
-  [FAIL] MAIN_MATRIX_ETH
-         Config : config/devices.py -> NUMATO_RELAY_MATRIX_CONFIG (RELAY32ETHRL00 / 169.254.1.1:23)
+  [FAIL] MATRIX_NUMATO_201
+         Config : config/devices.py -> ETHERNET_DEVICES["MATRIX_NUMATO_201"] (RELAY32ETHRL00 / 169.254.1.201:23)
          [ERROR]
          Relay controller not reachable
 
@@ -1595,12 +1627,13 @@ Full design writeup: `docs/architecture.md` Section 9. Future database/recovery 
 |--------|---------|----------|--------|
 | Relay | `relay on/off <n>` | `relay read <n>` + `relay readall` | Commanded state matches, all others unaffected (unchanged -- this is what the others now mirror) |
 | SMU | Instrument built-in self-test | Self-test result code + message | Code indicates success, else `SMUError` (`hardware/smu.py::SMU.identify()`) |
+| SMU | Configure + enable a DC voltage output point | `query_in_compliance()` + the SMU's own voltage measurement | Not in current-limit compliance, else `SMUError`; output always disabled afterward regardless (`hardware/smu.py::SMU.source_dc_voltage_point()`) -- the measured value itself is reported informationally, verified by the operator's handheld DMM, not asserted against a tolerance (none is configured) |
 | DMM | Instrument built-in self-test | Self-test result code + message | Code indicates success, else `DMMError` (`hardware/dmm.py::DMM.identify()`) |
 | DMM | Configure + trigger a DC volts measurement | The measured value | Finite and within the configured range, +5% overrange margin (`DMM.measure_dc_voltage()`) |
 | DAQ | Instrument built-in self-test | `self_test_device()` (raises on failure) | No exception raised (`hardware/daq.py::DAQ.identify()`) |
 | DAQ | Configure + read one analog channel | The read value | Finite and within the configured `voltage_range_v`, +5% overrange margin (`test.py::_functional_daq()`) |
 
-**What is deliberately NOT verified yet:** SMU sourcing (`set_charge_mode`/`output_enable`/`measure`) is still a placeholder (`docs/TODO.md`) -- testing "source a current and measure it back" around a stub that returns a fixed value would be a fake PASS, exactly what this philosophy exists to prevent. Self-test is the strongest verification available for the SMU until real sourcing exists.
+**What is deliberately NOT verified yet:** SMU *battery* sourcing (`set_charge_mode`/`set_discharge_mode`/`output_enable`/`measure`, used by the future charge/discharge cycle) is still a placeholder (`docs/TODO.md`) -- testing "source a current and measure it back" around a stub that returns a fixed value would be a fake PASS, exactly what this philosophy exists to prevent. `source_dc_voltage_point()` (SMU Functional Validation, Section 8.1b) is real and separate from this -- a single bench DC voltage point with no relay/battery/channel involved, not the battery charge/discharge path.
 
 Full design writeup, including why Hardware Discovery needed no code changes to inherit this: `docs/architecture.md` Section 10.
 

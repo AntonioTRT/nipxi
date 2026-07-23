@@ -5,12 +5,19 @@ hardware or config in this project -- the SMU IS the PMU. "PMU" in
 docs/architecture.md's "PMU Safety Philosophy" section refers to this class).
 
 connect()/disconnect()/identify() are real (NI-DCPower session open/close +
-instrument_model query + a hardware self-test). Sourcing functionality
-(set_charge_mode, set_discharge_mode, output_enable, measure) is still a
-TODO placeholder; implementing it is a separate, later step -- deliberately
-NOT done here, since sourcing anything (even a tiny test current) is real
-instrument functionality with real electrical consequences, not a
-connectivity check.
+instrument_model query + a hardware self-test). Battery charge/discharge
+sourcing (set_charge_mode, set_discharge_mode, output_enable, measure) is
+still a TODO placeholder; implementing it is a separate, later step --
+deliberately NOT done here, since sourcing anything for a real battery
+channel has real electrical consequences well beyond a connectivity check.
+
+source_dc_voltage_point() IS real, but is a separate, narrow capability:
+a single static bench DC voltage point for SMU Functional Validation only
+(see test.py's SMU Functional Validation workflow) -- no relay, no
+battery channel, no charge/discharge mode. It always disables output
+again before returning, and the caller always derives its voltage/current
+arguments from existing config (config/devices.py + config/settings.py),
+never from raw operator input.
 
 output_disable()/verify_output_disabled()/emergency_output_off() ARE
 implemented for real, unlike the sourcing methods above -- disabling output
@@ -29,12 +36,15 @@ still be sourcing/sinking current) -- called from every layer that can
 detect a PMU-relevant failure: test_control/charge_cycle.py and
 discharge_cycle.py (any exception during a charge/discharge loop),
 test_control/safety_monitor.py::emergency_stop(), and
-test_control/hardware_manager.py (startup safety + shutdown). None of
-these callers need real sourcing to exist yet -- output_enable() being a
-stub means there is currently no way for the PMU to actually be sourcing
-anything, so this infrastructure is ready and waiting for when
-output_enable()/set_charge_mode() are implemented for real, rather than
-being retrofitted under time pressure later.
+test_control/hardware_manager.py (startup safety + shutdown), and now
+also source_dc_voltage_point()'s own `finally` block (SMU Functional
+Validation always ends every step, PASS or FAIL, by disabling output).
+None of the charge/discharge callers above need battery sourcing to exist
+yet -- output_enable()/set_charge_mode() being stubs means there is
+currently no way for the PMU to be sourcing anything during a battery
+cycle, so this infrastructure was ready and waiting for when they are
+implemented for real, rather than being retrofitted under time pressure
+later.
 
 Verification philosophy (see docs/architecture.md "Instrument Verification
 Philosophy" and hardware/relay_eth.py, which this mirrors): a bare identity
@@ -231,3 +241,80 @@ class SMU(HardwareBase):
         """Return instantaneous voltage and current reading."""
         # TODO: return self._session.measure(nidcpower.MeasurementTypes.VOLTAGE, CURRENT)
         return {"voltage_v": 0.0, "current_a": 0.0}
+
+    # ------------------------------------------------------------------
+    # Functional Validation -- bench-only DC voltage sourcing. Separate
+    # from set_charge_mode()/set_discharge_mode()/output_enable() above
+    # (which remain placeholders for real battery charge/discharge): this
+    # method is real, but deliberately narrow -- a single static DC
+    # voltage point, no relay, no channel, no battery involved. The
+    # caller (test.py's SMU Functional Validation workflow) always derives
+    # voltage_v/current_limit_a/voltage_range_v from config
+    # (config/devices.py + config/settings.py) -- this method itself does
+    # not choose or bound them beyond what the driver requires structurally.
+    # ------------------------------------------------------------------
+
+    def source_dc_voltage_point(self, voltage_v: float, current_limit_a: float,
+                                 voltage_range_v: float) -> dict:
+        """
+        Source a single static DC voltage point and confirm it electrically.
+
+        COMMAND (configure DC_VOLTAGE output at voltage_v, current_limit_a
+        compliance, enable output) -> READBACK (query_in_compliance() +
+        measure the SMU's own voltage reading) -> VERIFY (not in current-
+        limit compliance -- a compliance hit indicates a short or
+        unexpected load, not a successful source point) -> return a dict
+        with the commanded and measured values.
+
+        Output is always disabled again before this method returns or
+        raises -- see the `finally` block below -- regardless of whether
+        this point PASSED or FAILED. Never asserts the measured voltage
+        matches voltage_v to some tolerance: there is no project-
+        configured measurement tolerance to compare against, and the
+        operator's handheld DMM is the actual verification instrument for
+        this step (see test.py's SMU Functional Validation workflow) --
+        the measured value here is reported as informational context only.
+        """
+        if self._session is None:
+            raise SMUError(f"SMU {self.resource} is not connected")
+
+        import nidcpower
+
+        try:
+            self._session.output_function = nidcpower.OutputFunction.DC_VOLTAGE
+            self._session.source_mode = nidcpower.SourceMode.SINGLE_POINT
+            self._session.voltage_level_range = voltage_range_v
+            self._session.current_limit = current_limit_a
+            self._session.voltage_level = voltage_v
+            self._session.output_enabled = True
+            self._session.commit()
+        except Exception as e:
+            raise SMUError(
+                f"SMU {self.resource} failed to configure {voltage_v:+.3f} V: {e}"
+            ) from e
+
+        in_compliance = None
+        measured_v = None
+        try:
+            with self._session.initiate():
+                in_compliance = self._session.query_in_compliance()
+                measured_v = self._session.measure(nidcpower.MeasurementTypes.VOLTAGE)
+        except Exception as e:
+            raise SMUError(
+                f"SMU {self.resource} failed while sourcing {voltage_v:+.3f} V: {e}"
+            ) from e
+        finally:
+            self.output_disable()
+
+        if in_compliance:
+            raise SMUError(
+                f"SMU {self.resource} entered current-limit compliance while sourcing "
+                f"{voltage_v:+.3f} V (limit {current_limit_a:.3f} A) -- possible short "
+                f"or unexpected load."
+            )
+
+        self.log.info(
+            "SMU %s sourced %.3f V (measured %.6f V, current limit %.3f A, not in compliance)",
+            self.resource, voltage_v, measured_v, current_limit_a,
+        )
+        return {"commanded_v": voltage_v, "measured_v": measured_v}

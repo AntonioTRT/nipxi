@@ -141,7 +141,9 @@ main.py
 ```
 
 Production path: `main.py -> HardwareManager -> RelayFactory -> NumatoRelayMatrix -> Numato Relay`.
-Validated Numato settings: IP `169.254.1.1`, port `23`, user/password `admin`/`admin`.
+Validated Numato settings: `MATRIX_NUMATO_201` IP `169.254.1.201`, `MATRIX_NUMATO_202` IP `169.254.1.202`
+(both static, DHCP disabled), port `23`, user/password `admin`/`admin` on both. (`MAIN_MATRIX_ETH`/
+`AUX_MATRIX_ETH_1` are legacy compat aliases for these two, kept for old code that still imports them.)
 Serial COM13 (`RELAY_CONFIG`) is diagnostic-only and is never used by `main.py`.
 
 Before `main.py` reaches this point at all, the test framework's own gate
@@ -542,8 +544,9 @@ Step 2: second-level menu, for the ONE device just selected:
 
 Functional Validation is intentionally a separate, later phase from Identity Validation (see Section 8.2a) -- but existing, already-implemented functional tests are kept, not deleted, and reached from their category's Functional Validation option instead of being separate top-level menu items:
 
-- **DMM -> Functional Validation** (`_functional_dmm()`): a real DC voltage measurement (`DMM.measure_dc_voltage()`), verified finite and within the configured range.
-- **DAQ -> Functional Validation** (`_functional_daq()`): a real deep channel read (`nidaqmx` directly, since `DAQ.read_channel()` is still a placeholder), verified finite and within the configured ADC range.
+- **SMU -> Functional Validation** (`_functional_smu()`): laboratory-only, operator physically present with a handheld DMM on the SMU output. Verifies the SMU can source DC voltage correctly via `hardware/smu.py::SMU.source_dc_voltage_point()` -- COMMAND (configure DC voltage output + enable) -> READBACK (`query_in_compliance()` + the SMU's own voltage measurement) -> VERIFY (not in compliance) -> always disable output again in a `finally` block, regardless of outcome. Sequence: safe state -> 0 V (baseline) -> charge validation voltage -> 0 V (return to baseline) -> output OFF. This sequence is deliberately **positive-voltage only** -- it mirrors how the SMU is actually used in NIPXI (charging: source voltage + source current; discharging: source voltage + **sink** current, never a negative source voltage -- see Section 12.6), not a generic bipolar power-supply validation. This is also deliberately NOT the battery charge/discharge path itself -- no relay, no battery channel, `set_charge_mode()`/`set_discharge_mode()` remain untouched placeholders. See Section 12.6 for the safety-sequence detail and where the validation voltage/current/range values come from (`config/settings.py`'s existing Charge/Battery-limit constants).
+- **DMM -> Functional Validation** (`_functional_dmm()`): laboratory-only, operator connects a known external DC source. A real DC voltage measurement (`DMM.measure_dc_voltage()`), verified finite and within the configured range, with the "Measured Voltage" displayed to the operator. Deliberately minimal first implementation: no current measurement, no calibration validation, no accuracy certification, no automated metrology limits -- answers only "can the DMM successfully perform a voltage measurement?".
+- **DAQ -> Functional Validation** (`_functional_daq()`): a real deep channel read via `hardware/daq.py::DAQ.read_channel()`, verified finite and within the configured ADC range. `test.py` itself only calls `daq.read_channel(test_ch)` -- no `nidaqmx` import or `Task()` construction remains in `test.py`; see Section 8 (Hardware Abstraction Pipeline) for the architecture this now completes.
 - **Numato Relay Matrix -> Functional Validation** (`_functional_relay_numato()`): a submenu of `test_relay_numato_matrix()` (relay-1 quick check), `test_relay_matrix_scan()` (full channel scan), `test_relay_ethernet_test()` (native-primitive test), and `test_relay_safety_selftest()` (mandatory-sequence self-test) -- each of these four functions still accepts no arguments for standalone/scripted use, and now also accepts an optional preselected `(name, cfg)` so the submenu can route to them without prompting for the device twice.
 
 `test_relay_serial()` (bench-only serial relay) and the GPIB/MiniSQL stubs (`test_electronic_load()`, `test_minisql()`) are no longer in the operator-facing `MENU` list -- out of scope for the current NIPXI bring-up stage (Section 4/17 of README.md) -- but their code is unchanged and still importable directly from `test.py`.
@@ -656,7 +659,7 @@ never trust a command send on its own) applied to every other instrument driver.
 | DMM | Instrument built-in self-test | Self-test result code + message | Code indicates success, else raise `DMMError` | `hardware/dmm.py::DMM.identify()` |
 | DMM | Configure + trigger a DC volts measurement | The measured value | Finite (not NaN/inf) and within the configured range (+5% overrange margin) | `hardware/dmm.py::DMM.measure_dc_voltage()` |
 | DAQ | Instrument built-in self-test | `self_test_device()` (nidaqmx raises on failure) | No exception raised | `hardware/daq.py::DAQ.identify()` |
-| DAQ | Configure + read one analog channel | The read value | Finite and within the configured `voltage_range_v` (+5% overrange margin) | `test.py::test_daq()` Step 3 (not yet in the driver -- `read_channel()` is still a placeholder) |
+| DAQ | Configure + read one analog channel | The read value | Finite and within the configured `voltage_range_v` (+5% overrange margin) | `hardware/daq.py::DAQ.read_channel()` |
 
 **What is deliberately NOT verified yet, and why:** SMU sourcing (`set_charge_mode`,
 `output_enable`, `measure`) is still a placeholder (`docs/TODO.md`). Testing "source a
@@ -729,6 +732,19 @@ no `LimitResolver` class or module exists yet.** `BATTERY_CONFIGS` and `battery_
 resolver will eventually consume; PMU/DAQ hardware-capability limits and a
 first-class Safety Limits config are not yet modeled as data today and would need to
 be defined before `LimitResolver` itself can be implemented.
+
+**First real consumer of existing configuration for a bench check:** SMU Functional
+Validation (`test.py::_functional_smu()`, Section 12.6) reuses
+`Settings.CHARGE_VOLTAGE_V` as its bench validation voltage, `Settings.
+CHARGE_CURRENT_A` as the current-limit/compliance value, and `Settings.
+BAT_VOLTAGE_MAX` as the SMU's source range -- deliberately reusing the same
+charge-parameter and battery-limit constants this section's `BATTERY_CONFIGS`
+philosophy already governs, rather than introducing a second, independent set of
+test voltages. This is a bench sanity check (no battery/relay involved), not an
+"operational limit" in the `LimitResolver` sense above, but it draws from the same
+single source of truth. It deliberately sources only the charge-phase (positive)
+voltage -- see Section 12.6 for why discharge's current-sink behavior is out of
+scope for this check.
 
 ## 12. PMU Safety Philosophy
 
@@ -813,6 +829,80 @@ shutdown/fail-safe behavior in this pass -- DAQ handling is intentionally left
 unchanged. Future DAQ safety behavior (if any) should be reviewed once the final DAQ
 architecture (multi-channel measurement ownership, calibration, etc.) is established,
 not retrofitted onto the current placeholder driver.
+
+### 12.6 SMU Functional Validation sourcing (bench-only, not battery charge/discharge)
+
+**Charging/discharging architecture, and why this validation is positive-voltage
+only:**
+
+```
+Charging:     source voltage,  source current
+Discharging:  source voltage,  SINK current   (SMU acts as a current sink)
+```
+
+NIPXI never relies on negative-voltage sourcing to implement discharge -- the SMU
+sinks current at a positive voltage, exactly as `hardware/smu.py::
+set_discharge_mode()`'s docstring already states ("Configure CC discharge (sink)").
+An earlier version of this validation sourced a negative voltage point to
+demonstrate bipolar capability; that was corrected because it does not reflect
+this project's actual application and is not guaranteed to be representative of
+every configured SMU model in `PXI_SLOTS` (only `PRIMARY_SMU`/PXIe-4141 is
+documented in this codebase as 4-quadrant -- see `PXI_SLOTS[5]`'s
+`validation_notes`; `HIGH_POWER_SMU`/PXIe-4139 and `AUX_SMU_1`/`AUX_SMU_2`/PXI-4130
+have no polarity capability documented here). The validation below therefore
+exercises only the polarity the real charge path will actually use.
+
+`hardware/smu.py::SMU.source_dc_voltage_point(voltage_v, current_limit_a,
+voltage_range_v)` is the first real PMU sourcing capability implemented in this
+codebase -- but it is deliberately scoped to laboratory Functional Validation
+(`test.py::_functional_smu()`, Section 8.2b), not the battery charge/discharge
+path (`set_charge_mode()`/`set_discharge_mode()`/`output_enable()` remain
+untouched placeholders, Section 12.1's PMU failure handling and this section's
+principles apply identically to both). The method itself is polarity-agnostic
+(it sources whatever `voltage_v` it is given) -- the positive-only constraint is
+enforced by the caller (`test.py::_functional_smu()`), not by the driver.
+
+Same "unknown PMU state = unsafe state" principle as the rest of this section,
+applied to a single bench voltage point:
+
+```
+COMMAND    configure DC_VOLTAGE output at voltage_v, current_limit_a
+           compliance, voltage_range_v range -> enable output -> commit()
+READBACK   query_in_compliance() + the SMU's own voltage measurement
+           (session.measure(MeasurementTypes.VOLTAGE))
+VERIFY     not in current-limit compliance (a compliance hit means a short
+           or unexpected load, not a successful source point) -> else raise
+SMUError
+ALWAYS     output_disable() runs in a `finally` block -- on PASS, FAIL, or
+           an exception of any kind, before the method returns or the
+           exception propagates
+```
+
+`test.py::_functional_smu()`'s sequence is: safe state (forced off + verified)
+-> 0 V (baseline) -> charge validation voltage (`Settings.CHARGE_VOLTAGE_V`) ->
+0 V (return to baseline) -> output OFF (forced + verified again). It wraps this
+with the same fail-safe reflex used everywhere else in this section:
+`emergency_output_off()` is called once before the first sourcing step (start
+from a verified safe state, mirroring Section 12.2's startup check) and once
+more in its own `finally` block after the last step, on FAIL, or on operator
+cancellation (Ctrl+C / blank input at a prompt) -- the operator can never be
+left with an energized output. No cancellation checkpoint/token is used here
+(unlike the relay scan loops, Section 13) -- this is a short, discrete 3-step
+sequence with an explicit per-step operator prompt, not a long-running loop, so
+a plain `try/except (KeyboardInterrupt, EOFError)` around each `input()` call,
+combined with the `finally` block's `emergency_output_off()`, gives the same
+safety guarantee with less machinery.
+
+The measured voltage from the SMU's own readback is reported to the operator
+as **informational context only** -- there is no project-configured
+measurement tolerance to verify it against, so no PASS/FAIL decision is made
+on it. The operator's handheld DMM is the actual verification instrument for
+this step, per the laboratory bring-up workflow (README.md Section 8.1a/8.1b).
+
+**Not yet covered:** discharge's current-sink behavior has no Functional
+Validation of its own yet -- this is future work (see `docs/TODO.md`), not part
+of this bench voltage-sourcing check, and no current-sink capability exists in
+`hardware/smu.py` today (`set_discharge_mode()` remains a placeholder).
 
 ## 13. Safe Cancellation Architecture
 
@@ -982,7 +1072,8 @@ reports zero current, but will become live once real DAQ acquisition exists.
 | Numato relay TCP (`hardware/relay_eth.py`) | ~5.0s per command (default) | `cfg["timeout"]` in `config/devices.py` |
 | nidcpower (SMU) | **Unconfigured** | No explicit timeout set anywhere in `hardware/smu.py` |
 | nidmm (DMM) | **Unconfigured** | No explicit timeout set anywhere in `hardware/dmm.py` |
-| nidaqmx (DAQ) | N/A today | `read_channel`/`read_all_batteries` are still stubs -- no real blocking call exists yet |
+| nidaqmx (DAQ) `read_channel()` | **Unconfigured** | No explicit timeout set anywhere in `hardware/daq.py` -- now a real blocking call (`task.read()`) |
+| nidaqmx (DAQ) `read_all_batteries()` | N/A today | Still a stub -- no real blocking call exists yet |
 | Charge/discharge sampling loop | ~1s (`SAMPLE_RATE_HZ = 1.0`) | `config/settings.py` |
 | Pre-loop stabilization sleep | ~5.0s, single unchunked `time.sleep()` | `STABILIZATION_S` in `config/settings.py` |
 
@@ -1078,7 +1169,7 @@ DMM_CONFIG      = DMM_CONFIGS["MAIN_DMM"]
 
 ### 14.3 Nicknames
 
-Nicknames reflect intended system role, not just the model number (`PRIMARY_SMU`, `MAIN_DMM`, `TEMP_MODULE`), per the same principle already established for the Numato relay (`MAIN_MATRIX_ETH`) and battery channels (`BAT_1`..`BAT_8`). Every driver-facing config dict is now keyed by nickname, not an arbitrary label like the old `"SMU1"` -- this changed a real call site: `test.py`'s Configuration Validation used to hardcode `dev_cfg.SMU_ASSIGNMENTS.get("SMU1", {})`, which silently returned `{}` after the rename; fixed to `next(iter(dev_cfg.SMU_ASSIGNMENTS.values()), {})`, matching how `HardwareManager` already picks the primary device.
+Nicknames reflect intended system role, not just the model number (`PRIMARY_SMU`, `MAIN_DMM`, `TEMP_MODULE`), per the same principle already established for the Numato relays (`MATRIX_NUMATO_201`, `MATRIX_NUMATO_202` -- named after their static IP's last octet for easier hardware ID) and battery channels (`BAT_1`..`BAT_8`). Every driver-facing config dict is now keyed by nickname, not an arbitrary label like the old `"SMU1"` -- this changed a real call site: `test.py`'s Configuration Validation used to hardcode `dev_cfg.SMU_ASSIGNMENTS.get("SMU1", {})`, which silently returned `{}` after the rename; fixed to `next(iter(dev_cfg.SMU_ASSIGNMENTS.values()), {})`, matching how `HardwareManager` already picks the primary device.
 
 ### 14.4 Current relay architecture
 
@@ -1130,7 +1221,7 @@ Consolidated from the cancellation-architecture review (Section 13.7) and the st
 **Hardware timeout characterization (blocking-call bounds):**
 - NI-DCPower (SMU) sessions have **no explicit timeout configured** anywhere in `hardware/smu.py` -- behavior relies entirely on the driver's own default, which is unconfirmed. This is also the upper bound on cancellation latency for any SMU call (Section 13.6).
 - NI-DMM sessions have the same gap -- no explicit timeout configured in `hardware/dmm.py`.
-- NI-DAQmx (DAQ) has no real blocking call yet to characterize -- `read_channel()`/`read_all_batteries()` are still stubs.
+- NI-DAQmx (DAQ) `read_channel()` is now a real blocking call (`task.read()`) with **no explicit timeout configured** anywhere in `hardware/daq.py` -- same unconfirmed-driver-default gap as SMU/DMM above. `read_all_batteries()` is still a stub, nothing to characterize there yet.
 - The Numato relay TCP/Telnet path IS bounded (~5.0s per command, `cfg["timeout"]`) -- the one instrument type with a confirmed, configured timeout.
 
 **PMU behavior under communication loss:** if the VISA/PXI link to the SMU is down, `emergency_output_off()` cannot force the hardware off -- `output_disable()` raises, is caught, logged CRITICAL ("PMU may still be actively sourcing/sinking current"), and returns `False` rather than pretending success. There is no hardware-level fail-safe confirmed for this scenario -- unverified against the real NI-4141/4139/4130 cards.

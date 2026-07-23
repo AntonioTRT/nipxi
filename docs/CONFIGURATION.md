@@ -55,11 +55,15 @@ These are safety hard limits. The system raises `SafetyViolationError` if any is
 | `CHARGE_CUTOFF_A` | `0.05` | float (A) | End-of-charge: CV taper current threshold |
 | `CHARGE_TIMEOUT_S` | `7200` | int (s) | Maximum charge duration before abort |
 
+**Also consumed by SMU Functional Validation** (`test.py::_functional_smu()`, laboratory-only bench check): `CHARGE_VOLTAGE_V` is reused as the validation voltage, `CHARGE_CURRENT_A` as the current-limit/compliance value, and `BAT_VOLTAGE_MAX` (above) as the SMU's source range -- no separate test-voltage configuration exists or is needed. See README.md Section 8.1b and `docs/architecture.md` Section 12.6.
+
 ### Discharge parameters (CC)
+
+**Discharge is a current-sink operation, not a negative-voltage source.** The SMU sinks `DISCHARGE_CURRENT_A` while the battery's own voltage is at (or above) `DISCHARGE_CUTOFF_V` -- it never sources a negative voltage to discharge a cell. See `hardware/smu.py::SMU.set_discharge_mode()`'s docstring ("Configure CC discharge (sink)") and `docs/architecture.md` Section 12.6.
 
 | Parameter | Default | Type | Description |
 |-----------|---------|------|-------------|
-| `DISCHARGE_CURRENT_A` | `0.5` | float (A) | Constant discharge current |
+| `DISCHARGE_CURRENT_A` | `0.5` | float (A) | Constant discharge current (sink) |
 | `DISCHARGE_CUTOFF_V` | `3.0` | float (V) | End-of-discharge voltage |
 | `DISCHARGE_TIMEOUT_S` | `7200` | int (s) | Maximum discharge duration before abort |
 
@@ -148,6 +152,14 @@ Physical device mapping. Update to match your hardware wiring.
 ### BATTERY_CONFIGS
 
 Battery type/model catalog -- physical battery specs (chemistry, capacity, voltage/current/temperature limits), independent of which channel a battery currently occupies. Foundation for the future `data/battery_repository.py` (see `docs/DATABASE_ROADMAP.md` Section 2). **Not wired into `safety_monitor.py`/`charge_cycle.py`/`discharge_cycle.py` yet** -- those still read the single global `BAT_VOLTAGE_MAX`/`BAT_VOLTAGE_MIN`/`BAT_CURRENT_MAX`/`BAT_TEMP_MAX_C` from `config/settings.py` for every channel regardless of what's actually installed there.
+
+**Not used by SMU Functional Validation.** An earlier version of `test.py::
+_functional_smu()` reused `nominal_voltage_v`/`voltage_max_v` from this dict, but
+that was corrected: SMU Functional Validation now reuses `config/settings.py`'s
+`CHARGE_VOLTAGE_V`/`CHARGE_CURRENT_A`/`BAT_VOLTAGE_MAX` instead (see below), since
+those are the values that actually govern the SMU's real charge-phase behavior
+-- more representative of production than a battery-model nameplate value. See
+README.md Section 8.1b and `docs/architecture.md` Section 12.6.
 
 ```python
 BATTERY_CONFIGS = {
@@ -311,28 +323,44 @@ RELAY_CONFIG = {
 
 The query response is checked for `"ON"`, `"CLOSED"`, or `"1"` to determine closed state. Adjust `SerialRelay.query()` in `hardware/relay_serial.py` if your controller uses a different response format.
 
-### NUMATO_RELAY_MATRIX_CONFIG (Ethernet -- PRODUCTION)
+### ETHERNET_DEVICES / NUMATO_RELAY_MATRIX_CONFIG (Ethernet -- PRODUCTION)
 
-`NUMATO_RELAY_MATRIX_CONFIG` / `NumatoRelayMatrix` (Numato Lab 32-Channel Ethernet Relay Module) is the production relay control path: `main.py -> HardwareManager -> RelayFactory -> NumatoRelayMatrix -> Numato Relay`. `NumatoRelayMatrix.close(ch)`/`open(ch)` enforce a mandatory all-off -> verify -> activate -> verify safety sequence -- see [architecture.md section 6a](architecture.md#6a-mandatory-relay-safety-sequence).
+`ETHERNET_DEVICES` holds every Numato Lab 32-Channel Ethernet Relay Module in the finalized NIPXI network plan -- currently `MATRIX_NUMATO_201` and `MATRIX_NUMATO_202`, the only two Ethernet relay devices defined, named after their static IP's last octet for easier hardware ID/troubleshooting/rack labeling. `NUMATO_RELAY_MATRIX_CONFIG` is a backward-compat alias for `ETHERNET_DEVICES["MATRIX_NUMATO_201"]`; `NUMATO_RELAY_MATRIX_CONFIGS` aliases the whole `ETHERNET_DEVICES` dict. The old role-based names `MAIN_MATRIX_ETH`/`AUX_MATRIX_ETH_1` are kept as legacy compat aliases pointing at `MATRIX_NUMATO_201`/`MATRIX_NUMATO_202` respectively, for any code that still imports them directly. `NumatoRelayMatrix` is the production relay control path: `main.py -> HardwareManager -> RelayFactory -> NumatoRelayMatrix -> Numato Relay`. `NumatoRelayMatrix.close(ch)`/`open(ch)` enforce a mandatory all-off -> verify -> activate -> verify safety sequence -- see [architecture.md section 6a](architecture.md#6a-mandatory-relay-safety-sequence).
 
-Validated settings (confirmed reachable -- ping, web interface, Telnet login, and relay command/readback all work):
+Validated settings -- static IPs, DHCP disabled on both devices (confirmed reachable -- ping, web interface, Telnet login, and relay command/readback all work):
 
 ```python
-NUMATO_RELAY_MATRIX_CONFIG = {
-    "type":          "ethernet",
-    "driver":        "RELAY32ETHRL00",
-    "name":          "MAIN_MATRIX_ETH",
-    "ip":            "169.254.1.1",   # validated -- Numato factory link-local IP
-    "port":          23,              # validated -- Numato default Telnet port
-    "username":      "admin",         # validated Telnet credentials
-    "password":      "admin",         # validated Telnet credentials
-    "timeout":       5.0,
-    "num_channels":  32,              # physical relay count on the 32-ch module
-    "channel_count": 32,
+ETHERNET_DEVICES = {
+    # Numato Relay Matrix at 169.254.1.201
+    "MATRIX_NUMATO_201": {
+        "type":          "ethernet",
+        "driver":        "RELAY32ETHRL00",
+        "name":          "MATRIX_NUMATO_201",
+        "ip":            "169.254.1.201",  # static -- DHCP disabled
+        "port":          23,               # validated -- Numato default Telnet port
+        "username":      "admin",          # validated Telnet credentials
+        "password":      "admin",          # validated Telnet credentials
+        "timeout":       5.0,
+        "num_channels":  32,               # physical relay count on the 32-ch module
+        "channel_count": 32,
+    },
+    # Numato Relay Matrix at 169.254.1.202
+    "MATRIX_NUMATO_202": {
+        "type":          "ethernet",
+        "driver":        "RELAY32ETHRL00",
+        "name":          "MATRIX_NUMATO_202",
+        "ip":            "169.254.1.202",  # static -- DHCP disabled
+        "port":          23,
+        "username":      "admin",
+        "password":      "admin",
+        "timeout":       5.0,
+        "num_channels":  32,
+        "channel_count": 32,
+    },
 }
 ```
 
-If the relay is later moved to a routed/DHCP network instead of a direct link-local connection, find its new IP via your router's DHCP table or a network scanner and update `ip` accordingly.
+`169.254.1.1` was the Numato factory default (link-local) on both units before static IPs were assigned -- no longer used in active configuration.
 
 ---
 

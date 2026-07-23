@@ -99,7 +99,15 @@ PXI_SLOTS = {
                              "anticipated an NI-4140 in this slot/role. Real rack "
                              "hardware is a PXIe-4141 instead -- a functionally "
                              "compatible 4-quadrant precision SMU, not a discrepancy "
-                             "that changes the architecture, just the model string.",
+                             "that changes the architecture, just the model string. "
+                             "NOTE: this card's 4-quadrant (bipolar) capability is not "
+                             "used by NIPXI -- charging sources voltage+current, "
+                             "discharging sources voltage and SINKS current (never a "
+                             "negative source voltage); see docs/architecture.md "
+                             "Section 12.6. Bipolar capability is also NOT documented "
+                             "for HIGH_POWER_SMU (PXIe-4139) or AUX_SMU_1/AUX_SMU_2 "
+                             "(PXI-4130) below -- do not assume it without checking "
+                             "their datasheets first.",
     },
     6: {
         "slot":          6,
@@ -401,30 +409,65 @@ RELAY_CONFIG = {
     "command_query": "QUERY {ch}\r\n",
 }
 
-# Numato Relay Matrix -- Ethernet (Numato Lab 32 Channel Ethernet Relay Module)
+# Numato Relay Matrices -- Ethernet (Numato Lab 32 Channel Ethernet Relay Module)
 # Set "type": "ethernet" to use NumatoRelayMatrix instead of SerialRelay.
-# RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG) will return a NumatoRelayMatrix
+# RelayFactory.create(...) on any entry here will return a NumatoRelayMatrix
 # instance ("ethernet" names the transport interface, same as "serial" does --
 # the concrete driver is specifically for this Numato hardware, not a generic
 # vendor-neutral Ethernet relay). NOT a PXI-slot device -- see PXI_SLOTS[11]
 # ("CHASSIS_RELAY_MATRIX") for the PXI-resident relay/switch card that is
 # physically present in the rack but not the active relay driver.
 # Reference protocol: utils/ethernet_relay_python.py (manufacturer example).
-NUMATO_RELAY_MATRIX_CONFIG = {
-    "type":         "ethernet",
-    "driver":       "RELAY32ETHRL00",
-    "name":         "MAIN_MATRIX_ETH",
-    "ip":           "169.254.1.1",      # lab default -- Numato factory IP (link-local)
-    "port":         23,                 # default Numato Telnet port
-    "username":     "admin",            # Telnet login (factory default: admin/admin)
-    "user":         "admin",            # legacy alias, kept for compat -- same value
-    "password":     "admin",
-    "timeout":      5.0,
-    # Settings.RELAY_COUNT is the single source of truth for relay count --
-    # never hardcode 32 here or in any relay test.
-    "num_channels":  Settings.RELAY_COUNT,
-    "channel_count": Settings.RELAY_COUNT,  # alias -- same value, used by the matrix scan test
+#
+# Finalized NIPXI network plan -- static IPs on the link-local Numato subnet,
+# DHCP disabled on both devices. 169.254.1.1 was the Numato factory default
+# (link-local, both units ship identical) -- no longer used now that each
+# unit has its own reserved static address.
+#
+# Naming convention: each unit is named after its static IP's last octet
+# (MATRIX_NUMATO_<octet>) so hardware ID, troubleshooting, rack labeling, and
+# maintenance can all key off the same identifier -- no "MAIN"/"AUX" role
+# implication, since both units are identical, currently-deployed hardware.
+ETHERNET_DEVICES = {
+    # Numato Relay Matrix at 169.254.1.201
+    "MATRIX_NUMATO_201": {
+        "type":          "ethernet",
+        "driver":        "RELAY32ETHRL00",
+        "name":          "MATRIX_NUMATO_201",
+        "ip":            "169.254.1.201",
+        "port":          23,                 # Numato Telnet port
+        "username":      "admin",            # Telnet login (admin/admin, hardware-side)
+        "user":          "admin",            # legacy alias, kept for compat -- same value
+        "password":      "admin",
+        "timeout":       5.0,
+        # Settings.RELAY_COUNT is the single source of truth for relay count --
+        # never hardcode 32 here or in any relay test.
+        "num_channels":  Settings.RELAY_COUNT,
+        "channel_count": Settings.RELAY_COUNT,  # alias -- same value, used by the matrix scan test
+    },
+    # Numato Relay Matrix at 169.254.1.202
+    "MATRIX_NUMATO_202": {
+        "type":          "ethernet",
+        "driver":        "RELAY32ETHRL00",
+        "name":          "MATRIX_NUMATO_202",
+        "ip":            "169.254.1.202",
+        "port":          23,
+        "username":      "admin",
+        "user":          "admin",
+        "password":      "admin",
+        "timeout":       5.0,
+        "num_channels":  Settings.RELAY_COUNT,
+        "channel_count": Settings.RELAY_COUNT,
+    },
 }
+
+# Legacy compatibility -- old role-based names, kept only in case other code
+# or external scripts still import these directly.
+MAIN_MATRIX_ETH = ETHERNET_DEVICES["MATRIX_NUMATO_201"]
+AUX_MATRIX_ETH_1 = ETHERNET_DEVICES["MATRIX_NUMATO_202"]
+
+# Backward-compat alias -- primary Numato unit, previously the sole config dict.
+NUMATO_RELAY_MATRIX_CONFIG = ETHERNET_DEVICES["MATRIX_NUMATO_201"]
 
 # Backward-compat alias -- this dict was previously named RELAY_ETH_CONFIG.
 RELAY_ETH_CONFIG = NUMATO_RELAY_MATRIX_CONFIG
@@ -442,12 +485,10 @@ RELAY_SERIAL_CONFIGS = {
 
 # Every Numato Relay Matrix device, name -> config. Hardware Discovery,
 # startup device validation, RelayEthernetTest, and every test_relay_*()
-# function all iterate this dict -- add a second Numato unit here (a new
-# "type": "ethernet" entry with its own "name"/"ip") and every one of those
-# automatically covers it too, with no per-device code anywhere.
-NUMATO_RELAY_MATRIX_CONFIGS = {
-    NUMATO_RELAY_MATRIX_CONFIG["name"]: NUMATO_RELAY_MATRIX_CONFIG,
-}
+# function all iterate this dict -- add a new Numato unit to ETHERNET_DEVICES
+# above and every one of those automatically covers it too, with no
+# per-device code anywhere.
+NUMATO_RELAY_MATRIX_CONFIGS = dict(ETHERNET_DEVICES)
 
 # Backward-compat alias -- this dict was previously named RELAY_ETH_CONFIGS.
 RELAY_ETH_CONFIGS = NUMATO_RELAY_MATRIX_CONFIGS

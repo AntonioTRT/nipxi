@@ -763,17 +763,153 @@ def test_hardware_discovery():
 def test_smu():
     """
     Menu entry for the SMU hardware category. Lists every configured SMU
-    (config/devices.py::PXI_SLOTS, category="smu"), then routes to Identity
-    Validation (_identify_smu -- interface check + connect() + identify()
-    only) via the shared _run_hardware_category() workflow. No Functional
-    Validation is implemented yet -- SMU.set_charge_mode()/output_enable()/
-    measure() are still placeholders (see docs/TODO.md); testing around a
-    stub would be a fake PASS, exactly what this project's testing
-    philosophy exists to avoid, so the menu reports "not yet implemented"
-    instead.
+    (config/devices.py::PXI_SLOTS, category="smu"), then routes to either
+    Identity Validation (_identify_smu -- interface check + connect() +
+    identify() only, never sources anything) or Functional Validation
+    (_functional_smu -- a real, laboratory-only DC voltage sourcing check,
+    operator physically present at the rack), via the shared
+    _run_hardware_category() workflow. See docs/architecture.md, "Identity
+    Validation vs Functional Validation".
     """
     devices = _pxi_slots_by_category("smu")
-    return _run_hardware_category("SMU", devices, _identify_smu)
+    return _run_hardware_category("SMU", devices, _identify_smu, _functional_smu)
+
+
+def _functional_smu(name: str, cfg: dict):
+    """
+    SMU Functional Validation -- laboratory-only, operator physically
+    present at the rack with a handheld DMM connected to the SMU output.
+
+    Verifies the SMU can source DC voltage correctly, using a sequence that
+    reflects how this SMU is actually used in NIPXI, not a generic bipolar
+    power-supply check:
+
+        Charging:    source voltage,  source current
+        Discharging: source voltage,  SINK current (current-sink, never a
+                     negative source voltage -- see docs/architecture.md
+                     Section 12.6 and README.md Section 8.1b)
+
+    This validation therefore exercises a positive voltage point only --
+    the same polarity the real charge path (`set_charge_mode()`) will use
+    -- never a negative voltage. Discharge's current-sink behavior is not
+    covered here (no current-sink validation exists yet; that is separate,
+    future work, not part of this bench voltage-sourcing check).
+
+    This is NOT a battery operation: no relay, no battery channel, no
+    charge/discharge mode is touched (SMU.set_charge_mode()/
+    set_discharge_mode() remain untouched placeholders). See
+    hardware/smu.py::SMU.source_dc_voltage_point().
+
+    Sequence: SAFE STATE (output forced off + verified) -> 0 V (baseline)
+    -> charge validation voltage -> 0 V (return to baseline) -> output OFF
+    (forced + verified again). Every step, and any FAIL or operator
+    cancellation (Ctrl+C / blank input at a prompt), always ends with
+    SMU.emergency_output_off() -- the operator must never be left with an
+    energized output.
+
+    Validation points are derived entirely from EXISTING project
+    configuration -- no new hardcoded voltage/current constants, and no
+    duplicate configuration:
+      - Validation voltage: Settings.CHARGE_VOLTAGE_V -- the already-
+        configured real CV-phase charge target for this system, i.e. the
+        same voltage setpoint the real charge path is meant to use. This
+        is more representative of production behavior than an arbitrary
+        bench value, per this validation's purpose.
+      - Current limit (compliance): Settings.CHARGE_CURRENT_A -- the
+        already-configured real charge current for this system, reused
+        as the SMU's output current-limit during this bench check.
+      - Voltage source range: Settings.BAT_VOLTAGE_MAX -- the existing
+        station-level absolute voltage safety ceiling, reused to bound
+        the SMU's source range so it can never be programmed above the
+        limit the rest of the safety architecture already enforces.
+    """
+    resource   = cfg.get("resource", "")
+    model      = cfg.get("model", "NI-SMU")
+    config_ref = f"{resource} / {model}"
+    results    = []
+
+    validation_v    = Settings.CHARGE_VOLTAGE_V
+    current_limit_a = Settings.CHARGE_CURRENT_A
+    range_v         = Settings.BAT_VOLTAGE_MAX
+
+    print(f"\nSMU Functional Validation -- {name} ({config_ref})")
+    print(f"Validation voltage (Settings.CHARGE_VOLTAGE_V): {validation_v:.3f} V")
+    print(f"Current limit (Settings.CHARGE_CURRENT_A): {current_limit_a:.3f} A")
+    print("\nConnect handheld DMM to SMU output.")
+    try:
+        input("Press Enter when ready to begin (Ctrl+C to cancel)... ")
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled before sourcing -- output was never enabled.")
+        return [_warn("SMU Functional", name, config_ref,
+                      "Cancelled by operator before sourcing began")]
+
+    from hardware.smu import SMU
+    smu = SMU(cfg)
+    try:
+        smu.connect()
+    except Exception as e:
+        return [_fail("SMU Functional", name, config_ref,
+                      f"[ERROR] SMU connect failed: {e}")]
+
+    # Start from a safe state -- force output off and verify before sourcing
+    # anything, mirroring HardwareManager.connect_all()'s relay open_all().
+    if not smu.emergency_output_off("SMU Functional Validation: pre-check safe state"):
+        results.append(_fail("SMU Functional", name, config_ref,
+                             "[ERROR] Could not verify a safe starting state -- "
+                             "output disable/verify failed before sourcing began"))
+        try:
+            smu.disconnect()
+        except Exception:
+            pass
+        return results
+
+    steps = [
+        ("0 V (baseline)", 0.0),
+        ("Charge validation voltage", validation_v),
+        ("0 V (return to baseline)", 0.0),
+    ]
+    cancelled = False
+
+    try:
+        for step_label, level_v in steps:
+            print(f"\nCurrent Step:\n    {step_label}")
+            print(f"Expected Voltage:\n    {level_v:.3f} V")
+            try:
+                reading = smu.source_dc_voltage_point(level_v, current_limit_a, range_v)
+            except Exception as e:
+                results.append(_fail("SMU Functional", f"{name}: {step_label}", config_ref,
+                                     f"[ERROR] {e}"))
+                break
+            results.append(_ok("SMU Functional", f"{name}: {step_label}", config_ref,
+                               f"Commanded {level_v:.3f} V -- SMU-measured "
+                               f"{reading['measured_v']:.6f} V (informational; "
+                               f"verify against handheld DMM)"))
+            try:
+                input("Verify reading on handheld DMM, then press Enter to continue "
+                      "(Ctrl+C to cancel)... ")
+            except (KeyboardInterrupt, EOFError):
+                cancelled = True
+                print("\nCancelled by operator.")
+                break
+    finally:
+        safe = smu.emergency_output_off("SMU Functional Validation complete/cancelled/failed")
+        if safe:
+            results.append(_ok("SMU Functional", name, config_ref,
+                               "Output disabled and verified OFF -- SMU returned to safe state"))
+        else:
+            results.append(_fail("SMU Functional", name, config_ref,
+                                 "[ERROR] Output disable could not be verified -- "
+                                 "physically check the SMU output"))
+        try:
+            smu.disconnect()
+        except Exception:
+            pass
+
+    if cancelled:
+        results.append(_warn("SMU Functional", name, config_ref,
+                             "Cancelled by operator -- remaining validation steps not run"))
+
+    return results
 
 
 # =============================================================================
@@ -796,20 +932,44 @@ def test_dmm():
 
 def _functional_dmm(name: str, cfg: dict):
     """
-    Functional Validation for one DMM: a REAL DC voltage measurement
-    (DMM.measure_dc_voltage()) -- command (configure + trigger) -> readback
-    (measured value) -> verify (finite, within the configured range) ->
-    PASS/FAIL. Unlike SMU sourcing, a DMM measurement is passive (it only
-    observes), so this is safe to run unconditionally and is real
-    verification, not a stub-backed fake PASS. Deliberately does NOT repeat
-    the interface/identity checks -- those are Identity Validation's job
+    DMM Functional Validation -- laboratory-only, operator physically
+    present at the rack with a known DC voltage source (bench supply,
+    calibrator, or other external reference) connected to the DMM input.
+
+    Verifies the DMM can acquire a DC voltage measurement: a REAL
+    measurement (DMM.measure_dc_voltage()) -- command (configure + trigger)
+    -> readback (measured value) -> verify (finite, within the configured
+    range) -> PASS/FAIL. Unlike SMU sourcing, a DMM measurement is passive
+    (it only observes), so this never changes hardware state and is safe
+    to run unconditionally. Deliberately does NOT repeat the
+    interface/identity checks -- those are Identity Validation's job
     (_identify_dmm), run separately.
+
+    First-implementation scope, deliberately minimal: this answers "can the
+    DMM successfully perform a voltage measurement?" only. It does NOT
+    implement current measurement, calibration validation, accuracy
+    certification, or automated metrology limits -- the finite/in-range
+    check below is a basic sanity guard (catches a NaN or a wildly
+    out-of-range reading), not a claim about measurement accuracy against
+    the externally-connected reference. Range comes entirely from
+    config/devices.py (PXI_SLOTS -> DMM_CONFIGS[...]["range_v"]) -- no
+    hidden constants.
     """
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-4065")
     range_v    = cfg.get("range_v", 10.0)
     config_ref = f"{resource} / {model}"
     results    = []
+
+    print(f"\nDMM Functional Validation -- {name} ({config_ref})")
+    print("\nConnect a known DC source to the DMM input")
+    print("(e.g. bench supply, calibrator, or other external reference).")
+    try:
+        input("Press Enter when ready to measure (Ctrl+C to cancel)... ")
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled before measuring.")
+        return [_warn("DMM Functional", name, config_ref,
+                      "Cancelled by operator before measurement began")]
 
     from hardware.dmm import DMM
     dmm = DMM(cfg)
@@ -827,6 +987,7 @@ def _functional_dmm(name: str, cfg: dict):
 
     try:
         value = dmm.measure_dc_voltage()
+        print(f"\nMeasured Voltage:\n    {value:.6f} V")
         results.append(_ok("DMM Functional", f"{name} DC volts measurement", config_ref,
                            f"Measured {value:.6f} V (within configured range +/-{range_v} V)"))
     except Exception as e:
@@ -864,13 +1025,13 @@ def test_daq():
 
 def _functional_daq(name: str, cfg: dict):
     """
-    Functional Validation for one DAQ: a deep channel read -- goes beyond
-    connectivity/identification, using nidaqmx directly since
-    hardware.daq.DAQ.read_channel() is still a TODO placeholder. COMMAND
-    (configure + read the channel) -> READBACK (the value) -> VERIFY
-    (finite, within the configured +/-voltage_range_v ADC range) -> PASS/
-    FAIL -- a NaN, an out-of-range, or a stuck reading is a FAIL, not "the
-    read call didn't throw." Deliberately does NOT repeat the
+    Functional Validation for one DAQ: a deep channel read via
+    hardware.daq.DAQ.read_channel() -- the same production driver class
+    used everywhere else. COMMAND (configure + read the channel) ->
+    READBACK (the value) -> VERIFY (finite, within the configured
+    +/-voltage_range_v ADC range) -> PASS/FAIL -- a NaN, an out-of-range,
+    or a stuck reading is a FAIL, not "the read call didn't throw" (see
+    hardware/daq.py::DAQ.read_channel()). Deliberately does NOT repeat the
     interface/identity checks -- those are Identity Validation's job
     (_identify_daq), run separately.
 
@@ -881,6 +1042,7 @@ def _functional_daq(name: str, cfg: dict):
     """
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-6363")
+    range_v    = cfg.get("voltage_range_v", 5.0)
     config_ref = f"{resource} / {model}"
     test_ch    = dev_cfg.BATTERY_CHANNELS[1]["daq_voltage_ch"]
     results    = []
@@ -899,41 +1061,16 @@ def _functional_daq(name: str, cfg: dict):
         return results
 
     try:
-        import math
-        import nidaqmx
-        import nidaqmx.errors
-        v_range = cfg.get("voltage_range_v", 5.0)
-        with nidaqmx.Task() as task:
-            task.ai_channels.add_ai_voltage_chan(test_ch,
-                                                 min_val=-v_range, max_val=v_range)
-            val = task.read()
-
-        if not math.isfinite(val):
-            results.append(_fail("DAQ Functional", f"{name} channel read", config_ref,
-                                 f"[ERROR] DAQ channel read FAILED verification\n"
-                                 f"Configuration : {name}\n"
-                                 f"Channel       : {test_ch}\n"
-                                 f"Reason        : reading is not a finite number ({val!r})"))
-        elif abs(val) > v_range * 1.05:   # allow the ADC's own overrange headroom
-            results.append(_fail("DAQ Functional", f"{name} channel read", config_ref,
-                                 f"[ERROR] DAQ channel read FAILED verification\n"
-                                 f"Configuration : {name}\n"
-                                 f"Channel       : {test_ch}\n"
-                                 f"Reason        : {val:.4f} V is outside the configured "
-                                 f"+/-{v_range} V range"))
-        else:
-            results.append(_ok("DAQ Functional", f"{name} channel read", config_ref,
-                               f"Channel {test_ch} read: {val:.4f} V -- verified within "
-                               f"configured +/-{v_range} V range"))
-    except nidaqmx.errors.DaqError as e:
+        val = daq.read_channel(test_ch)
+        results.append(_ok("DAQ Functional", f"{name} channel read", config_ref,
+                           f"Channel {test_ch} read: {val:.4f} V -- verified within "
+                           f"configured +/-{range_v} V range"))
+    except Exception as e:
         results.append(_fail("DAQ Functional", f"{name} channel read", config_ref,
                              f"[ERROR] DAQ channel read failed\n"
                              f"Configuration : {name}\n"
                              f"Channel       : {test_ch}\n"
-                             f"Expected      : {resource} ({model})\n"
                              f"Reason        : {e}"))
-    except Exception as e:
-        results.append(_fail("DAQ Functional", f"{name} channel read", config_ref, str(e)))
     finally:
         try:
             daq.disconnect()

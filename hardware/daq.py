@@ -2,25 +2,30 @@
 DAQ driver. Covers NI 6363 for analog voltage/current/NTC acquisition.
 
 connect()/disconnect()/identify() are real (NI-DAQmx device enumeration +
-a hardware self-test). No task is created and no channel is read by
-identify() -- actual channel acquisition (read_channel, read_all_batteries,
-verify_zero_current) is still a TODO placeholder -- a separate, later step.
+a hardware self-test). read_channel() is also real -- a single analog
+input read, verified finite and within the configured range (mirrors
+hardware/dmm.py::DMM.measure_dc_voltage()'s verification philosophy).
+read_all_batteries()/verify_zero_current() (multi-channel synchronized
+acquisition) are still TODO placeholders -- a separate, later step.
 
 Verification philosophy (see docs/architecture.md "Instrument Verification
 Philosophy" and hardware/relay_eth.py, which this mirrors): a bare identity
 query is not a real verification. identify() does COMMAND (run the
 device's built-in self-test, device.self_test_device()) -> READBACK
 (nidaqmx raises DaqError on failure, so a clean return IS the readback) ->
-VERIFY (no exception raised) -> return the product type. test.py's deep
-DAQ test additionally takes one real channel reading and verifies it is
-within the configured ADC range before reporting PASS -- see
-test_daq()'s "Step 3" -- never just "the read call didn't throw."
+VERIFY (no exception raised) -> return the product type. read_channel()
+does COMMAND (configure one analog input channel at the configured range
+and trigger a read) -> READBACK (the sampled value) -> VERIFY (finite,
+within the configured range, +5% overrange margin) -> return it, raising
+DAQError on any failure -- never just "the read call didn't throw."
 
 Constructed from a config/devices.py DAQ_CONFIG-shaped dict -- the same
 config dict HardwareManager and Hardware Discovery both read, so there is
 one source of truth for the resource string (config/devices.py, not
 config/settings.py).
 """
+
+import math
 
 from hardware.base import HardwareBase
 from utils.errors import DAQError
@@ -38,8 +43,9 @@ class DAQ(HardwareBase):
         resource = cfg.get("resource", "")
         super().__init__(f"DAQ_{resource}")
         self.resource = resource
-        self._model  = cfg.get("model", "NI-6363")
-        self._device = None   # nidaqmx.system.Device, set by connect()
+        self._model    = cfg.get("model", "NI-6363")
+        self._range_v  = float(cfg.get("voltage_range_v", 5.0))
+        self._device   = None   # nidaqmx.system.Device, set by connect()
 
     def connect(self):
         self.log.info("Opening DAQ session: %s", self.resource)
@@ -82,15 +88,51 @@ class DAQ(HardwareBase):
         self._device.self_test_device()
         return product_type
 
+    def read_channel(self, physical_channel: str) -> float:
+        """
+        Read a single analog input channel -- COMMAND (configure a
+        temporary AI voltage channel at the configured +/-voltage_range_v
+        and trigger a read) -> READBACK (the sampled value) -> VERIFY
+        (finite, within the configured range, +5% overrange margin) ->
+        return it. Raises DAQError on any failure, including a value that
+        is technically returned but fails verification -- a NaN, an
+        out-of-range, or a stuck reading is a failure, not "the read call
+        didn't throw." Mirrors hardware/dmm.py::DMM.measure_dc_voltage().
+        """
+        if self._device is None:
+            raise DAQError(f"DAQ {self.resource} is not connected")
+
+        try:
+            import nidaqmx
+            import nidaqmx.errors
+            with nidaqmx.Task() as task:
+                task.ai_channels.add_ai_voltage_chan(
+                    physical_channel, min_val=-self._range_v, max_val=self._range_v)
+                value = task.read()
+        except nidaqmx.errors.DaqError as e:
+            raise DAQError(
+                f"DAQ {self.resource} channel {physical_channel} read failed: {e}"
+            ) from e
+
+        if not math.isfinite(value):
+            raise DAQError(
+                f"DAQ {self.resource} channel {physical_channel} read FAILED "
+                f"verification: reading is not a finite number ({value!r})"
+            )
+        if abs(value) > self._range_v * 1.05:   # allow the ADC's own overrange headroom
+            raise DAQError(
+                f"DAQ {self.resource} channel {physical_channel} read FAILED "
+                f"verification: {value:.4f} V is outside the configured "
+                f"+/-{self._range_v} V range"
+            )
+        self.log.info("DAQ %s channel %s read: %.4f V (range +/-%.1f V)",
+                      self.resource, physical_channel, value, self._range_v)
+        return value
+
     # ------------------------------------------------------------------
-    # Channel acquisition -- TODO, not implemented yet.
+    # Multi-channel synchronized acquisition -- TODO, not implemented yet.
     # Out of scope for connectivity/discovery work; see docs/TODO.md.
     # ------------------------------------------------------------------
-
-    def read_channel(self, physical_channel: str) -> float:
-        """Read a single analog input. Returns voltage in V."""
-        # TODO: create temporary task, configure ai channel, read one sample
-        return 0.0
 
     def read_all_batteries(self) -> dict:
         """

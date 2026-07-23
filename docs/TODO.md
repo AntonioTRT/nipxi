@@ -31,14 +31,25 @@ the bottom, with a pointer to where the real documentation lives
   `AUX_SMU_2` and `EXPANSION_DAQ`/`PRECISION_DAQ` are configured and
   individually testable but not yet assigned to any battery channel --
   `HardwareManager` still drives only `PRIMARY_SMU`/`MAIN_DAQ`.
-- [MUST] `SMU.set_charge_mode()`/`set_discharge_mode()`/`output_enable()`/
-  `output_disable()`*/`measure()` -- still placeholders (`*output_disable()`
-  is real; the others are not). Sourcing anything, even a small test
-  current, is real instrument functionality with real electrical
-  consequences, not a connectivity check -- deliberately deferred.
-- [MUST] `DAQ.read_channel()`/`read_all_batteries()`/`verify_zero_current()`
-  -- still placeholders; `test_daq()`'s deep channel read uses `nidaqmx`
-  directly until these exist.
+- [MUST] `SMU.set_charge_mode()`/`set_discharge_mode()`/`output_enable()`*/
+  `output_disable()`*/`measure()` -- still placeholders for the *battery*
+  charge/discharge path (`*output_disable()` is real; `output_enable()`/
+  `set_charge_mode()`/`set_discharge_mode()`/`measure()` are not). Sourcing
+  current into a real battery channel has real electrical consequences well
+  beyond a connectivity check -- deliberately deferred. `set_discharge_mode()`
+  must be implemented as a current-SINK at a positive voltage when this work
+  starts -- NOT a negative-voltage source (see docs/architecture.md Section
+  12.6). Note: bench-only DC voltage sourcing for SMU Functional Validation IS
+  implemented and real -- `SMU.source_dc_voltage_point()` (see
+  docs/architecture.md Section 12.6) -- this is a separate, narrow, positive-
+  voltage-only capability with no relay/battery/channel involvement, not the
+  battery charge/discharge path above.
+- [MUST] `DAQ.read_all_batteries()`/`verify_zero_current()` -- still
+  placeholders (multi-channel synchronized acquisition). `DAQ.read_channel()`
+  (single-channel read) IS implemented and real now -- moved out of
+  `test.py::_functional_daq()` into `hardware/daq.py`, matching the SMU/DMM/
+  Relay architecture (test.py orchestrates, hardware/*.py implements). See
+  docs/architecture.md Section 8.2b.
 - [ ] `hardware/pxi_rack.py` -- enumerate PXI cards at startup and cross-check
   against `PXI_SLOTS`, reporting a mismatch before any test runs rather than
   failing mid-test on a missing card.
@@ -148,9 +159,29 @@ here -- this is an index, not a changelog.
 - **Hardware Discovery + device selection workflow** -- grouped by category
   from `PXI_SLOTS`, identity-vs-configured-model comparison, N/A reporting
   for driver-less categories, shared `_run_hardware_category()` select-device
-  -> Identity Validation / Functional Validation (future) workflow reused
-  across SMU/DMM/DAQ/Temperature Module/Numato Relay Matrix/PXI Relay Matrix.
-  See `docs/architecture.md` Section 8.2/8.2a/8.2b.
+  -> Identity Validation / Functional Validation workflow reused across
+  SMU/DMM/DAQ/Temperature Module/Numato Relay Matrix/PXI Relay Matrix
+  (Temperature Module and PXI Relay Matrix have no Functional Validation
+  implemented yet). See `docs/architecture.md` Section 8.2/8.2a/8.2b.
+- **SMU and DMM Functional Validation (laboratory, operator physically
+  present)** -- `SMU.source_dc_voltage_point()` (bench-only DC voltage
+  sourcing, safe state -> 0 V -> charge validation voltage -> 0 V -> output
+  OFF, verified) and the enhanced `_functional_dmm()` (operator instructions
+  + "Measured Voltage" display). Positive-voltage only -- an earlier version
+  sourced a negative validation point to demonstrate bipolar capability;
+  corrected because NIPXI discharge is a current-sink operation, not a
+  negative-voltage source, and bipolar capability is only documented for
+  `PRIMARY_SMU` (PXIe-4141) in this codebase, not the other three configured
+  SMUs. Validation voltage/current/range reuse `Settings.CHARGE_VOLTAGE_V`/
+  `Settings.CHARGE_CURRENT_A`/`Settings.BAT_VOLTAGE_MAX`/`DMM_CONFIGS` -- no
+  new configuration introduced. See `docs/architecture.md` Section 12.6,
+  README.md Section 8.1b.
+- **DAQ Functional Validation architecture correction** -- `read_channel()`
+  moved from being implemented directly inside `test.py::_functional_daq()`
+  (a raw `nidaqmx.Task()` block) into `hardware/daq.py::DAQ.read_channel()`,
+  matching the SMU/DMM/Relay pattern (test.py orchestrates only,
+  hardware/*.py owns all instrument-specific behavior). No functional or
+  reporting change. See `docs/architecture.md` Section 8.2b.
 - **Identity vs Functional Validation menu simplification** -- the operator
   menu was narrowed to the current hardware bring-up scope (identification +
   readiness, safe to do remotely over RDP); the Electronic Load stub, MiniSQL

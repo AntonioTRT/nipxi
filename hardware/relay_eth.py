@@ -159,8 +159,8 @@ being renamed; "type": "ethernet" is the RelayFactory dispatch key and is
 unchanged -- it denotes the transport interface, not the brand):
     type          "ethernet"
     driver        "RELAY32ETHRL00"  (informational label)
-    name          human-readable label, e.g. "MAIN_MATRIX_ETH"
-    ip            IP address string, e.g. "169.254.1.1"
+    name          human-readable label, e.g. "MATRIX_NUMATO_201"
+    ip            IP address string, e.g. "169.254.1.201"
     port          TCP port integer, default 23
     username      Telnet username, default "admin"  ("user" also accepted for compat)
     password      Telnet password, default "admin"
