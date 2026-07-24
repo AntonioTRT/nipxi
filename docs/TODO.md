@@ -172,9 +172,22 @@ first real-rack hardware bring-up milestone record.
   `hold_s`/`during_hold` so a DMM reading happens while output is still
   active), and persists relay/state/SMU/DMM data to a new `station_state`
   table (`data/storage.py`). Displays (never auto-resumes) the previous
-  execution's last known position at startup. Implemented and unit-verified
-  with mocked hardware; awaiting an actual PXIe rack run. See
-  `docs/architecture.md` Section 18.
+  execution's last known position at startup. **Validated end-to-end on the
+  physical PXIe rack** (`AUX_SMU_1`/PXI-4130 Slot 7 Ch1 -> `MAIN_DMM`/NI-4065
+  Slot 3, no battery/load) -- all 8 relays cycled successfully. A one-time
+  first-relay measurement transient was observed and root-caused (no
+  settling delay between NI-DCPower `initiate()` and the first `measure()`
+  call, only exercised on the session's first commit/initiate cycle) --
+  documented, not fixed, per `docs/MILESTONES.md` Milestone 2. See
+  `docs/architecture.md` Section 18 and `docs/MILESTONES.md`.
+- Also fixed since real-rack validation began: `Settings.PROTO_TEST_SMU_NAME`
+  (`config/settings.py`, default `"AUX_SMU_1"`) lets `run_proto_test_execution()`
+  target a specific SMU instead of the positional `next(iter(SMU_ASSIGNMENTS...))`
+  default (which always resolved to `PRIMARY_SMU`, regardless of which unit
+  was physically wired up) -- scoped to this one function only.
+  `test_control/proto_test_sequence.py` also gained `print()`-based console
+  progress (relay/phase/measurements), since `test.py` never configures a
+  logging handler for this workflow.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies

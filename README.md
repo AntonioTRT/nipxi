@@ -54,10 +54,12 @@ not simulation.
 Remaining stubs are scoped to the *battery* charge/discharge sourcing path only (`SMU.set_charge_mode()`/
 `output_enable()`/`measure()`, `DAQ.read_all_batteries()`) -- deliberately deferred, since sourcing current into
 a real battery channel has real electrical consequences beyond a connectivity/bench check.  
-**Proto Test Execution (Milestone 2)** is implemented -- `test.py`'s "Proto Test Execution" menu item exercises
+**Proto Test Execution (Milestone 2) is validated** -- `test.py`'s "Proto Test Execution" menu item exercises
 the full production architecture (relay -> SMU -> DMM -> SQLite -> recovery display) end-to-end with no battery
-connected, reusing `HardwareManager`/`SafetyMonitor`/`CancellationToken` unchanged -- unit-verified with mocked
-hardware; awaiting an actual PXIe rack run.  
+connected, reusing `HardwareManager`/`SafetyMonitor`/`CancellationToken` unchanged. Confirmed PASSED on the
+physical PXIe rack (`AUX_SMU_1`/PXI-4130 Slot 7 Ch1 -> `MAIN_DMM`/NI-4065 Slot 3) -- see
+[docs/MILESTONES.md](docs/MILESTONES.md) for the full record, including a documented (not yet fixed) first-relay
+measurement transient.  
 See [docs/MILESTONES.md](docs/MILESTONES.md) for the full milestone record and [docs/TODO.md](docs/TODO.md) for
 the complete remaining-work checklist.
 
