@@ -63,6 +63,8 @@ one source of truth for the resource string (config/devices.py, not
 config/settings.py).
 """
 
+import time
+
 from config.settings import Settings
 from hardware.base import HardwareBase
 from utils.errors import SMUError, SMUStateVerificationError
@@ -320,7 +322,8 @@ class SMU(HardwareBase):
     # ------------------------------------------------------------------
 
     def source_dc_voltage_point(self, voltage_v: float, current_limit_a: float,
-                                 voltage_range_v: float) -> dict:
+                                 voltage_range_v: float, hold_s: float = 0.0,
+                                 during_hold=None) -> dict:
         """
         Source a single static DC voltage point and confirm it electrically.
 
@@ -355,6 +358,19 @@ class SMU(HardwareBase):
         instrument for this step (see test.py's SMU Functional Validation
         workflow) -- the measured values here are reported as informational
         context only.
+
+        `hold_s` (default 0.0 -- existing callers unaffected) keeps output
+        enabled for `hold_s` seconds AFTER the SMU's own measurement is
+        taken and BEFORE the `finally` block disables it -- used by
+        test_control/proto_test_sequence.py::ProtoTestSequence (Proto Test
+        Execution, Milestone 2) to dwell on a relay with output still
+        active. `during_hold` (default None), if given, is called with no
+        arguments once, immediately after the SMU's own measurement and
+        BEFORE the `hold_s` sleep -- lets a caller take an external reading
+        (e.g. DMM) while output is still genuinely active, without this
+        driver knowing anything about what `during_hold` is or does. Its
+        return value is included in the result dict as
+        `"during_hold_result"` (None if `during_hold` was not given).
         """
         if self._session is None:
             raise SMUError(f"SMU {self.resource} channel {self._channel} is not connected")
@@ -381,6 +397,7 @@ class SMU(HardwareBase):
         readback_v = None
         readback_current_limit_a = None
         readback_output_enabled = None
+        during_hold_result = None
         try:
             # Configuration verification -- READBACK + VERIFY each commanded
             # attribute before trusting the output is in the state just
@@ -414,6 +431,17 @@ class SMU(HardwareBase):
                 in_compliance = self._session.query_in_compliance()
                 measured_v = self._session.measure(nidcpower.MeasurementTypes.VOLTAGE)
                 measured_i = self._session.measure(nidcpower.MeasurementTypes.CURRENT)
+                # Optional hold -- output stays enabled for hold_s seconds
+                # after the SMU's own measurement, above, so a caller-
+                # supplied during_hold() (e.g. a DMM reading) observes a
+                # genuinely active output, not one already disabled by the
+                # finally block below. Both default to a no-op, so existing
+                # callers (test.py's SMU Functional Validation) see zero
+                # behavior change.
+                if during_hold is not None:
+                    during_hold_result = during_hold()
+                if hold_s > 0:
+                    time.sleep(hold_s)
         except SMUStateVerificationError:
             raise
         except Exception as e:
@@ -455,4 +483,6 @@ class SMU(HardwareBase):
             "in_compliance": in_compliance,
             "measured_v":    measured_v,
             "measured_i":    measured_i,
+            # Result of the optional during_hold() callback (None if unused).
+            "during_hold_result": during_hold_result,
         }

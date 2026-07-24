@@ -86,6 +86,12 @@ These are safety hard limits. The system raises `SafetyViolationError` if any is
 | `SMU_VOLTAGE_READBACK_TOLERANCE_V` | `1e-4` | float (V) | Tolerance for `hardware/smu.py::SMU._verify_config_readback()` when comparing NI-DCPower's `voltage_level` attribute readback to the commanded value after `commit()`. This is an **attribute round-trip bound** (floating-point + instrument coercion to its nearest programmable step), NOT a measurement-accuracy figure -- `voltage_level` is a stored IVI setpoint the driver echoes back, not a new ADC measurement. See docs/architecture.md Section 12.6b. |
 | `SMU_CURRENT_READBACK_TOLERANCE_A` | `1e-4` | float (A) | Same as above, for the `current_limit` attribute. |
 
+### Proto Test Execution (Milestone 2 -- infrastructure validation, no battery)
+
+| Parameter | Default | Type | Description |
+|-----------|---------|------|-------------|
+| `PROTO_TEST_DWELL_S` | `120.0` | float (s) | Per-relay dwell time (output stays enabled this long before disabling and advancing). Reuses `CHARGE_VOLTAGE_V`/`CHARGE_CURRENT_A`/`BAT_VOLTAGE_MAX` above as the bench source point/current-limit/voltage-range and `ACTIVE_CHANNELS` above as the relay sequence -- no new duplicate voltage/current/channel-list constants. See `docs/architecture.md` Section 18 and `test_control/proto_test_sequence.py`. |
+
 ### PXI hardware (simulation mode only)
 
 | Parameter | Default | Type | Description |
@@ -144,6 +150,8 @@ The default assumes a single NI 6363 at `Dev1`. Update if your DAQ resource name
 | `DATABASE_FILE` | `"data_output/development/nipxi_dev.db"` | `".../nipxi_validation.db"` | `".../nipxi.db"` | str | SQLite database path |
 | `CSV_DIR` | `"data_output/development/csv"` | `".../csv"` | `".../csv"` | str | Per-channel CSV output directory |
 | `REPORT_DIR` | `"data_output/development/reports"` | `".../reports"` | `".../reports"` | str | Generated reports directory |
+
+**`station_state` table** (`data/storage.py::DataStorage`, same `DATABASE_FILE` as `measurements` above): one row per relay processed during Proto Test Execution (Milestone 2) -- `relay`, `state` (`ACTIVE`/`COMPLETED`/`FAILED`/`SAFETY_VIOLATION`/`CANCELLED`, reusing `utils/stop_reason.py::StopReason`), `timestamp`, SMU commanded/readback values, SMU/DMM measurements. Written via `DataStorage.record_execution_state()`, read via `DataStorage.get_last_execution_state()` (always the latest row across all run_ids -- used to display, never auto-resume, the previous execution's last known position at startup). Deliberately a separate table from `measurements` -- station/execution position is a different concern from a per-sample battery reading, not part of the `StorageBackend` abstract interface (a future `MiniSQLStorage` need not implement it unless it also wants this feature). See `docs/architecture.md` Section 18.
 
 ---
 

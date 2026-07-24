@@ -82,6 +82,36 @@ CREATE TABLE IF NOT EXISTS measurements (
 _COLUMNS = ["run_id", "channel", "timestamp", "elapsed_s", "phase",
             "voltage_v", "current_a", "temp_c"]
 
+# Station/execution state -- one row per relay processed, used to display
+# "previous execution found" at startup (Proto Test Execution, Milestone 2,
+# and the future cycle/state recovery engine this anticipates -- see
+# docs/DATABASE_ROADMAP.md Section 4 / docs/TODO.md's previously-unwired
+# "station_state" table). Deliberately a separate table from `measurements`
+# above (a different concern: station/execution position, not a per-sample
+# battery reading) rather than overloading that schema's columns.
+CREATE_STATION_STATE_SQL = """
+CREATE TABLE IF NOT EXISTS station_state (
+    id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                        TEXT    NOT NULL,
+    timestamp                     TEXT    NOT NULL,
+    relay                         INTEGER,
+    state                         TEXT,
+    commanded_v                   REAL,
+    commanded_current_limit_a     REAL,
+    smu_readback_v                REAL,
+    smu_readback_current_limit_a  REAL,
+    smu_measured_v                REAL,
+    smu_measured_i                REAL,
+    dmm_measured_v                REAL
+);
+"""
+
+_STATION_STATE_COLUMNS = [
+    "relay", "state", "timestamp", "commanded_v", "commanded_current_limit_a",
+    "smu_readback_v", "smu_readback_current_limit_a", "smu_measured_v",
+    "smu_measured_i", "dmm_measured_v",
+]
+
 
 class DataStorage(StorageBackend):
     """SQLite + CSV storage. Implements StorageBackend."""
@@ -104,6 +134,7 @@ class DataStorage(StorageBackend):
             os.makedirs(self.s.CSV_DIR, exist_ok=True)
             self._db = sqlite3.connect(self.s.DATABASE_FILE)
             self._db.execute(CREATE_TABLE_SQL)
+            self._db.execute(CREATE_STATION_STATE_SQL)
             self._db.commit()
             self.log.info("Storage opened. run_id=%s", self.run_id)
         except (OSError, sqlite3.Error) as e:
@@ -178,6 +209,81 @@ class DataStorage(StorageBackend):
         except sqlite3.Error as e:
             self.log.error("DB query failed: %s", e)
             return []
+
+    # ------------------------------------------------------------------
+    # Station/execution state (Proto Test Execution, Milestone 2) -- NOT
+    # part of the StorageBackend interface above: this is a separate
+    # concern (station/execution position, not a per-sample measurement),
+    # so a future MiniSQLStorage need not implement it unless it also wants
+    # this feature. Same connection/table-lifetime as the measurements
+    # table (opened in open(), closed in close()).
+    # ------------------------------------------------------------------
+
+    def record_execution_state(self, relay: int, state: str, **fields) -> int:
+        """
+        Persist one station-state row: which relay was being processed,
+        what state it was in, and (optionally) the SMU configuration/
+        readback, SMU measurements, and DMM measurement at that point.
+
+        `state` is a plain string -- reuse utils/stop_reason.py's
+        StopReason constants for terminal states (COMPLETED/FAILED/
+        SAFETY_VIOLATION/CANCELLED) plus "ACTIVE" for an in-progress relay,
+        rather than inventing a second vocabulary.
+
+        `fields` accepts any of: commanded_v, commanded_current_limit_a,
+        smu_readback_v, smu_readback_current_limit_a, smu_measured_v,
+        smu_measured_i, dmm_measured_v -- any field omitted is stored NULL.
+        Unknown keys are ignored (not written) rather than raising, so a
+        caller can pass through a dict built for another purpose safely.
+
+        Raises if the storage backend is not open -- unlike record()'s
+        silent no-op, a caller relying on this for recovery/display data
+        should know immediately if it silently didn't persist.
+        """
+        if self._db is None:
+            raise RuntimeError("DataStorage.record_execution_state() called before open()")
+        row = {
+            "run_id": self.run_id,
+            "timestamp": datetime.now().isoformat(),
+            "relay": relay,
+            "state": state,
+        }
+        for key in _STATION_STATE_COLUMNS:
+            if key in fields and key not in row:
+                row[key] = fields[key]
+        for key in _STATION_STATE_COLUMNS:
+            row.setdefault(key, None)
+        cols = ["run_id"] + _STATION_STATE_COLUMNS
+        placeholders = ", ".join("?" for _ in cols)
+        cursor = self._db.execute(
+            f"INSERT INTO station_state ({', '.join(cols)}) VALUES ({placeholders})",
+            [row[c] for c in cols],
+        )
+        self._db.commit()
+        return cursor.lastrowid
+
+    def get_last_execution_state(self):
+        """
+        Return the most recently recorded station-state row as a dict
+        (relay/state/timestamp/commanded_v/.../dmm_measured_v), or None if
+        none has ever been recorded. Reads across run_ids deliberately --
+        "the previous execution's last known position" means the last row
+        in the table regardless of which run wrote it, since this is
+        queried at the START of a new run (a new run_id) specifically to
+        show what the PREVIOUS run left off at. No automatic resume is
+        implied or performed here -- display only (see
+        test.py::run_proto_test_execution()).
+        """
+        if self._db is None:
+            return None
+        cur = self._db.execute(
+            f"SELECT {', '.join(_STATION_STATE_COLUMNS)} FROM station_state "
+            f"ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return dict(zip(_STATION_STATE_COLUMNS, row))
 
     # ------------------------------------------------------------------
     # Internal helpers

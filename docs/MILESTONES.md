@@ -150,7 +150,99 @@ confirmed reachable and controllable in isolation.
 
 ---
 
+## Milestone 2: Proto Test Execution
+
+**Status:** IMPLEMENTED -- unit-verified with mocked hardware; awaiting an
+actual PXIe rack run to close out (unlike Milestone 1's record above, this
+entry does NOT claim real-hardware validation).
+**Scope:** exercise the real production architecture end-to-end -- relay,
+SMU, DMM, SQLite persistence, state display, safe shutdown, Ctrl+C
+cancellation -- through the same code path a future battery test will use,
+with **no battery connected**. Infrastructure validation, not battery
+validation. Inserted ahead of Milestone 1's originally recommended next
+step (battery charge/discharge sourcing, see below) as a deliberate,
+lower-risk step: prove every layer works together before sourcing current
+into a real battery channel.
+
+### Objectives achieved
+
+- Cycle every configured relay (force-all-off -> verify -> activate ->
+  verify, via the unchanged `hardware/relay_eth.py::NumatoRelayMatrix`),
+  source and fully verify a bench SMU voltage point on each
+  (`hardware/smu.py::SMU.source_dc_voltage_point()`, reused unchanged from
+  SMU Verification Hardening), and take a DMM reading while output is
+  genuinely still active.
+- Persist relay number, timestamp, SMU commanded/readback/measured values,
+  and the DMM reading to a new `station_state` SQLite table
+  (`data/storage.py::DataStorage`).
+- Display (never auto-resume) the previous execution's last known position
+  at startup, reading `station_state` across run_ids.
+- Preserve every existing safety/verification guarantee from Milestones 1
+  and the SMU Verification Hardening work: relay verification, SMU
+  configuration verification, safe-state teardown on every exit path
+  (success, failure, safety violation, operator cancellation), and the
+  centralized "return to Main Menu" operator workflow.
+
+### Architectural decisions made
+
+- **New file:** `test_control/proto_test_sequence.py::ProtoTestSequence` --
+  justified as the natural extension of this project's existing one-class-
+  per-sequence-file pattern (`battery_test.py`/`charge_cycle.py`/
+  `discharge_cycle.py` are already separate files), not a parallel
+  framework. Mirrors `BatteryTestSequence`'s constructor shape and
+  exception-handling structure exactly.
+- **Two new optional parameters on `SMU.source_dc_voltage_point()`**
+  (`hold_s`, `during_hold`), both defaulting to no-ops -- zero behavior
+  change for the existing SMU Functional Validation caller. Chosen over
+  duplicating the ~40 lines of already-audited configure/verify logic into
+  a second method, and over teaching `hardware/smu.py` anything about the
+  DMM (the `during_hold` callback is opaque to the driver).
+- **New `station_state` table, not a new database or storage class.**
+  Added directly to the existing `DataStorage` (two new concrete methods,
+  not part of the `StorageBackend` abstract interface, since station/
+  execution position is a different concern from a per-sample measurement).
+  This is the `station_state` table `docs/DATABASE_ROADMAP.md`/
+  `docs/TODO.md` already anticipated for the future recovery engine --
+  built now, scoped to Proto Test Execution's narrower "display, don't
+  resume" need.
+- **No new entry-point clutter in `main.py`.** The entire Proto Test
+  Execution workflow lives in `test.py::run_proto_test_execution()` and
+  `test_control/proto_test_sequence.py` -- `main.py` was not modified.
+- **No battery-limit logic added anywhere.** `SafetyMonitor` remains the
+  sole owner of limit/abort decisions, per the SMU Verification Hardening
+  separation-of-responsibilities decision -- `ProtoTestSequence` only calls
+  `safety.emergency_stop()`/`safety.safe_cancel_shutdown()`.
+
+### Remaining work
+
+- Real PXIe rack execution of this workflow -- not yet run against physical
+  hardware in this session.
+- Automatic resume from a previous execution position -- deliberately out
+  of scope for this milestone (display only).
+- The originally-recommended Milestone 2 (battery charge/discharge sourcing
+  bring-up, see below) is now effectively Milestone 3.
+
+### Risks
+
+- Unverified against real NI-DCPower/DMM/relay timing -- the `hold_s`
+  dwell and `during_hold` DMM-read-while-active pattern is new code,
+  exercised only against mocked hardware so far.
+- `dwell_s` defaults to 120s per relay across up to 8 relays (~16 minutes
+  minimum for a full cycle) -- worth confirming this is an acceptable
+  bench-test duration before an unattended rack run.
+
+### Recommended next milestone
+
+**Milestone 3: Battery Charge/Discharge Sourcing Bring-Up** (carried over
+from Milestone 1's recommendation, renumbered) -- implement and validate
+`SMU.set_charge_mode()`/`set_discharge_mode()`/`output_enable()`/`measure()`
+for a single battery channel end-to-end, before scaling to all 8 channels
+or additional SMUs.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
-physical PXIe rack. See `docs/TODO.md` for the live remaining-work
-checklist and `docs/architecture.md`/`docs/CONFIGURATION.md` for full
-technical detail on every item referenced above.*
+physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
+implementation. See `docs/TODO.md` for the live remaining-work checklist
+and `docs/architecture.md`/`docs/CONFIGURATION.md` for full technical
+detail on every item referenced above.*

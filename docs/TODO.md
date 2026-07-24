@@ -103,8 +103,12 @@ the bottom, with a pointer to where the real documentation lives
   single global `BAT_VOLTAGE_MAX`/etc. See `docs/architecture.md` Section 11
   ("Operational Limit Resolution" / planned `LimitResolver`, doc-only today).
 - [ ] Cycle/state recovery engine (`docs/DATABASE_ROADMAP.md` Section 4) --
-  only the `is_recovery_enabled()` config hook exists; no recovery logic, no
-  `station_state` table.
+  `is_recovery_enabled()` config hook and a `station_state` table now exist
+  (`data/storage.py`, added for Proto Test Execution, Milestone 2 -- see
+  docs/architecture.md Section 18), and `get_last_execution_state()` DISPLAYS
+  the previous run's last position at startup, but no automatic resume
+  logic exists yet -- still display-only, by this milestone's explicit
+  scope, not a gap introduced now.
 - [ ] `battery_repository.py`/`cycle_repository.py`/`measurement_repository.py`/
   `state_repository.py` (`docs/DATABASE_ROADMAP.md` Section 2) -- planned
   repository split of today's single `DataStorage` class.
@@ -157,6 +161,20 @@ Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
 
+- **Proto Test Execution (Milestone 2 -- infrastructure validation, no
+  battery)** -- `test.py::run_proto_test_execution()` +
+  `test_control/proto_test_sequence.py::ProtoTestSequence` exercise the real
+  production architecture end-to-end (`HardwareManager`, relay, SMU, DMM,
+  SQLite, `CancellationToken`/Ctrl+C, safe shutdown) with no battery
+  connected -- cycles every configured relay, sources+verifies a bench SMU
+  voltage point (`hardware/smu.py::SMU.source_dc_voltage_point()`, reused
+  unchanged, extended with two new backward-compatible optional parameters
+  `hold_s`/`during_hold` so a DMM reading happens while output is still
+  active), and persists relay/state/SMU/DMM data to a new `station_state`
+  table (`data/storage.py`). Displays (never auto-resumes) the previous
+  execution's last known position at startup. Implemented and unit-verified
+  with mocked hardware; awaiting an actual PXIe rack run. See
+  `docs/architecture.md` Section 18.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies

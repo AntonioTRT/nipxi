@@ -2550,11 +2550,117 @@ def run_main_test():
 
 
 # =============================================================================
+# 0b. Proto Test Execution -- Milestone 2: infrastructure validation, no
+# battery connected. Exercises the real architecture end-to-end (relay ->
+# SMU -> DMM -> SQLite -> recovery display) using test_control/
+# proto_test_sequence.py::ProtoTestSequence -- reuses HardwareManager,
+# CancellationToken/Ctrl+C handling, and DataStorage exactly as
+# run_main_test() above, so this is the same production plumbing, not a
+# parallel framework. See docs/architecture.md "Proto Test Execution".
+# =============================================================================
+
+def run_proto_test_execution():
+    """
+    Proto Test Execution: cycles every configured relay, sourcing a bench
+    SMU voltage point (fully verified -- see hardware/smu.py) and taking a
+    DMM reading on each, persisting station state to SQLite, with NO
+    battery connected. Reads and displays (never auto-resumes) the previous
+    execution's last known position at startup.
+    """
+    print("PROTO TEST EXECUTION -- infrastructure validation (no battery connected)")
+
+    import signal
+    from data.storage import DataStorage
+    from test_control.hardware_manager import HardwareManager
+    from test_control.proto_test_sequence import ProtoTestSequence
+    from test_control.safety_monitor import SafetyMonitor
+    from utils.cancellation import CancellationToken
+    from utils.errors import HardwareInitError, OperationCancelledError
+
+    smu_name, smu_cfg = next(iter(dev_cfg.SMU_ASSIGNMENTS.items()))
+    dmm_cfg            = dev_cfg.DMM_CONFIG
+    relay_cfg          = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
+
+    print("\nSelected Hardware\n")
+    print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}  [{smu_name}]\n  {smu_cfg.get('resource', '')}\n")
+    print(f"DMM:\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
+    print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}\n  {relay_cfg.get('ip', '')}\n")
+
+    # DMM is required for this workflow (unlike run_main_test(), which
+    # leaves it optional) -- pass dmm_cfg explicitly so HardwareManager
+    # actually constructs and connects it.
+    hw = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, dmm_cfg=dmm_cfg)
+
+    try:
+        hw.connect_all()
+    except HardwareInitError as e:
+        print(f"[FAIL] Hardware initialization failed: {e}")
+        return
+
+    storage = DataStorage(settings=Settings)
+    storage.open()
+
+    try:
+        last_state = storage.get_last_execution_state()
+        print("\nPrevious execution found:\n" if last_state else "\nNo previous execution found.\n")
+        if last_state:
+            print(f"    Relay:     {last_state['relay']}")
+            print(f"    State:     {last_state['state']}")
+            print(f"    Timestamp: {last_state['timestamp']}")
+        print("\n(Display only -- no automatic resume.)")
+
+        relays  = Settings.ACTIVE_CHANNELS
+        dwell_s = Settings.PROTO_TEST_DWELL_S
+        print(f"\nRelays to cycle: {relays}")
+        print(f"Dwell per relay: {dwell_s:.0f}s")
+
+        token = CancellationToken(owner="test.py:run_proto_test_execution")
+        previous_sigint_handler = signal.signal(
+            signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+        )
+        print("\nPress Ctrl+C to cancel safely.\n")
+
+        try:
+            safety   = SafetyMonitor(Settings)
+            sequence = ProtoTestSequence(
+                smu=hw.smu, dmm=hw.dmm, relay=hw.relay, safety=safety,
+                storage=storage, settings=Settings,
+            )
+            try:
+                sequence.run(relays, dwell_s, token=token)
+                print("\nProto Test Execution complete -- all relays cycled successfully.")
+            except OperationCancelledError:
+                print("\nProto Test Execution cancelled by operator -- "
+                      "hardware is in a verified safe state.")
+            except KeyboardInterrupt:
+                # Defensive fallback only -- should not normally fire while
+                # the SIGINT handler above is installed.
+                print("\nProto Test Execution interrupted by user (Ctrl+C).")
+            except Exception as e:
+                print(f"\n[FAIL] Proto Test Execution aborted: {e}")
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+
+    finally:
+        try:
+            storage.close()
+        except Exception as e:
+            print(f"[WARNING] Storage close failed: {e}")
+        try:
+            hw.disconnect_all()
+        except Exception as shutdown_err:
+            print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+            print("           Hardware may still be energized -- "
+                  "physically disconnect power if this cannot be resolved immediately.")
+
+
+# =============================================================================
 # Menu
 # =============================================================================
 
 MENU = [
     ("Run Main Test",                 run_main_test),
+    ("Proto Test Execution (infrastructure validation, no battery)", run_proto_test_execution),
     ("Startup Device Validation (config/devices.py -- no hardware I/O)", test_device_validation),
     ("Hardware Discovery (connectivity + identification, config-driven)", test_hardware_discovery),
     ("Test SMU (PSU)",                test_smu),
@@ -2600,6 +2706,14 @@ def _pause_before_main_menu():
         print()
 
 
+# Full-hardware-run menu entries -- each drives its own real hardware run
+# (HardwareManager/CancellationToken/etc.) and returns nothing (unlike every
+# other MENU entry, which returns a list[TestResult]). Checked by name here
+# (not by category/label) so "Run All Tests" below never calls them via
+# run_section() -- doing so would crash on `for r in None`.
+_FULL_RUN_ENTRIES = (run_main_test, run_proto_test_execution)
+
+
 def _dispatch_menu_choice(label: str, fn, config_results):
     """
     Run exactly one Main Menu selection, print its summary the same way it
@@ -2607,12 +2721,12 @@ def _dispatch_menu_choice(label: str, fn, config_results):
     pause at "Press Enter to return to the Main Menu..." before returning --
     regardless of whether the test PASSED, WARNED, FAILED, raised, or was
     cancelled by the operator (Ctrl+C). This is the one place that behavior
-    is implemented, so every menu entry (Run Main Test, an individual
-    category test, or Run All Tests) gets it identically with no duplicated
-    per-entry code.
+    is implemented, so every menu entry (Run Main Test, Proto Test
+    Execution, an individual category test, or Run All Tests) gets it
+    identically with no duplicated per-entry code.
     """
     try:
-        if fn is run_main_test:
+        if fn in _FULL_RUN_ENTRIES:
             print(f"\n{'-' * 60}")
             print(f"  {label}")
             print(f"{'-' * 60}")
@@ -2620,6 +2734,8 @@ def _dispatch_menu_choice(label: str, fn, config_results):
         elif fn is None:
             all_results = list(config_results)
             for lbl, f in MENU[1:-1]:
+                if f in _FULL_RUN_ENTRIES:
+                    continue
                 all_results.extend(run_section(lbl, f))
             print_summary(all_results)
         else:

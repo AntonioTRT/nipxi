@@ -93,6 +93,17 @@ class Settings:
     SMU_CURRENT_READBACK_TOLERANCE_A = 1e-4   # A
 
     # -------------------------------------------------------------------------
+    # Proto Test Execution (Milestone 2) -- infrastructure validation, no
+    # battery connected. Reuses CHARGE_VOLTAGE_V/CHARGE_CURRENT_A/
+    # BAT_VOLTAGE_MAX above as the bench source point/current-limit/voltage-
+    # range (same constants SMU Functional Validation already sources from
+    # -- no new duplicate voltage/current constant). ACTIVE_CHANNELS above
+    # is reused as the relay sequence (relay numbering matches battery
+    # channel numbering on the BLOSS Hub PCB).
+    # -------------------------------------------------------------------------
+    PROTO_TEST_DWELL_S = 120.0   # s -- per-relay dwell time (~2 min default)
+
+    # -------------------------------------------------------------------------
     # PXI rack -- simulation mode only. VISA resource strings (slot numbers)
     # live in config/devices.py (SMU_ASSIGNMENTS / DAQ_CONFIG / DMM_CONFIG)
     # ONLY -- that is their single source of truth. They used to be
