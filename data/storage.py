@@ -67,33 +67,68 @@ class StorageBackend(ABC):
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS measurements (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id      TEXT    NOT NULL,
-    channel     INTEGER NOT NULL,
-    timestamp   TEXT    NOT NULL,
-    elapsed_s   REAL,
-    phase       TEXT,
-    voltage_v   REAL,
-    current_a   REAL,
-    temp_c      REAL
+    id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                        TEXT    NOT NULL,
+    channel                       INTEGER NOT NULL,
+    timestamp                     TEXT    NOT NULL,
+    elapsed_s                     REAL,
+    phase                         TEXT,
+    voltage_v                     REAL,
+    current_a                     REAL,
+    temp_c                        REAL,
+    test_type                     TEXT,
+    relay                         INTEGER,
+    phase_detail                  TEXT,
+    commanded_v                   REAL,
+    commanded_current_limit_a     REAL,
+    smu_readback_v                REAL,
+    smu_readback_current_limit_a  REAL,
+    smu_measured_v                REAL,
+    smu_measured_i                REAL,
+    dmm_measured_v                REAL,
+    output_enabled_readback       INTEGER,
+    in_compliance                 INTEGER
 );
 """
 
+# Original columns -- unchanged shape, still what record()/query()/the CSV
+# writer use (backward compatible with charge_cycle.py/discharge_cycle.py's
+# existing 2-arg record(channel, sample) callers).
 _COLUMNS = ["run_id", "channel", "timestamp", "elapsed_s", "phase",
             "voltage_v", "current_a", "temp_c"]
 
-# Station/execution state -- one row per relay processed, used to display
-# "previous execution found" at startup (Proto Test Execution, Milestone 2,
-# and the future cycle/state recovery engine this anticipates -- see
-# docs/DATABASE_ROADMAP.md Section 4 / docs/TODO.md's previously-unwired
-# "station_state" table). Deliberately a separate table from `measurements`
-# above (a different concern: station/execution position, not a per-sample
-# battery reading) rather than overloading that schema's columns.
+# Milestone II additions -- Proto Test (and future Charge/Discharge/cycle
+# execution) write through record_measurement() below, which populates
+# these alongside _COLUMNS above. All nullable: a Proto Test row leaves
+# elapsed_s/phase/temp_c NULL, a battery row leaves the SMU/DMM-specific
+# columns NULL -- NULL is exactly what the UI layer renders as "N/A" (see
+# test_control/execution_screen.py, Phase 2). test_type is deliberately
+# nullable too (not NOT NULL) so this column can be added to an existing
+# database via ALTER TABLE without a default-value migration -- every real
+# caller populates it; nothing enforces that at the schema level.
+_MEASUREMENT_EXTRA_COLUMNS = [
+    "test_type", "relay", "phase_detail",
+    "commanded_v", "commanded_current_limit_a",
+    "smu_readback_v", "smu_readback_current_limit_a",
+    "smu_measured_v", "smu_measured_i",
+    "dmm_measured_v",
+    "output_enabled_readback", "in_compliance",
+]
+
+_MEASUREMENT_ALL_COLUMNS = _COLUMNS + _MEASUREMENT_EXTRA_COLUMNS
+
+# Station/execution state -- Milestone II: RECOVERY ONLY. Previously also
+# carried the full SMU/DMM measurement payload (commanded_v/smu_readback_v/
+# .../dmm_measured_v below) -- that data now lives in `measurements` via
+# record_measurement(). Those columns remain in the schema (existing rows
+# from before this change stay readable) but new code no longer populates
+# them -- see _STATION_STATE_COLUMNS' comment below.
 CREATE_STATION_STATE_SQL = """
 CREATE TABLE IF NOT EXISTS station_state (
     id                            INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id                        TEXT    NOT NULL,
     timestamp                     TEXT    NOT NULL,
+    channel                       INTEGER,
     relay                         INTEGER,
     state                         TEXT,
     commanded_v                   REAL,
@@ -106,11 +141,114 @@ CREATE TABLE IF NOT EXISTS station_state (
 );
 """
 
+# Actively maintained going forward: channel, relay, state (+ run_id/
+# timestamp, handled separately in record_execution_state()). The
+# commanded_v/.../dmm_measured_v columns stay in this list so
+# get_last_execution_state()/record_execution_state() remain able to read
+# and write them for backward compatibility (a caller can still pass them),
+# but no current caller does -- Proto Test (Phase 3) passes only
+# channel/relay/state.
 _STATION_STATE_COLUMNS = [
-    "relay", "state", "timestamp", "commanded_v", "commanded_current_limit_a",
+    "channel", "relay", "state", "timestamp", "commanded_v", "commanded_current_limit_a",
     "smu_readback_v", "smu_readback_current_limit_a", "smu_measured_v",
     "smu_measured_i", "dmm_measured_v",
 ]
+
+# Run-level summary -- one row per run, Milestone II. Not part of the
+# StorageBackend abstract interface (same reasoning as station_state above:
+# a separate concern from per-sample measurement persistence). `id` is the
+# operator-facing "Run Number" (matches the existing id/run_id convention
+# already used by `measurements`/`station_state`); `run_id` remains the
+# timestamp-based identifier used everywhere else in this codebase.
+CREATE_RUN_SUMMARY_SQL = """
+CREATE TABLE IF NOT EXISTS run_summary (
+    id                                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                             TEXT UNIQUE NOT NULL,
+    test_type                          TEXT,
+    start_time                         TEXT,
+    end_time                           TEXT,
+    duration_s                         REAL,
+    stop_reason                        TEXT,
+    result                             TEXT,
+    battery_type                       TEXT,
+    battery_voltage_max_v              REAL,
+    battery_voltage_min_v              REAL,
+    battery_charge_current_limit_a     REAL,
+    battery_discharge_current_limit_a  REAL,
+    capacity_ah                        REAL,
+    energy_wh                          REAL,
+    cycle_count                        INTEGER
+);
+"""
+
+_RUN_SUMMARY_COLUMNS = [
+    "id", "run_id", "test_type", "start_time", "end_time", "duration_s",
+    "stop_reason", "result", "battery_type", "battery_voltage_max_v",
+    "battery_voltage_min_v", "battery_charge_current_limit_a",
+    "battery_discharge_current_limit_a", "capacity_ah", "energy_wh", "cycle_count",
+]
+
+# Runtime event history -- Milestone II. Fine-grained, timestamped narrative
+# of meaningful runtime transitions (relay activated, output enabled,
+# compliance check passed, measurement acquired, ...) -- NOT a replacement
+# for logger output (self.log.* is untouched everywhere); only meaningful
+# runtime events are written here. channel/relay are nullable so an event
+# not tied to a specific DUT (e.g. a run-level event) is still valid.
+CREATE_EVENT_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS event_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id    TEXT    NOT NULL,
+    timestamp TEXT    NOT NULL,
+    channel   INTEGER,
+    relay     INTEGER,
+    level     TEXT,
+    source    TEXT,
+    message   TEXT
+);
+"""
+
+_EVENT_LOG_COLUMNS = ["id", "run_id", "timestamp", "channel", "relay", "level", "source", "message"]
+
+# Schema migration -- additive only (ALTER TABLE ... ADD COLUMN), for
+# databases created before Milestone II's schema additions. CREATE TABLE
+# IF NOT EXISTS above already gives a brand-new database every column from
+# the start; this only matters for a pre-existing measurements.db/
+# station_state that predates these columns. Never touches existing data --
+# no DROP, no rebuild, matches every migration recommendation made earlier
+# in this project's data-strategy reviews (docs/DATABASE_ROADMAP.md).
+_MEASUREMENT_MIGRATION_COLUMNS = [
+    ("test_type", "TEXT"),
+    ("relay", "INTEGER"),
+    ("phase_detail", "TEXT"),
+    ("commanded_v", "REAL"),
+    ("commanded_current_limit_a", "REAL"),
+    ("smu_readback_v", "REAL"),
+    ("smu_readback_current_limit_a", "REAL"),
+    ("smu_measured_v", "REAL"),
+    ("smu_measured_i", "REAL"),
+    ("dmm_measured_v", "REAL"),
+    ("output_enabled_readback", "INTEGER"),
+    ("in_compliance", "INTEGER"),
+]
+
+_STATION_STATE_MIGRATION_COLUMNS = [
+    ("channel", "INTEGER"),
+]
+
+
+def _migrate_add_missing_columns(conn: sqlite3.Connection, table: str, columns: list):
+    """
+    Add any column in `columns` (list of (name, sql_type)) that isn't
+    already present on `table`, via ALTER TABLE ... ADD COLUMN. Idempotent
+    and safe to call every open() -- PRAGMA table_info() reflects reality,
+    so a column added on a previous run is simply skipped on the next.
+    Never touches existing rows/columns; new columns come back NULL for
+    every row that predates them, which is exactly what should happen.
+    """
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, sql_type in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
 class DataStorage(StorageBackend):
@@ -135,6 +273,15 @@ class DataStorage(StorageBackend):
             self._db = sqlite3.connect(self.s.DATABASE_FILE)
             self._db.execute(CREATE_TABLE_SQL)
             self._db.execute(CREATE_STATION_STATE_SQL)
+            self._db.execute(CREATE_RUN_SUMMARY_SQL)
+            self._db.execute(CREATE_EVENT_LOG_SQL)
+            # Additive migration -- brings a pre-Milestone-II database (e.g.
+            # an existing data_output/development/nipxi_dev.db) up to the
+            # current schema without touching any existing row. No-op on a
+            # brand-new database (CREATE TABLE above already has every
+            # column) and no-op on an already-migrated one.
+            _migrate_add_missing_columns(self._db, "measurements", _MEASUREMENT_MIGRATION_COLUMNS)
+            _migrate_add_missing_columns(self._db, "station_state", _STATION_STATE_MIGRATION_COLUMNS)
             self._db.commit()
             self.log.info("Storage opened. run_id=%s", self.run_id)
         except (OSError, sqlite3.Error) as e:
@@ -284,6 +431,249 @@ class DataStorage(StorageBackend):
         if row is None:
             return None
         return dict(zip(_STATION_STATE_COLUMNS, row))
+
+    # ------------------------------------------------------------------
+    # Historical measurements (Milestone II) -- the authoritative result
+    # store for every test type (Proto Test, Charge, Discharge, future
+    # cycle execution). NOT part of the StorageBackend abstract interface:
+    # record()/query() above remain the original, narrower per-sample
+    # contract (still used by charge_cycle.py/discharge_cycle.py exactly as
+    # before -- untouched by this change). record_measurement() is the new,
+    # general write path Proto Test (Phase 3) and future battery cycles use.
+    # ------------------------------------------------------------------
+
+    def record_measurement(self, test_type: str, channel: int, relay: int = None,
+                            timestamp: str = None, **fields) -> int:
+        """
+        Persist one historical measurement row -- the Milestone II
+        replacement for writing result data into station_state.
+
+        `test_type` ("proto"/"charge"/"discharge"/future) and `channel`
+        (canonical DUT identifier) are required; `relay` (physical routing
+        path -- provenance, may diverge from `channel` in the future, see
+        docs/architecture.md) is optional.
+
+        `fields` accepts any of: elapsed_s, phase, phase_detail, voltage_v,
+        current_a, temp_c, commanded_v, commanded_current_limit_a,
+        smu_readback_v, smu_readback_current_limit_a, smu_measured_v,
+        smu_measured_i, dmm_measured_v, output_enabled_readback,
+        in_compliance -- any field omitted is stored NULL (rendered as
+        "N/A" by the UI layer, never by this method). Unknown keys are
+        ignored rather than raising, same policy as
+        record_execution_state().
+
+        Raises if the storage backend is not open -- this is historical
+        result data, a caller must know immediately if it silently failed
+        to persist.
+        """
+        if self._db is None:
+            raise RuntimeError("DataStorage.record_measurement() called before open()")
+        row = {
+            "run_id": self.run_id,
+            "channel": channel,
+            "timestamp": timestamp or datetime.now().isoformat(),
+            "test_type": test_type,
+            "relay": relay,
+        }
+        writable = set(_MEASUREMENT_ALL_COLUMNS) - set(row)
+        for key in writable:
+            if key in fields:
+                row[key] = fields[key]
+        for key in _MEASUREMENT_ALL_COLUMNS:
+            row.setdefault(key, None)
+        cols = ["run_id", "channel", "timestamp"] + [
+            c for c in _MEASUREMENT_ALL_COLUMNS if c not in ("run_id", "channel", "timestamp")
+        ]
+        placeholders = ", ".join("?" for _ in cols)
+        cursor = self._db.execute(
+            f"INSERT INTO measurements ({', '.join(cols)}) VALUES ({placeholders})",
+            [row[c] for c in cols],
+        )
+        self._db.commit()
+        return cursor.lastrowid
+
+    def get_measurements(self, run_id: str = None, channel: int = None) -> list:
+        """
+        Return full measurement rows (every Milestone II column, not just
+        the original _COLUMNS subset query() returns) as a list of dicts,
+        optionally filtered by run_id/channel. Defaults to all rows when
+        both filters are None -- callers needing "this run only" should
+        pass run_id explicitly (e.g. data/report.py::ReportGenerator).
+        """
+        if self._db is None:
+            return []
+        conditions, params = [], []
+        if run_id is not None:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+        if channel is not None:
+            conditions.append("channel = ?")
+            params.append(channel)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        try:
+            cur = self._db.execute(
+                f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
+                f"{where} ORDER BY id",
+                params,
+            )
+            return [dict(zip(_MEASUREMENT_ALL_COLUMNS, row)) for row in cur.fetchall()]
+        except sqlite3.Error as e:
+            self.log.error("DB query failed (get_measurements): %s", e)
+            return []
+
+    # ------------------------------------------------------------------
+    # Run summary (Milestone II) -- one row per run, the entry point for
+    # "list all historical runs without scanning telemetry". `id` is the
+    # operator-facing Run Number; `run_id` is the timestamp-based identifier
+    # used everywhere else. One DataStorage instance == one run (self.run_id
+    # is generated once in __init__), so start/finish operate on that run_id
+    # implicitly rather than taking it as a parameter.
+    # ------------------------------------------------------------------
+
+    def start_run_summary(self, test_type: str, **fields) -> None:
+        """
+        Insert the initial run_summary row for this DataStorage instance's
+        run_id. Call once, at the start of a run. `fields` accepts any of
+        the optional run_summary columns (battery_type, battery_voltage_max_v,
+        etc.) -- all NULL/"N/A" if omitted, exactly as with
+        record_measurement().
+
+        Raises if the storage backend is not open, same policy as
+        record_measurement()/record_execution_state().
+        """
+        if self._db is None:
+            raise RuntimeError("DataStorage.start_run_summary() called before open()")
+        row = {
+            "run_id": self.run_id,
+            "test_type": test_type,
+            "start_time": datetime.now().isoformat(),
+        }
+        optional_cols = [c for c in _RUN_SUMMARY_COLUMNS if c not in ("id", "run_id", "test_type", "start_time")]
+        for key in optional_cols:
+            if key in fields:
+                row[key] = fields[key]
+        for key in optional_cols:
+            row.setdefault(key, None)
+        cols = ["run_id", "test_type", "start_time"] + optional_cols
+        placeholders = ", ".join("?" for _ in cols)
+        self._db.execute(
+            f"INSERT INTO run_summary ({', '.join(cols)}) VALUES ({placeholders})",
+            [row[c] for c in cols],
+        )
+        self._db.commit()
+
+    def finish_run_summary(self, stop_reason: str = None, result: str = None, **fields) -> None:
+        """
+        Update this run's run_summary row with end-of-run values (end_time
+        is always set to now; duration_s is computed from start_time if not
+        explicitly provided in `fields`). Call once, at the end of a run.
+        No-op (logs a warning) if start_run_summary() was never called for
+        this run_id, rather than raising -- a missing summary row is a
+        historical-visibility gap, not a safety-relevant failure.
+        """
+        if self._db is None:
+            raise RuntimeError("DataStorage.finish_run_summary() called before open()")
+        end_time = datetime.now().isoformat()
+        updates = {"end_time": end_time, "stop_reason": stop_reason, "result": result}
+        for key in ("capacity_ah", "energy_wh", "cycle_count"):
+            if key in fields:
+                updates[key] = fields[key]
+        if "duration_s" in fields:
+            updates["duration_s"] = fields["duration_s"]
+        else:
+            cur = self._db.execute(
+                "SELECT start_time FROM run_summary WHERE run_id = ?", (self.run_id,)
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                try:
+                    start_dt = datetime.fromisoformat(row[0])
+                    updates["duration_s"] = (datetime.fromisoformat(end_time) - start_dt).total_seconds()
+                except ValueError:
+                    pass
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        cur = self._db.execute(
+            f"UPDATE run_summary SET {set_clause} WHERE run_id = ?",
+            [*updates.values(), self.run_id],
+        )
+        if cur.rowcount == 0:
+            self.log.warning(
+                "finish_run_summary(): no run_summary row found for run_id=%s "
+                "(start_run_summary() was never called for this run)", self.run_id,
+            )
+        self._db.commit()
+
+    def get_last_run_summary(self):
+        """Return the most recent run_summary row (by id) as a dict, or None."""
+        if self._db is None:
+            return None
+        cur = self._db.execute(
+            f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        return dict(zip(_RUN_SUMMARY_COLUMNS, row)) if row else None
+
+    def get_run_summary(self, run_id: str):
+        """Return the run_summary row for a specific run_id as a dict, or None."""
+        if self._db is None:
+            return None
+        cur = self._db.execute(
+            f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary WHERE run_id = ?",
+            (run_id,),
+        )
+        row = cur.fetchone()
+        return dict(zip(_RUN_SUMMARY_COLUMNS, row)) if row else None
+
+    def list_run_summaries(self) -> list:
+        """Return every run_summary row, most recent first."""
+        if self._db is None:
+            return []
+        cur = self._db.execute(
+            f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary ORDER BY id DESC"
+        )
+        return [dict(zip(_RUN_SUMMARY_COLUMNS, row)) for row in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Event log (Milestone II) -- fine-grained runtime narrative. NOT a
+    # replacement for logger output (self.log.* is unrelated and
+    # untouched) -- only meaningful runtime transitions are written here
+    # (relay activated, output enabled, compliance check passed,
+    # measurement acquired, ...), never per-loop-iteration noise.
+    # ------------------------------------------------------------------
+
+    def log_event(self, level: str, source: str, message: str,
+                   channel: int = None, relay: int = None) -> int:
+        """
+        Persist one event_log row for this DataStorage instance's run_id.
+        `channel`/`relay` are optional -- a run-level event (not tied to a
+        specific DUT) is still valid with both NULL.
+        """
+        if self._db is None:
+            raise RuntimeError("DataStorage.log_event() called before open()")
+        cursor = self._db.execute(
+            "INSERT INTO event_log (run_id, timestamp, channel, relay, level, source, message) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (self.run_id, datetime.now().isoformat(), channel, relay, level, source, message),
+        )
+        self._db.commit()
+        return cursor.lastrowid
+
+    def get_recent_events(self, run_id: str = None, limit: int = 20) -> list:
+        """
+        Return the most recent `limit` event_log rows for `run_id`
+        (defaults to this DataStorage instance's own run_id), oldest first
+        (natural reading order for a "recent events" panel).
+        """
+        if self._db is None:
+            return []
+        run_id = run_id or self.run_id
+        cur = self._db.execute(
+            f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log "
+            f"WHERE run_id = ? ORDER BY id DESC LIMIT ?",
+            (run_id, limit),
+        )
+        rows = [dict(zip(_EVENT_LOG_COLUMNS, row)) for row in cur.fetchall()]
+        return list(reversed(rows))
 
     # ------------------------------------------------------------------
     # Internal helpers

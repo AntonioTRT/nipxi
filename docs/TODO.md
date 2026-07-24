@@ -188,6 +188,21 @@ first real-rack hardware bring-up milestone record.
   `test_control/proto_test_sequence.py` also gained `print()`-based console
   progress (relay/phase/measurements), since `test.py` never configures a
   logging handler for this workflow.
+- **Milestone II data/UI architecture (in progress)** -- Phase 1:
+  `measurements` extended into the authoritative historical result store
+  for every test type (`test_type`/`relay`/`phase_detail`/SMU-DMM columns,
+  additive migration, `data/storage.py::DataStorage.record_measurement()`);
+  `station_state` narrowed to execution-recovery-only; new `run_summary`
+  (one row per run, `id` = operator-facing Run Number) and `event_log`
+  (fine-grained runtime narrative) tables. Phase 2:
+  `test_control/execution_screen.py::ExecutionFrame`/`render_execution_frame()`
+  -- the one shared runtime UI for Proto Test, future Battery Charge/
+  Discharge/cycle execution, the Historical Results Viewer, and
+  `UI Preview Test`; both `from_live()`/`from_database()` constructors
+  built together to prevent live/replay drift. See `docs/architecture.md`
+  Sections 18/18a. `ProtoTestSequence`'s migration to this infrastructure
+  (Phase 3) and the Historical Results Viewer/`UI Preview Test` menu
+  entries (Phase 4) are still pending.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies
