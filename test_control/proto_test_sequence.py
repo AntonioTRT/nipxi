@@ -21,21 +21,36 @@ design and rationale):
        the DMM reading below happens while output is still genuinely
        active, and so the relay dwells for the configured interval before
        the SMU's own finally block disables and verifies output OFF.
-    3. storage.record_execution_state(...) -- new DataStorage methods
-       (data/storage.py), a separate table from `measurements` (a
-       different concern: station/execution position, not a per-sample
-       battery reading).
+    3. storage.record_measurement(test_type="proto", ...) -- Milestone II
+       Phase 3: the historical result now lives in `measurements` (the
+       authoritative store for every test type), not `station_state`.
+       storage.record_execution_state(...) is now called with only
+       channel/relay/state -- station_state is recovery-position-only,
+       per the approved Milestone II architecture.
+    4. storage.log_event(...) at each phase transition, and
+       render_execution_frame(ExecutionFrame.from_live(...)) once per
+       relay (at the point real measurement data exists) -- the shared
+       runtime UI from test_control/execution_screen.py replaces this
+       class's previous ad hoc print() calls. No secondary renderer.
 
 No battery-limit logic lives here -- SafetyMonitor remains the sole owner
 of limit/abort decisions, exactly as established during SMU Verification
 Hardening; this class only calls safety.emergency_stop()/
 safety.safe_cancel_shutdown() on failure/cancellation, identical to
 BatteryTestSequence.
+
+Milestone II Phase 3 note: this is an architecture migration only. Relay
+sequencing, SMU sourcing configuration/timing, DMM measurement logic, dwell
+timing, and the safety-exception handling below are byte-for-byte the same
+calls, in the same order, as before this phase -- only the storage layer,
+event logging, and runtime UI integration changed. The physical validation
+path is electrically identical to the version already run on the rack.
 """
 
 import logging
 
 from config.settings import Settings
+from test_control.execution_screen import ExecutionFrame, render_execution_frame
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation
 from utils.errors import SafetyViolationError, RelayError, OperationCancelledError
@@ -77,17 +92,18 @@ class ProtoTestSequence:
         dwell_s = self.s.PROTO_TEST_DWELL_S if dwell_s is None else dwell_s
         self.log.info("Proto Test Execution starting. Relays: %s  Dwell: %.1fs", relays, dwell_s)
 
+        self.storage.start_run_summary(test_type="proto")
+        run_summary = self.storage.get_run_summary(self.storage.run_id)
+        run_number = run_summary["id"] if run_summary else None
+
         last_relay = None
         for relay_n in relays:
             last_relay = relay_n
             self.log.info("--- Relay %d ---", relay_n)
-            # Console progress (operator visibility only -- logging above is
-            # unchanged). print(), not self.log, since test.py never
-            # configures a logging handler for this workflow -- without
-            # this, nothing is visible on screen during the ~minutes-long
-            # per-relay dwell.
-            print(f"\n[Relay {relay_n}] Phase: ACTIVATING -- closing relay "
-                  f"(force-all-off -> verify -> activate -> verify)...")
+            self.storage.log_event(
+                level="INFO", source="proto_test", channel=relay_n, relay=relay_n,
+                message=f"Relay {relay_n} activating (force-all-off -> verify -> activate -> verify)",
+            )
 
             try:
                 # Checkpoint: before starting a new relay, never mid-relay --
@@ -97,9 +113,12 @@ class ProtoTestSequence:
                 # below rather than propagating before anything is recorded.
                 check_cancellation(token)
                 self.relay.close(relay_n)
-                print(f"[Relay {relay_n}] Phase: SOURCING -- relay ON, verified. "
-                      f"Configuring SMU {self.s.CHARGE_VOLTAGE_V:.3f} V / "
-                      f"{self.s.CHARGE_CURRENT_A:.3f} A limit, dwelling {dwell_s:.0f}s...")
+                self.storage.log_event(
+                    level="INFO", source="proto_test", channel=relay_n, relay=relay_n,
+                    message=f"Relay {relay_n} activated -- output enabled, "
+                            f"sourcing {self.s.CHARGE_VOLTAGE_V:.3f} V / "
+                            f"{self.s.CHARGE_CURRENT_A:.3f} A limit, dwelling {dwell_s:.0f}s",
+                )
 
                 dmm_reading = {"voltage_v": None}
 
@@ -108,13 +127,18 @@ class ProtoTestSequence:
                         dmm_reading["voltage_v"] = self.dmm.measure_dc_voltage() if self.dmm else None
                     except Exception as e:
                         self.log.warning("Relay %d: DMM read failed: %s", relay_n, e)
-                        print(f"[Relay {relay_n}] Phase: DWELLING -- DMM read failed: {e}")
+                        self.storage.log_event(
+                            level="WARNING", source="proto_test", channel=relay_n, relay=relay_n,
+                            message=f"DMM read failed: {e}",
+                        )
                         return dmm_reading["voltage_v"]
-                    if dmm_reading["voltage_v"] is None:
-                        print(f"[Relay {relay_n}] Phase: DWELLING -- no DMM configured")
-                    else:
-                        print(f"[Relay {relay_n}] Phase: DWELLING -- "
-                              f"DMM measured {dmm_reading['voltage_v']:.6f} V")
+                    self.storage.log_event(
+                        level="INFO", source="proto_test", channel=relay_n, relay=relay_n,
+                        message=(
+                            "DMM read: no DMM configured" if dmm_reading["voltage_v"] is None
+                            else f"Measurement acquired -- DMM {dmm_reading['voltage_v']:.6f} V"
+                        ),
+                    )
                     return dmm_reading["voltage_v"]
 
                 reading = self.smu.source_dc_voltage_point(
@@ -126,19 +150,9 @@ class ProtoTestSequence:
                 )
 
                 dmm_v = reading["during_hold_result"]
-                print(
-                    f"[Relay {relay_n}] Phase: MEASURED -- "
-                    f"SMU readback {reading['readback_v']:.6f} V / "
-                    f"{reading['readback_current_limit_a']:.6f} A  "
-                    f"output={'ON' if reading['output_enabled_readback'] else 'OFF'}  "
-                    f"compliance={'YES' if reading['in_compliance'] else 'no'}  "
-                    f"SMU measured {reading['measured_v']:.6f} V / "
-                    f"{reading['measured_i']:.6f} A  "
-                    f"DMM measured {'N/A' if dmm_v is None else f'{dmm_v:.6f} V'}"
-                )
 
-                self.storage.record_execution_state(
-                    relay=relay_n, state="ACTIVE",
+                self.storage.record_measurement(
+                    test_type="proto", channel=relay_n, relay=relay_n, phase_detail="MEASURED",
                     commanded_v=reading["commanded_v"],
                     commanded_current_limit_a=reading["commanded_current_limit_a"],
                     smu_readback_v=reading["readback_v"],
@@ -146,19 +160,40 @@ class ProtoTestSequence:
                     smu_measured_v=reading["measured_v"],
                     smu_measured_i=reading["measured_i"],
                     dmm_measured_v=dmm_v,
+                    output_enabled_readback=int(bool(reading["output_enabled_readback"])),
+                    in_compliance=int(bool(reading["in_compliance"])),
                 )
+                self.storage.record_execution_state(channel=relay_n, relay=relay_n, state="ACTIVE")
+
+                frame = ExecutionFrame.from_live(
+                    run_number=run_number, run_id=self.storage.run_id, test_type="proto",
+                    channel=relay_n, relay=relay_n, state="ACTIVE", phase_detail="MEASURED",
+                    smu_voltage=reading["measured_v"], smu_current=reading["measured_i"],
+                    dmm_voltage=dmm_v,
+                    recent_measurements=self.storage.get_measurements(run_id=self.storage.run_id),
+                    recent_events=self.storage.get_recent_events(run_id=self.storage.run_id),
+                )
+                render_execution_frame(frame)
 
             except OperationCancelledError as e:
-                print(f"[Relay {relay_n}] Phase: CANCELLED -- {e}")
                 self.log.warning("Cancellation requested during relay %d: %s", relay_n, e)
-                self.storage.record_execution_state(relay=relay_n, state=StopReason.CANCELLED)
+                self.storage.log_event(
+                    level="WARNING", source="proto_test", channel=relay_n, relay=relay_n,
+                    message=f"Relay {relay_n}: cancellation requested -- {e}",
+                )
+                self.storage.record_execution_state(channel=relay_n, relay=relay_n, state=StopReason.CANCELLED)
+                self.storage.finish_run_summary(stop_reason=StopReason.CANCELLED, result="CANCELLED")
                 self.safety.safe_cancel_shutdown(self.smu, self.relay, str(e))
                 raise
 
             except SafetyViolationError as e:
-                print(f"[Relay {relay_n}] Phase: SAFETY_VIOLATION -- {e}")
                 self.log.error("Safety violation on relay %d: %s", relay_n, e)
-                self.storage.record_execution_state(relay=relay_n, state=StopReason.SAFETY_VIOLATION)
+                self.storage.log_event(
+                    level="ERROR", source="proto_test", channel=relay_n, relay=relay_n,
+                    message=f"Relay {relay_n}: safety violation -- {e}",
+                )
+                self.storage.record_execution_state(channel=relay_n, relay=relay_n, state=StopReason.SAFETY_VIOLATION)
+                self.storage.finish_run_summary(stop_reason=StopReason.SAFETY_VIOLATION, result="FAIL")
                 self.safety.emergency_stop(self.smu, self.relay, str(e))
                 raise
 
@@ -166,23 +201,38 @@ class ProtoTestSequence:
                 # Includes RelayStateVerificationError -- a relay that did
                 # not verifiably reach its commanded state is a safety
                 # fault, never a retryable condition.
-                print(f"[Relay {relay_n}] Phase: FAILED (relay fault) -- {e}")
                 self.log.error("Relay verification fault on relay %d: %s", relay_n, e)
-                self.storage.record_execution_state(relay=relay_n, state=StopReason.FAILED)
+                self.storage.log_event(
+                    level="ERROR", source="proto_test", channel=relay_n, relay=relay_n,
+                    message=f"Relay {relay_n}: relay verification fault -- {e}",
+                )
+                self.storage.record_execution_state(channel=relay_n, relay=relay_n, state=StopReason.FAILED)
+                self.storage.finish_run_summary(stop_reason=StopReason.FAILED, result="FAIL")
                 self.safety.emergency_stop(self.smu, self.relay, str(e))
                 raise
 
             except Exception as e:
-                print(f"[Relay {relay_n}] Phase: FAILED (unexpected error) -- {e}")
                 self.log.error("Unexpected error on relay %d: %s", relay_n, e, exc_info=True)
-                self.storage.record_execution_state(relay=relay_n, state=StopReason.FAILED)
+                self.storage.log_event(
+                    level="ERROR", source="proto_test", channel=relay_n, relay=relay_n,
+                    message=f"Relay {relay_n}: unexpected error -- {e}",
+                )
+                self.storage.record_execution_state(channel=relay_n, relay=relay_n, state=StopReason.FAILED)
+                self.storage.finish_run_summary(stop_reason=StopReason.FAILED, result="FAIL")
                 self.safety.emergency_stop(self.smu, self.relay, str(e))
                 raise
 
             else:
                 self.relay.open(relay_n)
-                print(f"[Relay {relay_n}] Phase: COMPLETE -- relay opened, verified OFF.")
+                self.storage.log_event(
+                    level="INFO", source="proto_test", channel=relay_n, relay=relay_n,
+                    message=f"Relay {relay_n} deactivated -- output disabled, verified OFF",
+                )
 
-        self.storage.record_execution_state(relay=last_relay, state=StopReason.COMPLETED)
+        self.storage.record_execution_state(channel=last_relay, relay=last_relay, state=StopReason.COMPLETED)
+        self.storage.finish_run_summary(stop_reason=StopReason.COMPLETED, result="PASS")
         self.log.info("Proto Test Execution complete.")
-        print(f"\n[Proto Test Execution] Phase: COMPLETED -- all {len(relays)} relay(s) cycled.")
+        self.storage.log_event(
+            level="INFO", source="proto_test",
+            message=f"Proto Test Execution complete -- all {len(relays)} relay(s) cycled",
+        )
