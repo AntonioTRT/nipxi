@@ -444,7 +444,7 @@ RELAY_CONFIG = {
 # Reference protocol: utils/ethernet_relay_python.py (manufacturer example).
 #
 # Finalized NIPXI network plan -- static IPs on the link-local Numato subnet,
-# DHCP disabled on both devices. 169.254.1.1 was the Numato factory default
+# DHCP disabled on both devices. 169.254.1.1 wa0s the Numato factory default
 # (link-local, both units ship identical) -- no longer used now that each
 # unit has its own reserved static address.
 #
