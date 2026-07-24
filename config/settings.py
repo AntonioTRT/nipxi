@@ -100,8 +100,23 @@ class Settings:
     # -- no new duplicate voltage/current constant). ACTIVE_CHANNELS above
     # is reused as the relay sequence (relay numbering matches battery
     # channel numbering on the BLOSS Hub PCB).
+    #
+    # PROTO_TEST_SMU_NAME -- which config/devices.py::SMU_ASSIGNMENTS entry
+    # Proto Test Execution sources from. Named explicitly rather than
+    # falling back to next(iter(SMU_ASSIGNMENTS.items())) (the "whichever
+    # SMU is listed first" default HardwareManager/run_main_test() use) --
+    # that positional default always resolves to PRIMARY_SMU regardless of
+    # which physical unit is actually wired up for this bench workflow, and
+    # is shared with the real battery-test default, so changing it would
+    # have changed main.py's behavior too. This setting is consulted ONLY
+    # by test.py::run_proto_test_execution() -- HardwareManager's own
+    # default and the real battery-test path are untouched.
     # -------------------------------------------------------------------------
-    PROTO_TEST_DWELL_S = 120.0   # s -- per-relay dwell time (~2 min default)
+    PROTO_TEST_SMU_NAME = "AUX_SMU_1"   # PXI-4130, Slot 7, channel "1"
+
+    # TEMPORARY -- shortened for the first physical rack validation run.
+    # Restore to 120.0 (~2 min) once the quick end-to-end check passes.
+    PROTO_TEST_DWELL_S = 5   # s -- per-relay dwell time
 
     # -------------------------------------------------------------------------
     # PXI rack -- simulation mode only. VISA resource strings (slot numbers)

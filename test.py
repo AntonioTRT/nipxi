@@ -2577,9 +2577,17 @@ def run_proto_test_execution():
     from utils.cancellation import CancellationToken
     from utils.errors import HardwareInitError, OperationCancelledError
 
-    smu_name, smu_cfg = next(iter(dev_cfg.SMU_ASSIGNMENTS.items()))
-    dmm_cfg            = dev_cfg.DMM_CONFIG
-    relay_cfg          = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
+    # Named explicitly via Settings.PROTO_TEST_SMU_NAME -- NOT
+    # next(iter(SMU_ASSIGNMENTS.items())) (that positional "whichever SMU is
+    # listed first" default is what HardwareManager/run_main_test() use for
+    # the real battery-test path, and always resolves to PRIMARY_SMU
+    # regardless of which physical unit is wired up for this bench
+    # workflow). Scoped to this function only -- HardwareManager's own
+    # default and main.py are untouched.
+    smu_name = Settings.PROTO_TEST_SMU_NAME
+    smu_cfg  = dev_cfg.SMU_ASSIGNMENTS[smu_name]
+    dmm_cfg  = dev_cfg.DMM_CONFIG
+    relay_cfg = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
 
     print("\nSelected Hardware\n")
     print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}  [{smu_name}]\n  {smu_cfg.get('resource', '')}\n")
