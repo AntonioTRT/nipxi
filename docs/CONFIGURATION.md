@@ -27,12 +27,15 @@ See `config/system_mode.py` and `docs/architecture.md` Section 9 for the full de
 
 **DEVELOPMENT** (the default): hardware optional, a missing device warns and startup continues. **VALIDATION**: a missing device is reported as an error but the framework still launches. **PRODUCTION**: any missing device aborts startup (`HardwareInitError`) -- this was the *only* behavior before `SYSTEM_MODE` existed.
 
-### Channel count
+### Battery positions
+
+Renamed from `NUM_CHANNELS` -- this constant has always meant "how many battery positions exist" (see `docs/architecture.md` Section 19), not a generic DAQ/electrical channel count.
 
 | Parameter | Default | Type | Description |
 |-----------|---------|------|-------------|
-| `NUM_CHANNELS` | `8` | int | Total relay / battery channels available |
-| `ACTIVE_CHANNELS` | `[1..8]` | list[int] | Channels to test in a run |
+| `BATTERY_POSITIONS` | `8` | int | Total battery positions available |
+| `GROUP_SIZE` | `8` | int | Battery positions served by one relay matrix (one `BATTERY_GROUPS` entry) |
+| `ACTIVE_CHANNELS` | `[1..8]` | list[int] | Positions to test in a run (rename to `ACTIVE_POSITIONS` deliberately deferred -- would touch `test_control/` files outside this change's scope) |
 
 ### Battery limits
 
@@ -191,27 +194,34 @@ Physical device mapping. Update to match your hardware wiring.
 
 ### BATTERY_CONFIGS
 
-Battery type/model catalog -- physical battery specs (chemistry, capacity, voltage/current/temperature limits), independent of which channel a battery currently occupies. Foundation for the future `data/battery_repository.py` (see `docs/DATABASE_ROADMAP.md` Section 2). **Not wired into `safety_monitor.py`/`charge_cycle.py`/`discharge_cycle.py` yet** -- those still read the single global `BAT_VOLTAGE_MAX`/`BAT_VOLTAGE_MIN`/`BAT_CURRENT_MAX`/`BAT_TEMP_MAX_C` from `config/settings.py` for every channel regardless of what's actually installed there.
+Battery type/model catalog -- the real BLOSS Hub battery types (`HUB_2_SB`, `HUB_SB`), physical specs (chemistry, capacity, voltage/current/temperature limits), independent of which position a battery currently occupies. Foundation for the future `data/battery_repository.py` (see `docs/DATABASE_ROADMAP.md` Section 2). **Not wired into `safety_monitor.py`/`charge_cycle.py`/`discharge_cycle.py` yet** -- those still read the single global `BAT_VOLTAGE_MAX`/`BAT_VOLTAGE_MIN`/`BAT_CURRENT_MAX`/`BAT_TEMP_MAX_C` from `config/settings.py` for every position regardless of what's actually installed there.
 
-**Not used by SMU Functional Validation.** An earlier version of `test.py::
-_functional_smu()` reused `nominal_voltage_v`/`voltage_max_v` from this dict, but
-that was corrected: SMU Functional Validation now reuses `config/settings.py`'s
-`CHARGE_VOLTAGE_V`/`CHARGE_CURRENT_A`/`BAT_VOLTAGE_MAX` instead (see below), since
-those are the values that actually govern the SMU's real charge-phase behavior
--- more representative of production than a battery-model nameplate value. See
-README.md Section 8.1b and `docs/architecture.md` Section 12.6.
+The previous placeholder entry, `GENERIC_LIION_18650`, was removed -- it is no longer the operator-facing option (see `docs/architecture.md` Section 19). Selection is explicit and operator-controlled via a menu prompt (`test.py::_select_battery_type()`), never inferred from `BATTERY_CHANNELS`.
+
+Fields not yet confirmed against a datasheet are marked `# unconfirmed placeholder` inline -- update these against the real BLOSS Hub spec before relying on them for safety enforcement.
 
 ```python
 BATTERY_CONFIGS = {
-    "GENERIC_LIION_18650": {
+    "HUB_2_SB": {
+        "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
+        "form_factor":             None,       # unconfirmed
+        "nominal_voltage_v":       3.7,
+        "voltage_max_v":           4.2,        # unconfirmed placeholder
+        "voltage_min_v":           3.0,        # unconfirmed placeholder
+        "capacity_ah":             1.05,       # 1050 mAh
+        "max_charge_current_a":    0.525,      # unconfirmed placeholder -- 0.5C
+        "max_discharge_current_a": 1.05,       # unconfirmed placeholder -- 1C
+        "max_temp_c":              45.0,       # unconfirmed placeholder
+    },
+    "HUB_SB": {
         "chemistry":               "Li-ion",
-        "form_factor":             "18650",
+        "form_factor":             None,
         "nominal_voltage_v":       3.7,
         "voltage_max_v":           4.2,
         "voltage_min_v":           3.0,
-        "capacity_ah":             2.5,
-        "max_charge_current_a":    1.25,   # 0.5C
-        "max_discharge_current_a": 2.5,    # 1C
+        "capacity_ah":             0.16,       # 160 mAh
+        "max_charge_current_a":    0.08,
+        "max_discharge_current_a": 0.16,
         "max_temp_c":              45.0,
     },
 }
@@ -219,26 +229,41 @@ BATTERY_CONFIGS = {
 
 ### BATTERY_CHANNELS
 
-Maps logical channel index (1-8) to physical wiring, plus which `BATTERY_CONFIGS` entry is currently installed:
+Maps global battery position (1-8, Group A today) to physical wiring **only** -- no battery-type field. Which battery type is being tested is always an explicit operator choice (`test.py::_select_battery_type()`), never derived from this dict:
 
 ```python
 BATTERY_CHANNELS = {
     1: {
+        "id":              "BAT_1",
         "relay_address":   1,           # relay matrix channel number (1-based)
         "daq_voltage_ch":  "Dev1/ai0",  # NI 6363 analog input for battery voltage
         "daq_current_ch":  "Dev1/ai8",  # analog input for current (via shunt resistor)
         "daq_ntc_ch":      "Dev1/ai16", # analog input for NTC thermistor divider output
         "fuse_rating_a":   2.0,         # polyfuse rating (for documentation)
-        "battery_type":    "GENERIC_LIION_18650",  # key into BATTERY_CONFIGS
         "enabled":         True,
     },
-    # ... channels 2-8
+    # ... positions 2-8
 }
 ```
 
-`utils/device_validator.py` validates every `battery_type` at startup: it must reference a key that actually exists in `BATTERY_CONFIGS`, catching a typo/rename before it surfaces as a confusing `KeyError` later.
+`utils/device_validator.py::_check_battery_groups()` validates at startup that every `BATTERY_CHANNELS` key is covered by exactly one `BATTERY_GROUPS` range (replaces the removed `_check_battery_types()`, which validated the now-deleted `battery_type` field).
 
-**Important:** Verify that `relay_address` matches the physical relay wiring on the BLOSS Hub PCB. Mismatch will connect the wrong battery to the SMU.
+**Important:** Verify that `relay_address` matches the physical relay wiring on the BLOSS Hub PCB. Mismatch will connect the wrong battery to the SMU/DAQ.
+
+### BATTERY_GROUPS
+
+Battery Groups are a relay routing architecture, **not** a purely logical grouping -- each group of `Settings.GROUP_SIZE` (8) battery positions corresponds to one physical relay matrix. See `docs/architecture.md` Section 19 for the full table and rationale.
+
+```python
+BATTERY_GROUPS = {
+    "A": {"relay_matrix": "MATRIX_NUMATO_201", "position_start": 1,  "position_end": 8,  "enabled": True},
+    "B": {"relay_matrix": "MATRIX_NUMATO_202", "position_start": 9,  "position_end": 16, "enabled": False},
+    "C": {"relay_matrix": None,                 "position_start": 17, "position_end": 24, "enabled": False},
+    "D": {"relay_matrix": None,                 "position_start": 25, "position_end": 32, "enabled": False},
+}
+```
+
+Helper functions: `resolve_group_position(group, position_in_group) -> global_position` and `group_for_position(global_position) -> group_name`. Only `enabled=True` groups can be selected in the Monitor Battery workflow.
 
 ### PXI_SLOTS -- single source of truth for the PXI chassis
 

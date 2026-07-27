@@ -1379,3 +1379,68 @@ What changed, all storage/UI-layer only:
 **`state` vs. `phase_detail` in a historical frame:** `from_database()` populates `state` from `run_summary.stop_reason` (the same `StopReason` vocabulary -- `COMPLETED`/`FAILED`/`SAFETY_VIOLATION`/`CANCELLED` -- `station_state.state` already uses for a live run) and `phase_detail` from the last `measurements` row's `phase_detail` column. These deliberately stay two different concepts with two different lifetimes: a completed historical run has no "ACTIVE"/"DWELLING" moment left to replay, only its final outcome (`state`) and whatever phase was in effect when the last measurement was actually taken (`phase_detail`). A live frame's `state`/`phase_detail` can show the fine-grained in-progress values a replay never can -- this is an accepted, intentional difference between live monitoring and historical playback, not a bug.
 
 **`recent_measurements`/`recent_events` are required fields, not an add-on:** both are populated from day one by both constructors -- `from_live()` from whatever in-memory buffer the calling sequence maintains, `from_database()` from `DataStorage.get_measurements()`/`get_recent_events()` -- so the same data source powers the Runtime Screen, `UI Preview Test`, and the Historical Results Viewer identically.
+
+## 19. Battery Definitions, Groups, and Positions (Milestone II)
+
+**Battery types (`config/devices.py::BATTERY_CONFIGS`):** the operator-facing battery catalog is now the two real BLOSS Hub battery types -- `HUB_2_SB` (1050 mAh, 3.7 V nominal) and `HUB_SB` (160 mAh, 3.7 V nominal). The previous placeholder `GENERIC_LIION_18650` entry was removed; voltage/current/temperature limit fields on each entry not yet confirmed against a datasheet are marked with an inline `# unconfirmed placeholder` comment rather than silently presented as verified.
+
+**Battery type selection is explicit and operator-controlled, never inferred.** `BATTERY_CHANNELS` is physical wiring information only (`id`, `relay_address`, `daq_voltage_ch`, `daq_current_ch`, `daq_ntc_ch`, `fuse_rating_a`, `enabled`) -- it has no `battery_type` field and never did after this change. The operator picks a battery type from a menu (`test.py::_select_battery_type()`) independently of which position is wired up; nothing in this codebase infers "which battery" from "which channel."
+
+**Battery Groups are a relay routing architecture, not a purely logical grouping.** `config/devices.py::BATTERY_GROUPS` maps each group of `Settings.GROUP_SIZE` (8) battery positions to one physical relay matrix:
+
+| Group | Positions | Relay matrix | Status |
+|---|---|---|---|
+| A | 1-8   | `MATRIX_NUMATO_201` | enabled -- real hardware today |
+| B | 9-16  | `MATRIX_NUMATO_202` | disabled -- pre-wired, no matrix installed yet |
+| C | 17-24 | none | disabled -- future |
+| D | 25-32 | none | disabled -- future |
+
+Every future relay expansion is expected to arrive in additional groups of 8 positions, each backed by its own relay matrix entry in `BATTERY_GROUPS` -- this is the intended, documented scaling path, not a one-off for Group A.
+
+Two helpers resolve between a group-relative position and the global position number `BATTERY_CHANNELS` is keyed by: `resolve_group_position(group, position_in_group) -> global_position` and `group_for_position(global_position) -> group_name`. `utils/device_validator.py::_check_battery_groups()` validates at startup that every `BATTERY_CHANNELS` key is covered by exactly one `BATTERY_GROUPS` range (replacing the removed `_check_battery_types()`, which validated the now-deleted `battery_type` field).
+
+**Operator workflow order is always Battery Type -> Battery Group -> Battery Position**, and a position is always displayed and entered relative to its group (e.g. "Group A Position 3"), never as a raw global number ("Position 11") -- see Section 20 below for where this is implemented.
+
+**`BATTERY_POSITIONS`/`GROUP_SIZE` (renamed from `NUM_CHANNELS`, `config/settings.py`):** `NUM_CHANNELS` read as a generic DAQ/electrical term but has only ever meant "how many battery positions exist" (confirmed by its only two real call sites: `test.py`'s `BATTERY_CHANNELS` count-check and `utils/validators.py`'s range validation, neither DAQ-channel-related). `BATTERY_POSITIONS = 8` replaces it directly; `GROUP_SIZE = 8` is new, expressing that one relay matrix serves `GROUP_SIZE` positions. `Settings.ACTIVE_CHANNELS` (the list every real sequence -- `BatteryTestSequence`, `ProtoTestSequence`, `TestExecutor` -- actually iterates) was deliberately left unrenamed: doing so would touch `test_control/` files outside this change's scope. A `ACTIVE_CHANNELS` -> `ACTIVE_POSITIONS` rename is recommended future cleanup, not performed here.
+
+## 20. Monitor Battery (Milestone II)
+
+**Objective:** the first real mode of the new battery-centric Run Main Test menu -- read-only battery monitoring, **no charging, no discharging**. Reuses the same Milestone II infrastructure Proto Test Execution already validated (`measurements`/`run_summary`/`event_log`/`station_state`, `ExecutionFrame`/`render_execution_frame()`) rather than any new storage design.
+
+**Run Main Test is now a submenu**, not a single legacy action: `1. Monitor Battery` / `2. Charge Battery` / `3. Discharge Battery` / `4. Cycle Battery`. Only Monitor Battery is implemented; the other three print "not yet implemented" and take no action. The previous `run_main_test()` body (`TestExecutor`/`ResultManager`, the same path `main.py` uses) was retired from this menu entry -- `main.py`'s own production path is untouched.
+
+**Workflow (`test.py::_run_monitor_battery()`):** Select Battery Type (`_select_battery_type()`) -> Select Battery Group (`_select_battery_group()`, only enabled groups selectable) -> Select Battery Position (`_select_battery_position()`, relative to the chosen group) -> Confirmation Screen (`_confirm_monitor_battery()`) -> Configuration Snapshot Logged -> Relay Close -> Start Monitoring.
+
+**Confirmation screen** displays Mode, Battery Type, Capacity, Group, Position (as "Group X Position N"), Max/Min Voltage, Max Charge/Discharge Current, and Max Temperature, then prompts `Continue? (Y/N)`. Declining (`N` or anything else) exits without constructing `HardwareManager`, opening `DataStorage`, or touching any hardware -- verified by a mocked smoke test asserting `HardwareManager` is never called on decline.
+
+**Configuration traceability (critical, mandatory):** once the operator accepts the confirmation screen, and **before** the relay closes / monitoring starts / any measurement is acquired, `_run_monitor_battery()` calls `storage.start_run_summary(test_type="monitor", battery_type=..., battery_voltage_max_v=..., battery_voltage_min_v=..., battery_charge_current_limit_a=..., battery_discharge_current_limit_a=..., capacity_ah=...)` (populating the `run_summary` battery-config snapshot columns added in Milestone II Phase 1) followed by a fixed sequence of `event_log` entries, all tied to the run's `run_id`:
+
+1. "Run started"
+2. "Mode selected: Monitor"
+3. "Battery selected: `<type>`"
+4. "Battery capacity: `<n>` mAh"
+5. "Group selected: `<group>`"
+6. "Position selected: `<n>` (Group `<group>` Position `<n>`)"
+7. "Configuration snapshot recorded"
+
+Only after all seven are written does `MonitorBatterySequence` get constructed and `sequence.run()` called. This ordering is verified by a mocked smoke test (`storage`/`HardwareManager`/`MonitorBatterySequence` all mocked) that asserts every traceability `log_event` call precedes the sequence's relay-close/monitoring call. Because these are ordinary `event_log`/`run_summary` rows, the full configuration a run was executed under is already visible via the Historical Results Viewer, `UI Preview Test`, and `ReportGenerator` -- no new read path was needed.
+
+**`test_control/monitor_battery_sequence.py::MonitorBatterySequence`** mirrors `ProtoTestSequence`'s structure deliberately (same constructor shape, same `try/except OperationCancelledError/SafetyViolationError/RelayError/Exception` handling, same `safety.emergency_stop()`/`safety.safe_cancel_shutdown()` calls) rather than a parallel design. Per monitoring session:
+
+1. `relay.close(relay_address)` -- unchanged, reuses `hardware/relay_eth.py`'s full mandatory force-all-off -> verify -> activate -> verify-single -> verify-all sequence.
+2. A loop: `daq.read_channel(daq_voltage_ch)`/`daq.read_channel(daq_current_ch)` (NTC temperature remains `None` -- an existing, unrelated TODO already carried by `charge_cycle.py`/`discharge_cycle.py`), `storage.record_measurement(test_type="monitor", channel=..., relay=..., voltage_v=..., current_a=..., temp_c=...)`, then `ExecutionFrame.from_live()`/`render_execution_frame()`, then a fixed sample interval sleep -- repeated until the operator cancels.
+3. **Cancellation (Ctrl+C) is the expected, normal way a monitoring session ends** -- there is no bounded "success" exit the way Proto Test's fixed relay cycle has one. `OperationCancelledError` is handled as a deliberate operator action (`run_summary.result = "STOPPED_BY_OPERATOR"`, `stop_reason = StopReason.CANCELLED`), not a failure.
+
+**No new `measurements` columns were needed.** `battery_voltage`/`battery_current`/`battery_temp` (the three new `ExecutionFrame` fields added for this mode, Section 18a) reuse the **original**, pre-Milestone-II `voltage_v`/`current_a`/`temp_c` measurement columns -- the same ones `charge_cycle.py`/`discharge_cycle.py` already write -- populated via `record_measurement()`'s existing `**fields` mechanism. These are kept as distinct `ExecutionFrame` fields from `smu_voltage`/`smu_current`/`dmm_voltage` because Monitor Battery never sources through the SMU -- overloading the SMU/DMM-named fields would have mislabeled a plain DAQ reading of the battery itself as an SMU measurement.
+
+**SMU involvement:** although Monitor Battery never sources or sinks current, `MonitorBatterySequence` still takes an `smu` reference and still calls `safety.emergency_stop()`/`safety.safe_cancel_shutdown()` (both require an SMU argument) on every exit path -- a cheap, idempotent no-op in this mode, kept so every mode shares one safety-shutdown entry point rather than a Monitor-specific relay-only shutdown path.
+
+**Not yet done / explicitly out of scope for this milestone:** Charge Battery, Discharge Battery, Cycle Battery (menu placeholders only); NTC temperature reads (still `None`, same pre-existing gap as the charge/discharge cycle modules); any battery-limit enforcement logic in `MonitorBatterySequence` itself (`SafetyMonitor` remains the sole owner of limit/abort decisions, unchanged from every other sequence).
+
+## 21. Relay Functional Validation -- Group-Scoped Matrix Scan
+
+**Objective:** let relay validation be scoped to one battery group's relay positions, or the full configured population, rather than always scanning every channel -- future-proof for additional relay matrices as Groups B/C/D come online.
+
+**Menu:** `test.py::_functional_relay_numato()`'s "Matrix Scan" option now routes through `_test_relay_matrix_scan_scoped()`, which calls `_select_relay_scope()` first -- `1. All Groups` / `2. Group A` / `3. Group B` / `4. Group C` / `5. Group D`. Selecting a disabled group (no relay matrix installed -- currently B/C/D) falls back to "All Groups" with a printed explanation, rather than silently scanning the wrong device or failing.
+
+**Implementation:** `test_relay_matrix_scan()`/`_run_relay_matrix_scan()` gained optional `channel_start`/`channel_end` parameters (both 1-based, inclusive, clipped to the selected device's configured channel count), defaulting to the full range when omitted -- existing callers and behavior are unchanged. The scan's `for ch in range(...)` loop was updated from the previous hardcoded `range(1, num_channels + 1)` to `range(channel_start, channel_end + 1)`. Scope selection maps directly onto `BATTERY_GROUPS[group]["position_start"/"position_end"]`, since relay address == battery position on the currently deployed hardware (Group A / `MATRIX_NUMATO_201`).

@@ -115,6 +115,22 @@ the bottom, with a pointer to where the real documentation lives
 - [ ] Wire `hardware/simulated.py` into `HardwareManager`'s lenient connect
   path and `RelayFactory` (`"type": "simulated"`) -- foundations only exist
   today.
+- [ ] Charge Battery / Discharge Battery / Cycle Battery -- Run Main Test
+  submenu placeholders only, not implemented (see `docs/architecture.md`
+  Section 20). Should reuse the same Battery Type/Group/Position selection,
+  confirmation screen, and traceability logging Monitor Battery established.
+- [ ] Physical rack validation of Monitor Battery on real Group A hardware
+  -- verified with mocked hardware only so far (see `docs/MILESTONES.md`
+  Milestone II).
+- [ ] NTC temperature reads in `MonitorBatterySequence` remain `None` --
+  same pre-existing gap already carried by `charge_cycle.py`/
+  `discharge_cycle.py`.
+- [ ] `BATTERY_CONFIGS`' `HUB_2_SB`/`HUB_SB` voltage/current/temperature
+  limits marked `# unconfirmed placeholder` should be confirmed against the
+  real BLOSS Hub datasheet before being relied on for safety enforcement.
+- [ ] `Settings.ACTIVE_CHANNELS` -> `ACTIVE_POSITIONS` rename, deliberately
+  deferred from the `NUM_CHANNELS` -> `BATTERY_POSITIONS` rename (would
+  touch `test_control/` files outside that change's scope).
 
 ### Configuration
 
@@ -203,6 +219,32 @@ first real-rack hardware bring-up milestone record.
   Sections 18/18a. `ProtoTestSequence`'s migration to this infrastructure
   (Phase 3) and the Historical Results Viewer/`UI Preview Test` menu
   entries (Phase 4) are still pending.
+- **Monitor Battery (Milestone II)** -- Run Main Test replaced with a
+  submenu (`1. Monitor Battery`/`2. Charge Battery`/`3. Discharge Battery`/
+  `4. Cycle Battery`); only Monitor Battery implemented. Real battery
+  catalog (`HUB_2_SB`/`HUB_SB`, replacing the placeholder
+  `GENERIC_LIION_18650`), explicit operator-controlled battery type
+  selection (never inferred from `BATTERY_CHANNELS`), and new
+  `BATTERY_GROUPS` relay-routing architecture (Group A/`MATRIX_NUMATO_201`
+  enabled today, B/C/D pre-wired for future matrices) with
+  `resolve_group_position()`/`group_for_position()` helpers. `NUM_CHANNELS`
+  renamed to `BATTERY_POSITIONS` (+ new `GROUP_SIZE`). Confirmation screen
+  (Mode/Battery Type/Capacity/Group/Position/limits, `Continue? (Y/N)`)
+  gates every relay activation; accepting it writes a `run_summary`
+  battery-config snapshot and a mandatory, ordered `event_log` traceability
+  sequence *before* the relay closes or any measurement is taken. New
+  `test_control/monitor_battery_sequence.py::MonitorBatterySequence`
+  mirrors `ProtoTestSequence`'s structure, reusing
+  `measurements`/`run_summary`/`event_log`/`station_state`/`ExecutionFrame`
+  unchanged -- read-only monitoring, no charging/discharging/SMU sourcing.
+  `ExecutionFrame` gained `battery_voltage`/`battery_current`/`battery_temp`
+  fields (reusing the original `measurements.voltage_v`/`current_a`/
+  `temp_c` columns). Relay Functional Validation's Matrix Scan gained a
+  group-scope menu (`All Groups`/Group A-D). Verified with mocked-hardware
+  smoke tests (traceability ordering, hardware untouched on declined
+  confirmation); physical rack validation still pending. See
+  `docs/architecture.md` Sections 19-21 and `docs/MILESTONES.md`
+  Milestone II.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies

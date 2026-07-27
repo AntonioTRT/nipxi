@@ -6,8 +6,8 @@ from utils.errors import ValidationError
 
 
 def validate_channel(channel: int, settings: Settings):
-    if channel < 1 or channel > settings.NUM_CHANNELS:
-        raise ValidationError(f"Channel {channel} out of range (1-{settings.NUM_CHANNELS})")
+    if channel < 1 or channel > settings.BATTERY_POSITIONS:
+        raise ValidationError(f"Channel {channel} out of range (1-{settings.BATTERY_POSITIONS})")
 
 
 def validate_channels(channels: list, settings: Settings):
@@ -34,8 +34,8 @@ def validate_settings(settings: Settings):
     """Sanity-check the whole settings object at startup. Raises ValidationError on failure."""
     parse_system_mode(settings.SYSTEM_MODE)  # raises ValidationError if not DEVELOPMENT/VALIDATION/PRODUCTION
 
-    if settings.NUM_CHANNELS <= 0:
-        raise ValidationError("NUM_CHANNELS must be > 0")
+    if settings.BATTERY_POSITIONS <= 0:
+        raise ValidationError("BATTERY_POSITIONS must be > 0")
     if settings.BAT_VOLTAGE_MIN >= settings.BAT_VOLTAGE_MAX:
         raise ValidationError(
             f"BAT_VOLTAGE_MIN ({settings.BAT_VOLTAGE_MIN}) must be < "

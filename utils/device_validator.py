@@ -162,24 +162,32 @@ def _check_duplicate_relay_identifiers(dev_cfg, errors: list) -> dict:
     return battery_channels
 
 
-def _check_battery_types(dev_cfg, battery_channels: dict, errors: list):
+def _check_battery_groups(dev_cfg, battery_channels: dict, errors: list):
     """
-    Every BATTERY_CHANNELS[i]["battery_type"] must reference a real key in
-    BATTERY_CONFIGS -- catches a typo'd/renamed battery type at startup
-    instead of surfacing later as a confusing KeyError deep inside future
-    battery-repository/safety-limit code that looks it up.
+    Every BATTERY_CHANNELS global position must fall inside exactly one
+    BATTERY_GROUPS range -- catches a position added to BATTERY_CHANNELS
+    without a corresponding group entry (or a group range that overlaps
+    another) at startup, before it surfaces as a confusing None from
+    config/devices.py::group_for_position() later.
+
+    Note: BATTERY_CHANNELS deliberately no longer references a battery
+    type (see its module comment) -- battery selection is an explicit,
+    operator-controlled choice at run start (test.py's battery-type
+    selection prompt), not statically wired to a position/relay. There is
+    therefore no "battery_type must reference BATTERY_CONFIGS" check here
+    any more; BATTERY_CONFIGS is validated only by virtue of being a plain
+    dict the operator's selection prompt reads from directly.
     """
-    battery_configs = getattr(dev_cfg, "BATTERY_CONFIGS", {})
-    for ch_id, ch in battery_channels.items():
-        battery_type = ch.get("battery_type")
-        if not battery_type:
-            errors.append(f"BATTERY_CHANNELS[{ch_id}]: missing 'battery_type'")
-            continue
-        if battery_type not in battery_configs:
-            errors.append(
-                f"BATTERY_CHANNELS[{ch_id}]: battery_type {battery_type!r} is not "
-                f"defined in BATTERY_CONFIGS (known: {sorted(battery_configs)})"
-            )
+    groups = getattr(dev_cfg, "BATTERY_GROUPS", {})
+    for ch_id in battery_channels:
+        matches = [
+            name for name, grp in groups.items()
+            if grp["position_start"] <= ch_id <= grp["position_end"]
+        ]
+        if not matches:
+            errors.append(f"BATTERY_CHANNELS[{ch_id}]: not covered by any BATTERY_GROUPS range")
+        elif len(matches) > 1:
+            errors.append(f"BATTERY_CHANNELS[{ch_id}]: covered by overlapping groups {matches}")
 
 
 def _check_relay_count_consistency(dev_cfg, battery_channels: dict, errors: list):
@@ -235,8 +243,8 @@ def validate_devices(dev_cfg) -> list:
         - relay count consistency (num_channels == channel_count ==
           Settings.RELAY_COUNT, and every relay_address in range)
         - every relay 'type' is registered in RelayFactory
-        - every BATTERY_CHANNELS "battery_type" references a real
-          BATTERY_CONFIGS entry
+        - every BATTERY_CHANNELS position is covered by exactly one
+          BATTERY_GROUPS range
     """
     errors = []
     registry = _build_registry(dev_cfg)
@@ -252,7 +260,7 @@ def validate_devices(dev_cfg) -> list:
     _check_duplicate_com_ports(registry, errors)
     battery_channels = _check_duplicate_relay_identifiers(dev_cfg, errors)
     _check_relay_count_consistency(dev_cfg, battery_channels, errors)
-    _check_battery_types(dev_cfg, battery_channels, errors)
+    _check_battery_groups(dev_cfg, battery_channels, errors)
 
     return errors
 

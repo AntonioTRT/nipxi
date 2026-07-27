@@ -33,11 +33,24 @@ class Settings:
     RECOVERY_ENABLED_OVERRIDE = None
 
     # -------------------------------------------------------------------------
-    # Channels
-    # Number of battery channels available on the relay matrix / BLOSS Hub PCB
+    # Battery positions -- the system is organized around battery positions
+    # grouped into blocks of GROUP_SIZE (see config/devices.py::BATTERY_GROUPS
+    # -- each group of GROUP_SIZE positions corresponds to a distinct relay
+    # matrix; Group A/positions 1-8 is the only group with real hardware
+    # today). Renamed from NUM_CHANNELS -- "channel" reads as a generic DAQ/
+    # electrical term; this constant has always meant "how many battery
+    # positions exist", confirmed by its only two real call sites
+    # (test.py's BATTERY_CHANNELS count-check, utils/validators.py's range
+    # validation) -- neither is DAQ-channel-related.
     # -------------------------------------------------------------------------
-    NUM_CHANNELS = 8
+    GROUP_SIZE = 8
+    BATTERY_POSITIONS = 8
     ACTIVE_CHANNELS = list(range(1, 9))  # [1, 2, 3, 4, 5, 6, 7, 8]
+    # NOTE: ACTIVE_CHANNELS is the list every real sequence (BatteryTestSequence,
+    # ProtoTestSequence, TestExecutor) actually iterates -- a "positions"
+    # rename for this one is recommended but deliberately deferred to avoid
+    # touching test_control/ files outside this change's scope (see
+    # docs/architecture.md "Battery Group / Position Architecture").
 
     # -------------------------------------------------------------------------
     # Battery limits (Li-ion, per BLOSS Hub spec)

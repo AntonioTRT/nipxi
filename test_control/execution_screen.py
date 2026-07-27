@@ -63,10 +63,18 @@ class ExecutionFrame:
     state: str = None         # coarse status -- ACTIVE/COMPLETED/FAILED/...
     phase_detail: str = None  # fine-grained phase -- ACTIVATING/DWELLING/CC_CHARGE/...
 
-    # Current measurements
+    # Current measurements -- SMU/DMM (Proto Test / future Charge/Discharge
+    # sourcing) and battery/DAQ (Monitor Battery -- a real DAQ.read_channel()
+    # reading of the battery itself, no SMU sourcing involved). Kept as
+    # distinct fields, not reused/overloaded, since they observe genuinely
+    # different signals -- a test type populates whichever set applies and
+    # leaves the other at None/"N/A".
     smu_voltage: float = None
     smu_current: float = None
     dmm_voltage: float = None
+    battery_voltage: float = None
+    battery_current: float = None
+    battery_temp: float = None
 
     # Battery metrics -- N/A for Proto Test, populated once Battery
     # Charge/Discharge/cycle execution computes them
@@ -92,19 +100,22 @@ class ExecutionFrame:
     @classmethod
     def from_live(cls, *, run_id, test_type, channel, run_number=None, relay=None,
                   state=None, phase_detail=None, smu_voltage=None, smu_current=None,
-                  dmm_voltage=None, capacity=None, energy=None, cycle_count=None,
+                  dmm_voltage=None, battery_voltage=None, battery_current=None,
+                  battery_temp=None, capacity=None, energy=None, cycle_count=None,
                   recent_measurements=None, recent_events=None) -> "ExecutionFrame":
         """
         Build a frame from live, in-memory values during a real execution
-        (Proto Test Execution today; future Battery Charge/Discharge/cycle
-        execution the same way). Callers pass exactly the values they
-        have -- any field not applicable to the current test type is left
-        at its None default, never invented.
+        (Proto Test Execution / Monitor Battery today; future Battery
+        Charge/Discharge/cycle execution the same way). Callers pass
+        exactly the values they have -- any field not applicable to the
+        current test type is left at its None default, never invented.
         """
         return cls(
             run_number=run_number, run_id=run_id, test_type=test_type,
             channel=channel, relay=relay, state=state, phase_detail=phase_detail,
             smu_voltage=smu_voltage, smu_current=smu_current, dmm_voltage=dmm_voltage,
+            battery_voltage=battery_voltage, battery_current=battery_current,
+            battery_temp=battery_temp,
             capacity=capacity, energy=energy, cycle_count=cycle_count,
             recent_measurements=list(recent_measurements) if recent_measurements else [],
             recent_events=list(recent_events) if recent_events else [],
@@ -159,6 +170,15 @@ class ExecutionFrame:
             smu_voltage=latest.get("smu_measured_v"),
             smu_current=latest.get("smu_measured_i"),
             dmm_voltage=latest.get("dmm_measured_v"),
+            # battery_voltage/current/temp reuse the ORIGINAL, pre-Milestone-II
+            # measurements columns (voltage_v/current_a/temp_c) -- the same
+            # columns charge_cycle.py/discharge_cycle.py's record() calls
+            # already write, and what Monitor Battery's DAQ.read_channel()
+            # readings populate via record_measurement(test_type="monitor", ...).
+            # No new measurements columns needed for this.
+            battery_voltage=latest.get("voltage_v"),
+            battery_current=latest.get("current_a"),
+            battery_temp=latest.get("temp_c"),
             capacity=run_summary.get("capacity_ah"),
             energy=run_summary.get("energy_wh"),
             cycle_count=run_summary.get("cycle_count"),
@@ -217,6 +237,9 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
     print(f"SMU Voltage    : {_fmt_volts(frame.smu_voltage)}")
     print(f"SMU Current    : {_fmt_amps(frame.smu_current)}")
     print(f"DMM Voltage    : {_fmt_volts(frame.dmm_voltage)}")
+    print(f"Battery Voltage: {_fmt_volts(frame.battery_voltage)}")
+    print(f"Battery Current: {_fmt_amps(frame.battery_current)}")
+    print(f"Battery Temp   : {_fmt(frame.battery_temp)}" + ("" if frame.battery_temp is None else " C"))
     print()
     print("Battery Metrics")
     print("-" * 60)

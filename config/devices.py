@@ -393,22 +393,52 @@ DMM_CONFIG = DMM_CONFIGS["MAIN_DMM"]
 # example (Battery 3.0 A / PMU 2.0 A / Safety 1.5 A -> effective 1.5 A) and
 # the planned LimitResolver concept (documentation only -- not implemented).
 # =============================================================================
+# Operator-selectable battery types. Battery selection is explicit and
+# operator-controlled (see test.py's battery-type selection prompt,
+# Monitor Battery workflow) -- BATTERY_CHANNELS below deliberately does NOT
+# reference a battery type; it is physical wiring information only.
+#
+# voltage_max_v/voltage_min_v/max_charge_current_a/max_discharge_current_a/
+# max_temp_c are NOT yet confirmed against a real datasheet for either
+# battery below -- placeholders derived from nominal_voltage_v/capacity_ah
+# (the two values actually specified) using the same standard Li-ion
+# voltage window and 0.5C/1C charge/discharge ratios the previous generic
+# entry used. Update these once real datasheet limits are available --
+# until then, the global Settings.BAT_* limits (config/settings.py) remain
+# the enforced safety ceiling regardless of what's listed here (see
+# docs/architecture.md "Operational Limit Resolution").
 BATTERY_CONFIGS = {
-    "GENERIC_LIION_18650": {
-        "chemistry":             "Li-ion",
-        "form_factor":           "18650",
-        "nominal_voltage_v":     3.7,
-        "voltage_max_v":         4.2,
-        "voltage_min_v":         3.0,
-        "capacity_ah":           2.5,
-        "max_charge_current_a":  1.25,   # 0.5C
-        "max_discharge_current_a": 2.5,  # 1C
-        "max_temp_c":            45.0,
+    "HUB_2_SB": {
+        "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
+        "form_factor":             None,       # unconfirmed
+        "nominal_voltage_v":       3.7,
+        "voltage_max_v":           4.2,        # unconfirmed placeholder
+        "voltage_min_v":           3.0,        # unconfirmed placeholder
+        "capacity_ah":             1.05,       # 1050 mAh
+        "max_charge_current_a":    0.525,      # unconfirmed placeholder -- 0.5C
+        "max_discharge_current_a": 1.05,       # unconfirmed placeholder -- 1C
+        "max_temp_c":              45.0,       # unconfirmed placeholder
+    },
+    "HUB_SB": {
+        "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
+        "form_factor":             None,       # unconfirmed
+        "nominal_voltage_v":       3.7,
+        "voltage_max_v":           4.2,        # unconfirmed placeholder
+        "voltage_min_v":           3.0,        # unconfirmed placeholder
+        "capacity_ah":             0.16,       # 160 mAh
+        "max_charge_current_a":    0.08,       # unconfirmed placeholder -- 0.5C
+        "max_discharge_current_a": 0.16,       # unconfirmed placeholder -- 1C
+        "max_temp_c":              45.0,       # unconfirmed placeholder
     },
 }
 
-# Battery channel definitions
-# Key: channel index (1-based), Value: metadata dict
+# Battery channel definitions -- PHYSICAL WIRING ONLY.
+# Key: global battery position (1-based, see BATTERY_GROUPS below for how
+# a position maps to a group + relay matrix). Deliberately does NOT
+# reference a battery type -- which battery is being tested is an explicit
+# operator choice at run start (test.py's battery-type selection prompt),
+# never inferred from which position/relay was picked. See docs/
+# architecture.md "Battery Group / Position Architecture".
 #
 # daq_voltage_ch/daq_current_ch/daq_ntc_ch use "Dev1" as the NI-MAX device
 # alias placeholder for MAIN_DAQ (PXI_SLOTS[2], resource "PXI1Slot2") --
@@ -424,13 +454,83 @@ BATTERY_CHANNELS = {
         "daq_current_ch": f"Dev1/ai{i + 7}",
         "daq_ntc_ch":     f"Dev1/ai{i + 15}",
         "fuse_rating_a":  2.0,
-        "battery_type":   "GENERIC_LIION_18650",  # key into BATTERY_CONFIGS --
-                                                    # update when a different
-                                                    # battery is installed here
         "enabled":        True,
     }
     for i in range(1, 9)
 }
+
+# =============================================================================
+# Battery groups -- relay routing architecture.
+#
+# Battery groups are NOT a purely logical grouping: each group of
+# Settings.GROUP_SIZE (8) battery positions corresponds to a distinct relay
+# routing section, physically one Ethernet relay matrix per group. Group A
+# (positions 1-8) is the only group with real hardware today -- MATRIX_NUMATO_201
+# (see ETHERNET_DEVICES above). Group B is pre-wired to MATRIX_NUMATO_202
+# (already configured, Milestone 1) but not yet enabled for battery routing.
+# Groups C/D are placeholders for future relay matrices that don't exist yet
+# (`relay_matrix: None`) -- present so the operator workflow and Relay
+# Functional Validation's group-scope menu are future-proof without a later
+# redesign; selecting a disabled/unconfigured group reports "no relays
+# configured for this group" (same graceful pattern as the hardware-cleanup
+# disabled-device entries above), never a crash.
+#
+# position_start/position_end are GLOBAL battery position numbers (matching
+# BATTERY_CHANNELS' keys); relay_offset is subtracted from a global position
+# to get the 1-based position *within* the group (e.g. global position 11
+# in Group B -> position_start=9 -> in-group position 11-9+1 = 3).
+# =============================================================================
+BATTERY_GROUPS = {
+    "A": {
+        "relay_matrix":   "MATRIX_NUMATO_201",
+        "position_start": 1,
+        "position_end":   8,
+        "enabled":        True,
+    },
+    "B": {
+        "relay_matrix":   "MATRIX_NUMATO_202",
+        "position_start": 9,
+        "position_end":   16,
+        "enabled":        False,   # matrix exists in config, not yet wired for battery routing
+    },
+    "C": {
+        "relay_matrix":   None,    # no relay matrix assigned yet
+        "position_start": 17,
+        "position_end":   24,
+        "enabled":        False,
+    },
+    "D": {
+        "relay_matrix":   None,    # no relay matrix assigned yet
+        "position_start": 25,
+        "position_end":   32,
+        "enabled":        False,
+    },
+}
+
+
+def resolve_group_position(group: str, position_in_group: int) -> int:
+    """
+    Convert (group, position-within-group) -- what the operator selects,
+    e.g. "Group A, Position 3" -- to the global battery position number
+    BATTERY_CHANNELS is keyed by. Raises KeyError for an unknown group,
+    ValueError if position_in_group is out of range for that group.
+    """
+    grp = BATTERY_GROUPS[group]
+    size = grp["position_end"] - grp["position_start"] + 1
+    if not (1 <= position_in_group <= size):
+        raise ValueError(
+            f"Position {position_in_group} out of range for group {group!r} "
+            f"(1..{size})"
+        )
+    return grp["position_start"] + position_in_group - 1
+
+
+def group_for_position(global_position: int):
+    """Return the group name a global battery position belongs to, or None."""
+    for name, grp in BATTERY_GROUPS.items():
+        if grp["position_start"] <= global_position <= grp["position_end"]:
+            return name
+    return None
 
 # Relay matrix -- serial (COM port) -- MAIN_MATRIX / COM13.
 #

@@ -314,10 +314,120 @@ from Milestone 1's recommendation, renumbered) -- implement and validate
 for a single battery channel end-to-end, before scaling to all 8 channels
 or additional SMUs.
 
+## Milestone II: Monitor Battery
+
+### Objectives achieved
+
+- Run Main Test's single legacy action replaced with a submenu: `1. Monitor
+  Battery` / `2. Charge Battery` / `3. Discharge Battery` / `4. Cycle
+  Battery`. Only Monitor Battery is implemented; the other three are
+  explicit placeholders.
+- `config/devices.py::BATTERY_CONFIGS` now catalogs the two real BLOSS Hub
+  battery types (`HUB_2_SB` -- 1050 mAh, `HUB_SB` -- 160 mAh), replacing the
+  placeholder `GENERIC_LIION_18650` entry.
+- Battery type selection is explicit and operator-controlled
+  (`test.py::_select_battery_type()`) -- `BATTERY_CHANNELS` was stripped of
+  its `battery_type` field and is now physical wiring information only.
+- New `config/devices.py::BATTERY_GROUPS` -- battery groups are a relay
+  routing architecture (one relay matrix per group of `GROUP_SIZE` (8)
+  positions), not a purely logical grouping. Group A (positions 1-8,
+  `MATRIX_NUMATO_201`) is the only enabled group today; B/C/D are pre-wired
+  for future relay matrices. Operator workflow is always Battery Type ->
+  Battery Group -> Battery Position, with position always shown relative to
+  its group ("Group A Position 3").
+- `Settings.NUM_CHANNELS` renamed to `Settings.BATTERY_POSITIONS`, with a
+  new `Settings.GROUP_SIZE` constant -- both call sites
+  (`test.py`/`utils/validators.py`) updated.
+- Confirmation screen (Mode/Battery Type/Capacity/Group/Position/Max-Min
+  Voltage/Max Charge-Discharge Current/Max Temperature, `Continue? (Y/N)`)
+  gates every relay activation -- declining touches no hardware at all.
+- Mandatory configuration traceability: accepting the confirmation screen
+  writes a `run_summary` battery-config snapshot and a fixed sequence of
+  seven `event_log` entries (Run started / Mode selected / Battery selected
+  / Battery capacity / Group selected / Position selected / Configuration
+  snapshot recorded) **before** the relay closes or any measurement is
+  taken -- verified in order by a mocked smoke test.
+- New `test_control/monitor_battery_sequence.py::MonitorBatterySequence`,
+  mirroring `ProtoTestSequence`'s structure, using the same Milestone II
+  infrastructure (`measurements`/`run_summary`/`event_log`/`station_state`,
+  `ExecutionFrame`/`render_execution_frame()`) -- no new storage design.
+  Read-only: no charging, no discharging, no SMU sourcing.
+- `ExecutionFrame` extended with `battery_voltage`/`battery_current`/
+  `battery_temp` fields (reusing the original `measurements.voltage_v`/
+  `current_a`/`temp_c` columns), kept distinct from `smu_voltage`/
+  `smu_current`/`dmm_voltage` since Monitor Battery observes a different
+  signal (a plain DAQ reading of the battery, no SMU sourcing).
+- Relay Functional Validation's Matrix Scan gained a scope-selection menu
+  (`1. All Groups` / `2. Group A` / `3. Group B` / `4. Group C` / `5. Group
+  D`) via new optional `channel_start`/`channel_end` parameters on
+  `test_relay_matrix_scan()`/`_run_relay_matrix_scan()` -- future-proof for
+  additional relay matrices.
+
+### Architectural decisions made
+
+- Battery type is never inferred from wiring config (`BATTERY_CHANNELS`) --
+  always an explicit operator choice, so the same physical position can be
+  reused across different battery models without a config edit.
+- Battery Groups model physical relay-matrix boundaries, not just a display
+  grouping -- this is the scaling path for every future relay expansion
+  (each new group of 8 positions gets its own matrix and `BATTERY_GROUPS`
+  entry).
+- Cancellation (Ctrl+C) is Monitor Battery's expected, normal end -- there
+  is no bounded "success" exit the way Proto Test's fixed relay cycle has
+  one; `run_summary.result = "STOPPED_BY_OPERATOR"` on that path, not a
+  failure result.
+- `MonitorBatterySequence` still takes an `smu` reference purely for
+  `safety.emergency_stop()`/`safety.safe_cancel_shutdown()` (both require
+  one) even though this mode never sources through it -- one shared
+  safety-shutdown entry point for every mode, not a Monitor-specific
+  relay-only path.
+- The previous `run_main_test()` body (`TestExecutor`/`ResultManager`, the
+  same path `main.py` uses) was retired from this menu entry in favor of
+  the new submenu; `main.py`'s own production path is untouched.
+
+### Verification
+
+- `python -m py_compile` clean on every touched file
+  (`config/devices.py`, `utils/device_validator.py`, `config/settings.py`,
+  `utils/validators.py`, `test_control/execution_screen.py`,
+  `test_control/monitor_battery_sequence.py`, `test.py`).
+- `utils/device_validator.py::validate_devices()` returns zero errors
+  against the updated `BATTERY_CONFIGS`/`BATTERY_CHANNELS`/`BATTERY_GROUPS`.
+- Mocked-hardware smoke test (`HardwareManager`/`DataStorage`/
+  `MonitorBatterySequence` all mocked, `input()` scripted through the full
+  Battery Type -> Group -> Position -> Confirm flow): confirms the seven
+  traceability `event_log` calls all precede relay/monitoring start, and
+  that `MonitorBatterySequence` receives the correct channel/relay/DAQ
+  channel arguments.
+- A second mocked run confirms that declining the confirmation screen
+  (`N`) never constructs `HardwareManager` -- no hardware is touched.
+
+### Remaining work
+
+- Charge Battery, Discharge Battery, Cycle Battery -- menu placeholders
+  only, not implemented.
+- NTC temperature reads in Monitor Battery remain `None` -- same
+  pre-existing gap already carried by `charge_cycle.py`/`discharge_cycle.py`.
+- Physical rack validation of Monitor Battery on real Group A hardware
+  (this milestone's changes have been verified with mocked hardware only).
+- `BATTERY_CONFIGS` voltage/current/temperature limits marked
+  `# unconfirmed placeholder` should be confirmed against the real BLOSS
+  Hub datasheet before being relied on for safety enforcement.
+- `Settings.ACTIVE_CHANNELS` -> `ACTIVE_POSITIONS` rename, deliberately
+  deferred (would touch `test_control/` files outside this change's scope).
+
+### Recommended next milestone
+
+**Milestone III: Charge Battery** -- implement the first real
+current-sourcing battery mode using the same Battery Type/Group/Position
+selection, confirmation screen, and traceability logging Monitor Battery
+established, adding CC-CV charge control on top.
+
 ---
 
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
+implementation, and again for Milestone II's Monitor Battery
 implementation. See `docs/TODO.md` for the live remaining-work checklist
 and `docs/architecture.md`/`docs/CONFIGURATION.md` for full technical
 detail on every item referenced above.*

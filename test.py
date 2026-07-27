@@ -291,7 +291,7 @@ def test_configuration():
 
     # -- Battery channel map --------------------------------------------------
     ref = "config/devices.py -> BATTERY_CHANNELS"
-    expected = list(range(1, Settings.NUM_CHANNELS + 1))
+    expected = list(range(1, Settings.BATTERY_POSITIONS + 1))
     actual   = sorted(dev_cfg.BATTERY_CHANNELS.keys())
     if actual != expected:
         results.append(_fail("Configuration", "BATTERY_CHANNELS", ref,
@@ -1490,7 +1490,7 @@ def _run_relay_numato_matrix_test(cfg, name, host, port, driver, user, config_re
 # 5c. Relay -- Ethernet full matrix scan (commissioning)
 # =============================================================================
 
-def test_relay_matrix_scan(name=None, cfg=None):
+def test_relay_matrix_scan(name=None, cfg=None, channel_start=None, channel_end=None):
     """
     Commissioning test: exercises every configured channel of the Numato
     Relay Matrix module -- ON, READ, OFF -- one connection for the whole scan.
@@ -1498,6 +1498,12 @@ def test_relay_matrix_scan(name=None, cfg=None):
     -- see _functional_relay_numato(), which routes here from the shared
     hardware-category menu; called with no arguments it falls back to its
     own device picker for standalone use.
+
+    `channel_start`/`channel_end` (both optional, 1-based, inclusive) scope
+    the scan to a subset of channels -- e.g. one battery group's relay
+    positions (see _select_relay_scope()/config/devices.py::BATTERY_GROUPS).
+    Defaults to the full configured channel population when omitted, same
+    as before this parameter existed.
 
     Before scanning, device availability is verified (ping + connect/auth) --
     the scan itself only starts once the device is confirmed reachable and
@@ -1520,7 +1526,11 @@ def test_relay_matrix_scan(name=None, cfg=None):
     driver       = cfg.get("driver", "RELAY32ETHRL00")
     user         = cfg.get("username", cfg.get("user", ""))
     num_channels = cfg.get("channel_count", cfg.get("num_channels", 8))
-    config_ref   = f"config/devices.py -> {name} ({driver} / {host}:{port}, {num_channels} ch)"
+
+    ch_start = 1 if channel_start is None else max(1, channel_start)
+    ch_end   = num_channels if channel_end is None else min(num_channels, channel_end)
+    scope_note = "" if (ch_start == 1 and ch_end == num_channels) else f", channels {ch_start}-{ch_end}"
+    config_ref = f"config/devices.py -> {name} ({driver} / {host}:{port}, {num_channels} ch{scope_note})"
 
     # Safe Cancellation (see docs/architecture.md "Safe Cancellation
     # Architecture"): same pattern as run_main_test() -- Ctrl+C requests a
@@ -1536,12 +1546,15 @@ def test_relay_matrix_scan(name=None, cfg=None):
     print("\nPress Ctrl+C to cancel safely.\n")
     try:
         with _numato_relay_debug_logging():
-            return _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref, token)
+            return _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref, token,
+                                           channel_start=ch_start, channel_end=ch_end)
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
-def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref, token=None):
+def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_ref, token=None,
+                            channel_start=1, channel_end=None):
+    channel_end = num_channels if channel_end is None else channel_end
     from utils.cancellation import check_cancellation
     from utils.errors import OperationCancelledError
 
@@ -1581,7 +1594,7 @@ def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_r
 
     # Full channel scan -- ON, READ, OFF per channel ------------------------------
     try:
-        for ch in range(1, num_channels + 1):
+        for ch in range(channel_start, channel_end + 1):
             # Checkpoint: before starting a new channel, never mid-channel
             # (never between relay.close(ch)/relay.read(ch)/relay.open(ch)).
             try:
@@ -1900,6 +1913,46 @@ def test_relay_numato():
                                    _identify_relay_eth, _functional_relay_numato)
 
 
+def _select_relay_scope():
+    """
+    Scope-selection menu for Relay Functional Validation -- lets a scan be
+    restricted to one battery group's relay positions instead of the full
+    channel population (see config/devices.py::BATTERY_GROUPS). Future-proof:
+    as relay matrices for Groups B/C/D come online, this same menu already
+    supports scoping to them without further changes here.
+
+    Returns (channel_start, channel_end) as 1-based, inclusive, global
+    battery-position numbers, or (None, None) for "All Groups" (the full
+    configured population -- previous, unscoped behavior).
+    """
+    print("\nRelay Validation Scope")
+    print("1. All Groups")
+    print("2. Group A")
+    print("3. Group B")
+    print("4. Group C")
+    print("5. Group D")
+    choice = input("\nScope: ").strip()
+    group_by_choice = {"2": "A", "3": "B", "4": "C", "5": "D"}
+    if choice in ("", "1"):
+        return None, None
+    group = group_by_choice.get(choice)
+    if group is None:
+        print("Invalid selection -- defaulting to All Groups.")
+        return None, None
+    grp = dev_cfg.BATTERY_GROUPS.get(group)
+    if grp is None or not grp["enabled"]:
+        print(f"Group {group} has no relay matrix installed yet -- defaulting to All Groups.")
+        return None, None
+    return grp["position_start"], grp["position_end"]
+
+
+def _test_relay_matrix_scan_scoped(name=None, cfg=None):
+    """Matrix Scan wrapper that prompts for a scope (see _select_relay_scope())
+    before running -- the Functional Validation menu entry point."""
+    channel_start, channel_end = _select_relay_scope()
+    return test_relay_matrix_scan(name, cfg, channel_start=channel_start, channel_end=channel_end)
+
+
 def _functional_relay_numato(name: str, cfg: dict):
     """
     Functional Validation submenu for one Numato Relay Matrix device --
@@ -1910,7 +1963,7 @@ def _functional_relay_numato(name: str, cfg: dict):
     """
     options = [
         ("Relay 1 quick check (READ / ON / OFF)",        test_relay_numato_matrix),
-        ("Matrix Scan (ON -> READ -> OFF, every channel)", test_relay_matrix_scan),
+        ("Matrix Scan (ON -> READ -> OFF, scoped by group)", _test_relay_matrix_scan_scoped),
         ("RelayEthernetTest (native 0-based primitives)", test_relay_ethernet_test),
         ("Safety Self-Test (1..N, stop on first failure)", test_relay_safety_selftest),
     ]
@@ -2466,87 +2519,234 @@ def preflight_check():
 # 0. Main Test -- real commissioning run via HardwareManager / TestExecutor
 # =============================================================================
 
-def run_main_test():
+def _select_battery_type():
+    """Explicit, operator-controlled battery type selection (never inferred
+    from BATTERY_CHANNELS -- see docs/architecture.md "Battery Type
+    Selection")."""
+    names = list(dev_cfg.BATTERY_CONFIGS.keys())
+    print("\nSelect Battery Type")
+    for i, name in enumerate(names, start=1):
+        cfg = dev_cfg.BATTERY_CONFIGS[name]
+        print(f"  {i}. {name}  ({cfg['capacity_ah'] * 1000:.0f} mAh, "
+              f"{cfg['nominal_voltage_v']:.1f} V nominal)")
+    choice = input("\nBattery type: ").strip()
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(names):
+            return names[idx]
+    except ValueError:
+        pass
+    print("Invalid selection.")
+    return None
+
+
+def _select_battery_group():
+    """Battery group selection -- each group is a distinct relay-matrix
+    routing section (see config/devices.py::BATTERY_GROUPS), not a purely
+    logical grouping. Only groups with enabled=True can be selected."""
+    names = list(dev_cfg.BATTERY_GROUPS.keys())
+    print("\nSelect Battery Group")
+    for name in names:
+        grp = dev_cfg.BATTERY_GROUPS[name]
+        status = "" if grp["enabled"] else "  (no relay matrix installed yet)"
+        print(f"  {name}. Positions {grp['position_start']}-{grp['position_end']}{status}")
+    choice = input("\nGroup: ").strip().upper()
+    grp = dev_cfg.BATTERY_GROUPS.get(choice)
+    if grp is None:
+        print("Invalid selection.")
+        return None
+    if not grp["enabled"]:
+        print(f"Group {choice} has no relay matrix installed yet -- cannot select.")
+        return None
+    return choice
+
+
+def _select_battery_position(group: str):
+    """Position selection is always relative to the selected group (e.g.
+    "Group A Position 3"), never a raw global position number."""
+    grp = dev_cfg.BATTERY_GROUPS[group]
+    size = grp["position_end"] - grp["position_start"] + 1
+    choice = input(f"\nPosition within Group {group} (1-{size}): ").strip()
+    try:
+        pos = int(choice)
+    except ValueError:
+        print("Invalid selection.")
+        return None
+    if not (1 <= pos <= size):
+        print(f"Position {pos} out of range (1-{size}).")
+        return None
+    return pos
+
+
+def _confirm_monitor_battery(battery_type: str, battery_cfg: dict, group: str, position: int):
+    print("\n" + "=" * 60)
+    print("Confirm Configuration")
+    print("=" * 60)
+    print(f"Mode                  : Monitor Battery")
+    print(f"Battery Type          : {battery_type}")
+    print(f"Capacity              : {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
+    print(f"Group                 : {group}")
+    print(f"Position              : {position} (Group {group} Position {position})")
+    print(f"Max Voltage           : {battery_cfg['voltage_max_v']:.2f} V")
+    print(f"Min Voltage           : {battery_cfg['voltage_min_v']:.2f} V")
+    print(f"Max Charge Current    : {battery_cfg['max_charge_current_a']:.3f} A")
+    print(f"Max Discharge Current : {battery_cfg['max_discharge_current_a']:.3f} A")
+    print(f"Max Temperature       : {battery_cfg['max_temp_c']:.1f} C")
+    print("=" * 60)
+    answer = input("\nContinue? (Y/N): ").strip().upper()
+    return answer == "Y"
+
+
+def _run_monitor_battery():
     """
-    Real commissioning run: loads config/settings.py + config/devices.py,
-    builds HardwareManager, and executes the configured test sequence via
-    TestExecutor / ResultManager (same path as main.py).
+    Monitor Battery -- read-only battery monitoring, no charging, no
+    discharging. Workflow: Select Battery Type -> Select Battery Group ->
+    Select Battery Position -> Confirmation Screen -> Configuration
+    Snapshot Logged -> Relay Close -> Start Monitoring. Uses the same
+    Milestone II infrastructure Proto Test Execution already validated
+    (DataStorage: measurements/run_summary/event_log/station_state,
+    ExecutionFrame/render_execution_frame()) via
+    test_control/monitor_battery_sequence.py::MonitorBatterySequence.
     """
-    print("RUNNING MAIN TEST")
+    print("MONITOR BATTERY")
 
     import signal
+    from data.storage import DataStorage
     from test_control.hardware_manager import HardwareManager
-    from test_control.test_executor import TestExecutor
-    from test_control.result_manager import ResultManager
+    from test_control.monitor_battery_sequence import MonitorBatterySequence
+    from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken
-    from utils.errors import HardwareInitError
-    from utils.stop_reason import StopReason
+    from utils.errors import HardwareInitError, OperationCancelledError
 
-    # Production relay is the Numato Ethernet module -- RELAY_CONFIG (serial)
-    # is kept only for diagnostics via menu options 5/6/7.
-    smu_name, smu_cfg   = next(iter(dev_cfg.SMU_ASSIGNMENTS.items()))
-    dmm_name, dmm_cfg   = next(iter(dev_cfg.DMM_CONFIGS.items()))
-    daq_name, daq_cfg   = next(iter(dev_cfg.DAQ_CONFIGS.items()))
-    relay_cfg           = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
-    relay_name          = relay_cfg.get("name", "RELAY")
+    battery_type = _select_battery_type()
+    if battery_type is None:
+        return
+    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
+    group = _select_battery_group()
+    if group is None:
+        return
+
+    position = _select_battery_position(group)
+    if position is None:
+        return
+
+    if not _confirm_monitor_battery(battery_type, battery_cfg, group, position):
+        print("\nCancelled -- no relay activated.")
+        return
+
+    channel = dev_cfg.resolve_group_position(group, position)
+    ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
+    if ch_cfg is None:
+        print(f"\n[FAIL] No BATTERY_CHANNELS entry for resolved position {channel} -- check config/devices.py.")
+        return
+    relay_address = ch_cfg["relay_address"]
+
+    relay_cfg = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
     print("\nSelected Hardware\n")
-    print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}  [{smu_name}]\n  {smu_cfg.get('resource', '')}\n")
-    print(f"DMM:\n  {dev_cfg.device_display_name(dmm_cfg)}  [{dmm_name}]\n  {dmm_cfg.get('resource', '')}\n")
-    print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  [{relay_name}]\n  {relay_cfg.get('ip', '')}\n")
-    print(f"DAQ:\n  {dev_cfg.device_display_name(daq_cfg)}  [{daq_name}]\n  {daq_cfg.get('resource', '')}\n")
+    print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
 
     hw = HardwareManager(Settings, relay_cfg=relay_cfg)
-
     try:
         hw.connect_all()
     except HardwareInitError as e:
         print(f"[FAIL] Hardware initialization failed: {e}")
         return
 
-    # Safe Cancellation (see docs/architecture.md "Safe Cancellation
-    # Architecture"): identical pattern to main.py -- Ctrl+C requests a
-    # cooperative, checkpoint-based cancellation instead of raising
-    # KeyboardInterrupt while this handler is installed. Restored to
-    # Python's default before returning either way.
-    token = CancellationToken(owner="test.py:run_main_test")
-    previous_sigint_handler = signal.signal(
-        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-    )
-    print("\nPress Ctrl+C to cancel safely.\n")
+    storage = DataStorage(settings=Settings)
+    storage.open()
 
     try:
+        # CRITICAL traceability requirement: every selected-configuration
+        # fact is recorded via event_log BEFORE relay activation/monitor
+        # start/measurement acquisition -- see docs/architecture.md
+        # "Configuration Traceability".
+        storage.start_run_summary(
+            test_type="monitor",
+            battery_type=battery_type,
+            battery_voltage_max_v=battery_cfg["voltage_max_v"],
+            battery_voltage_min_v=battery_cfg["voltage_min_v"],
+            battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
+            battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
+            capacity_ah=battery_cfg["capacity_ah"],
+        )
+        storage.log_event(level="INFO", source="monitor_battery", message="Run started")
+        storage.log_event(level="INFO", source="monitor_battery", message="Mode selected: Monitor")
+        storage.log_event(level="INFO", source="monitor_battery", message=f"Battery selected: {battery_type}")
+        storage.log_event(level="INFO", source="monitor_battery",
+                           message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
+        storage.log_event(level="INFO", source="monitor_battery", message=f"Group selected: {group}")
+        storage.log_event(level="INFO", source="monitor_battery",
+                           channel=channel, relay=relay_address,
+                           message=f"Position selected: {position} (Group {group} Position {position})")
+        storage.log_event(level="INFO", source="monitor_battery",
+                           message="Configuration snapshot recorded")
+
+        token = CancellationToken(owner="test.py:_run_monitor_battery")
+        previous_sigint_handler = signal.signal(
+            signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+        )
+        print("\nPress Ctrl+C to stop monitoring safely.\n")
+
         try:
-            result_mgr = ResultManager(settings=Settings)
-            executor   = TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)
-
-            with result_mgr:
-                result = executor.run(token=token)
-
-            result_mgr.generate_report(result.run_id)
-            print(result.summary())
-            if result.stop_reason == StopReason.CANCELLED:
-                print("Test cancelled by operator -- hardware is in a verified safe state.")
-
-        except KeyboardInterrupt:
-            # Defensive fallback only -- should not normally fire while the
-            # SIGINT handler above is installed.
-            print("\nTest interrupted by user (Ctrl+C).")
-
+            safety = SafetyMonitor(Settings)
+            sequence = MonitorBatterySequence(
+                smu=hw.smu, daq=hw.daq, relay=hw.relay, safety=safety,
+                storage=storage, settings=Settings,
+            )
+            try:
+                sequence.run(
+                    channel=channel, relay_address=relay_address,
+                    daq_voltage_ch=ch_cfg["daq_voltage_ch"],
+                    daq_current_ch=ch_cfg.get("daq_current_ch"),
+                    token=token,
+                )
+            except OperationCancelledError:
+                print("\nMonitor Battery stopped by operator -- hardware is in a verified safe state.")
+            except KeyboardInterrupt:
+                print("\nMonitor Battery interrupted by user (Ctrl+C).")
+            except Exception as e:
+                print(f"\n[FAIL] Monitor Battery aborted: {e}")
         finally:
             signal.signal(signal.SIGINT, previous_sigint_handler)
 
     finally:
-        # Always attempted (Python's finally always runs, including on
-        # KeyboardInterrupt/any exception above) -- see docs/architecture.md
-        # "Emergency Shutdown Strategy". Wrapped defensively so a shutdown
-        # failure is reported clearly instead of silently lost.
+        try:
+            storage.close()
+        except Exception as e:
+            print(f"[WARNING] Storage close failed: {e}")
         try:
             hw.disconnect_all()
         except Exception as shutdown_err:
             print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
             print("           Hardware may still be energized -- "
                   "physically disconnect power if this cannot be resolved immediately.")
+
+
+def run_main_test():
+    """
+    Run Main Test -- battery-centric operator workflow entry point
+    (Milestone II Monitor Battery blueprint). Submenu: only Monitor
+    Battery is implemented; Charge/Discharge/Cycle Battery are
+    placeholders reserved for future work.
+    """
+    print("RUN MAIN TEST")
+    print("\n1. Monitor Battery")
+    print("2. Charge Battery")
+    print("3. Discharge Battery")
+    print("4. Cycle Battery")
+    choice = input("\nSelect mode: ").strip()
+
+    if choice == "1":
+        _run_monitor_battery()
+    elif choice == "2":
+        print("\nCharge Battery -- not yet implemented.")
+    elif choice == "3":
+        print("\nDischarge Battery -- not yet implemented.")
+    elif choice == "4":
+        print("\nCycle Battery -- not yet implemented.")
+    else:
+        print("\nInvalid selection.")
 
 
 # =============================================================================
