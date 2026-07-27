@@ -200,63 +200,78 @@ PXI_SLOTS = {
                              "repurposing it would need a future niswitch-based "
                              "hardware/switch.py, not implemented here.",
     },
-    15: {
-        "slot":            15,
-        "resource":        "PXI1Slot15",
-        "model":           "PXIe-4353",
-        "nickname":        "TEMP_MODULE",
-        "driver_family":   "nidaqmx",   # NI-4353 is an NI-DAQmx universal TC/RTD input module
-        "category":        "temperature",
-        "role":            "Per-channel battery temperature acquisition "
-                            "(thermocouple/RTD). Terminal block TB-4353 (connector "
-                            "0) attached at this slot.",
-        "enabled":         False,
-        "terminal_block":  "TB-4353",
-        "terminal_block_connector": 0,
-        "validation_notes": "Not present in the original VI plan equipment list -- "
-                             "a new finding from the real rack inventory. This is "
-                             "the most likely real hardware source for the "
-                             "per-channel temperature readings that "
-                             "charge_cycle.py/discharge_cycle.py currently stub as "
-                             "t_c = None (see the 'TODO: get temperature from NTC "
-                             "channel' comments there). No driver class exists yet "
-                             "(would be a future NI-DAQmx-based hardware/"
-                             "temperature.py) -- not wired into any code path today.",
-    },
-    17: {
-        "slot":            17,
-        "resource":        "PXI1Slot17",
-        "model":           "PXIe-6368",
-        "nickname":        "EXPANSION_DAQ",
-        "driver_family":   "nidaqmx",
-        "category":        "daq",
-        "role":            "Additional high-speed multifunction DAQ -- candidate "
-                            "for future channel-count scaling or higher sample "
-                            "rates. Not wired into HardwareManager today (which "
-                            "uses MAIN_DAQ only).",
-        "enabled":         False,
-        "sample_rate_hz":  1.0,
-        "voltage_range_v": 5.0,
-        "validation_notes": "Not present in the original VI plan equipment list -- "
-                             "a new finding from the real rack inventory.",
-    },
-    18: {
-        "slot":            18,
-        "resource":        "PXI1Slot18",
-        "model":           "PXIe-6365",
-        "nickname":        "PRECISION_DAQ",
-        "driver_family":   "nidaqmx",
-        "category":        "daq",
-        "role":            "Additional multifunction DAQ (16-bit precision "
-                            "variant) -- candidate for future expansion. Not "
-                            "wired into HardwareManager today (which uses "
-                            "MAIN_DAQ only).",
-        "enabled":         False,
-        "sample_rate_hz":  1.0,
-        "voltage_range_v": 5.0,
-        "validation_notes": "Not present in the original VI plan equipment list -- "
-                             "a new finding from the real rack inventory.",
-    },
+    # -------------------------------------------------------------------
+    # Hardware cleanup (post-Milestone-II Phase 3 review): TEMP_MODULE
+    # (slot 15), EXPANSION_DAQ (slot 17), and PRECISION_DAQ (slot 18) are
+    # NOT physically installed in this PXI system. Commented out --
+    # deliberately not deleted -- so they disappear from Hardware
+    # Discovery/Test DAQ/Test Temperature Module's device lists (both
+    # already handle an empty category gracefully: "(no ... devices
+    # configured)", not a crash) instead of reporting [FAIL] for hardware
+    # that was never there. Re-enable by uncommenting if/when this
+    # hardware is actually installed -- nothing else needs to change
+    # (SMU_ASSIGNMENTS/DAQ_CONFIGS/DMM_CONFIGS below are all *derived*
+    # from PXI_SLOTS, so removing an entry here automatically removes it
+    # from every downstream dict too). See docs/CONFIGURATION.md
+    # "Installed vs. Disabled Hardware" for the current inventory.
+    #
+    # 15: {
+    #     "slot":            15,
+    #     "resource":        "PXI1Slot15",
+    #     "model":           "PXIe-4353",
+    #     "nickname":        "TEMP_MODULE",
+    #     "driver_family":   "nidaqmx",   # NI-4353 is an NI-DAQmx universal TC/RTD input module
+    #     "category":        "temperature",
+    #     "role":            "Per-channel battery temperature acquisition "
+    #                         "(thermocouple/RTD). Terminal block TB-4353 (connector "
+    #                         "0) attached at this slot.",
+    #     "enabled":         False,
+    #     "terminal_block":  "TB-4353",
+    #     "terminal_block_connector": 0,
+    #     "validation_notes": "Not present in the original VI plan equipment list -- "
+    #                          "a new finding from the real rack inventory. This is "
+    #                          "the most likely real hardware source for the "
+    #                          "per-channel temperature readings that "
+    #                          "charge_cycle.py/discharge_cycle.py currently stub as "
+    #                          "t_c = None (see the 'TODO: get temperature from NTC "
+    #                          "channel' comments there). No driver class exists yet "
+    #                          "(would be a future NI-DAQmx-based hardware/"
+    #                          "temperature.py) -- not wired into any code path today.",
+    # },
+    # 17: {
+    #     "slot":            17,
+    #     "resource":        "PXI1Slot17",
+    #     "model":           "PXIe-6368",
+    #     "nickname":        "EXPANSION_DAQ",
+    #     "driver_family":   "nidaqmx",
+    #     "category":        "daq",
+    #     "role":            "Additional high-speed multifunction DAQ -- candidate "
+    #                         "for future channel-count scaling or higher sample "
+    #                         "rates. Not wired into HardwareManager today (which "
+    #                         "uses MAIN_DAQ only).",
+    #     "enabled":         False,
+    #     "sample_rate_hz":  1.0,
+    #     "voltage_range_v": 5.0,
+    #     "validation_notes": "Not present in the original VI plan equipment list -- "
+    #                          "a new finding from the real rack inventory.",
+    # },
+    # 18: {
+    #     "slot":            18,
+    #     "resource":        "PXI1Slot18",
+    #     "model":           "PXIe-6365",
+    #     "nickname":        "PRECISION_DAQ",
+    #     "driver_family":   "nidaqmx",
+    #     "category":        "daq",
+    #     "role":            "Additional multifunction DAQ (16-bit precision "
+    #                         "variant) -- candidate for future expansion. Not "
+    #                         "wired into HardwareManager today (which uses "
+    #                         "MAIN_DAQ only).",
+    #     "enabled":         False,
+    #     "sample_rate_hz":  1.0,
+    #     "voltage_range_v": 5.0,
+    #     "validation_notes": "Not present in the original VI plan equipment list -- "
+    #                          "a new finding from the real rack inventory.",
+    # },
 }
 
 # =============================================================================
@@ -417,21 +432,35 @@ BATTERY_CHANNELS = {
     for i in range(1, 9)
 }
 
-# Relay matrix -- serial (COM port)
-# Set "type": "serial" and fill in the real command strings once you have the datasheet.
-# RelayFactory.create(RELAY_CONFIG) will return a SerialRelay instance.
-RELAY_CONFIG = {
-    "type":         "serial",
-    "name":         "MAIN_MATRIX",
-    "port":         "COM13",
-    "baud_rate":    9600,
-    "timeout":      2.0,
-    "num_channels": 8,
-    # TODO: replace these with the real protocol strings from your relay controller datasheet
-    "command_open":  "OPEN {ch}\r\n",
-    "command_close": "CLOSE {ch}\r\n",
-    "command_query": "QUERY {ch}\r\n",
-}
+# Relay matrix -- serial (COM port) -- MAIN_MATRIX / COM13.
+#
+# Hardware cleanup (post-Milestone-II Phase 3 review): this serial relay
+# controller is NOT physically installed/connected -- commented out,
+# deliberately not deleted, so it disappears from Hardware Discovery's
+# "Relay (Serial)" group and Startup Device Validation's registry instead
+# of reporting [FAIL] for hardware that isn't there. Production is, and
+# has always been, the Numato Ethernet relay (ETHERNET_DEVICES/
+# NUMATO_RELAY_MATRIX_CONFIG below) -- this serial path was diagnostic-only
+# even when present (see hardware/relay_serial.py's module docstring).
+#
+# IMPORTANT -- do not uncomment RELAY_CONFIG alone: RELAY_SERIAL_CONFIGS
+# below references RELAY_CONFIG by name unconditionally at import time.
+# Both must be restored together, or every entry point that imports
+# config.devices (main.py, test.py, everything) fails immediately with
+# NameError. See docs/CONFIGURATION.md "Installed vs. Disabled Hardware".
+#
+# RELAY_CONFIG = {
+#     "type":         "serial",
+#     "name":         "MAIN_MATRIX",
+#     "port":         "COM13",
+#     "baud_rate":    9600,
+#     "timeout":      2.0,
+#     "num_channels": 8,
+#     # TODO: replace these with the real protocol strings from your relay controller datasheet
+#     "command_open":  "OPEN {ch}\r\n",
+#     "command_close": "CLOSE {ch}\r\n",
+#     "command_query": "QUERY {ch}\r\n",
+# }
 
 # Numato Relay Matrices -- Ethernet (Numato Lab 32 Channel Ethernet Relay Module)
 # Set "type": "ethernet" to use NumatoRelayMatrix instead of SerialRelay.
@@ -503,9 +532,13 @@ RELAY_ETH_CONFIG = NUMATO_RELAY_MATRIX_CONFIG
 # added; nothing else needs to change.
 # =============================================================================
 
-RELAY_SERIAL_CONFIGS = {
-    RELAY_CONFIG["name"]: RELAY_CONFIG,
-}
+# Empty while RELAY_CONFIG (MAIN_MATRIX, COM13) is commented out above --
+# see the "hardware cleanup" note there. Hardware Discovery's "Relay
+# (Serial)" group and Startup Device Validation both already handle an
+# empty dict here gracefully (report "no devices configured" / skip,
+# never crash). Restore to `{RELAY_CONFIG["name"]: RELAY_CONFIG}` only
+# when RELAY_CONFIG itself is uncommented again.
+RELAY_SERIAL_CONFIGS = {}
 
 # Every Numato Relay Matrix device, name -> config. Hardware Discovery,
 # startup device validation, RelayEthernetTest, and every test_relay_*()

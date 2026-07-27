@@ -151,7 +151,37 @@ The default assumes a single NI 6363 at `Dev1`. Update if your DAQ resource name
 | `CSV_DIR` | `"data_output/development/csv"` | `".../csv"` | `".../csv"` | str | Per-channel CSV output directory |
 | `REPORT_DIR` | `"data_output/development/reports"` | `".../reports"` | `".../reports"` | str | Generated reports directory |
 
-**`station_state` table** (`data/storage.py::DataStorage`, same `DATABASE_FILE` as `measurements` above): one row per relay processed during Proto Test Execution (Milestone 2) -- `relay`, `state` (`ACTIVE`/`COMPLETED`/`FAILED`/`SAFETY_VIOLATION`/`CANCELLED`, reusing `utils/stop_reason.py::StopReason`), `timestamp`, SMU commanded/readback values, SMU/DMM measurements. Written via `DataStorage.record_execution_state()`, read via `DataStorage.get_last_execution_state()` (always the latest row across all run_ids -- used to display, never auto-resume, the previous execution's last known position at startup). Deliberately a separate table from `measurements` -- station/execution position is a different concern from a per-sample battery reading, not part of the `StorageBackend` abstract interface (a future `MiniSQLStorage` need not implement it unless it also wants this feature). See `docs/architecture.md` Section 18.
+**`station_state` table** (`data/storage.py::DataStorage`, same `DATABASE_FILE` as `measurements` above): **recovery/current-position only, as of Milestone II Phase 3.** One row per relay processed -- `channel`, `relay`, `state` (`ACTIVE`/`COMPLETED`/`FAILED`/`SAFETY_VIOLATION`/`CANCELLED`, reusing `utils/stop_reason.py::StopReason`), `timestamp`. Written via `DataStorage.record_execution_state()`, read via `DataStorage.get_last_execution_state()` (always the latest row across all run_ids -- used to display, never auto-resume, the previous execution's last known position at startup). The historical SMU/DMM measurement payload columns still exist on this table for backward compatibility with rows written before Phase 3, but new code no longer populates them -- that data now lives in `measurements` (see below), the authoritative historical result store for every test type. Deliberately a separate table from `measurements` -- station/execution position is a different concern from a per-sample result, not part of the `StorageBackend` abstract interface. See `docs/architecture.md` Section 18b.
+
+**`run_summary` table** -- one row per run: `id` (the operator-facing Run Number), `run_id`, `test_type`, `start_time`/`end_time`/`duration_s`, `stop_reason`, `result`, and (nullable, `N/A` for Proto Test) battery-config snapshot and `capacity_ah`/`energy_wh`/`cycle_count`. Written via `DataStorage.start_run_summary()`/`finish_run_summary()`. See `docs/architecture.md` Section 18.
+
+**`event_log` table** -- fine-grained, timestamped runtime narrative (relay activated/deactivated, output enabled, measurement acquired, ...) -- NOT a replacement for logger output; only meaningful runtime transitions are recorded. Written via `DataStorage.log_event()`, read via `get_recent_events()`. See `docs/architecture.md` Section 18a/18b.
+
+### Inspecting the database manually
+
+**Recommended tool: [DB Browser for SQLite](https://sqlitebrowser.org/)** (free, GUI) -- open `data_output/<mode>/nipxi_<mode>.db` directly, browse `measurements`/`station_state`/`run_summary`/`event_log` as tables, and run ad hoc SQL from its "Execute SQL" tab. The `sqlite3` CLI works too for quick one-off queries (`sqlite3 data_output/development/nipxi_dev.db`) if you don't want to install anything.
+
+**Example queries:**
+```sql
+-- run_summary: list all runs, most recent first
+SELECT id AS run_number, run_id, test_type, start_time, stop_reason, result
+FROM run_summary ORDER BY id DESC;
+
+-- measurements: everything from one run (channel/relay both shown --
+-- see docs/architecture.md's discussion of why they're separate columns)
+SELECT channel, relay, test_type, phase_detail,
+       smu_measured_v, smu_measured_i, dmm_measured_v, in_compliance
+FROM measurements WHERE run_id = '<run_id>' ORDER BY id;
+
+-- station_state: current/last recovery position (narrowed, Phase 3 --
+-- no measurement columns expected here anymore)
+SELECT channel, relay, state, timestamp FROM station_state ORDER BY id DESC LIMIT 1;
+
+-- event_log: the full runtime narrative for one run
+SELECT timestamp, level, message FROM event_log WHERE run_id = '<run_id>' ORDER BY id;
+```
+
+After a successful Proto Test Execution run, **all four tables** should contain rows for that `run_id` -- `measurements` (one row per relay cycled), `station_state` (one `ACTIVE` row per relay plus one final terminal row), `run_summary` (exactly one row), and `event_log` (several rows per relay). Before Phase 3, only `station_state` was populated -- if you're comparing against an older run, expect that difference.
 
 ---
 
@@ -235,14 +265,48 @@ PXI_SLOTS = {
 
 Every entry has: `slot`, `resource`, `model`, `nickname` (role-based, not just
 the model number), `driver_family`, `category` (`smu`/`daq`/`dmm`/`switch`/
-`temperature` -- used to derive the per-type dicts below), `role`, `enabled`
-(participates in the active pipeline vs. present-but-not-wired-in), and
-`validation_notes` where the real rack differs from what was originally
-planned (see `flowcharts/vi plan.md`).
+`temperature` -- used to derive the per-type dicts below), `role`, `enabled`,
+and `validation_notes` where the real rack differs from what was originally
+planned (see `flowcharts/vi plan.md`). **Note:** `enabled` is documentation
+only today -- no code path reads it (confirmed by inspection: Hardware
+Discovery, `test_daq()`/`test_temperature_module()`, and
+`utils/device_validator.py` all filter purely by `category`, never by
+`enabled`). An entry actually stops being probed/tested only when it is
+removed or commented out of `PXI_SLOTS` entirely -- see "Installed vs.
+Disabled Hardware" below.
 
 Not a PXI slot: `GPIB_INSTRUMENTS` documents the separate NI-488.2/GPIB0
 interface detected in the rack -- no instrument model confirmed at that
 address yet, kept `enabled: False` until one is.
+
+### Installed vs. Disabled Hardware
+
+**Currently installed and validated on the physical rack** (Hardware Bring-Up Milestone 1 / Proto Test Execution, `docs/MILESTONES.md`):
+
+| Nickname | Slot/Address | Model |
+|---|---|---|
+| `PRIMARY_SMU` | Slot 5 | PXIe-4141 |
+| `HIGH_POWER_SMU` | Slot 6 | PXIe-4139 |
+| `AUX_SMU_1` | Slot 7, channel `"1"` | PXI-4130 |
+| `AUX_SMU_2` | Slot 8, channel `"1"` | PXI-4130 |
+| `MAIN_DAQ` | Slot 2 | PXIe-6363 |
+| `MAIN_DMM` | Slot 3 | PXI-4065 |
+| `MATRIX_NUMATO_201` | 169.254.1.201 | Numato 32-ch Ethernet Relay |
+| `MATRIX_NUMATO_202` | 169.254.1.202 | Numato 32-ch Ethernet Relay |
+| `CHASSIS_RELAY_MATRIX` | Slot 11 | PXIe-2569 (present, no driver -- reported N/A, not disabled) |
+
+**Intentionally disabled -- not physically installed** (hardware cleanup pass following the Milestone II Phase 3 review): the `PXI_SLOTS`/`RELAY_CONFIG` entries below are commented out in `config/devices.py`, not deleted, so they disappear entirely from Hardware Discovery/`Test DAQ`/`Test Temperature Module`'s device lists instead of reporting `[FAIL]` for hardware that was never installed:
+
+| Nickname | Slot/Address | Model | Why disabled |
+|---|---|---|---|
+| `TEMP_MODULE` | Slot 15 | PXIe-4353 | Not physically installed |
+| `EXPANSION_DAQ` | Slot 17 | PXIe-6368 | Not physically installed |
+| `PRECISION_DAQ` | Slot 18 | PXIe-6365 | Not physically installed |
+| `MAIN_MATRIX` (serial relay) | COM13 | Generic serial relay | Not physically installed/connected -- production has always been the Numato Ethernet relay above; this was diagnostic-only even when present |
+
+**To re-enable:** uncomment the corresponding `PXI_SLOTS` entry (or `RELAY_CONFIG`) in `config/devices.py`. **`RELAY_CONFIG` has one hard dependency to restore correctly:** `RELAY_SERIAL_CONFIGS` references `RELAY_CONFIG` by name -- both must be uncommented/restored together (`RELAY_SERIAL_CONFIGS = {RELAY_CONFIG["name"]: RELAY_CONFIG}`), or `import config.devices` fails immediately with `NameError` for every entry point in the application. Nothing else needs to change -- `SMU_ASSIGNMENTS`/`DAQ_CONFIGS`/`DMM_CONFIGS` are all *derived* from `PXI_SLOTS`, so an uncommented entry reappears in every downstream dict automatically.
+
+**Effect on Proto Test Execution / Battery Cycling:** none. `HardwareManager` never constructs `EXPANSION_DAQ`/`PRECISION_DAQ`/`TEMP_MODULE`/the serial relay regardless of whether they're configured -- disabling them only affects the discovery/validation menu surface.
 
 ### SMU_ASSIGNMENTS (derived from PXI_SLOTS, category="smu")
 
