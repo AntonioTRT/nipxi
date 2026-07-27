@@ -18,7 +18,12 @@ the bottom, with a pointer to where the real documentation lives
   `t_c` reading in `charge_cycle.py`/`discharge_cycle.py` (`t_c = None`
   today). `test_temperature_module()` today only does presence/identity
   (reusing `hardware.daq.DAQ`) -- no TC/RTD channel read exists. Would need a
-  new NI-DAQmx-based `hardware/temperature.py` (or extend `DAQ`).
+  new NI-DAQmx-based `hardware/temperature.py` (or extend `DAQ`). Once wired
+  in, extend the hardware identity traceability snapshot (`run_summary`'s
+  `smu_name`/`dmm_name`/`daq_name`/`relay_matrix_name` pattern, see
+  `docs/architecture.md` Section 22) with a matching
+  `temp_module_name`/`_resource`/`_model` triplet -- schema is additive, so
+  this is a small follow-up, not a redesign.
 - [ ] Confirm the instrument connected at GPIB0 (`config/devices.py::GPIB_INSTRUMENTS`)
   -- likely the "Programmable Electronic Load" or "Programmable Power Supply"
   from `equipment_Requirement.md`, not yet confirmed. No GPIB driver class
@@ -271,6 +276,23 @@ first real-rack hardware bring-up milestone record.
   at end-of-run from an in-memory running accumulation
   (`monitor_battery_sequence.py::_VoltageStats`) -- no new storage
   mechanism.
+- **Hardware identity traceability (Milestone II)** -- battery configuration
+  was already captured via `run_summary`/`event_log`, but which physical
+  SMU/DMM/DAQ/relay matrix executed a run was not (console-only, lost at
+  session end). Extended the same traceability pattern: `run_summary` gains
+  twelve additive columns (`smu_name`/`smu_resource`/`smu_model`, `dmm_*`,
+  `daq_*`, `relay_matrix_*`), and both `run_proto_test_execution()` and
+  `_run_monitor_battery()` log one `event_log` entry per connected
+  instrument plus a "Hardware configuration snapshot recorded" entry,
+  before the first relay closes. New shared helpers
+  `config/devices.py::find_config_name()`/`hardware_traceability_messages()`
+  and `test.py::_hardware_snapshot_fields()` avoid duplicating identity
+  resolution or message wording between test types.
+  `ProtoTestSequence.run()` gained one new optional, backward-compatible
+  `hardware_snapshot` parameter; `MonitorBatterySequence` needed no change.
+  No new table; verified with mocked smoke tests (traceability precedes
+  relay activation for both test types) and real-DB round-trip/migration
+  tests. See `docs/architecture.md` Section 22.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies

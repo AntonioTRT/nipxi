@@ -183,7 +183,19 @@ CREATE TABLE IF NOT EXISTS run_summary (
     min_voltage                        REAL,
     max_voltage                        REAL,
     average_voltage                    REAL,
-    sample_count                       INTEGER
+    sample_count                       INTEGER,
+    smu_name                           TEXT,
+    smu_resource                       TEXT,
+    smu_model                          TEXT,
+    dmm_name                           TEXT,
+    dmm_resource                       TEXT,
+    dmm_model                          TEXT,
+    daq_name                           TEXT,
+    daq_resource                       TEXT,
+    daq_model                          TEXT,
+    relay_matrix_name                  TEXT,
+    relay_matrix_resource              TEXT,
+    relay_matrix_model                 TEXT
 );
 """
 
@@ -197,6 +209,21 @@ _RUN_SUMMARY_COLUMNS = [
     # NULL for every other test_type (proto/future charge/discharge/cycle).
     "start_voltage", "end_voltage", "min_voltage", "max_voltage",
     "average_voltage", "sample_count",
+    # Hardware identity/configuration snapshot (Milestone II traceability
+    # extension) -- which physical instrument produced this run's data.
+    # Populated once, at start_run_summary() time (same mechanism as the
+    # battery-config snapshot above), before any relay closes -- see
+    # docs/architecture.md "Hardware Identity Traceability". NULL for a
+    # role that wasn't connected for this run (e.g. dmm_* when no DMM was
+    # configured). "name" is the config/devices.py dict key (e.g.
+    # "PRIMARY_SMU", "MATRIX_NUMATO_201"); "resource" is the VISA resource
+    # string (PXI devices) or "ip:port" (Ethernet relay matrix); "model" is
+    # the real instrument model string (PXI devices) or driver identifier
+    # (relay matrix).
+    "smu_name", "smu_resource", "smu_model",
+    "dmm_name", "dmm_resource", "dmm_model",
+    "daq_name", "daq_resource", "daq_model",
+    "relay_matrix_name", "relay_matrix_resource", "relay_matrix_model",
 ]
 
 # Runtime event history -- Milestone II. Fine-grained, timestamped narrative
@@ -256,6 +283,20 @@ _RUN_SUMMARY_MIGRATION_COLUMNS = [
     ("max_voltage", "REAL"),
     ("average_voltage", "REAL"),
     ("sample_count", "INTEGER"),
+    # Hardware identity/configuration snapshot -- additive, for a
+    # run_summary table created before these existed.
+    ("smu_name", "TEXT"),
+    ("smu_resource", "TEXT"),
+    ("smu_model", "TEXT"),
+    ("dmm_name", "TEXT"),
+    ("dmm_resource", "TEXT"),
+    ("dmm_model", "TEXT"),
+    ("daq_name", "TEXT"),
+    ("daq_resource", "TEXT"),
+    ("daq_model", "TEXT"),
+    ("relay_matrix_name", "TEXT"),
+    ("relay_matrix_resource", "TEXT"),
+    ("relay_matrix_model", "TEXT"),
 ]
 
 

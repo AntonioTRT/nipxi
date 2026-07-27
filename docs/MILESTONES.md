@@ -385,6 +385,44 @@ mapping/wiring is confirmed. `run_summary` gained six new columns
 entry ("Monitoring source: DMM") records the acquisition source for every
 session.
 
+### Update: hardware identity traceability
+
+Review found that while battery configuration (type/capacity/group/position/
+mode) was correctly persisted via the traceability pattern, hardware identity
+(which physical SMU/DMM/DAQ/relay matrix executed the run) was not -- it only
+ever appeared in console output, lost once the session ended. Extended the
+same traceability pattern (durable `run_summary` snapshot + `event_log`
+entries before hardware activation) to cover it:
+
+- `run_summary` gains twelve additive columns: `smu_name`/`smu_resource`/
+  `smu_model`, `dmm_name`/`dmm_resource`/`dmm_model`, `daq_name`/
+  `daq_resource`/`daq_model`, `relay_matrix_name`/`relay_matrix_resource`/
+  `relay_matrix_model` -- `name` is the `config/devices.py` dict key,
+  `resource` is the VISA resource string (PXI) or `ip:port` (Ethernet relay
+  matrix), `model` is the real instrument model or relay driver identifier.
+- Both `run_proto_test_execution()` and `_run_monitor_battery()` now log one
+  `event_log` entry per connected instrument ("SMU in use: ...", "DMM in
+  use: ...", "DAQ in use: ...", "Relay matrix in use: ...") plus a
+  "Hardware configuration snapshot recorded" entry, all before the first
+  relay closes -- verified by mocked smoke tests to precede relay
+  activation for both test types.
+- New shared helpers: `config/devices.py::find_config_name()` (reverse
+  dict-key lookup by identity, avoids hardcoding a second copy of a
+  config key like `"MAIN_DMM"`) and `hardware_traceability_messages()`
+  (shared message-building, used identically by both test types);
+  `test.py::_hardware_snapshot_fields()` (shared `run_summary` field
+  builder).
+- `ProtoTestSequence.run()` gained one new, optional, backward-compatible
+  parameter (`hardware_snapshot: dict = None`) -- `None` reproduces prior
+  behavior exactly. `MonitorBatterySequence` needed no change -- its
+  `start_run_summary()` call already lives in `test.py` itself.
+- No new table. No behavior change to what hardware actually connects --
+  `smu_cfg`/`daq_cfg` are now passed explicitly into `HardwareManager(...)`
+  in both workflows (previously left to its internal defaults) purely so
+  the snapshot matches, 1:1, the exact cfg dict a driver was built from.
+
+See `docs/architecture.md` Section 22 for full rationale.
+
 ### Architectural decisions made
 
 - Battery type is never inferred from wiring config (`BATTERY_CHANNELS`) --

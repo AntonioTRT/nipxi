@@ -50,6 +50,7 @@ path is electrically identical to the version already run on the rack.
 import logging
 
 from config.settings import Settings
+from config import devices as dev_cfg
 from test_control.execution_screen import ExecutionFrame, render_execution_frame
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation
@@ -67,7 +68,7 @@ class ProtoTestSequence:
         self.s = settings
         self.log = logging.getLogger("nipxi.proto_test")
 
-    def run(self, relays: list, dwell_s: float = None, token=None):
+    def run(self, relays: list, dwell_s: float = None, token=None, hardware_snapshot: dict = None):
         """
         Cycle through `relays` (defaults to settings.ACTIVE_CHANNELS),
         sourcing settings.CHARGE_VOLTAGE_V at settings.CHARGE_CURRENT_A
@@ -81,6 +82,16 @@ class ProtoTestSequence:
         relay starts -- same checkpoint granularity as
         BatteryTestSequence.run(), never mid-relay-sequence.
 
+        `hardware_snapshot` (optional dict of run_summary hardware-identity
+        columns -- smu_name/smu_resource/smu_model/dmm_name/.../
+        relay_matrix_model, see data/storage.py's run_summary schema and
+        docs/architecture.md "Hardware Identity Traceability") is recorded
+        via start_run_summary()/event_log BEFORE the first relay closes,
+        the same traceability pattern already used for battery configuration
+        (see test.py::_run_monitor_battery()). None (the default) preserves
+        prior behavior exactly -- every field stays NULL, as before this
+        parameter existed.
+
         On any failure or cancellation, records the abnormal stop reason to
         storage (so the next startup's "previous execution found" display
         reflects it), runs the same safety shutdown BatteryTestSequence
@@ -92,7 +103,10 @@ class ProtoTestSequence:
         dwell_s = self.s.PROTO_TEST_DWELL_S if dwell_s is None else dwell_s
         self.log.info("Proto Test Execution starting. Relays: %s  Dwell: %.1fs", relays, dwell_s)
 
-        self.storage.start_run_summary(test_type="proto")
+        self.storage.start_run_summary(test_type="proto", **(hardware_snapshot or {}))
+        if hardware_snapshot:
+            for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
+                self.storage.log_event(level="INFO", source="proto_test", message=message)
         run_summary = self.storage.get_run_summary(self.storage.run_id)
         run_number = run_summary["id"] if run_summary else None
 

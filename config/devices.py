@@ -719,3 +719,49 @@ def device_display_name(cfg: dict) -> str:
         return f"{base}-Ch{cfg.get('smu_channel', '0')}"
 
     return base
+
+
+def find_config_name(configs: dict, cfg: dict):
+    """
+    Reverse-lookup a device's dict key (e.g. "PRIMARY_SMU", "MAIN_DMM") given
+    the enumeration dict it came from (SMU_ASSIGNMENTS/DAQ_CONFIGS/DMM_CONFIGS)
+    and the resolved cfg dict itself (identity comparison, not equality --
+    two distinct entries could otherwise have identical field values). Used
+    for hardware traceability logging (see docs/architecture.md "Hardware
+    Identity Traceability") so the run_summary/event_log name always matches
+    the SAME config/devices.py dict key HardwareManager actually built the
+    driver from -- avoids hardcoding a second copy of "MAIN_DMM"/"MAIN_DAQ"
+    that could silently drift from the real default if it ever changes.
+    Returns None if `cfg` is not (identically) one of `configs`' values.
+    """
+    for name, candidate in configs.items():
+        if candidate is cfg:
+            return name
+    return None
+
+
+def hardware_traceability_messages(snapshot: dict) -> list:
+    """
+    Build one human-readable event_log message per instrument present in
+    `snapshot` (a run_summary hardware-identity dict -- smu_name/
+    smu_resource/smu_model, dmm_*, daq_*, relay_matrix_* -- see
+    data/storage.py's run_summary schema and docs/architecture.md "Hardware
+    Identity Traceability"), plus a final confirmation message. A role
+    missing from `snapshot` (e.g. no DMM configured for this run) is
+    silently skipped, not reported as "N/A" -- an event_log entry implies
+    "this instrument was in use", so an absent instrument gets no entry at
+    all. Used identically by test_control/proto_test_sequence.py and
+    test.py::_run_monitor_battery() so the traceability wording never
+    drifts between test types.
+    """
+    messages = []
+    for role, label in (("smu", "SMU"), ("dmm", "DMM"), ("daq", "DAQ"),
+                        ("relay_matrix", "Relay matrix")):
+        name = snapshot.get(f"{role}_name")
+        if not name:
+            continue
+        model = snapshot.get(f"{role}_model") or "?"
+        resource = snapshot.get(f"{role}_resource") or "?"
+        messages.append(f"{label} in use: {name} ({model}, {resource})")
+    messages.append("Hardware configuration snapshot recorded")
+    return messages

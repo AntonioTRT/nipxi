@@ -2519,6 +2519,38 @@ def preflight_check():
 # 0. Main Test -- real commissioning run via HardwareManager / TestExecutor
 # =============================================================================
 
+def _hardware_snapshot_fields(smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg):
+    """
+    Build the run_summary hardware-identity snapshot dict (see
+    data/storage.py's run_summary schema and docs/architecture.md "Hardware
+    Identity Traceability") from the SAME resolved config/devices.py dicts
+    HardwareManager was actually constructed with -- single source of
+    truth, no independent re-derivation. Shared by run_proto_test_execution()
+    and _run_monitor_battery() so the field-building logic never drifts
+    between test types.
+
+    `dmm_name`/`dmm_cfg` may be None (the DMM is optional for some
+    workflows) -- every other role is always present, since HardwareManager
+    always constructs an SMU/DAQ/relay driver.
+    """
+    fields = {
+        "smu_name": smu_name, "smu_resource": smu_cfg.get("resource"), "smu_model": smu_cfg.get("model"),
+        "daq_name": daq_name, "daq_resource": daq_cfg.get("resource"), "daq_model": daq_cfg.get("model"),
+        "relay_matrix_name": relay_cfg.get("name"),
+        "relay_matrix_model": relay_cfg.get("driver"),
+        "relay_matrix_resource": (
+            f"{relay_cfg.get('ip', '')}:{relay_cfg.get('port', '')}"
+            if relay_cfg.get("type", "").lower() == "ethernet"
+            else str(relay_cfg.get("port", ""))
+        ),
+    }
+    if dmm_cfg is not None:
+        fields["dmm_name"] = dmm_name
+        fields["dmm_resource"] = dmm_cfg.get("resource")
+        fields["dmm_model"] = dmm_cfg.get("model")
+    return fields
+
+
 def _select_battery_type():
     """Explicit, operator-controlled battery type selection (never inferred
     from BATTERY_CHANNELS -- see docs/architecture.md "Battery Type
@@ -2648,11 +2680,19 @@ def _run_monitor_battery():
     # is passed explicitly so HardwareManager actually constructs/connects
     # it, same as run_proto_test_execution() already does.
     dmm_cfg = dev_cfg.DMM_CONFIG
+    dmm_name = dev_cfg.find_config_name(dev_cfg.DMM_CONFIGS, dmm_cfg)
+    # SMU/DAQ resolved explicitly here (previously left to HardwareManager's
+    # internal defaults) purely so the hardware-identity snapshot below
+    # matches, 1:1, the exact cfg dicts HardwareManager actually builds its
+    # drivers from -- same values as the prior defaults, no behavior change.
+    smu_name, smu_cfg = next(iter(dev_cfg.SMU_ASSIGNMENTS.items()))
+    daq_cfg = dev_cfg.DAQ_CONFIG
+    daq_name = dev_cfg.find_config_name(dev_cfg.DAQ_CONFIGS, daq_cfg)
     print("\nSelected Hardware\n")
     print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
     print(f"DMM (temporary voltage source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
 
-    hw = HardwareManager(Settings, relay_cfg=relay_cfg, dmm_cfg=dmm_cfg)
+    hw = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
     try:
         hw.connect_all()
     except HardwareInitError as e:
@@ -2667,6 +2707,9 @@ def _run_monitor_battery():
         # fact is recorded via event_log BEFORE relay activation/monitor
         # start/measurement acquisition -- see docs/architecture.md
         # "Configuration Traceability".
+        hardware_snapshot = _hardware_snapshot_fields(
+            smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
+        )
         storage.start_run_summary(
             test_type="monitor",
             battery_type=battery_type,
@@ -2675,6 +2718,7 @@ def _run_monitor_battery():
             battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
             battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
             capacity_ah=battery_cfg["capacity_ah"],
+            **hardware_snapshot,
         )
         storage.log_event(level="INFO", source="monitor_battery", message="Run started")
         storage.log_event(level="INFO", source="monitor_battery", message="Mode selected: Monitor")
@@ -2687,6 +2731,11 @@ def _run_monitor_battery():
                            message=f"Position selected: {position} (Group {group} Position {position})")
         storage.log_event(level="INFO", source="monitor_battery",
                            message="Configuration snapshot recorded")
+        # Hardware identity traceability -- BEFORE relay activation/monitor
+        # start, same requirement as the battery-config snapshot above (see
+        # docs/architecture.md "Hardware Identity Traceability").
+        for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
+            storage.log_event(level="INFO", source="monitor_battery", message=message)
 
         token = CancellationToken(owner="test.py:_run_monitor_battery")
         previous_sigint_handler = signal.signal(
@@ -2790,7 +2839,10 @@ def run_proto_test_execution():
     # default and main.py are untouched.
     smu_name = Settings.PROTO_TEST_SMU_NAME
     smu_cfg  = dev_cfg.SMU_ASSIGNMENTS[smu_name]
+    dmm_name = dev_cfg.find_config_name(dev_cfg.DMM_CONFIGS, dev_cfg.DMM_CONFIG)
     dmm_cfg  = dev_cfg.DMM_CONFIG
+    daq_name = dev_cfg.find_config_name(dev_cfg.DAQ_CONFIGS, dev_cfg.DAQ_CONFIG)
+    daq_cfg  = dev_cfg.DAQ_CONFIG
     relay_cfg = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
 
     print("\nSelected Hardware\n")
@@ -2800,8 +2852,12 @@ def run_proto_test_execution():
 
     # DMM is required for this workflow (unlike run_main_test(), which
     # leaves it optional) -- pass dmm_cfg explicitly so HardwareManager
-    # actually constructs and connects it.
-    hw = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, dmm_cfg=dmm_cfg)
+    # actually constructs and connects it. daq_cfg is now passed explicitly
+    # too (previously left to HardwareManager's internal default) so the
+    # hardware-identity snapshot below matches, 1:1, the exact cfg dict
+    # HardwareManager actually built the DAQ driver from -- same value as
+    # before (DAQ_CONFIG), no behavior change.
+    hw = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
 
     try:
         hw.connect_all()
@@ -2838,8 +2894,11 @@ def run_proto_test_execution():
                 smu=hw.smu, dmm=hw.dmm, relay=hw.relay, safety=safety,
                 storage=storage, settings=Settings,
             )
+            hardware_snapshot = _hardware_snapshot_fields(
+                smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
+            )
             try:
-                sequence.run(relays, dwell_s, token=token)
+                sequence.run(relays, dwell_s, token=token, hardware_snapshot=hardware_snapshot)
                 print("\nProto Test Execution complete -- all relays cycled successfully.")
             except OperationCancelledError:
                 print("\nProto Test Execution cancelled by operator -- "
