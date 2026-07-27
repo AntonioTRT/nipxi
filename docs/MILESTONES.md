@@ -359,12 +359,31 @@ or additional SMUs.
   `battery_temp` fields (reusing the original `measurements.voltage_v`/
   `current_a`/`temp_c` columns), kept distinct from `smu_voltage`/
   `smu_current`/`dmm_voltage` since Monitor Battery observes a different
-  signal (a plain DAQ reading of the battery, no SMU sourcing).
+  signal (a plain reading of the battery itself, no SMU sourcing).
 - Relay Functional Validation's Matrix Scan gained a scope-selection menu
   (`1. All Groups` / `2. Group A` / `3. Group B` / `4. Group C` / `5. Group
   D`) via new optional `channel_start`/`channel_end` parameters on
   `test_relay_matrix_scan()`/`_run_relay_matrix_scan()` -- future-proof for
   additional relay matrices.
+
+### Update: temporary DMM voltage source (post real-hardware validation)
+
+The original DAQ-per-channel voltage read (`hardware/daq.py::DAQ.read_channel()`
+against `BATTERY_CHANNELS[i]["daq_voltage_ch"]`) failed during real-hardware
+validation due to channel/device configuration issues not yet resolved.
+`MonitorBatterySequence` was changed to read voltage from the DMM instead
+(`hardware/dmm.py::DMM.measure_dc_voltage()`, the same call already validated
+by Proto Test Execution) -- already-working hardware, sufficient for basic
+voltage-only monitoring at this development phase. `current_a`/`temp_c` are
+`None` for every Monitor Battery sample as a result (the DMM is voltage-only).
+This is explicitly documented as temporary (see `docs/architecture.md`
+Section 20a) -- Charge/Discharge/Cycle Battery and a future Monitor Battery
+revision must migrate to the final per-position DAQ architecture once channel
+mapping/wiring is confirmed. `run_summary` gained six new columns
+(`start_voltage`/`end_voltage`/`min_voltage`/`max_voltage`/`average_voltage`/
+`sample_count`, additive migration) populated at end-of-run; an `event_log`
+entry ("Monitoring source: DMM") records the acquisition source for every
+session.
 
 ### Architectural decisions made
 
@@ -396,12 +415,14 @@ or additional SMUs.
   `test_control/monitor_battery_sequence.py`, `test.py`).
 - `utils/device_validator.py::validate_devices()` returns zero errors
   against the updated `BATTERY_CONFIGS`/`BATTERY_CHANNELS`/`BATTERY_GROUPS`.
-- Mocked-hardware smoke test (`HardwareManager`/`DataStorage`/
-  `MonitorBatterySequence` all mocked, `input()` scripted through the full
-  Battery Type -> Group -> Position -> Confirm flow): confirms the seven
-  traceability `event_log` calls all precede relay/monitoring start, and
-  that `MonitorBatterySequence` receives the correct channel/relay/DAQ
-  channel arguments.
+- Mocked-hardware smoke test (`HardwareManager`/`DataStorage` mocked,
+  `input()` scripted through the full Battery Type -> Group -> Position ->
+  Confirm flow, `DMM.measure_dc_voltage()` mocked, `MonitorBatterySequence`
+  run for real): confirms the seven traceability `event_log` calls plus
+  "Monitoring source: DMM" all precede/accompany relay/monitoring start,
+  that `MonitorBatterySequence` receives the correct channel/relay
+  arguments, and that `finish_run_summary()` receives correct
+  start/end/min/max/average voltage and sample_count values.
 - A second mocked run confirms that declining the confirmation screen
   (`N`) never constructs `HardwareManager` -- no hardware is touched.
 
@@ -409,10 +430,18 @@ or additional SMUs.
 
 - Charge Battery, Discharge Battery, Cycle Battery -- menu placeholders
   only, not implemented.
-- NTC temperature reads in Monitor Battery remain `None` -- same
-  pre-existing gap already carried by `charge_cycle.py`/`discharge_cycle.py`.
-- Physical rack validation of Monitor Battery on real Group A hardware
-  (this milestone's changes have been verified with mocked hardware only).
+- Migrate Monitor Battery from the temporary DMM voltage source to the
+  final per-position DAQ architecture once `BATTERY_CHANNELS`'
+  `daq_voltage_ch`/`daq_current_ch`/`daq_ntc_ch` channel mapping is
+  confirmed against real NI-MAX aliases/wiring (see `docs/architecture.md`
+  Section 20a).
+- `current_a`/NTC temperature reads in Monitor Battery remain `None` --
+  the former because the temporary DMM source is voltage-only, the latter
+  the same pre-existing gap already carried by `charge_cycle.py`/
+  `discharge_cycle.py`.
+- Physical rack validation of Monitor Battery (DMM voltage path) on real
+  Group A hardware (this milestone's changes have been verified with
+  mocked hardware only).
 - `BATTERY_CONFIGS` voltage/current/temperature limits marked
   `# unconfirmed placeholder` should be confirmed against the real BLOSS
   Hub datasheet before being relied on for safety enforcement.

@@ -177,7 +177,13 @@ CREATE TABLE IF NOT EXISTS run_summary (
     battery_discharge_current_limit_a  REAL,
     capacity_ah                        REAL,
     energy_wh                          REAL,
-    cycle_count                        INTEGER
+    cycle_count                        INTEGER,
+    start_voltage                      REAL,
+    end_voltage                        REAL,
+    min_voltage                        REAL,
+    max_voltage                        REAL,
+    average_voltage                    REAL,
+    sample_count                       INTEGER
 );
 """
 
@@ -186,6 +192,11 @@ _RUN_SUMMARY_COLUMNS = [
     "stop_reason", "result", "battery_type", "battery_voltage_max_v",
     "battery_voltage_min_v", "battery_charge_current_limit_a",
     "battery_discharge_current_limit_a", "capacity_ah", "energy_wh", "cycle_count",
+    # Monitor Battery voltage summary (Milestone II) -- populated by
+    # MonitorBatterySequence.run() at end-of-run via finish_run_summary();
+    # NULL for every other test_type (proto/future charge/discharge/cycle).
+    "start_voltage", "end_voltage", "min_voltage", "max_voltage",
+    "average_voltage", "sample_count",
 ]
 
 # Runtime event history -- Milestone II. Fine-grained, timestamped narrative
@@ -235,6 +246,18 @@ _STATION_STATE_MIGRATION_COLUMNS = [
     ("channel", "INTEGER"),
 ]
 
+# Monitor Battery voltage summary columns (Milestone II) -- additive, for a
+# run_summary table created before these existed (e.g. an existing
+# data_output/development/nipxi_dev.db from Proto Test Execution).
+_RUN_SUMMARY_MIGRATION_COLUMNS = [
+    ("start_voltage", "REAL"),
+    ("end_voltage", "REAL"),
+    ("min_voltage", "REAL"),
+    ("max_voltage", "REAL"),
+    ("average_voltage", "REAL"),
+    ("sample_count", "INTEGER"),
+]
+
 
 def _migrate_add_missing_columns(conn: sqlite3.Connection, table: str, columns: list):
     """
@@ -282,6 +305,7 @@ class DataStorage(StorageBackend):
             # column) and no-op on an already-migrated one.
             _migrate_add_missing_columns(self._db, "measurements", _MEASUREMENT_MIGRATION_COLUMNS)
             _migrate_add_missing_columns(self._db, "station_state", _STATION_STATE_MIGRATION_COLUMNS)
+            _migrate_add_missing_columns(self._db, "run_summary", _RUN_SUMMARY_MIGRATION_COLUMNS)
             self._db.commit()
             self.log.info("Storage opened. run_id=%s", self.run_id)
         except (OSError, sqlite3.Error) as e:
@@ -575,7 +599,9 @@ class DataStorage(StorageBackend):
             raise RuntimeError("DataStorage.finish_run_summary() called before open()")
         end_time = datetime.now().isoformat()
         updates = {"end_time": end_time, "stop_reason": stop_reason, "result": result}
-        for key in ("capacity_ah", "energy_wh", "cycle_count"):
+        for key in ("capacity_ah", "energy_wh", "cycle_count",
+                    "start_voltage", "end_voltage", "min_voltage",
+                    "max_voltage", "average_voltage", "sample_count"):
             if key in fields:
                 updates[key] = fields[key]
         if "duration_s" in fields:

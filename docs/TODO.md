@@ -119,9 +119,17 @@ the bottom, with a pointer to where the real documentation lives
   submenu placeholders only, not implemented (see `docs/architecture.md`
   Section 20). Should reuse the same Battery Type/Group/Position selection,
   confirmation screen, and traceability logging Monitor Battery established.
-- [ ] Physical rack validation of Monitor Battery on real Group A hardware
-  -- verified with mocked hardware only so far (see `docs/MILESTONES.md`
-  Milestone II).
+- [MUST] Migrate `MonitorBatterySequence` from its temporary DMM voltage
+  source back to the final per-position DAQ architecture
+  (`BATTERY_CHANNELS[i]["daq_voltage_ch"]`/`daq_current_ch"]`) once the
+  channel/device configuration issue that blocked the original DAQ path is
+  resolved and confirmed against real NI-MAX aliases/wiring -- see
+  `docs/architecture.md` Section 20a. Until then, Monitor Battery reads one
+  shared DMM regardless of selected Group/Position, and `current_a` is
+  always `None` (DMM is voltage-only).
+- [ ] Physical rack validation of Monitor Battery (DMM voltage path) on
+  real Group A hardware -- verified with mocked hardware only so far (see
+  `docs/MILESTONES.md` Milestone II).
 - [ ] NTC temperature reads in `MonitorBatterySequence` remain `None` --
   same pre-existing gap already carried by `charge_cycle.py`/
   `discharge_cycle.py`.
@@ -249,6 +257,20 @@ first real-rack hardware bring-up milestone record.
   confirmation); physical rack validation still pending. See
   `docs/architecture.md` Sections 19-21 and `docs/MILESTONES.md`
   Milestone II.
+- **Monitor Battery: temporary DMM voltage source** -- the original
+  per-position DAQ voltage read failed during real-hardware validation
+  (unresolved channel/device configuration); `MonitorBatterySequence` now
+  reads voltage from the already-validated DMM (`dmm.measure_dc_voltage()`)
+  instead, once per loop iteration -- `current_a`/`temp_c` stay `None`
+  since the DMM is voltage-only. Explicitly documented as temporary (module
+  docstring TODO + `docs/architecture.md` Section 20a); migration back to
+  the final per-position DAQ architecture remains open (see Remaining Work
+  above). New `event_log` entry `"Monitoring source: DMM"` per session.
+  `run_summary` gained six additive columns (`start_voltage`/`end_voltage`/
+  `min_voltage`/`max_voltage`/`average_voltage`/`sample_count`), populated
+  at end-of-run from an in-memory running accumulation
+  (`monitor_battery_sequence.py::_VoltageStats`) -- no new storage
+  mechanism.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies

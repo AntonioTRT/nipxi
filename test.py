@@ -2643,10 +2643,16 @@ def _run_monitor_battery():
     relay_address = ch_cfg["relay_address"]
 
     relay_cfg = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
+    # TEMPORARY: voltage source is the DMM, not the DAQ (see
+    # test_control/monitor_battery_sequence.py module docstring) -- dmm_cfg
+    # is passed explicitly so HardwareManager actually constructs/connects
+    # it, same as run_proto_test_execution() already does.
+    dmm_cfg = dev_cfg.DMM_CONFIG
     print("\nSelected Hardware\n")
     print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
+    print(f"DMM (temporary voltage source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
 
-    hw = HardwareManager(Settings, relay_cfg=relay_cfg)
+    hw = HardwareManager(Settings, relay_cfg=relay_cfg, dmm_cfg=dmm_cfg)
     try:
         hw.connect_all()
     except HardwareInitError as e:
@@ -2691,14 +2697,12 @@ def _run_monitor_battery():
         try:
             safety = SafetyMonitor(Settings)
             sequence = MonitorBatterySequence(
-                smu=hw.smu, daq=hw.daq, relay=hw.relay, safety=safety,
+                smu=hw.smu, dmm=hw.dmm, relay=hw.relay, safety=safety,
                 storage=storage, settings=Settings,
             )
             try:
                 sequence.run(
                     channel=channel, relay_address=relay_address,
-                    daq_voltage_ch=ch_cfg["daq_voltage_ch"],
-                    daq_current_ch=ch_cfg.get("daq_current_ch"),
                     token=token,
                 )
             except OperationCancelledError:
