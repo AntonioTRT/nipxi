@@ -125,9 +125,11 @@ the bottom, with a pointer to where the real documentation lives
 - [ ] NTC temperature reads in `MonitorBatterySequence` remain `None` --
   same pre-existing gap already carried by `charge_cycle.py`/
   `discharge_cycle.py`.
-- [ ] `BATTERY_CONFIGS`' `HUB_2_SB`/`HUB_SB` voltage/current/temperature
-  limits marked `# unconfirmed placeholder` should be confirmed against the
-  real BLOSS Hub datasheet before being relied on for safety enforcement.
+- [ ] `BATTERY_CONFIGS`' `HUB`/`SB` voltage/current/temperature limits
+  marked `# unconfirmed placeholder` (assumed standard Li-ion window and
+  0.5C/1C ratios, not from a datasheet) should be confirmed against the
+  real datasheet before being relied on for safety enforcement. Only
+  `nominal_voltage_v`/`capacity_ah` are currently confirmed.
 - [ ] `Settings.ACTIVE_CHANNELS` -> `ACTIVE_POSITIONS` rename, deliberately
   deferred from the `NUM_CHANNELS` -> `BATTERY_POSITIONS` rename (would
   touch `test_control/` files outside that change's scope).
@@ -222,8 +224,10 @@ first real-rack hardware bring-up milestone record.
 - **Monitor Battery (Milestone II)** -- Run Main Test replaced with a
   submenu (`1. Monitor Battery`/`2. Charge Battery`/`3. Discharge Battery`/
   `4. Cycle Battery`); only Monitor Battery implemented. Real battery
-  catalog (`HUB_2_SB`/`HUB_SB`, replacing the placeholder
-  `GENERIC_LIION_18650`), explicit operator-controlled battery type
+  catalog (`HUB`/`SB`, replacing the placeholder `GENERIC_LIION_18650` --
+  only `nominal_voltage_v`/`capacity_ah` confirmed from spec, remaining
+  limit fields still assumed placeholders pending datasheet confirmation),
+  explicit operator-controlled battery type
   selection (never inferred from `BATTERY_CHANNELS`), and new
   `BATTERY_GROUPS` relay-routing architecture (Group A/`MATRIX_NUMATO_201`
   enabled today, B/C/D pre-wired for future matrices) with

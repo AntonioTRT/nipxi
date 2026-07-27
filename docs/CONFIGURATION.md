@@ -194,35 +194,35 @@ Physical device mapping. Update to match your hardware wiring.
 
 ### BATTERY_CONFIGS
 
-Battery type/model catalog -- the real BLOSS Hub battery types (`HUB_2_SB`, `HUB_SB`), physical specs (chemistry, capacity, voltage/current/temperature limits), independent of which position a battery currently occupies. Foundation for the future `data/battery_repository.py` (see `docs/DATABASE_ROADMAP.md` Section 2). **Not wired into `safety_monitor.py`/`charge_cycle.py`/`discharge_cycle.py` yet** -- those still read the single global `BAT_VOLTAGE_MAX`/`BAT_VOLTAGE_MIN`/`BAT_CURRENT_MAX`/`BAT_TEMP_MAX_C` from `config/settings.py` for every position regardless of what's actually installed there.
+Battery type/model catalog -- the real battery types (`HUB`, `SB`), physical specs (chemistry, capacity, voltage/current/temperature limits), independent of which position a battery currently occupies. Foundation for the future `data/battery_repository.py` (see `docs/DATABASE_ROADMAP.md` Section 2). **Not wired into `safety_monitor.py`/`charge_cycle.py`/`discharge_cycle.py` yet** -- those still read the single global `BAT_VOLTAGE_MAX`/`BAT_VOLTAGE_MIN`/`BAT_CURRENT_MAX`/`BAT_TEMP_MAX_C` from `config/settings.py` for every position regardless of what's actually installed there.
 
 The previous placeholder entry, `GENERIC_LIION_18650`, was removed -- it is no longer the operator-facing option (see `docs/architecture.md` Section 19). Selection is explicit and operator-controlled via a menu prompt (`test.py::_select_battery_type()`), never inferred from `BATTERY_CHANNELS`.
 
-Fields not yet confirmed against a datasheet are marked `# unconfirmed placeholder` inline -- update these against the real BLOSS Hub spec before relying on them for safety enforcement.
+**Confirmed vs. assumed:** only `nominal_voltage_v` and `capacity_ah` come from the actual battery spec -- everything else is an assumption (standard Li-ion voltage window, 0.5C/1C charge/discharge ratios applied to capacity) and is marked `# unconfirmed placeholder`/`# unconfirmed` inline. Update these against the real datasheet before relying on them for safety enforcement -- do not treat an "unconfirmed" value as verified.
 
 ```python
 BATTERY_CONFIGS = {
-    "HUB_2_SB": {
+    "HUB": {
         "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
         "form_factor":             None,       # unconfirmed
-        "nominal_voltage_v":       3.7,
-        "voltage_max_v":           4.2,        # unconfirmed placeholder
-        "voltage_min_v":           3.0,        # unconfirmed placeholder
-        "capacity_ah":             1.05,       # 1050 mAh
-        "max_charge_current_a":    0.525,      # unconfirmed placeholder -- 0.5C
-        "max_discharge_current_a": 1.05,       # unconfirmed placeholder -- 1C
-        "max_temp_c":              45.0,       # unconfirmed placeholder
+        "nominal_voltage_v":       3.7,        # confirmed
+        "voltage_max_v":           4.2,        # unconfirmed placeholder -- assumed standard Li-ion window
+        "voltage_min_v":           3.0,        # unconfirmed placeholder -- assumed standard Li-ion window
+        "capacity_ah":             1.05,       # confirmed -- 1050 mAh
+        "max_charge_current_a":    0.525,      # unconfirmed placeholder -- assumed 0.5C
+        "max_discharge_current_a": 1.05,       # unconfirmed placeholder -- assumed 1C
+        "max_temp_c":              45.0,       # unconfirmed placeholder -- assumed standard Li-ion ceiling
     },
-    "HUB_SB": {
-        "chemistry":               "Li-ion",
-        "form_factor":             None,
-        "nominal_voltage_v":       3.7,
-        "voltage_max_v":           4.2,
-        "voltage_min_v":           3.0,
-        "capacity_ah":             0.16,       # 160 mAh
-        "max_charge_current_a":    0.08,
-        "max_discharge_current_a": 0.16,
-        "max_temp_c":              45.0,
+    "SB": {
+        "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
+        "form_factor":             None,       # unconfirmed
+        "nominal_voltage_v":       3.7,        # confirmed
+        "voltage_max_v":           4.2,        # unconfirmed placeholder -- assumed standard Li-ion window
+        "voltage_min_v":           3.0,        # unconfirmed placeholder -- assumed standard Li-ion window
+        "capacity_ah":             0.16,       # confirmed -- 160 mAh
+        "max_charge_current_a":    0.08,       # unconfirmed placeholder -- assumed 0.5C
+        "max_discharge_current_a": 0.16,       # unconfirmed placeholder -- assumed 1C
+        "max_temp_c":              45.0,       # unconfirmed placeholder -- assumed standard Li-ion ceiling
     },
 }
 ```

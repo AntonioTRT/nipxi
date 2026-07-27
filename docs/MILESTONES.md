@@ -322,9 +322,12 @@ or additional SMUs.
   Battery` / `2. Charge Battery` / `3. Discharge Battery` / `4. Cycle
   Battery`. Only Monitor Battery is implemented; the other three are
   explicit placeholders.
-- `config/devices.py::BATTERY_CONFIGS` now catalogs the two real BLOSS Hub
-  battery types (`HUB_2_SB` -- 1050 mAh, `HUB_SB` -- 160 mAh), replacing the
-  placeholder `GENERIC_LIION_18650` entry.
+- `config/devices.py::BATTERY_CONFIGS` now catalogs the two real battery
+  types (`HUB` -- 1050 mAh, `SB` -- 160 mAh), replacing the placeholder
+  `GENERIC_LIION_18650` entry. Only `nominal_voltage_v`/`capacity_ah` are
+  confirmed from the spec -- voltage/current/temperature limits remain
+  assumed placeholders (marked `# unconfirmed placeholder` inline) pending
+  datasheet confirmation.
 - Battery type selection is explicit and operator-controlled
   (`test.py::_select_battery_type()`) -- `BATTERY_CHANNELS` was stripped of
   its `battery_type` field and is now physical wiring information only.

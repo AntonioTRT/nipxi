@@ -393,42 +393,52 @@ DMM_CONFIG = DMM_CONFIGS["MAIN_DMM"]
 # example (Battery 3.0 A / PMU 2.0 A / Safety 1.5 A -> effective 1.5 A) and
 # the planned LimitResolver concept (documentation only -- not implemented).
 # =============================================================================
-# Operator-selectable battery types. Battery selection is explicit and
-# operator-controlled (see test.py's battery-type selection prompt,
-# Monitor Battery workflow) -- BATTERY_CHANNELS below deliberately does NOT
-# reference a battery type; it is physical wiring information only.
+# Operator-selectable battery types: HUB and SB. Battery selection is
+# explicit and operator-controlled (see test.py's battery-type selection
+# prompt, Monitor Battery workflow) -- BATTERY_CHANNELS below deliberately
+# does NOT reference a battery type; it is physical wiring information only.
 #
-# voltage_max_v/voltage_min_v/max_charge_current_a/max_discharge_current_a/
-# max_temp_c are NOT yet confirmed against a real datasheet for either
-# battery below -- placeholders derived from nominal_voltage_v/capacity_ah
-# (the two values actually specified) using the same standard Li-ion
-# voltage window and 0.5C/1C charge/discharge ratios the previous generic
-# entry used. Update these once real datasheet limits are available --
-# until then, the global Settings.BAT_* limits (config/settings.py) remain
-# the enforced safety ceiling regardless of what's listed here (see
-# docs/architecture.md "Operational Limit Resolution").
+# CONFIRMED vs ASSUMED -- read before relying on these for safety enforcement:
+#   CONFIRMED (from the source spec):
+#     - nominal_voltage_v (3.7 V, both types)
+#     - capacity_ah (HUB = 1.05 Ah / 1050 mAh, SB = 0.16 Ah / 160 mAh)
+#   ASSUMED / NOT YET CONFIRMED against a real datasheet (marked inline
+#   "unconfirmed placeholder"/"unconfirmed"):
+#     - chemistry, form_factor
+#     - voltage_max_v, voltage_min_v -- assumed standard Li-ion window
+#     - max_charge_current_a, max_discharge_current_a -- assumed 0.5C/1C
+#       ratios applied to capacity_ah, not measured/specified
+#     - max_temp_c -- assumed standard Li-ion ceiling
+#   These assumed values are placeholders derived from the two confirmed
+#   values above using the same standard Li-ion voltage window and 0.5C/1C
+#   charge/discharge ratios the previous generic entry used. They must be
+#   confirmed against the real BLOSS Hub/SB datasheet before being treated
+#   as production limits -- until then, the global Settings.BAT_* limits
+#   (config/settings.py) remain the enforced safety ceiling regardless of
+#   what's listed here (see docs/architecture.md "Operational Limit
+#   Resolution"). Do not silently treat any "unconfirmed" value as verified.
 BATTERY_CONFIGS = {
-    "HUB_2_SB": {
+    "HUB": {
         "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
         "form_factor":             None,       # unconfirmed
-        "nominal_voltage_v":       3.7,
-        "voltage_max_v":           4.2,        # unconfirmed placeholder
-        "voltage_min_v":           3.0,        # unconfirmed placeholder
-        "capacity_ah":             1.05,       # 1050 mAh
-        "max_charge_current_a":    0.525,      # unconfirmed placeholder -- 0.5C
-        "max_discharge_current_a": 1.05,       # unconfirmed placeholder -- 1C
-        "max_temp_c":              45.0,       # unconfirmed placeholder
+        "nominal_voltage_v":       3.7,        # confirmed
+        "voltage_max_v":           4.2,        # unconfirmed placeholder -- assumed standard Li-ion window
+        "voltage_min_v":           3.0,        # unconfirmed placeholder -- assumed standard Li-ion window
+        "capacity_ah":             1.05,       # confirmed -- 1050 mAh
+        "max_charge_current_a":    0.525,      # unconfirmed placeholder -- assumed 0.5C
+        "max_discharge_current_a": 1.05,       # unconfirmed placeholder -- assumed 1C
+        "max_temp_c":              45.0,       # unconfirmed placeholder -- assumed standard Li-ion ceiling
     },
-    "HUB_SB": {
+    "SB": {
         "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
         "form_factor":             None,       # unconfirmed
-        "nominal_voltage_v":       3.7,
-        "voltage_max_v":           4.2,        # unconfirmed placeholder
-        "voltage_min_v":           3.0,        # unconfirmed placeholder
-        "capacity_ah":             0.16,       # 160 mAh
-        "max_charge_current_a":    0.08,       # unconfirmed placeholder -- 0.5C
-        "max_discharge_current_a": 0.16,       # unconfirmed placeholder -- 1C
-        "max_temp_c":              45.0,       # unconfirmed placeholder
+        "nominal_voltage_v":       3.7,        # confirmed
+        "voltage_max_v":           4.2,        # unconfirmed placeholder -- assumed standard Li-ion window
+        "voltage_min_v":           3.0,        # unconfirmed placeholder -- assumed standard Li-ion window
+        "capacity_ah":             0.16,       # confirmed -- 160 mAh
+        "max_charge_current_a":    0.08,       # unconfirmed placeholder -- assumed 0.5C
+        "max_discharge_current_a": 0.16,       # unconfirmed placeholder -- assumed 1C
+        "max_temp_c":              45.0,       # unconfirmed placeholder -- assumed standard Li-ion ceiling
     },
 }
 
