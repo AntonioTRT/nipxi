@@ -1459,11 +1459,32 @@ Only after all seven are written does `MonitorBatterySequence` get constructed a
 
 ## 21. Relay Functional Validation -- Group-Scoped Matrix Scan
 
-**Objective:** let relay validation be scoped to one battery group's relay positions, or the full configured population, rather than always scanning every channel -- future-proof for additional relay matrices as Groups B/C/D come online.
+**Objective:** let relay validation be scoped to one group's channel range on the currently selected relay matrix device, or the full configured population, rather than always scanning every channel -- future-proof for additional relay matrices as Groups B/C/D come online. Group A = channels 1-8, Group B = 9-16, Group C = 17-24, Group D = 25-32 (`config/devices.py::BATTERY_GROUPS`' `position_start`/`position_end`).
 
-**Menu:** `test.py::_functional_relay_numato()`'s "Matrix Scan" option now routes through `_test_relay_matrix_scan_scoped()`, which calls `_select_relay_scope()` first -- `1. All Groups` / `2. Group A` / `3. Group B` / `4. Group C` / `5. Group D`. Selecting a disabled group (no relay matrix installed -- currently B/C/D) falls back to "All Groups" with a printed explanation, rather than silently scanning the wrong device or failing.
+**Menu:** `test.py::_functional_relay_numato()`'s "Matrix Scan" option routes through `_test_relay_matrix_scan_scoped()`, which calls `_select_relay_scope()` first -- `1. All Groups` / `2. Group A` / `3. Group B` / `4. Group C` / `5. Group D`.
 
-**Implementation:** `test_relay_matrix_scan()`/`_run_relay_matrix_scan()` gained optional `channel_start`/`channel_end` parameters (both 1-based, inclusive, clipped to the selected device's configured channel count), defaulting to the full range when omitted -- existing callers and behavior are unchanged. The scan's `for ch in range(...)` loop was updated from the previous hardcoded `range(1, num_channels + 1)` to `range(channel_start, channel_end + 1)`. Scope selection maps directly onto `BATTERY_GROUPS[group]["position_start"/"position_end"]`, since relay address == battery position on the currently deployed hardware (Group A / `MATRIX_NUMATO_201`).
+**Bug found and fixed (initial implementation):** `_select_relay_scope()` originally gated the scope resolution on `BATTERY_GROUPS[group]["enabled"]` and fell back to "All Groups" (scanning all 32 channels) whenever it was `False` -- which is every group except A today. Selecting "Group B", "Group C", or "Group D" therefore silently scanned channels 1-32 instead of the requested 8-channel range, with only an easy-to-miss one-line print explaining why. Root cause: `enabled` means "no battery relay matrix has been deployed/wired for this group yet for actual battery testing" -- a battery-wiring concern that only matters to `_select_battery_group()`/Monitor Battery. Relay Functional Validation tests raw relay hardware on whichever device is *already selected*, completely independent of whether a battery is wired to those channels -- channels 9-32 are just as real and safely testable on a 32-channel Numato matrix as channels 1-8, even before any battery relay matrix exists for Group B/C/D. `_select_relay_scope()` no longer checks `enabled` at all -- it resolves purely from `BATTERY_GROUPS[group]["position_start"/"position_end"]`, for any group key that exists in the dict.
+
+**Before/after (mocked, `MATRIX_NUMATO_201` selected, 32-channel device):**
+
+| Scope selected | Before (buggy) | After (fixed) |
+|---|---|---|
+| All Groups | 1-32 | 1-32 |
+| Group A | 1-8 | 1-8 |
+| Group B | **1-32** (bug) | 9-16 |
+| Group C | **1-32** (bug) | 17-24 |
+| Group D | **1-32** (bug) | 25-32 |
+
+**Off-by-one / 1-based vs. 0-based addressing:** reviewed and confirmed correct, unaffected by this fix. `test_relay_matrix_scan()`/`_run_relay_matrix_scan()`'s scan loop (`for ch in range(channel_start, channel_end + 1)`) calls only `hardware/relay_eth.py::NumatoRelayMatrix`'s public 1-based API (`relay.close(ch)`/`relay.read(ch)`/`relay.open(ch)`), which itself converts to the Numato device's native 0-based addressing internally (`close()`'s `relay0 = channel - 1`) -- e.g. requesting channel 9 (Group B's first relay) correctly activates native relay index 8. This conversion lives entirely inside the driver and was never touched by the group-scoping feature or this fix.
+
+**Visibility (added by this fix):** `test_relay_matrix_scan()` gained a `scope_label` parameter; when set (i.e. whenever the scope-selection menu was used), it prints an explicit, unmissable banner before the scan starts, for every choice including "All Groups" -- not just non-default ones:
+```
+INFO Relay validation scope: Group B
+INFO Relays under test: 9-16
+```
+Standalone callers (`scope_label=None`, no scope selection happened) print no banner, matching prior unscoped behavior exactly.
+
+**Implementation:** `test_relay_matrix_scan()`/`_run_relay_matrix_scan()` retain the `channel_start`/`channel_end` parameters added for group-scoping (both 1-based, inclusive, clipped to the selected device's configured channel count), defaulting to the full range when omitted. `_select_relay_scope()` now returns `(label, channel_start, channel_end)` instead of just the bounds, so the caller can print the scope banner above.
 
 ## 22. Hardware Identity Traceability (Milestone II)
 

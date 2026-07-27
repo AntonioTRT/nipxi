@@ -262,6 +262,15 @@ first real-rack hardware bring-up milestone record.
   confirmation); physical rack validation still pending. See
   `docs/architecture.md` Sections 19-21 and `docs/MILESTONES.md`
   Milestone II.
+- **Fix: Relay Functional Validation group scoping bug** -- `_select_relay_scope()`
+  incorrectly gated scope resolution on `BATTERY_GROUPS[group]["enabled"]`,
+  silently falling back to "All Groups" (scanning channels 1-32) for every
+  Group B/C/D selection instead of the requested 8-channel range. Fixed by
+  resolving purely from `position_start`/`position_end` regardless of
+  `enabled` (a battery-wiring concern irrelevant to raw relay-hardware
+  testing). Also added an explicit "Relay validation scope: ..."/"Relays
+  under test: N-M" banner before every scan. See `docs/architecture.md`
+  Section 21.
 - **Monitor Battery: temporary DMM voltage source** -- the original
   per-position DAQ voltage read failed during real-hardware validation
   (unresolved channel/device configuration); `MonitorBatterySequence` now

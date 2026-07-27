@@ -1490,7 +1490,7 @@ def _run_relay_numato_matrix_test(cfg, name, host, port, driver, user, config_re
 # 5c. Relay -- Ethernet full matrix scan (commissioning)
 # =============================================================================
 
-def test_relay_matrix_scan(name=None, cfg=None, channel_start=None, channel_end=None):
+def test_relay_matrix_scan(name=None, cfg=None, channel_start=None, channel_end=None, scope_label=None):
     """
     Commissioning test: exercises every configured channel of the Numato
     Relay Matrix module -- ON, READ, OFF -- one connection for the whole scan.
@@ -1500,10 +1500,14 @@ def test_relay_matrix_scan(name=None, cfg=None, channel_start=None, channel_end=
     own device picker for standalone use.
 
     `channel_start`/`channel_end` (both optional, 1-based, inclusive) scope
-    the scan to a subset of channels -- e.g. one battery group's relay
-    positions (see _select_relay_scope()/config/devices.py::BATTERY_GROUPS).
+    the scan to a subset of channels -- e.g. one battery group's channel
+    range (see _select_relay_scope()/config/devices.py::BATTERY_GROUPS).
     Defaults to the full configured channel population when omitted, same
-    as before this parameter existed.
+    as before this parameter existed. `scope_label` (e.g. "Group B" or
+    "All Groups") is purely for the printed "Relay validation scope"/
+    "Relays under test" banner below -- omitted (None) when called
+    standalone (no scope selection happened), in which case no banner is
+    printed, matching prior behavior exactly.
 
     Before scanning, device availability is verified (ping + connect/auth) --
     the scan itself only starts once the device is confirmed reachable and
@@ -1531,6 +1535,16 @@ def test_relay_matrix_scan(name=None, cfg=None, channel_start=None, channel_end=
     ch_end   = num_channels if channel_end is None else min(num_channels, channel_end)
     scope_note = "" if (ch_start == 1 and ch_end == num_channels) else f", channels {ch_start}-{ch_end}"
     config_ref = f"config/devices.py -> {name} ({driver} / {host}:{port}, {num_channels} ch{scope_note})"
+
+    if scope_label is not None:
+        # Clear, unmissable confirmation of the applied scope -- printed
+        # BEFORE the scan starts, for every scope choice (including "All
+        # Groups"), not just non-default ones. See docs/architecture.md
+        # "Relay Functional Validation -- Group-Scoped Matrix Scan" for the
+        # bug this fixes (a scope selection that silently fell back to
+        # scanning every channel).
+        print(f"\nINFO Relay validation scope: {scope_label}")
+        print(f"INFO Relays under test: {ch_start}-{ch_end}")
 
     # Safe Cancellation (see docs/architecture.md "Safe Cancellation
     # Architecture"): same pattern as run_main_test() -- Ctrl+C requests a
@@ -1916,14 +1930,29 @@ def test_relay_numato():
 def _select_relay_scope():
     """
     Scope-selection menu for Relay Functional Validation -- lets a scan be
-    restricted to one battery group's relay positions instead of the full
-    channel population (see config/devices.py::BATTERY_GROUPS). Future-proof:
-    as relay matrices for Groups B/C/D come online, this same menu already
-    supports scoping to them without further changes here.
+    restricted to one group's channel range on the CURRENTLY SELECTED relay
+    matrix device: Group A = channels 1-8, Group B = 9-16, Group C = 17-24,
+    Group D = 25-32 (see config/devices.py::BATTERY_GROUPS' position_start/
+    position_end).
 
-    Returns (channel_start, channel_end) as 1-based, inclusive, global
-    battery-position numbers, or (None, None) for "All Groups" (the full
-    configured population -- previous, unscoped behavior).
+    Deliberately NOT gated on BATTERY_GROUPS[group]["enabled"]. That flag
+    means "no battery relay matrix has been deployed/wired for this group
+    yet for actual battery testing" -- a battery-wiring concern relevant
+    only to _select_battery_group()/Monitor Battery. Relay Functional
+    Validation tests raw relay hardware on whichever device is already
+    selected, completely independent of whether a battery is wired to those
+    channels -- channels 9-32 are just as real and safely testable on a
+    32-channel Numato matrix as channels 1-8, even before any battery relay
+    matrix exists for Group B/C/D. Gating this scope selector on `enabled`
+    was a bug: it silently collapsed every Group B/C/D selection back to
+    "All Groups" (scanning all 32 channels instead of the requested 8),
+    since every group but A currently has `enabled=False`.
+
+    Returns (label, channel_start, channel_end) -- label is "All Groups" or
+    "Group <X>" (for the "Relay validation scope: ..." banner the caller
+    prints); channel_start/channel_end are 1-based, inclusive, or
+    (None, None) for "All Groups" (the full configured population,
+    resolved against the actual device's channel count by the caller).
     """
     print("\nRelay Validation Scope")
     print("1. All Groups")
@@ -1934,23 +1963,21 @@ def _select_relay_scope():
     choice = input("\nScope: ").strip()
     group_by_choice = {"2": "A", "3": "B", "4": "C", "5": "D"}
     if choice in ("", "1"):
-        return None, None
+        return "All Groups", None, None
     group = group_by_choice.get(choice)
-    if group is None:
+    grp = dev_cfg.BATTERY_GROUPS.get(group) if group else None
+    if grp is None:
         print("Invalid selection -- defaulting to All Groups.")
-        return None, None
-    grp = dev_cfg.BATTERY_GROUPS.get(group)
-    if grp is None or not grp["enabled"]:
-        print(f"Group {group} has no relay matrix installed yet -- defaulting to All Groups.")
-        return None, None
-    return grp["position_start"], grp["position_end"]
+        return "All Groups", None, None
+    return f"Group {group}", grp["position_start"], grp["position_end"]
 
 
 def _test_relay_matrix_scan_scoped(name=None, cfg=None):
     """Matrix Scan wrapper that prompts for a scope (see _select_relay_scope())
     before running -- the Functional Validation menu entry point."""
-    channel_start, channel_end = _select_relay_scope()
-    return test_relay_matrix_scan(name, cfg, channel_start=channel_start, channel_end=channel_end)
+    scope_label, channel_start, channel_end = _select_relay_scope()
+    return test_relay_matrix_scan(name, cfg, channel_start=channel_start, channel_end=channel_end,
+                                   scope_label=scope_label)
 
 
 def _functional_relay_numato(name: str, cfg: dict):
