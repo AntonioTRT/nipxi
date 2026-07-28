@@ -108,6 +108,12 @@ class SMU(HardwareBase):
         # unit/installation.
         self._channel  = cfg.get("smu_channel", "0")
         self._session  = None
+        # Last output_enabled state actually read from the instrument (via
+        # query_output_state()), or None if never queried yet -- see
+        # check_current_output_state()/the "PSU Safety Verification
+        # Pattern" in docs/architecture.md. Purely a diagnostic record;
+        # nothing in this driver's own logic depends on this being fresh.
+        self.last_known_output_state: bool | None = None
 
     def connect(self):
         self.log.info("Opening SMU session: %s (channel %s)", self.resource, self._channel)
@@ -225,6 +231,145 @@ class SMU(HardwareBase):
                 "SMU %s: failed to read back output_enabled state: %s", self.resource, e
             )
             return False
+
+    # ------------------------------------------------------------------
+    # PSU Safety Verification Pattern (see docs/architecture.md) -- mirrors
+    # hardware/relay_eth.py's Relay Safety Verification Pattern:
+    #     Query PSU State -> Verify Current State -> Force Output OFF ->
+    #     Query PSU State -> Verify Output OFF -> [caller configures] ->
+    #     Enable Output -> Query PSU State -> Verify Output ON
+    #
+    # query_output_state() is the pure read (no safety decision).
+    # check_current_output_state() is steps 1-2 (read + log/record).
+    # force_output_off_and_verify() is steps 1-2 + 3-4-5 together (the PSU
+    # equivalent of hardware/relay_eth.py's _force_all_off_and_verify()).
+    # source_dc_voltage_point() below calls force_output_off_and_verify()
+    # once at its start, before any configuration is attempted, then does
+    # its own existing configure -> enable -> readback-verify (steps 6-8,
+    # unchanged) -- this is the ONE real PSU-output-enabling method in the
+    # codebase today, so this single change covers every real caller
+    # (test.py's SMU Functional Validation, ProtoTestSequence) at once, the
+    # same "fix centrally" principle used for the relay driver.
+    # ------------------------------------------------------------------
+
+    def query_output_state(self) -> bool | None:
+        """
+        Pure READBACK of the instrument's actual output_enabled state --
+        no safety decision, no fail-safe assumption, just the real query
+        result (or None if it can't be answered). Distinct from
+        verify_output_disabled(), which treats "disconnected" as True
+        (safe) and a failed query as False (assume unsafe) -- those
+        fail-safe defaults are correct for a safety GATE, but wrong for a
+        diagnostic state record, which should say "unknown" (None) rather
+        than silently asserting a value it doesn't actually have.
+
+        Stores the result on self.last_known_output_state. Returns True
+        (output enabled), False (output disabled), or None (no session, or
+        the query itself failed).
+        """
+        if self._session is None:
+            self.last_known_output_state = None
+            return None
+        try:
+            state = bool(self._session.output_enabled)
+        except Exception as e:
+            self.log.warning(
+                "SMU %s: output state query failed: %s", self.resource, e
+            )
+            self.last_known_output_state = None
+            return None
+        self.last_known_output_state = state
+        return state
+
+    def check_current_output_state(self, context: str = "") -> bool | None:
+        """
+        STEP 1 + STEP 2 of the PSU safety sequence: query the PSU's CURRENT
+        output state (BEFORE forcing it off or enabling anything) and log/
+        report if output is unexpectedly already enabled. A diagnostic
+        checkpoint, not a gate -- never raises; the mandatory force-off +
+        verify that follows (force_output_off_and_verify()) is what
+        actually enforces safety regardless of what this read finds.
+
+        `context` is a short label (e.g. "source_dc_voltage_point")
+        included in the log lines so a reader can tell which caller
+        triggered this check. Mirrors
+        hardware/relay_eth.py::NumatoRelayMatrix.check_current_relay_state().
+        """
+        prefix = f"{context}: " if context else ""
+        state = self.query_output_state()
+        if state is None:
+            self.log.warning(
+                "%sSMU %s: pre-action PSU state query failed -- proceeding to "
+                "force-safe regardless (fail-safe).", prefix, self.resource,
+            )
+        elif state:
+            self.log.warning(
+                "%sSMU %s: pre-action state check: PSU output NOT off before "
+                "this operation -- forcing safe state now.", prefix, self.resource,
+            )
+        else:
+            self.log.info(
+                "%sSMU %s: pre-action state check: PSU output already off "
+                "(verified).", prefix, self.resource,
+            )
+        return state
+
+    def force_output_off_and_verify(self, context: str = "") -> bool:
+        """
+        Full PSU safety sequence for reaching a verified-safe baseline:
+        Query PSU State -> Verify Current State (check_current_output_state(),
+        above) -> Force Output OFF -> Query PSU State -> Verify Output OFF
+        (output_disable() + verify_output_disabled(), unchanged/existing).
+
+        Never raises -- returns True if output is confirmed OFF afterward,
+        False otherwise (same non-raising contract as
+        verify_output_disabled()/emergency_output_off(); callers decide
+        whether a False return is fatal for their own workflow).
+        """
+        self.check_current_output_state(context=context)
+        prefix = f"{context}: " if context else ""
+        try:
+            self.output_disable()
+        except Exception as e:
+            self.log.error(
+                "%sSMU %s: force-output-off command failed: %s", prefix, self.resource, e,
+            )
+            self.last_known_output_state = None
+            return False
+        ok = self.verify_output_disabled()
+        self.last_known_output_state = False if ok else True
+        if not ok:
+            self.log.error(
+                "%sSMU %s: output force-off could not be verified OFF.", prefix, self.resource,
+            )
+        return ok
+
+    def cross_validate_output_state(self, measured_v: float = None, measured_i: float = None):
+        """
+        FUTURE EXTENSION POINT -- NOT IMPLEMENTED YET. See
+        docs/architecture.md "PSU/Relay Cross-Validation (Future)".
+
+        Intended to compare this driver's reported/verified output_enabled
+        state (self.last_known_output_state / query_output_state()) against
+        an INDEPENDENTLY measured signal -- a DMM reading, or this SMU's own
+        session.measure() ADC readback -- to catch a PSU-reported state
+        that disagrees with physical reality: PSU reports ON but measured
+        voltage is ~0 V, or PSU reports OFF but voltage is still present.
+
+        Deliberately left unimplemented. This method exists only to mark
+        WHERE that comparison belongs once it is built, so callers of the
+        PSU safety sequence (source_dc_voltage_point(),
+        force_output_off_and_verify(), a future Charge/Discharge Battery
+        implementation) have one obvious place to call into later, rather
+        than requiring a redesign of this driver when cross-validation is
+        actually implemented.
+        """
+        raise NotImplementedError(
+            "Cross-validation of PSU output state against an external "
+            "measurement (DMM reading or PSU ADC readback) is a documented "
+            "future extension point -- not implemented yet. See "
+            "docs/architecture.md 'PSU/Relay Cross-Validation (Future)'."
+        )
 
     def emergency_output_off(self, reason: str) -> bool:
         """
@@ -371,9 +516,25 @@ class SMU(HardwareBase):
         driver knowing anything about what `during_hold` is or does. Its
         return value is included in the result dict as
         `"during_hold_result"` (None if `during_hold` was not given).
+
+        PSU Safety Verification Pattern (see docs/architecture.md):
+        BEFORE any configuration is attempted, this method now calls
+        force_output_off_and_verify() -- Query PSU State -> Verify Current
+        State -> Force Output OFF -> Query PSU State -> Verify Output OFF
+        -- so every call starts from a freshly-confirmed-safe baseline
+        rather than assuming the previous call's own teardown is still
+        true. Raises SMUError immediately (before any configuration is
+        attempted) if that baseline cannot be verified.
         """
         if self._session is None:
             raise SMUError(f"SMU {self.resource} channel {self._channel} is not connected")
+
+        if not self.force_output_off_and_verify(context="source_dc_voltage_point pre-check"):
+            raise SMUError(
+                f"SMU {self.resource} channel {self._channel}: could not verify a safe "
+                f"(output-off) baseline before sourcing {voltage_v:+.3f} V -- aborting "
+                f"before any configuration was attempted."
+            )
 
         import nidcpower
 
@@ -420,6 +581,10 @@ class SMU(HardwareBase):
                 tolerance=Settings.SMU_CURRENT_READBACK_TOLERANCE_A,
             )
             self._verify_config_readback("output_enabled", True, readback_output_enabled)
+            # Steps "Enable Output -> Query PSU State -> Verify Output ON"
+            # of the PSU safety sequence: the readback just verified above
+            # IS that query -- record it as the current known state.
+            self.last_known_output_state = bool(readback_output_enabled)
 
             # Runtime measurements -- real ADC readback of the physical output,
             # taken once output is initiated. Distinct from the configuration

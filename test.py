@@ -1754,6 +1754,15 @@ def test_relay_ethernet_test(name=None, cfg=None):
 
                 print(f"\n  -- Relay index {relay_index}/{relay_count - 1} (native 0-based) --")
                 try:
+                    # STEP 1-2 of the Relay Safety Verification Pattern (see
+                    # docs/architecture.md): read + log the bank's CURRENT
+                    # state before forcing anything off. This test bypasses
+                    # close()/open() on purpose (it validates the native
+                    # command layer independently of that wrapper), so it
+                    # calls the same shared check the wrapper uses
+                    # internally, rather than skipping steps 1-2 entirely.
+                    relay.check_current_relay_state(context=f"RelayEthernetTest relay {relay_index}")
+
                     relay.write_all(0)
                     relay.verify_all(0)
 
@@ -1765,8 +1774,8 @@ def test_relay_ethernet_test(name=None, cfg=None):
 
                     results.append(_ok(
                         "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
-                        "write_all(OFF) -> verify -> write(ON) -> verify -> "
-                        "write_all(OFF) -> verify  PASS"
+                        "read_all (pre-check) -> write_all(OFF) -> verify -> write(ON) -> "
+                        "verify -> write_all(OFF) -> verify  PASS"
                     ))
                 except Exception as e:
                     results.append(_fail(

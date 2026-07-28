@@ -31,10 +31,13 @@ Two API layers are exposed:
      close(channel), query(channel)/read(channel), open_all(), close_all().
      open()/close() are implemented ON TOP of the native primitives and are
      the only methods that ever change relay state; both always run the
-     mandatory all-off -> verify -> (activate -> verify) safety sequence.
-     They never call the Numato command layer directly -- the requested
-     relay is never activated without first forcing and verifying an
-     all-off baseline.
+     mandatory Read All -> Verify Current Status -> Force All OFF -> Verify
+     All OFF -> Action -> Verify Action sequence (see
+     _force_all_off_and_verify()/check_current_relay_state(), and
+     docs/architecture.md "Relay Safety Verification Pattern"). They never
+     call the Numato command layer directly -- the requested relay is
+     never activated without first reading/logging the pre-existing state,
+     then forcing and verifying an all-off baseline.
 
 =====================================================================
 Authentication debugging -- CONFIRMED FIXED against the physical unit
@@ -228,6 +231,12 @@ class NumatoRelayMatrix(RelayBase):
         self._password = cfg.get("password", self.DEFAULT_PASSWORD)
         self._timeout  = float(cfg.get("timeout", 5.0))
         self._sock: socket.socket | None = None
+        # Last relay bank state actually read from hardware (via read_all()),
+        # or None if never read yet -- see check_current_relay_state()/the
+        # "Relay Safety Verification Pattern" in docs/architecture.md. Purely
+        # a diagnostic record; nothing in this driver's own logic depends on
+        # this value being fresh or even present.
+        self.last_known_mask: int | None = None
 
         if not self._host:
             raise ValidationError(
@@ -478,7 +487,9 @@ class NumatoRelayMatrix(RelayBase):
     def read_all(self) -> int:
         """Native "relay readall" -- hex bitmask of every relay's state."""
         response = self._call_with_reconnect(self._send_and_capture, "relay readall")
-        return self._parse_readall_response(response)
+        mask = self._parse_readall_response(response)
+        self.last_known_mask = mask
+        return mask
 
     def write(self, relay_number: int, state: bool):
         """Native "relay on/off <n>" for a single 0-based relay number."""
@@ -555,15 +566,89 @@ class NumatoRelayMatrix(RelayBase):
     # ------------------------------------------------------------------
     # Mandatory safety sequence (used by open()/close()/open_all())
     # ------------------------------------------------------------------
+    #
+    # Full sequence, per docs/architecture.md "Relay Safety Verification
+    # Pattern":
+    #     Read All -> Verify Current Status -> Force All OFF -> Verify
+    #     All OFF -> [caller's requested action] -> Verify Requested Action
+    #
+    # check_current_relay_state() implements the first two steps;
+    # _force_all_off_and_verify() calls it, then performs the next two
+    # (unchanged from before this pattern was added). Every real relay path
+    # in this codebase (open()/close()/open_all(), and therefore every
+    # caller of them -- MonitorBatterySequence, ProtoTestSequence,
+    # BatteryTestSequence, and every commissioning test in test.py that
+    # uses the public API) converges on this ONE function, so this single
+    # change brings all of them into compliance simultaneously. The one
+    # deliberate exception is test.py::test_relay_ethernet_test(), which
+    # exercises the native command layer directly (bypassing open()/
+    # close() on purpose, to test that layer independently) -- it calls
+    # check_current_relay_state() itself, explicitly, immediately before
+    # its own native write_all(0) (see that function).
+    # ------------------------------------------------------------------
+
+    def check_current_relay_state(self, context: str = "") -> int | None:
+        """
+        STEP 1 + STEP 2 of the relay safety sequence: read the relay
+        bank's CURRENT state (BEFORE any force-off or action is attempted)
+        and log/report if anything is unexpectedly already active. This is
+        a diagnostic checkpoint, not a gate -- it never raises and never
+        changes any relay state; the mandatory force-off-and-verify step
+        that always follows it is what actually enforces safety regardless
+        of what this read finds. Exists to surface "hidden routing issues"
+        (a relay found active that nothing here expected) in the log/
+        console BEFORE it gets silently corrected, rather than never being
+        recorded at all.
+
+        `context` is a short label (e.g. "close()", "RelayEthernetTest")
+        included in the log lines so a reader can tell which caller
+        triggered this check.
+
+        Stores the result on `self.last_known_mask` (None if the read
+        itself failed) for later inspection -- e.g. a future caller
+        wiring this into `event_log` traceability. Never raises: a read
+        failure here is logged and the caller proceeds to force-off
+        regardless (fail-safe -- the subsequent write_all(0)/verify_all(0)
+        is the real safety net, not this diagnostic read).
+
+        Returns the mask read (0 = all off), or None if the read failed.
+        """
+        prefix = f"{context}: " if context else ""
+        try:
+            mask = self.read_all()
+        except Exception as e:
+            self.log.warning(
+                "%sPre-action relay state check FAILED (%s) -- proceeding to "
+                "force-off regardless (fail-safe).", prefix, e,
+            )
+            self.last_known_mask = None
+            return None
+
+        if mask != 0:
+            self.log.warning(
+                "%sPre-action state check: relay bank NOT all-off before this "
+                "operation (mask=0x%0*X, active=%s) -- forcing safe state now.",
+                prefix, self._hex_digits(), mask, self._mask_to_channels(mask),
+            )
+        else:
+            self.log.info(
+                "%sPre-action state check: relay bank already all-off (verified).",
+                prefix,
+            )
+        return mask
 
     def _force_all_off_and_verify(self):
         """
-        STEP 1 + STEP 2 of the mandatory safety sequence.
+        Full mandatory safety sequence: Read All -> Verify Current Status
+        (check_current_relay_state(), new) -> Force All OFF -> Verify All
+        OFF (write_all(0)/verify_all(0), unchanged from before this
+        pattern was added).
 
-        Turn OFF all relays, then read back and verify ALL relays are OFF.
         Raises RelayStateVerificationError and stops execution if any
-        relay is still active -- no continuation, no retry, no exceptions.
+        relay is still active after the force-off -- no continuation, no
+        retry, no exceptions.
         """
+        self.check_current_relay_state(context="close()/open()/open_all()")
         self.write_all(0)
         self.verify_all(0)
 

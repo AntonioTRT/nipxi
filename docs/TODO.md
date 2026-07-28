@@ -60,6 +60,10 @@ the bottom, with a pointer to where the real documentation lives
   attribute via `_verify_config_readback()`, real `measure()` readback feeding
   `SafetyMonitor.check()`, no limit logic duplicated inside `hardware/smu.py`,
   and never an equality check between measured and commanded voltage/current).
+  It MUST ALSO follow the PSU Safety Verification Pattern (docs/architecture.md
+  Section 25) -- call `SMU.force_output_off_and_verify()` before configuring/
+  enabling output, the same way `source_dc_voltage_point()` already does,
+  rather than reinventing the pre-check.
 - [MUST] `DAQ.read_all_batteries()`/`verify_zero_current()` -- still
   placeholders (multi-channel synchronized acquisition). `DAQ.read_channel()`
   (single-channel read) IS implemented and real now -- moved out of
@@ -174,6 +178,15 @@ the bottom, with a pointer to where the real documentation lives
 
 - [ ] Add a `--dry-run` / `PXI_SIMULATE` mode exercising test logic without
   hardware (builds on `hardware/simulated.py` above).
+- [ ] Implement PSU/relay cross-validation (docs/architecture.md Section 26)
+  -- `SMU.cross_validate_output_state(measured_v, measured_i)` currently
+  only raises `NotImplementedError`; wire it into `source_dc_voltage_point()`
+  (comparing the SMU's own `measured_v`/`measured_i` against the reported
+  `output_enabled` state) and/or `ProtoTestSequence`'s existing DMM reading
+  once a real accuracy tolerance/threshold is decided. Not needed for a
+  relay equivalent -- see that section's rationale (the relay's own
+  `readall` readback already IS a direct physical confirmation, unlike a
+  PSU's `output_enabled` attribute).
 - [ ] Continue expanding `test.py::test_safety_monitor()`'s Part 2 workflow
   walkthrough (see `docs/architecture.md` Section 23e, now the designated
   development reference implementation for Charge/Discharge/Cycle Battery)
@@ -366,6 +379,31 @@ first real-rack hardware bring-up milestone record.
   its injected overtemperature fault). No hardware/relay/instrument/
   database access anywhere in the code path -- confirmed by inspection.
   See `docs/architecture.md` Section 23e and `docs/MILESTONES.md`.
+- **Relay + PSU Safety Verification Pattern** -- implements the compliance
+  fix identified by `docs/RELAY_SAFETY_COMPLIANCE_REVIEW.md`: relay/PSU
+  paths previously went straight to "force off + verify" without ever
+  reading/recording the pre-existing state first. New
+  `NumatoRelayMatrix.check_current_relay_state()` (Read All -> Verify
+  Current Status) is now called at the start of the shared
+  `_force_all_off_and_verify()` -- bringing every real relay path
+  (`MonitorBatterySequence`, `ProtoTestSequence`, legacy
+  `BatteryTestSequence`, `HardwareManager`, `SafetyMonitor`, every Numato
+  commissioning test in `test.py`) into full compliance with one
+  centralized change; `test_relay_ethernet_test()` (which deliberately
+  bypasses the public API) calls the same shared method explicitly so it
+  isn't left behind. The identical pattern was extended to PSU control:
+  new `SMU.query_output_state()`/`check_current_output_state()`/
+  `force_output_off_and_verify()`, with `source_dc_voltage_point()` (the
+  one real PSU-output-enabling method today) now calling
+  `force_output_off_and_verify()` before any configuration is attempted.
+  New `last_known_mask`/`last_known_output_state` attributes record the
+  most recently read state on each driver. A `SMU.cross_validate_output_state()`
+  stub (raises `NotImplementedError`, never called) marks the future
+  DMM/PSU-readback cross-validation extension point without implementing
+  it. Verified with mocked-socket (relay) and mocked-NI-DCPower-session
+  (SMU) tests confirming the exact 8-step/PSU-equivalent command sequence,
+  plus a full non-hardware MENU regression with no failures. See
+  `docs/architecture.md` Sections 24-26 and `docs/MILESTONES.md`.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies

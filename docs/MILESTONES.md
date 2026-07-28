@@ -586,6 +586,78 @@ console output format confirmed against the requested display spec;
 confirmed by code inspection that no step anywhere imports or calls
 `HardwareManager`/`DataStorage`/`RelayFactory`/any `hardware/*.py` driver.
 
+## Milestone II: Relay + PSU Safety Verification Pattern
+
+Implements the compliance improvement identified by
+`docs/RELAY_SAFETY_COMPLIANCE_REVIEW.md`, and extends the same philosophy
+to PSU/SMU output control. See `docs/architecture.md` Sections 24-26 for
+full detail; summary here.
+
+**Root cause:** every real relay path converged on one shared function
+(`NumatoRelayMatrix._force_all_off_and_verify()`), which forced the relay
+bank off and verified it -- but never first read and recorded the bank's
+*pre-existing* state. A pre-existing unsafe state (a relay left active
+from an earlier fault) was silently corrected, never diagnosed. The exact
+same shape of gap existed in `SMU.source_dc_voltage_point()` -- the one
+real PSU-output-enabling method in the codebase -- which configured and
+enabled output on every call without first confirming a safe baseline.
+
+**Relay fix (`hardware/relay_eth.py`):** new `check_current_relay_state()`
+(Read All -> Verify Current Status, steps 1-2) is now called at the start
+of `_force_all_off_and_verify()` (which already did Force Off -> Verify
+Off -> Action -> Verify Action, steps 3-8) -- bringing every real relay
+path (`MonitorBatterySequence`, `ProtoTestSequence`, legacy
+`BatteryTestSequence`, `HardwareManager` startup/shutdown, `SafetyMonitor`
+shutdown, and every Numato commissioning test in `test.py` that uses the
+public `open()`/`close()`/`open_all()` API) into full compliance with a
+single, centralized change. `test.py::test_relay_ethernet_test()` (the
+one path that deliberately bypasses the public API to test native
+primitives) now calls the same shared `check_current_relay_state()`
+explicitly, so it is not left behind. New `NumatoRelayMatrix.last_known_mask`
+attribute records the most recently read state.
+
+**PSU fix (`hardware/smu.py`):** new `query_output_state()` (pure
+readback), `check_current_output_state()` (steps 1-2, mirrors the relay
+method), and `force_output_off_and_verify()` (steps 1-2 + 3-4-5 combined)
+-- `source_dc_voltage_point()` now calls `force_output_off_and_verify()`
+as its first action, before any configuration is attempted, raising
+`SMUError` immediately if a safe baseline can't be verified. New
+`SMU.last_known_output_state` attribute records the most recently queried
+state. `emergency_output_off()` (the existing shutdown reflex) already
+implemented the agreed Disable -> Query -> Verify Off shutdown pattern
+exactly, unchanged.
+
+**Future cross-validation, prepared not implemented:** new
+`SMU.cross_validate_output_state(measured_v, measured_i)` stub (raises
+`NotImplementedError`, never called) marks where a future comparison of
+PSU-reported state against an independent measurement (DMM, or the SMU's
+own ADC readback) belongs -- documented rationale for why this extension
+point was added to the PSU side and not the relay side in
+`docs/architecture.md` Section 26.
+
+**Compliance status:** every real, production/validation-reachable relay
+path -- previously Partially Compliant (steps 3-8 only) -- is now Fully
+Compliant with the agreed 6-stage pattern. The one real PSU-output path
+(`source_dc_voltage_point()`, and therefore SMU Functional Validation and
+Proto Test Execution) now implements the full agreed pattern too. The
+three non-production relay abstractions already flagged as unreachable
+(`SerialRelay`, `SimulatedRelay`, `RelayMatrix`) were intentionally left
+unmodified -- out of scope for this centralized fix.
+
+Verified: `py_compile` clean on all touched files; a mocked-socket test
+confirms `close(1)` against a bank with relay 3 already active issues,
+in order, `relay readall` (finds/logs the unexpected state) ->
+`relay writeall 00` -> `relay readall` (verify off) -> `relay on 0` ->
+`relay read 0` -> `relay readall` (verify action) -- the complete 8-step
+sequence, command-by-command; a mocked NI-DCPower session test confirms
+`source_dc_voltage_point()` detects a PSU already reporting ON, forces
+off + verifies, then configures/enables/verifies-ON as before, with
+`last_known_output_state` tracked correctly throughout; `cross_validate_
+output_state()` confirmed to raise `NotImplementedError`; full
+non-hardware MENU smoke test (all 13 top-level entries) and the Monitor
+Battery/Safety Monitor Simulator mocked smoke tests re-run with no
+regressions.
+
 ---
 
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the

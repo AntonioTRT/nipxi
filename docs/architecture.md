@@ -1646,3 +1646,83 @@ No `HardwareManager`, no `DataStorage`, no relay, no SMU/DMM/DAQ import anywhere
 ```
 
 Removed from the top level: **Test Temperature Module** (retired -- 23b; function still callable, still covered by Hardware Discovery), **Test Configuration** (removed -- 23f; function still called by `preflight_check()`), **Test SQLite (foundation)** and **Test Database Layer** (merged into Database Tools -- 23g/23h), **Run All Tests** (replaced by UI Test -- 23i).
+
+## 24. Relay Safety Verification Pattern
+
+**Root cause (from the relay architecture compliance review, `docs/RELAY_SAFETY_COMPLIANCE_REVIEW.md`):** every real relay path in the codebase converged on one shared function, `hardware/relay_eth.py::NumatoRelayMatrix._force_all_off_and_verify()`, for "force everything off, then verify" -- but that function went straight to forcing off without ever first reading and recording the relay bank's pre-existing state. The consequence: if the bank was already in an unexpected state (a relay left active from an earlier fault, a stale session, a hidden routing issue) when an operation began, that fact was silently corrected by the force-off step and never surfaced anywhere -- diagnostically invisible, even though the eventual outcome (all relays confirmed off) was the same either way.
+
+**The agreed pattern:**
+```
+Read All -> Verify Current Status -> Force All OFF -> Verify All OFF -> Action -> Verify Action
+```
+
+**Fix -- solved centrally, in the one function every real path already shares:**
+
+- `NumatoRelayMatrix.check_current_relay_state(context: str = "")` (new) -- implements steps 1-2. Calls `read_all()` (which now also records the result on `self.last_known_mask`, a new instance attribute -- "store the queried state if useful," per the same principle later applied to the PSU pattern in Section 25) and logs a WARNING naming exactly which channels were unexpectedly active if the mask is non-zero, or an INFO confirming the bank was already all-off. Never raises, never changes relay state -- a diagnostic checkpoint, not a gate. A failed read is logged and the caller proceeds to force-off regardless (fail-safe: the force-off-and-verify step that always follows is the real safety net, not this read).
+- `NumatoRelayMatrix._force_all_off_and_verify()` (existing, modified) -- now calls `check_current_relay_state()` first, then performs the unchanged `write_all(0)`/`verify_all(0)` (steps 3-5).
+
+**Why this brings every real path into compliance simultaneously, with zero per-caller changes:** `open()`, `close()`, and `open_all()` all call `_force_all_off_and_verify()` internally -- and every real relay usage path in the codebase calls one of those three:
+
+| Path | How it reaches `_force_all_off_and_verify()` |
+|---|---|
+| `MonitorBatterySequence.run()` | `relay.close(relay_address)` |
+| `ProtoTestSequence.run()` | `relay.close(relay_n)` / `relay.open(relay_n)` |
+| Legacy `BatteryTestSequence.run()` | `relay.close(ch)` / `relay.open(ch)` |
+| `HardwareManager` startup/shutdown/`atexit` | `relay.open_all()` |
+| `SafetyMonitor.emergency_stop()`/`safe_cancel_shutdown()` | `relay_matrix.open_all()` |
+| `test.py` "Relay 1 quick check" | `relay.close(1)` / `relay.open(1)` |
+| `test.py` Matrix Scan (group-scoped) | `relay.close(ch)` / `relay.open(ch)` / `relay.open_all()` (on cancel) |
+| `test.py` Safety Self-Test | `relay.close(ch)` / `relay.open(ch)` / `relay.open_all()` |
+
+**The one deliberate exception: `test.py::test_relay_ethernet_test()` (RelayEthernetTest).** This test exercises the native command layer (`write_all()`/`write()`/`verify_all()`) directly, by design, to validate that layer independently of the `close()`/`open()` safety wrapper -- it does not call `_force_all_off_and_verify()`. To ensure this path is not left bypassing steps 1-2 (per requirement 6, "verify no new relay path bypasses the shared safety sequence"), it now calls the same shared `relay.check_current_relay_state(context=...)` explicitly, once per relay index, immediately before its own native `write_all(0)` -- reusing the identical logic, not a duplicate implementation.
+
+**Verified (mocked socket, no real hardware):** a `close(1)` call against a bank with relay 3 already active issues, in order: `relay readall` (read all -- reports mask=0x04, logs a WARNING naming channel 3) -> `relay writeall 00` (force off) -> `relay readall` (verify off) -> `relay on 0` (action) -> `relay read 0` (individual verify) -> `relay readall` (bulk verify) -- the full 8-step pattern, confirmed command-by-command.
+
+**Compliance status:** every real, production/validation-reachable relay path -- previously "Partially Compliant" (steps 3-8 only) per `docs/RELAY_SAFETY_COMPLIANCE_REVIEW.md` -- is now **Fully Compliant** with the agreed 6-stage pattern. The three non-production/scaffolded abstractions flagged in that review (`hardware/relay_serial.py::SerialRelay`, `hardware/simulated.py::SimulatedRelay`, `hardware/relay_matrix.py::RelayMatrix`) were **not** modified -- they remain unreachable via current configuration (`RELAY_SERIAL_CONFIGS == {}`, `SimulatedRelay` not wired into `RelayFactory`, `RelayMatrix` unreferenced dead code) and were out of scope for this fix, which targeted the shared production mechanism specifically.
+
+## 25. PSU Safety Verification Pattern
+
+Extends the same philosophy (fix the one shared mechanism, not each caller) to PSU/SMU output control.
+
+**The agreed pattern, enable side:**
+```
+Query PSU State -> Verify Current State -> Force Output OFF -> Query PSU State ->
+Verify Output OFF -> Configure PSU -> Enable Output -> Query PSU State -> Verify Output ON
+```
+**Shutdown side:**
+```
+Disable Output -> Query PSU State -> Verify Output OFF
+```
+
+**What already existed (`hardware/smu.py::SMU`, before this change):** `output_disable()` (COMMAND), `verify_output_disabled()` (READBACK+VERIFY, fail-safe: treats "disconnected" as safe/True and a failed query as unsafe/False), and `emergency_output_off(reason)` (the existing public, non-raising Disable -> Query -> Verify shutdown reflex -- already implements the shutdown-side pattern above exactly, unchanged by this work). `source_dc_voltage_point()` (the one real, implemented output-enabling method in the codebase today -- `output_enable()`/`set_charge_mode()`/`set_discharge_mode()` remain TODO placeholders, see `docs/TODO.md`) already did Configure -> Enable -> Query+Verify ON (via `_verify_config_readback("output_enabled", True, readback_output_enabled)`) and Disable -> Query -> Verify OFF in its `finally` teardown -- but, like the relay driver before Section 24's fix, it went straight to configuring/enabling on every call with no pre-check that the PSU was actually starting from a verified-off baseline.
+
+**New (mirroring Section 24's relay methods exactly):**
+
+- `SMU.query_output_state() -> bool | None` -- pure READBACK of `session.output_enabled`, no safety-gate fail-safe assumption (distinct from `verify_output_disabled()`, whose "assume unsafe on failure" default is correct for a safety gate but wrong for a diagnostic record). Returns `None` (not `True`/`False`) when the state genuinely isn't known -- no session, or the query failed. Stores the result on `self.last_known_output_state` (new instance attribute -- "store the queried PSU state internally," e.g. exactly the `output_enabled`/`psu_output_state` naming the requirements suggested).
+- `SMU.check_current_output_state(context: str = "") -> bool | None` -- steps 1-2: calls `query_output_state()`, logs a WARNING if output is unexpectedly already enabled, INFO if already confirmed off, WARNING if the query itself failed. Never raises. Mirrors `check_current_relay_state()` exactly.
+- `SMU.force_output_off_and_verify(context: str = "") -> bool` -- steps 1-2 + 3-4-5 together: calls `check_current_output_state()`, then `output_disable()` + `verify_output_disabled()` (existing, unchanged). Returns `True`/`False`, never raises -- same non-raising contract as `verify_output_disabled()`/`emergency_output_off()`; callers decide whether `False` is fatal for their own workflow.
+- `source_dc_voltage_point()` (modified) -- now calls `force_output_off_and_verify(context="source_dc_voltage_point pre-check")` as its very first action (before the session is configured at all), raising `SMUError` immediately if a safe baseline cannot be verified. This one change covers every real caller today: test.py's SMU Functional Validation and `ProtoTestSequence` (Proto Test Execution) both go through this single method, the same "fix centrally" principle used for the relay driver.
+
+**Verified (mocked NI-DCPower session, no real hardware):** a `source_dc_voltage_point()` call against a session already reporting `output_enabled=True` triggers the pre-check WARNING ("PSU output NOT off before this operation"), forces off + verifies, then proceeds through configure -> enable -> verify-ON exactly as before, with `self.last_known_output_state` correctly tracking `True` (already-on, detected) then `True` again (re-enabled, confirmed) across the call. A second run starting from a genuinely-off session confirms the normal (no pre-existing fault) path and the `finally` teardown still leave the session `output_enabled == False` afterward, unchanged from before this work.
+
+**Compliance status:** the one real PSU-output-enabling path in the codebase (`source_dc_voltage_point()`, and therefore SMU Functional Validation and Proto Test Execution) now implements the full agreed pattern. `output_enable()`/`set_charge_mode()`/`set_discharge_mode()` remain unimplemented placeholders (see `docs/TODO.md`) -- when Charge/Discharge Battery are built on top of them, they should call `force_output_off_and_verify()` first (mirroring `source_dc_voltage_point()`) rather than reinventing the pre-check, so this pattern extends to them automatically once written that way.
+
+## 26. PSU/Relay Cross-Validation (Future)
+
+**Evaluated per Part 3 of the PSU/relay safety review -- deliberately NOT implemented yet, extension points only.**
+
+**The problem this would catch:** an instrument's *reported* state (`session.output_enabled`, or a relay's `readall` bitmask) is a claim from the instrument's own firmware/driver, not an independent physical measurement. It is possible (firmware bug, stuck relay contact, a session attribute that silently didn't commit) for the reported state to disagree with reality:
+- PSU reports ON, but a DMM (or the SMU's own `session.measure()` ADC readback) shows ~0 V.
+- PSU reports OFF, but voltage is still physically present.
+- (Analogously, though considered lower-priority for now -- see below -- a relay reports a channel closed but the routed signal doesn't reflect it.)
+
+**Why PSU, not relay, is the priority extension point:** the relay driver's `readall`/`read` commands are already a direct, positive hardware confirmation of the switch contact itself -- there is no intermediate "reported vs. physical" gap the way there is for a PSU, where `output_enabled` is an internal instrument attribute that may not perfectly track the actual analog output under all fault conditions. This is why `cross_validate_output_state()` (below) was added to `SMU`, and no relay equivalent was added -- not an oversight, a judgment that the relay side's existing `verify_single()`/`verify_all()` readback IS already close to this kind of cross-validation (it reads the bank's actual reported switch state, which is the same signal the switch operation itself commanded), whereas the PSU's `output_enabled` flag and the battery's actual voltage are two genuinely independent signals today.
+
+**Extension point added:** `SMU.cross_validate_output_state(measured_v: float = None, measured_i: float = None)` -- a stub method that currently only raises `NotImplementedError` with a message pointing back to this section. It is never called anywhere in the codebase today. It exists so that when cross-validation IS built, there is one obvious place to put it (comparing `self.last_known_output_state`/`query_output_state()` against a caller-supplied external measurement) rather than requiring a redesign of `SMU`, `source_dc_voltage_point()`, or the PSU safety sequence in Section 25.
+
+**Where a future implementation would plug in, without redesigning anything above:**
+- Inside `source_dc_voltage_point()`, after the existing runtime measurement (`measured_v`/`measured_i`, already captured from `session.measure()`) -- call `cross_validate_output_state(measured_v=measured_v, measured_i=measured_i)` there instead of only logging them as "informational context," once a real accuracy tolerance/threshold is decided.
+- In `test_control/proto_test_sequence.py::ProtoTestSequence`, which already takes an independent DMM reading (`during_hold`) while the SMU's own output is active -- that DMM value is exactly the kind of external measurement `cross_validate_output_state()` is meant to accept once wired in.
+- In a future Charge/Discharge Battery implementation, alongside `force_output_off_and_verify()`/`output_enable()`, using either the DMM (if present) or the SMU's own ADC readback as the independent signal.
+
+**Explicitly not done:** no threshold/tolerance was chosen, no DMM wiring was added, and `cross_validate_output_state()` is not called from anywhere -- this section documents where the hook belongs, per the review's explicit instruction not to implement external validation yet.
