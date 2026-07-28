@@ -493,11 +493,71 @@ current-sourcing battery mode using the same Battery Type/Group/Position
 selection, confirmation screen, and traceability logging Monitor Battery
 established, adding CC-CV charge control on top.
 
+## Milestone II: Menu Restructuring Review
+
+Following a full execution-tree review of `test.py`
+(`docs/EXECUTION_TREE_REVIEW.md`), nine annotated architecture questions
+were addressed. Full rationale for each is in `docs/architecture.md`
+Section 23; summary here:
+
+- **Test Sensors (NTC)** gained a real DAQ-based NTC channel scan (Test 6),
+  iterating every `BATTERY_CHANNELS` position marked `enabled` and reading
+  its `daq_ntc_ch` -- config-driven, no new configuration variable, no
+  hardcoded channel list. Pure-math Tests 1-5 unchanged.
+- **Test Temperature Module** retired as a standalone top-level MENU
+  entry (temperature monitoring now comes through the DAQ NTC path above)
+  -- the function and its Identity Validation check are kept, and Hardware
+  Discovery still reports `TEMP_MODULE`'s presence.
+- **Numato relay timing** reviewed: no hardcoded dwell/sleep exists
+  anywhere in the four relay Functional Validation tests; the differing
+  wall-clock speed between them is an intentional consequence of which
+  API layer each one exercises (public safety-wrapped `close()`/`open()`
+  vs. native `write()`/`verify_all()` primitives) -- not standardized,
+  since doing so would weaken or defeat each test's distinct purpose.
+- **PXI Relay Matrix** future reuse architecture documented (no PXI
+  hardware/driver exists yet, so nothing implemented): `test_relay_matrix_
+  scan()`/`test_relay_safety_selftest()` already operate purely through
+  `RelayFactory`/`RelayBase` and will work against a future `niswitch`
+  driver unchanged once one exists; only the native-primitives test
+  (`test_relay_ethernet_test()`) is Numato-protocol-specific.
+- **Test Safety Monitor** became a workflow-oriented simulator: the
+  original 7 logic unit tests are unchanged, plus a new step-by-step
+  simulation of Monitor/Charge/Discharge/Cycle Battery's phase shape
+  (relay close -> phases -> relay open) using the REAL `SafetyMonitor`
+  logic against simulated measurements -- no hardware, no database writes.
+  Cycle Battery's simulation deliberately injects an overtemperature fault
+  to demonstrate the abort path. Surfaced a pre-existing, already-tracked
+  Settings inconsistency (`DISCHARGE_CUTOFF_V` below `BAT_VOLTAGE_MIN`)
+  while building the Discharge simulation.
+- **Test Configuration** removed from the top-level MENU (redundant with
+  `preflight_check()`, which already runs it automatically at startup) --
+  the function itself is unchanged.
+- **Database Tools** (new, replaces "Test SQLite (foundation)"/"Test
+  Database Layer"): a submenu with 5 new read-only real-database
+  inspection views (Latest Run/Event Log/Measurements/Station State/
+  Statistics) plus the two original temp-DB regression self-tests,
+  relocated unchanged.
+- **Run All Tests** replaced with **UI Test**: a hardware-and-database-free
+  preview of Proto Test/Monitor Battery `ExecutionFrame` screens via
+  hardcoded demo data and the real `render_execution_frame()`; Charge/
+  Discharge/Cycle and a Historical Results Viewer are honestly reported as
+  "not yet implemented" rather than faked. The `fn=None`
+  aggregate-everything dispatch branch was removed alongside it (no
+  MENU entry uses that pattern anymore).
+
+Final top-level MENU count: 13 (was 16) -- see `docs/architecture.md`
+Section 23j for the full before/after list.
+
+Verified: `py_compile` clean; every non-hardware-run MENU entry executed
+via a mocked smoke test with no unhandled exceptions; `Database Tools`'
+inspection views confirmed against the real development database;
+`preflight_check()`/`validate_devices()` unaffected.
+
 ---
 
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
-implementation, and again for Milestone II's Monitor Battery
-implementation. See `docs/TODO.md` for the live remaining-work checklist
-and `docs/architecture.md`/`docs/CONFIGURATION.md` for full technical
-detail on every item referenced above.*
+implementation, Milestone II's Monitor Battery implementation, and the
+Menu Restructuring Review above. See `docs/TODO.md` for the live
+remaining-work checklist and `docs/architecture.md`/`docs/CONFIGURATION.md`
+for full technical detail on every item referenced above.*

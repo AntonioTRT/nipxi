@@ -13,25 +13,31 @@ the bottom, with a pointer to where the real documentation lives
 
 ### Hardware drivers / PXI rack
 
-- [ ] Wire `TEMP_MODULE` (PXIe-4353, slot 15) into a real driver -- this is
-  the most likely real hardware source for the currently-stubbed per-channel
-  `t_c` reading in `charge_cycle.py`/`discharge_cycle.py` (`t_c = None`
-  today). `test_temperature_module()` today only does presence/identity
-  (reusing `hardware.daq.DAQ`) -- no TC/RTD channel read exists. Would need a
-  new NI-DAQmx-based `hardware/temperature.py` (or extend `DAQ`). Once wired
-  in, extend the hardware identity traceability snapshot (`run_summary`'s
-  `smu_name`/`dmm_name`/`daq_name`/`relay_matrix_name` pattern, see
-  `docs/architecture.md` Section 22) with a matching
-  `temp_module_name`/`_resource`/`_model` triplet -- schema is additive, so
-  this is a small follow-up, not a redesign.
+- [ ] `TEMP_MODULE` (PXIe-4353, slot 15) has no real driver, and now has no
+  standalone top-level MENU entry either (retired -- see
+  `docs/architecture.md` Section 23b; `test_temperature_module()`/
+  `_identify_temperature()` still exist and are still covered by Hardware
+  Discovery). Battery temperature monitoring is expected to come entirely
+  through the DAQ NTC path (`test_sensors()`'s Test 6,
+  `BATTERY_CHANNELS[i]["daq_ntc_ch"]`) instead -- if a real TC/RTD-specific
+  need for this module is ever identified, revisit whether it's still
+  worth a driver at all before building one.
 - [ ] Confirm the instrument connected at GPIB0 (`config/devices.py::GPIB_INSTRUMENTS`)
   -- likely the "Programmable Electronic Load" or "Programmable Power Supply"
   from `equipment_Requirement.md`, not yet confirmed. No GPIB driver class
   exists in this codebase.
-- [ ] Decide whether to keep `CHASSIS_RELAY_MATRIX` (PXIe-2569, slot 11)
-  unused, or build a `niswitch`-based driver for it as an alternative to the
-  Numato Ethernet relay -- currently present in the chassis, reported N/A by
-  Hardware Discovery, disabled/unwired.
+- [ ] `niswitch`-based `CHASSIS_RELAY_MATRIX` (PXIe-2569, slot 11) driver --
+  long-term goal is functional parity with the Numato relay validation
+  suite. Architecture reviewed and documented (`docs/architecture.md`
+  Section 23d): `test_relay_matrix_scan()`/`test_relay_safety_selftest()`
+  already operate purely through `RelayFactory`/`RelayBase` and will work
+  against this driver unchanged once it exists; only
+  `test_relay_ethernet_test()` (Numato-native 0-based primitives) would
+  need a PXI-native equivalent, if one is worth building. Steps: (1)
+  `RelayBase`-conforming driver class, (2) a new `RelayFactory.create()`
+  branch, (3) a `PXI_RELAY_MATRIX_CONFIGS`-equivalent enumeration dict in
+  `config/devices.py`, (4) the two generic tests above then work with zero
+  changes.
 - [ ] Multi-SMU/multi-DAQ channel assignment: `HIGH_POWER_SMU`/`AUX_SMU_1`/
   `AUX_SMU_2` and `EXPANSION_DAQ`/`PRECISION_DAQ` are configured and
   individually testable but not yet assigned to any battery channel --
@@ -156,7 +162,11 @@ the bottom, with a pointer to where the real documentation lives
   against NI-MAX on the real machine.
 - [MUST] `config/settings.py` -- confirm `BAT_VOLTAGE_MAX`/`MIN` against the
   battery datasheet; decide `DISCHARGE_CUTOFF_V` (3.0 V) vs `BAT_VOLTAGE_MIN`
-  (3.5 V) -- which is correct?
+  (3.5 V) -- which is correct? Re-surfaced concretely by the new Safety
+  Monitor workflow simulator (`test.py::test_safety_monitor()` Part 2, see
+  `docs/architecture.md` Section 23e): simulating a discharge to
+  `DISCHARGE_CUTOFF_V` directly trips `BAT_VOLTAGE_MIN`'s Undervoltage
+  check every time, since 3.0 V < 3.5 V under the currently-enforced logic.
 - [MUST] Set `RELAY_COM_PORT` to the real COM port if serial relay diagnostics
   are ever used (diagnostic path only).
 
@@ -164,6 +174,16 @@ the bottom, with a pointer to where the real documentation lives
 
 - [ ] Add a `--dry-run` / `PXI_SIMULATE` mode exercising test logic without
   hardware (builds on `hardware/simulated.py` above).
+- [ ] Expand `test.py::test_safety_monitor()`'s Part 2 workflow simulator
+  (see `docs/architecture.md` Section 23e) into a full development/
+  validation harness for Charge/Discharge Battery logic, to exercise it
+  ahead of deploying against real hardware -- this is the explicitly
+  planned next step after the menu restructuring review. Candidates:
+  more injected-fault scenarios (overcurrent, undervoltage, relay-switch
+  guard mid-workflow), wiring the same simulated values through
+  `ExecutionFrame`/`render_execution_frame()` for a full mock execution
+  screen, or driving the simulator from `BATTERY_CONFIGS`' actual per-type
+  limits instead of only `Settings.BAT_*`.
 - [ ] Create `flowcharts/vi_flowchart.md` (referenced in `docs/architecture.md`
   but does not exist yet).
 - [ ] Set up a remote Git repository and update `README.md` with the URL.
@@ -302,6 +322,26 @@ first real-rack hardware bring-up milestone record.
   No new table; verified with mocked smoke tests (traceability precedes
   relay activation for both test types) and real-DB round-trip/migration
   tests. See `docs/architecture.md` Section 22.
+- **Menu Restructuring Review** -- full `test.py` execution-tree review
+  (`docs/EXECUTION_TREE_REVIEW.md`) followed by nine architectural
+  decisions: `test_sensors()` gained a DAQ-based NTC channel scan
+  (config-driven via `BATTERY_CHANNELS`' existing `enabled` flag); "Test
+  Temperature Module" retired as a standalone MENU entry (DAQ covers
+  temperature now; function/Hardware Discovery coverage kept); Numato
+  relay timing differences reviewed and confirmed intentional (no code
+  change); PXI Relay Matrix future reuse architecture documented (no
+  driver exists yet); "Test Safety Monitor" became a workflow-oriented
+  simulator (Part 2: step-by-step Monitor/Charge/Discharge/Cycle Battery
+  phase simulation against the real `SafetyMonitor` logic, no hardware/DB);
+  "Test Configuration" removed (redundant with `preflight_check()`); "Test
+  SQLite"/"Test Database Layer" consolidated into a new "Database Tools"
+  submenu with 5 new real-database read-only inspection views; "Run All
+  Tests" replaced with "UI Test" (hardware/DB-free `ExecutionFrame` demo
+  screens via the real `render_execution_frame()`). Top-level MENU count:
+  16 -> 13. Verified: `py_compile` clean, every non-hardware-run MENU
+  entry smoke-tested with no unhandled exceptions, Database Tools views
+  confirmed against the real development database. See
+  `docs/architecture.md` Section 23 and `docs/MILESTONES.md`.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies

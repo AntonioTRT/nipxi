@@ -1519,3 +1519,108 @@ Standalone callers (`scope_label=None`, no scope selection happened) print no ba
 **Future multi-group/multi-instrument alignment:** `relay_matrix_name`/`relay_matrix_resource` already vary per run based on whichever `relay_cfg` was actually connected -- when Group B/`MATRIX_NUMATO_202` (or a second SMU/DAQ for a future group) comes online, no schema change is needed; only the caller's cfg-resolution logic (already group-aware via `BATTERY_GROUPS`) needs to pass the correct `relay_cfg`/`smu_cfg`/`daq_cfg` into `HardwareManager`/`_hardware_snapshot_fields()`, which already exist as the single point of resolution.
 
 **Not yet done / explicitly out of scope:** `TEMP_MODULE` identity (no driver wired in yet -- nothing to capture); Charge/Discharge/Cycle Battery hardware traceability (menu placeholders only, not implemented); a queryable multi-instrument-per-run model (not needed today, since exactly one of each role is ever connected per run).
+
+## 23. Menu Restructuring Review (post `docs/EXECUTION_TREE_REVIEW.md` annotations)
+
+Following a full execution-tree review of `test.py` (`docs/EXECUTION_TREE_REVIEW.md`), nine annotated architectural questions were reviewed and acted on. Each is documented below with the decision made and the rationale.
+
+### 23a. NTC Sensor Acquisition -- DAQ Architecture
+
+**Decision: implemented.** `test_sensors()` gained a new Test 6: a real DAQ-based NTC channel scan, iterating every `config/devices.py::BATTERY_CHANNELS` entry whose existing `enabled` flag is `True` and reading its existing `daq_ntc_ch` field via `hardware/daq.py::DAQ.read_channel()`, converting each reading with the existing `ntc_voltage_to_celsius()`. No new configuration variable was introduced -- `enabled`/`daq_ntc_ch` already existed per position (added during the Monitor Battery/hardware-traceability work) and are reused directly, satisfying "config-driven, no hardcoded channel list" without a duplicate source of truth. Tests 1-5 (pure NTC-thermistor math, no hardware) are unchanged -- this is additive, not a replacement, so the menu item still completes cleanly on a laptop with no DAQ attached (Test 6 reports a clean per-channel FAIL with reason in that case, never raises).
+
+This IS the future DAQ acquisition architecture: temperature monitoring is expected to come entirely through this per-position DAQ NTC channel path, not through a separate module -- see 23b below.
+
+### 23b. Test Temperature Module -- Retired as a Standalone Menu Entry
+
+**Decision: retired from the top-level `MENU`, function kept.** The PXIe-4353 Temperature Module (`TEMP_MODULE`) has never had a thermocouple/RTD channel driver and none is planned now that 23a's DAQ path covers per-position battery temperature. `test_temperature_module()`/`_identify_temperature()` are NOT deleted -- `test_hardware_discovery()` (MENU item 4) still reports `TEMP_MODULE`'s presence/identity via `_identify_temperature()` unchanged, and the standalone function remains callable directly for one-off bring-up diagnosis. Only its own top-level `MENU` slot was removed, since it duplicated ground Hardware Discovery already covers and offered no Functional Validation (none is planned).
+
+### 23c. Numato Relay Matrix -- Timing/Delay Review (no code change)
+
+**Reviewed, no inconsistency found requiring a fix.** There is no hardcoded `time.sleep()`/dwell/settle timer anywhere in `test_relay_numato_matrix()`, `test_relay_matrix_scan()`, `test_relay_ethernet_test()`, or `test_relay_safety_selftest()` (confirmed by exhaustive search) -- the perceived difference in "wait time between switching" across these four tests is entirely a function of how many Telnet round trips each one issues per channel, which is intentional:
+
+- **`test_relay_matrix_scan()`/`test_relay_safety_selftest()`** use the public 1-based `close()`/`open()` API, which by design (`hardware/relay_eth.py`'s mandatory safety sequence) re-runs force-all-off + verify-all-off + activate + verify-single + verify-all on **every single relay operation, for every channel** -- the most Telnet round trips per channel, and deliberately so: "never touch a relay without first forcing a known, verified all-off baseline" is a safety requirement, not an accidental inefficiency.
+- **`test_relay_ethernet_test()`** uses the native 0-based primitives (`write()`/`write_all()`/`verify_all()`) directly, bypassing `close()`'s extra individual-verification step -- fewer round trips per channel, because this test's entire purpose is validating the native command layer independent of the safety wrapper above it.
+- **`test_relay_numato_matrix()`** ("Relay 1 quick check") only ever touches one channel, so its total wall-clock time is naturally the shortest regardless of which API layer it uses.
+
+**Recommendation: do not standardize.** Collapsing these to one uniform round-trip count would either weaken the safety-wrapper test's mandatory baseline-first behavior, or stop the native-primitive test from exercising the layer it exists to validate. The four tests intentionally exercise four different things (one channel via the safety wrapper, every channel via the safety wrapper, every channel via native primitives, and a scoped subset via the safety wrapper) -- differing speed is the correct, expected signature of that, not an inconsistency. No code was changed for this item.
+
+### 23d. Test PXI Relay Matrix -- Future Reuse Architecture (no code change, no driver exists)
+
+**Reviewed and documented; not implemented (no PXI relay hardware exists to validate against, and this project's testing philosophy is to never fake a check against hardware that isn't there).** The good news found during review: most of the "Numato relay validation suite" is **already** hardware-agnostic and would apply to a future PXI/`niswitch` relay driver with zero changes:
+
+- `test_relay_matrix_scan()` and `test_relay_safety_selftest()` operate entirely through `hardware.relay_factory.RelayFactory.create(cfg)` and the generic `RelayBase` interface (`close()`/`open()`/`read()`/`open_all()`) -- neither references anything Numato-specific. Once a PXI relay driver class implements `RelayBase` and `RelayFactory.create()` gains a branch for its config `"type"` (e.g. `"pxi_switch"`), these two tests work against it unchanged, exactly as they already work identically against `MATRIX_NUMATO_201`/`MATRIX_NUMATO_202` today.
+- Only `test_relay_ethernet_test()` (native 0-based Numato primitives: `write()`/`write_all()`/`verify_all()`) is genuinely Numato-protocol-specific and would NOT apply to a PXI relay -- a future PXI-native equivalent (if the `niswitch` driver exposes comparable native primitives) would need its own dedicated test, following the same "test the native layer independently of the generic `RelayBase` wrapper" pattern, not reusing this function's body.
+- `_functional_relay_numato()`'s 4-option submenu shape (device-agnostic wrapper picking Identity vs. Functional Validation, then a menu of specific checks) is itself the reusable pattern -- a future `_functional_pxi_relay()` should mirror that shape (quick single-channel check / scoped matrix scan / native-primitive test / safety self-test) rather than inventing a new submenu style.
+
+**Recommended path when PXI relay hardware/driver work begins:** (1) implement a `niswitch`-based driver class satisfying `RelayBase`, (2) add a `"pxi_switch"` (or similar) branch to `RelayFactory.create()`, (3) add a `PXI_RELAY_MATRIX_CONFIGS`-equivalent enumeration dict in `config/devices.py` (mirroring `NUMATO_RELAY_MATRIX_CONFIGS`), (4) `test_relay_matrix_scan()`/`test_relay_safety_selftest()` then work against it with **zero changes** to those two functions, (5) build a native-primitives test only if the `niswitch` API has an equivalent worth validating independently. `test_pxi_relay_matrix()`'s Identity Validation (`_identify_switch()`) and its "not yet implemented" Functional Validation remain exactly as-is until step 1 exists.
+
+### 23e. Safety Monitor Workflow Simulator
+
+**Decision: implemented.** `test_safety_monitor()` (MENU item 11, now labeled "Test Safety Monitor (workflow simulator)") keeps its original 7 pure-logic unit tests (Part 1, unchanged) and gains a new Part 2: a step-by-step workflow simulator (`_simulate_all_workflows()`/`_run_workflow_simulation()`/`_simulate_step()`) that walks through the same phase-by-phase shape Monitor Battery/Charge Battery/Discharge Battery/Cycle Battery use -- PRE-CHECK -> RELAY_CLOSE -> (workflow-specific phases) -> RELAY_OPEN -- calling the **real** `SafetyMonitor.check()`/`is_safe_to_switch_relay()` logic against **simulated** measurement values at each step. No hardware, no relay, no `HardwareManager`, no `DataStorage`, no database writes anywhere in this path.
+
+For each step, the console displays: current phase, current state, the simulated measurement, the exact safety check invoked and its result, the decision (CONTINUE/ABORT), and a WARNING line whenever a check fails -- directly satisfying the requested visibility (phase/state/checks/decisions/warnings/abort/pass-fail).
+
+Four scenarios are simulated:
+- **Monitor Battery** -- mirrors `MonitorBatterySequence`'s actual phase shape (relay close, repeated monitoring samples, relay open). Expected: PASS.
+- **Charge Battery** / **Discharge Battery** -- since neither is implemented yet, these simulate the *intended* shape (CC -> CV taper -> cutoff; CC discharge -> cutoff), reusing the already-configured real constants (`Settings.CHARGE_VOLTAGE_V`/`CHARGE_CURRENT_A`/`CHARGE_CUTOFF_A`/`DISCHARGE_CURRENT_A`) rather than inventing new hardcoded values. Expected: PASS.
+- **Cycle Battery** -- one charge phase followed by a discharge phase with a deliberately-injected overtemperature reading, to demonstrate the abort path explicitly. Expected (and verified): the simulation **correctly aborts** at that phase -- this is reported as a PASS ("correctly aborted"), not a failure, since aborting on an unsafe reading is the desired behavior.
+
+**A real Settings inconsistency was surfaced while building the Discharge simulation**: `Settings.DISCHARGE_CUTOFF_V` (3.0 V) is itself below `Settings.BAT_VOLTAGE_MIN` (3.5 V, the value `SafetyMonitor.check()` actually enforces) -- already tracked in `docs/TODO.md` ("decide `DISCHARGE_CUTOFF_V` vs `BAT_VOLTAGE_MIN` -- which is correct?"). Using `DISCHARGE_CUTOFF_V` directly in the simulation would make it always abort on Undervoltage, misrepresenting the simulator as broken. The simulation's cutoff step instead stops at `max(DISCHARGE_CUTOFF_V, BAT_VOLTAGE_MIN) + 0.05` -- documented inline as a workaround, not a silent fix of the underlying Settings values (still tracked separately in `docs/TODO.md`).
+
+This is explicitly the first step toward the "development and validation tool" the next planned task will expand before Charge/Discharge logic is deployed to real hardware (per the user's stated intent) -- the phase-list-driven design (`steps: list[dict]` consumed by one generic `_run_workflow_simulation()` engine) is deliberately structured so a future iteration can add more phases, more injected-fault scenarios, or wire the same engine's simulated values through to `ExecutionFrame`/`render_execution_frame()` (see Section 23i) without inventing a second simulator framework.
+
+### 23f. Test Configuration -- Removed from MENU
+
+**Decision: removed the standalone MENU entry; function unchanged.** `test_configuration()` already runs automatically inside `preflight_check()` before the menu is ever shown -- the standalone MENU entry only ever repeated that same check on demand. Per explicit review direction, the top-level entry was removed; `test_configuration()` itself is untouched and `preflight_check()`'s call to it is unaffected (config validation still gates startup exactly as before).
+
+### 23g. Database Tools (replaces "Test SQLite (foundation)" + "Test Database Layer")
+
+**Decision: implemented.** The two standalone top-level entries were consolidated into one new MENU item, **Database Tools** (`test_database_tools()`), with a 7-option submenu (same style as `_functional_relay_numato()`'s options-list pattern -- no new submenu framework):
+
+1. View Latest Run (`run_summary`)
+2. View Latest Event Log (`event_log`)
+3. View Latest Measurements (`measurements`)
+4. View Station State -- last execution (`station_state`)
+5. Database Statistics -- row counts per table + file size
+6. Run Storage Layer Self-Test -- the original `test_database()`, unchanged, temp DB
+7. Run SQLite Foundation Self-Test -- the original `test_sqlite()`, unchanged, temp DB
+
+Options 1-5 are new: read-only inspection of the **real** project database (`Settings.DATABASE_FILE` -- the same file Monitor Battery/Proto Test Execution actually write to), built entirely on `DataStorage`'s existing read methods (`get_last_run_summary()`/`get_recent_events()`/`get_measurements()`/`get_last_execution_state()`) -- no new read path, no new storage mechanism. A helper, `_open_real_storage_readonly()`, opens `DataStorage` against the real database file and returns `None` (printing a clear message) if the file doesn't exist yet, rather than creating one -- a "view" must never mutate the real database as a side effect of looking at it. Options 6-7 are the original functions, unchanged, simply relocated into this submenu instead of their own top-level slots (see 23h).
+
+### 23h. Test Database Layer -- Merged into Database Tools
+
+**Decision: implemented as part of 23g.** `test_database()` is no longer a standalone top-level MENU entry -- it is submenu option 6 under Database Tools, called with the exact same function, unchanged. This directly answers the review question: yes, it should be (and now is) a submenu within the consolidated database-tools area rather than a standalone entry.
+
+### 23i. UI Test (replaces "Run All Tests")
+
+**Decision: implemented.** "Run All Tests" (the `fn=None` MENU entry that aggregated every other menu item into one combined summary) was replaced with **UI Test** (`test_ui_preview()`), a hardware-and-database-free preview environment. Every option builds a demo `ExecutionFrame` via `ExecutionFrame.from_live()` with hardcoded, clearly-labeled sample values, then renders it through the exact same `render_execution_frame()` Proto Test Execution/Monitor Battery use live -- this previews the real renderer against static data, it is never a second UI implementation:
+
+1. Proto Test Execution screen (demo data)
+2. Monitor Battery screen (demo data)
+3. Charge/Discharge/Cycle Battery screens -- reported as "not yet implemented" (no real workflow exists to preview)
+4. Historical Results Viewer style screens -- reported as "not yet implemented" (no Historical Results Viewer has been built yet; faking one would misrepresent a feature that doesn't exist)
+
+No `HardwareManager`, no `DataStorage`, no relay, no SMU/DMM/DAQ import anywhere in this code path -- verified by inspection and by the mocked smoke test that ran every MENU entry with `input()` returning `"0"`/a chosen index.
+
+**Trade-off, called out explicitly:** removing "Run All Tests" also removes the one-button "run every menu item and summarize" regression convenience this project's session-verification workflow has used throughout Milestone II. `_dispatch_menu_choice()`'s `fn is None` aggregation branch was removed alongside it (no MENU entry has `fn=None` anymore) rather than left as unreachable dead code -- consistent with `docs/EXECUTION_TREE_REVIEW.md`'s "Remove candidates" finding about not leaving unreachable code behind. If a "run everything and summarize" capability is wanted again in the future, `run_section()`/`print_summary()` (still used by every individual MENU entry) remain available to rebuild it.
+
+### 23j. Updated Final Menu Structure
+
+```
+1.  Run Main Test
+2.  Proto Test Execution (infrastructure validation, no battery)
+3.  Startup Device Validation (config/devices.py -- no hardware I/O)
+4.  Hardware Discovery (connectivity + identification, config-driven)
+5.  Test SMU (PSU)
+6.  Test DMM
+7.  Test DAQ
+8.  Test Numato Relay Matrix (Ethernet)
+9.  Test PXI Relay Matrix
+10. Test Sensors (NTC)                          -- now includes a DAQ-based NTC scan (Test 6)
+11. Test Safety Monitor (workflow simulator)     -- now includes 4 workflow simulations
+12. Database Tools                               -- NEW, replaces items 14+15 below
+13. UI Test (demo screens -- no hardware, no database)  -- replaces "Run All Tests"
+0.  Exit
+```
+
+Removed from the top level: **Test Temperature Module** (retired -- 23b; function still callable, still covered by Hardware Discovery), **Test Configuration** (removed -- 23f; function still called by `preflight_check()`), **Test SQLite (foundation)** and **Test Database Layer** (merged into Database Tools -- 23g/23h), **Run All Tests** (replaced by UI Test -- 23i).

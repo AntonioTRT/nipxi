@@ -1120,17 +1120,20 @@ def _functional_daq(name: str, cfg: dict):
 
 def test_temperature_module():
     """
-    Menu entry for the Temperature Module hardware category (PXIe-4353,
-    config/devices.py::PXI_SLOTS, category="temperature"). Routes to
-    Identity Validation (_identify_temperature -- presence/identity only,
-    via the shared _run_hardware_category() workflow. No Functional
-    Validation is implemented yet -- no thermocouple/RTD channel read
-    driver exists (see PXI_SLOTS[15]'s validation_notes and docs/TODO.md),
-    so the menu reports "not yet implemented" instead of faking one.
-
-    NOT the same thing as "Test Sensors (NTC)" (test_sensors(), which
-    exercises hardware/temperature.py's pure NTC-thermistor math offline,
-    with no hardware I/O at all). This is real hardware, no math.
+    RETIRED as a standalone top-level MENU entry (see docs/architecture.md
+    "NTC Sensor Acquisition -- DAQ Architecture" / docs/MILESTONES.md):
+    battery temperature monitoring is expected to come entirely through the
+    per-position DAQ NTC channel path (BATTERY_CHANNELS[i]["daq_ntc_ch"],
+    see test_sensors()'s Test 6), never through this separate PXIe-4353
+    module -- no thermocouple/RTD channel driver has ever existed for it
+    (see PXI_SLOTS[15]'s validation_notes), and none is planned now that the
+    DAQ path covers the same need. The function/identify check are kept
+    (not deleted) since the card is still physically present in the rack
+    and `test_hardware_discovery()` (MENU item 4) still reports its
+    presence/identity via `_identify_temperature()` -- this function is
+    simply no longer wired into its own top-level MENU slot. Call directly
+    (`test_temperature_module()`) for the old standalone Identity
+    Validation workflow if ever needed for one-off bring-up diagnosis.
     """
     devices = _pxi_slots_by_category("temperature")
     return _run_hardware_category("Temperature Module", devices, _identify_temperature)
@@ -2042,9 +2045,34 @@ def test_pxi_relay_matrix():
 
 def test_sensors():
     """
-    Exercises hardware.temperature module logic without hardware.
-    Tests: 25 degC reference point, out-of-range guard, monotonicity.
-    Also tests TemperatureSensor class interface.
+    Two parts:
+
+    Part 1 (Tests 1-5, unchanged): exercises hardware/temperature.py's pure
+    NTC-thermistor math offline -- 25 degC reference point, out-of-range
+    guards, monotonicity, TemperatureSensor class interface. No hardware.
+
+    Part 2 (Test 6, DAQ-based): reads every ENABLED NTC channel through the
+    real DAQ (hardware/daq.py::DAQ.read_channel()) and converts each reading
+    via ntc_voltage_to_celsius() -- this is the future battery-temperature
+    acquisition architecture (see docs/architecture.md "NTC Sensor
+    Acquisition -- DAQ Architecture"): temperature monitoring is expected to
+    come entirely through this per-position DAQ channel path, NOT through a
+    separate Temperature Module (PXIe-4353/TEMP_MODULE, see
+    test_temperature_module()'s retirement note).
+
+    Which NTC channels are "enabled" is config-driven, reusing the SAME
+    per-position `enabled` flag and `daq_ntc_ch` field config/devices.py::
+    BATTERY_CHANNELS already carries (no new/duplicate configuration
+    variable introduced) -- this test iterates
+    `{i: ch for i, ch in BATTERY_CHANNELS.items() if ch["enabled"]}` rather
+    than any hardcoded channel list or count. Disabling a position in
+    BATTERY_CHANNELS (e.g. while its wiring is unconfirmed) automatically
+    removes it from this scan with no code change here.
+
+    Test 6 requires a real DAQ and is reported per-channel (PASS/FAIL) --
+    a missing/unreachable DAQ fails every channel with a clear reason
+    rather than raising, so this menu item still completes cleanly on a
+    laptop with no rack attached (Part 1 always runs regardless).
     """
     config_ref = "hardware/temperature.py  Beta=3950 K  R25=10 kOhm  Vcc=3.3 V"
     results    = []
@@ -2114,17 +2142,224 @@ def test_sensors():
     except Exception as e:
         results.append(_fail("Sensors", "TemperatureSensor class", config_ref, str(e)))
 
+    # Test 6: DAQ-based NTC channel scan -- the future battery-temperature
+    # acquisition architecture. Iterates every ENABLED BATTERY_CHANNELS
+    # entry's daq_ntc_ch -- config-driven, never a hardcoded channel list.
+    enabled_channels = {i: ch for i, ch in dev_cfg.BATTERY_CHANNELS.items() if ch.get("enabled")}
+    if not enabled_channels:
+        results.append(_warn("Sensors", "NTC DAQ scan", config_ref,
+                             "No enabled BATTERY_CHANNELS entries -- nothing to scan"))
+        return results
+
+    daq_cfg = dev_cfg.DAQ_CONFIG
+    daq_ref = f"{daq_cfg.get('resource', '')} / {daq_cfg.get('model', 'NI-6363')}"
+    from hardware.daq import DAQ
+    daq = DAQ(daq_cfg)
+    try:
+        daq.connect()
+    except Exception as e:
+        for i in enabled_channels:
+            results.append(_fail("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
+                                 f"[ERROR] DAQ not detected or connect failed\nReason: {e}"))
+        return results
+
+    try:
+        for i, ch in enabled_channels.items():
+            ntc_ch = ch["daq_ntc_ch"]
+            try:
+                v = daq.read_channel(ntc_ch)
+                t_c = ntc_voltage_to_celsius(v)
+                if t_c is None:
+                    results.append(_warn("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
+                                         f"Channel {ntc_ch}: {v:.4f} V -- out of NTC divider range "
+                                         f"(0 < V < {NTC_VCC} V), no valid temperature"))
+                else:
+                    results.append(_ok("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
+                                       f"Channel {ntc_ch}: {v:.4f} V -> {t_c:.2f} degC"))
+            except Exception as e:
+                results.append(_fail("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
+                                     f"Channel {ntc_ch} read failed: {e}"))
+    finally:
+        try:
+            daq.disconnect()
+        except Exception:
+            pass
+
     return results
 
 
 # =============================================================================
 # 7. Safety Monitor  (real logic, no hardware required)
 # =============================================================================
+#
+# Part 2 of this menu item (below the unit tests) is a workflow-oriented
+# SIMULATOR: it walks the same phase-by-phase shape Monitor Battery/Charge
+# Battery/Discharge Battery/Cycle Battery use (relay close -> phase
+# transitions -> relay open), calling the REAL SafetyMonitor.check()/
+# is_safe_to_switch_relay() logic against SIMULATED measurements -- no
+# hardware, no relay, no database writes. See docs/architecture.md "Safety
+# Monitor Workflow Simulator" -- this is deliberately the first step toward
+# a development/validation harness for exercising Charge/Discharge logic
+# before it is ever run against real hardware.
+
+def _simulate_step(monitor, phase: str, state: str, voltage_v: float, current_a: float,
+                    temp_c: float = None, relay_switch_check: bool = False):
+    """
+    Print one simulated workflow step and run the REAL SafetyMonitor
+    check(s) against the simulated values -- never touches hardware or a
+    database, only console output plus the real safety logic. Returns
+    (safe: bool, reason: str | None).
+    """
+    print(f"\n  Phase: {phase}")
+    print(f"  State: {state}")
+    temp_display = "N/A" if temp_c is None else f"{temp_c:.1f} degC"
+    print(f"  Simulated Measurement: V={voltage_v:.3f} V  I={current_a:.3f} A  T={temp_display}")
+
+    if relay_switch_check:
+        rs_ok = monitor.is_safe_to_switch_relay(current_a)
+        print(f"  Safety Check: is_safe_to_switch_relay(I={current_a:.3f} A) -> {rs_ok}")
+        if not rs_ok:
+            reason = f"Relay switch blocked -- current {current_a:.3f} A not near zero"
+            print(f"  WARNING: {reason}")
+            print("  Decision: ABORT")
+            return False, reason
+
+    s = monitor.check(voltage_v=voltage_v, current_a=current_a, temp_c=temp_c)
+    reason_note = f"  reason={s.reason}" if not s.safe else ""
+    print(f"  Safety Check: check(V={voltage_v:.3f}, I={current_a:.3f}, T={temp_c}) "
+          f"-> safe={s.safe}{reason_note}")
+    if s.safe:
+        print("  Decision: CONTINUE")
+    else:
+        print(f"  WARNING: {s.reason}")
+        print("  Decision: ABORT")
+    return s.safe, (None if s.safe else s.reason)
+
+
+def _run_workflow_simulation(monitor, workflow_name: str, steps: list, expect_abort: bool = False):
+    """
+    Walk `steps` (phase/state/voltage_v/current_a/temp_c/relay_switch_check
+    dicts) in order via _simulate_step(), stopping immediately on the first
+    unsafe result -- the same "stop at first failure, never continue"
+    discipline ProtoTestSequence/MonitorBatterySequence/the relay safety
+    self-test all already use. `expect_abort=True` marks a scenario that
+    deliberately injects an unsafe reading to demonstrate the abort path --
+    aborting there is the CORRECT outcome, not a failure.
+    """
+    print(f"\n{'-' * 60}")
+    print(f"  Workflow Simulation: {workflow_name}")
+    print(f"{'-' * 60}")
+    config_ref = "test_control/safety_monitor.py (simulated measurements, no hardware)"
+
+    for step in steps:
+        safe, reason = _simulate_step(
+            monitor, step["phase"], step["state"], step["voltage_v"], step["current_a"],
+            step.get("temp_c"), relay_switch_check=step.get("relay_switch_check", False),
+        )
+        if not safe:
+            if expect_abort:
+                return _ok("Safety Monitor Simulation", workflow_name, config_ref,
+                           f"Correctly aborted at phase '{step['phase']}' -- {reason}")
+            return _fail("Safety Monitor Simulation", workflow_name, config_ref,
+                         f"Unexpected abort at phase '{step['phase']}' -- {reason}")
+
+    if expect_abort:
+        return _fail("Safety Monitor Simulation", workflow_name, config_ref,
+                     "Expected an abort during this scenario, but every phase passed")
+    return _ok("Safety Monitor Simulation", workflow_name, config_ref,
+               f"All {len(steps)} phases completed -- PASS")
+
+
+def _monitor_battery_simulation_steps():
+    """Mirrors test_control/monitor_battery_sequence.py::MonitorBatterySequence's
+    actual phase shape: relay close -> repeated monitoring samples -> relay open."""
+    return [
+        {"phase": "PRE-CHECK",   "state": "IDLE",      "voltage_v": 3.70, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True},
+        {"phase": "RELAY_CLOSE", "state": "ACTIVE",    "voltage_v": 3.70, "current_a": 0.0, "temp_c": 25.0},
+        {"phase": "MONITORING",  "state": "ACTIVE",    "voltage_v": 3.71, "current_a": 0.0, "temp_c": 25.2},
+        {"phase": "MONITORING",  "state": "ACTIVE",    "voltage_v": 3.69, "current_a": 0.0, "temp_c": 25.1},
+        {"phase": "RELAY_OPEN",  "state": "COMPLETED", "voltage_v": 3.69, "current_a": 0.0, "temp_c": 25.1, "relay_switch_check": True},
+    ]
+
+
+def _charge_battery_simulation_steps():
+    """Simulated INTENDED shape for the not-yet-implemented Charge Battery
+    workflow (CC -> CV taper -> cutoff), reusing the already-configured
+    real charge constants (Settings.CHARGE_VOLTAGE_V/CHARGE_CURRENT_A/
+    CHARGE_CUTOFF_A) -- no new hardcoded values invented for this."""
+    return [
+        {"phase": "PRE-CHECK",      "state": "IDLE",      "voltage_v": 3.60, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True},
+        {"phase": "RELAY_CLOSE",    "state": "ACTIVE",    "voltage_v": 3.60, "current_a": 0.0, "temp_c": 25.0},
+        {"phase": "CC_CHARGE",      "state": "ACTIVE",    "voltage_v": 3.95, "current_a": Settings.CHARGE_CURRENT_A, "temp_c": 27.0},
+        {"phase": "CV_TAPER",       "state": "ACTIVE",    "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": Settings.CHARGE_CURRENT_A * 0.3, "temp_c": 28.0},
+        {"phase": "CUTOFF_DETECTED","state": "ACTIVE",    "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": Settings.CHARGE_CUTOFF_A, "temp_c": 27.5},
+        {"phase": "RELAY_OPEN",     "state": "COMPLETED", "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": 0.0, "temp_c": 27.0, "relay_switch_check": True},
+    ]
+
+
+def _discharge_battery_simulation_steps():
+    """Simulated INTENDED shape for the not-yet-implemented Discharge
+    Battery workflow (CC discharge -> cutoff), reusing
+    Settings.DISCHARGE_CURRENT_A.
+
+    NOTE: Settings.DISCHARGE_CUTOFF_V (3.0 V) is itself BELOW
+    Settings.BAT_VOLTAGE_MIN (3.5 V, the value SafetyMonitor.check()
+    actually enforces) -- a pre-existing configuration inconsistency
+    already tracked in docs/TODO.md ("decide DISCHARGE_CUTOFF_V vs
+    BAT_VOLTAGE_MIN -- which is correct?"). Using DISCHARGE_CUTOFF_V
+    directly here would make this simulation always abort on Undervoltage,
+    which would misrepresent the simulator as broken rather than surfacing
+    a Settings inconsistency outside this task's scope. The cutoff step
+    below therefore stops at whichever value is actually enforced today
+    (max(DISCHARGE_CUTOFF_V, BAT_VOLTAGE_MIN) + a small margin) -- fixing
+    the underlying Settings values is tracked separately in docs/TODO.md,
+    not silently changed here.
+    """
+    cutoff_v = max(Settings.DISCHARGE_CUTOFF_V, Settings.BAT_VOLTAGE_MIN) + 0.05
+    return [
+        {"phase": "PRE-CHECK",      "state": "IDLE",      "voltage_v": 4.10, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True},
+        {"phase": "RELAY_CLOSE",    "state": "ACTIVE",    "voltage_v": 4.10, "current_a": 0.0, "temp_c": 25.0},
+        {"phase": "CC_DISCHARGE",   "state": "ACTIVE",    "voltage_v": 3.80, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 26.0},
+        {"phase": "CC_DISCHARGE",   "state": "ACTIVE",    "voltage_v": 3.60, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 27.0},
+        {"phase": "CUTOFF_DETECTED","state": "ACTIVE",    "voltage_v": cutoff_v, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 27.0},
+        {"phase": "RELAY_OPEN",     "state": "COMPLETED", "voltage_v": cutoff_v, "current_a": 0.0, "temp_c": 26.5, "relay_switch_check": True},
+    ]
+
+
+def _cycle_battery_simulation_steps_with_fault():
+    """One charge phase followed by a discharge phase that deliberately
+    injects an overtemperature reading -- demonstrates the abort decision
+    path a real Cycle Battery workflow must also take."""
+    steps = list(_charge_battery_simulation_steps())
+    steps.append({"phase": "CYCLE_COUNT", "state": "ACTIVE",
+                  "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": 0.0, "temp_c": 27.0})
+    steps.append({"phase": "CC_DISCHARGE", "state": "ACTIVE",
+                  "voltage_v": 3.80, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 26.0})
+    steps.append({"phase": "CC_DISCHARGE", "state": "ACTIVE",
+                  "voltage_v": 3.60, "current_a": Settings.DISCHARGE_CURRENT_A,
+                  "temp_c": Settings.BAT_TEMP_MAX_C + 5.0})  # deliberately injected fault
+    return steps
+
+
+def _simulate_all_workflows(monitor):
+    """Runs all four workflow simulations and returns their TestResult list."""
+    return [
+        _run_workflow_simulation(monitor, "Monitor Battery", _monitor_battery_simulation_steps()),
+        _run_workflow_simulation(monitor, "Charge Battery (simulated -- not yet implemented on real hardware)",
+                                 _charge_battery_simulation_steps()),
+        _run_workflow_simulation(monitor, "Discharge Battery (simulated -- not yet implemented on real hardware)",
+                                 _discharge_battery_simulation_steps()),
+        _run_workflow_simulation(monitor, "Cycle Battery (simulated -- injected overtemperature fault)",
+                                 _cycle_battery_simulation_steps_with_fault(), expect_abort=True),
+    ]
+
 
 def test_safety_monitor():
     """
-    Exercise test_control/safety_monitor.SafetyMonitor logic.
-    Tests: overvoltage, undervoltage, overcurrent, overtemperature, relay switch guard.
+    Part 1: exercise test_control/safety_monitor.SafetyMonitor's pure logic
+    directly -- overvoltage, undervoltage, overcurrent, overtemperature,
+    relay switch guard. Part 2 (below): a step-by-step workflow simulator
+    -- see the module comment above this function.
     """
     config_ref = "test_control/safety_monitor.py"
     results    = []
@@ -2203,6 +2438,9 @@ def test_safety_monitor():
     else:
         results.append(_fail("Safety Monitor", "relay switch guard", config_ref,
                              f"below threshold: {below}, above threshold: {above}"))
+
+    # Part 2: workflow simulation -- see module comment above this function.
+    results.extend(_simulate_all_workflows(monitor))
 
     return results
 
@@ -2395,6 +2633,212 @@ def test_database():
 
 
 # =============================================================================
+# 8b. Database Tools -- real-database inspection + regression self-tests
+#
+# Consolidates the previous "Test SQLite (foundation)"/"Test Database
+# Layer" top-level MENU entries into one submenu (see
+# docs/architecture.md "Database Tools"). Options 1-5 are read-only
+# inspection of the REAL project database (Settings.DATABASE_FILE -- the
+# same file Monitor Battery/Proto Test Execution write to), reusing
+# DataStorage's existing read methods (get_last_run_summary()/
+# get_measurements()/get_recent_events()/get_last_execution_state()) --
+# no new read path, no new storage mechanism. Options 6-7 are the original
+# test_database()/test_sqlite() temp-directory regression self-tests,
+# unchanged, just relocated here instead of their own top-level MENU slots.
+# =============================================================================
+
+def _open_real_storage_readonly():
+    """
+    Open DataStorage against the REAL, mode-specific database
+    (Settings.DATABASE_FILE) for read-only inspection. Returns None if the
+    file doesn't exist yet (no runs recorded) rather than creating one --
+    a "view" option must never create the real database as a side effect
+    of merely looking at it. (DataStorage.open()'s additive schema
+    migration on an EXISTING file is the same safe, idempotent behavior
+    every other real caller already relies on -- see data/storage.py's
+    _migrate_add_missing_columns().)
+    """
+    if not os.path.exists(Settings.DATABASE_FILE):
+        print(f"\n  No database found at {Settings.DATABASE_FILE} -- no runs recorded yet.")
+        return None
+    from data.storage import DataStorage
+    storage = DataStorage(settings=Settings)
+    storage.open()
+    return storage
+
+
+def _db_view_latest_run():
+    """View the most recent run_summary row -- battery config snapshot,
+    hardware identity snapshot, voltage summary, everything Milestone II
+    traceability records for one run."""
+    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    storage = _open_real_storage_readonly()
+    if storage is None:
+        return [_warn("Database Tools", "Latest Run", config_ref,
+                      "No database file yet -- no runs recorded")]
+    try:
+        run = storage.get_last_run_summary()
+        if run is None:
+            return [_warn("Database Tools", "Latest Run", config_ref,
+                          "run_summary is empty -- no runs recorded")]
+        print(f"\nLatest Run (run_summary)\n{'-' * 60}")
+        for k, v in run.items():
+            print(f"  {k:34s}: {v}")
+        return [_ok("Database Tools", "Latest Run", config_ref,
+                    f"Run #{run.get('id')}  run_id={run.get('run_id')}  "
+                    f"test_type={run.get('test_type')}  result={run.get('result')}")]
+    finally:
+        storage.close()
+
+
+def _db_view_latest_event_log():
+    """View the most recent run's event_log entries -- the full
+    traceability narrative (battery selection, hardware identity, phase
+    transitions) for that run."""
+    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    storage = _open_real_storage_readonly()
+    if storage is None:
+        return [_warn("Database Tools", "Latest Event Log", config_ref,
+                      "No database file yet -- no runs recorded")]
+    try:
+        run = storage.get_last_run_summary()
+        if run is None:
+            return [_warn("Database Tools", "Latest Event Log", config_ref,
+                          "run_summary is empty -- no runs recorded")]
+        events = storage.get_recent_events(run_id=run["run_id"], limit=50)
+        print(f"\nLatest Event Log -- run_id={run['run_id']}\n{'-' * 60}")
+        if not events:
+            print("  (no events recorded for this run)")
+            return [_warn("Database Tools", "Latest Event Log", config_ref,
+                          f"No event_log rows for run_id={run['run_id']}")]
+        for e in events:
+            print(f"  [{e.get('level')}] {e.get('timestamp')}  {e.get('message')}")
+        return [_ok("Database Tools", "Latest Event Log", config_ref,
+                    f"{len(events)} event(s) for run_id={run['run_id']}")]
+    finally:
+        storage.close()
+
+
+def _db_view_latest_measurements():
+    """View the most recent run's measurements rows -- the authoritative
+    per-sample historical result store for every test type."""
+    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    storage = _open_real_storage_readonly()
+    if storage is None:
+        return [_warn("Database Tools", "Latest Measurements", config_ref,
+                      "No database file yet -- no runs recorded")]
+    try:
+        run = storage.get_last_run_summary()
+        if run is None:
+            return [_warn("Database Tools", "Latest Measurements", config_ref,
+                          "run_summary is empty -- no runs recorded")]
+        rows = storage.get_measurements(run_id=run["run_id"])
+        print(f"\nLatest Measurements -- run_id={run['run_id']}\n{'-' * 60}")
+        if not rows:
+            print("  (no measurements recorded for this run)")
+            return [_warn("Database Tools", "Latest Measurements", config_ref,
+                          f"No measurements rows for run_id={run['run_id']}")]
+        for row in rows[-20:]:
+            print(f"  ch={row.get('channel')} relay={row.get('relay')} "
+                  f"phase={row.get('phase_detail')}  V={row.get('voltage_v')}  "
+                  f"I={row.get('current_a')}  T={row.get('temp_c')}")
+        return [_ok("Database Tools", "Latest Measurements", config_ref,
+                    f"{len(rows)} row(s) for run_id={run['run_id']} "
+                    f"(showing up to the last 20)")]
+    finally:
+        storage.close()
+
+
+def _db_view_station_state():
+    """View the last recorded station_state row -- recovery/current-position
+    only, as of Milestone II Phase 3 (read across all run_ids, same as the
+    startup "previous execution found" display)."""
+    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    storage = _open_real_storage_readonly()
+    if storage is None:
+        return [_warn("Database Tools", "Station State", config_ref,
+                      "No database file yet -- no runs recorded")]
+    try:
+        last = storage.get_last_execution_state()
+        print(f"\nStation State -- last recorded execution\n{'-' * 60}")
+        if last is None:
+            print("  (no station_state rows recorded yet)")
+            return [_warn("Database Tools", "Station State", config_ref,
+                          "station_state is empty -- no execution recorded")]
+        for k, v in last.items():
+            print(f"  {k:14s}: {v}")
+        return [_ok("Database Tools", "Station State", config_ref,
+                    f"relay={last.get('relay')}  state={last.get('state')}  "
+                    f"timestamp={last.get('timestamp')}")]
+    finally:
+        storage.close()
+
+
+def _db_view_statistics():
+    """Row counts per table + file size for the real project database."""
+    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    if not os.path.exists(Settings.DATABASE_FILE):
+        return [_warn("Database Tools", "Database Statistics", config_ref,
+                      "No database file yet -- no runs recorded")]
+    import sqlite3
+    conn = sqlite3.connect(Settings.DATABASE_FILE)
+    results = []
+    try:
+        print(f"\nDatabase Statistics -- {Settings.DATABASE_FILE}\n{'-' * 60}")
+        for table in ("measurements", "run_summary", "event_log", "station_state"):
+            try:
+                count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                print(f"  {table:14s}: {count} row(s)")
+                results.append(_ok("Database Tools", f"{table} row count", config_ref,
+                                   f"{count} row(s)"))
+            except sqlite3.OperationalError as e:
+                print(f"  {table:14s}: table not found")
+                results.append(_warn("Database Tools", f"{table} row count", config_ref, str(e)))
+        size_kb = os.path.getsize(Settings.DATABASE_FILE) / 1024.0
+        print(f"  {'file size':14s}: {size_kb:.1f} KB")
+        return results
+    finally:
+        conn.close()
+
+
+def test_database_tools():
+    """
+    Database Tools -- consolidated database inspection + regression menu.
+    Replaces the previous separate "Test SQLite (foundation)"/"Test
+    Database Layer" top-level MENU entries.
+    """
+    options = [
+        ("View Latest Run (run_summary)",                          _db_view_latest_run),
+        ("View Latest Event Log",                                   _db_view_latest_event_log),
+        ("View Latest Measurements",                                _db_view_latest_measurements),
+        ("View Station State (last execution)",                     _db_view_station_state),
+        ("Database Statistics",                                     _db_view_statistics),
+        ("Run Storage Layer Self-Test (data/storage.py, temp DB)",   test_database),
+        ("Run SQLite Foundation Self-Test (data/sqlite_manager.py, temp DB)", test_sqlite),
+    ]
+    print("\nDatabase Tools\n")
+    for i, (label, _fn) in enumerate(options, 1):
+        print(f"[{i}] {label}")
+    print("[0] Back")
+    try:
+        raw = input("\nChoice: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return []
+    if raw == "0" or raw == "":
+        return []
+    try:
+        idx = int(raw) - 1
+        if idx < 0 or idx >= len(options):
+            raise ValueError()
+    except ValueError:
+        print("Invalid choice.")
+        return []
+    _, fn = options[idx]
+    return fn()
+
+
+# =============================================================================
 # 9. MiniSQL hooks
 # =============================================================================
 
@@ -2464,6 +2908,104 @@ def test_electronic_load():
                              "Not yet configured",
                              "No GPIB instrument configured in config/devices.py -- stub only"))
     return results
+
+
+# =============================================================================
+# UI Test -- safe UI development/review environment, independent of
+# hardware availability. Replaces the previous "Run All Tests" MENU entry
+# (see docs/architecture.md "UI Test").
+#
+# NO hardware connections, NO real measurements, NO database writes: every
+# screen below is built via ExecutionFrame.from_live() with hardcoded,
+# clearly-labeled DEMO values, then rendered with the SAME
+# render_execution_frame() Proto Test Execution/Monitor Battery use live --
+# this previews the real renderer against static data, it is never a
+# second UI implementation.
+# =============================================================================
+
+def _demo_proto_test_frame():
+    from test_control.execution_screen import ExecutionFrame
+    return ExecutionFrame.from_live(
+        run_number=1, run_id="DEMO-0001", test_type="proto",
+        channel=3, relay=3, state="ACTIVE", phase_detail="MEASURED",
+        smu_voltage=4.200000, smu_current=0.021500, dmm_voltage=4.199870,
+        recent_measurements=[
+            {"channel": 1, "relay": 1, "smu_measured_v": 4.200012, "dmm_measured_v": 4.199901},
+            {"channel": 2, "relay": 2, "smu_measured_v": 4.199988, "dmm_measured_v": 4.199875},
+            {"channel": 3, "relay": 3, "smu_measured_v": 4.200000, "dmm_measured_v": 4.199870},
+        ],
+        recent_events=[
+            {"timestamp": "2026-01-01T12:00:00", "message": "Relay 3 activating (force-all-off -> verify -> activate -> verify)"},
+            {"timestamp": "2026-01-01T12:00:05", "message": "Relay 3 activated -- output enabled, sourcing 4.200 V / 0.500 A limit, dwelling 5s"},
+            {"timestamp": "2026-01-01T12:00:10", "message": "Measurement acquired -- DMM 4.199870 V"},
+        ],
+    )
+
+
+def _demo_monitor_battery_frame():
+    from test_control.execution_screen import ExecutionFrame
+    return ExecutionFrame.from_live(
+        run_number=7, run_id="DEMO-0007", test_type="monitor",
+        channel=3, relay=3, state="ACTIVE", phase_detail="MONITORING",
+        battery_voltage=3.712000, battery_current=None, battery_temp=None,
+        recent_measurements=[
+            {"channel": 3, "relay": 3, "voltage_v": 3.705},
+            {"channel": 3, "relay": 3, "voltage_v": 3.710},
+            {"channel": 3, "relay": 3, "voltage_v": 3.712},
+        ],
+        recent_events=[
+            {"timestamp": "2026-01-01T09:00:00", "message": "Battery selected: HUB"},
+            {"timestamp": "2026-01-01T09:00:01", "message": "Relay 3 activated -- monitoring started"},
+            {"timestamp": "2026-01-01T09:00:01", "message": "Monitoring source: DMM"},
+        ],
+    )
+
+
+def test_ui_preview():
+    """
+    UI Test -- a safe UI development/review environment. Every option
+    below constructs a demo ExecutionFrame (hardcoded sample data, no
+    hardware, no database) and renders it through the real
+    render_execution_frame() -- the identical renderer Proto Test
+    Execution/Monitor Battery use live. Charge/Discharge/Cycle Battery and
+    a Historical Results Viewer are reported honestly as "not yet
+    implemented" rather than faking a screen for a workflow/viewer that
+    doesn't exist yet.
+    """
+    from test_control.execution_screen import render_execution_frame
+
+    options = [
+        ("Proto Test Execution screen (demo data)",   _demo_proto_test_frame),
+        ("Monitor Battery screen (demo data)",         _demo_monitor_battery_frame),
+        ("Charge/Discharge/Cycle Battery screens",     None),
+        ("Historical Results Viewer style screens",    None),
+    ]
+    print("\nUI Test -- static/demo data only. No hardware, no database writes.\n")
+    for i, (label, _fn) in enumerate(options, 1):
+        print(f"[{i}] {label}")
+    print("[0] Back")
+    try:
+        raw = input("\nChoice: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return []
+    if raw == "0" or raw == "":
+        return []
+    try:
+        idx = int(raw) - 1
+        if idx < 0 or idx >= len(options):
+            raise ValueError()
+    except ValueError:
+        print("Invalid choice.")
+        return []
+    label, fn = options[idx]
+    if fn is None:
+        print(f"\n  {label} -- not yet implemented (no real workflow/viewer exists to preview yet).")
+        return []
+    frame = fn()
+    render_execution_frame(frame)
+    return [_ok("UI Test", label, "test_control/execution_screen.py (demo data, no hardware/DB)",
+               "Rendered via the real render_execution_frame() against static demo data")]
 
 
 # =============================================================================
@@ -2956,6 +3498,25 @@ def run_proto_test_execution():
 # Menu
 # =============================================================================
 
+# MENU structure history (see docs/architecture.md "Menu Restructuring
+# Review" and docs/MILESTONES.md for the full rationale behind each
+# change below):
+#   - "Test Temperature Module" retired as a standalone entry -- battery
+#     temperature monitoring comes through the DAQ NTC path (see
+#     test_sensors()'s Test 6); test_hardware_discovery() still reports
+#     TEMP_MODULE's identity.
+#   - "Test Configuration" removed -- test_configuration() already runs
+#     automatically in preflight_check() before this menu is ever shown;
+#     the function itself is unchanged and still called there.
+#   - "Test SQLite (foundation)"/"Test Database Layer" consolidated into
+#     one "Database Tools" entry (test_database_tools()) with a submenu
+#     that both inspects the REAL project database and still runs both
+#     original temp-DB regression self-tests.
+#   - "Run All Tests" replaced with "UI Test" (test_ui_preview()) -- a
+#     hardware/database-free ExecutionFrame rendering preview. The
+#     aggregate-everything behavior this replaced is intentionally not
+#     kept elsewhere (it depended on a MENU entry with fn=None, a pattern
+#     this restructuring removes -- see _dispatch_menu_choice() below).
 MENU = [
     ("Run Main Test",                 run_main_test),
     ("Proto Test Execution (infrastructure validation, no battery)", run_proto_test_execution),
@@ -2964,15 +3525,12 @@ MENU = [
     ("Test SMU (PSU)",                test_smu),
     ("Test DMM",                      test_dmm),
     ("Test DAQ",                      test_daq),
-    ("Test Temperature Module",       test_temperature_module),
     ("Test Numato Relay Matrix (Ethernet)", test_relay_numato),
     ("Test PXI Relay Matrix",         test_pxi_relay_matrix),
     ("Test Sensors (NTC)",            test_sensors),
-    ("Test Safety Monitor",           test_safety_monitor),
-    ("Test Configuration",            test_configuration),
-    ("Test SQLite (foundation)",      test_sqlite),
-    ("Test Database Layer",           test_database),
-    ("Run All Tests",                 None),
+    ("Test Safety Monitor (workflow simulator)", test_safety_monitor),
+    ("Database Tools",                test_database_tools),
+    ("UI Test (demo screens -- no hardware, no database)", test_ui_preview),
 ]
 
 
@@ -3007,21 +3565,26 @@ def _pause_before_main_menu():
 # Full-hardware-run menu entries -- each drives its own real hardware run
 # (HardwareManager/CancellationToken/etc.) and returns nothing (unlike every
 # other MENU entry, which returns a list[TestResult]). Checked by name here
-# (not by category/label) so "Run All Tests" below never calls them via
-# run_section() -- doing so would crash on `for r in None`.
+# (not by category/label) so run_section() below is never called on them --
+# doing so would crash on `for r in None`.
 _FULL_RUN_ENTRIES = (run_main_test, run_proto_test_execution)
 
 
-def _dispatch_menu_choice(label: str, fn, config_results):
+def _dispatch_menu_choice(label: str, fn):
     """
     Run exactly one Main Menu selection, print its summary the same way it
     always has (PASS/FAIL/WARNING reporting unchanged), then unconditionally
     pause at "Press Enter to return to the Main Menu..." before returning --
     regardless of whether the test PASSED, WARNED, FAILED, raised, or was
     cancelled by the operator (Ctrl+C). This is the one place that behavior
-    is implemented, so every menu entry (Run Main Test, Proto Test
-    Execution, an individual category test, or Run All Tests) gets it
-    identically with no duplicated per-entry code.
+    is implemented, so every menu entry gets it identically with no
+    duplicated per-entry code.
+
+    The previous "Run All Tests" (fn=None, aggregating every other MENU
+    entry) was replaced by "UI Test" as part of the menu restructuring
+    review (see docs/architecture.md) -- every MENU entry now returns
+    list[TestResult] or drives its own hardware run, so this function no
+    longer needs a third fn=None branch.
     """
     try:
         if fn in _FULL_RUN_ENTRIES:
@@ -3029,13 +3592,6 @@ def _dispatch_menu_choice(label: str, fn, config_results):
             print(f"  {label}")
             print(f"{'-' * 60}")
             fn()
-        elif fn is None:
-            all_results = list(config_results)
-            for lbl, f in MENU[1:-1]:
-                if f in _FULL_RUN_ENTRIES:
-                    continue
-                all_results.extend(run_section(lbl, f))
-            print_summary(all_results)
         else:
             results = run_section(label, fn)
             print_summary(results)
@@ -3054,7 +3610,7 @@ def main():
     print("=" * 60)
 
     print("\n[Pre-flight: Configuration Validation]")
-    config_results, config_ok = preflight_check()
+    _config_results, config_ok = preflight_check()
 
     if not config_ok:
         print("\n  Configuration has FAIL errors.")
@@ -3086,7 +3642,7 @@ def main():
             continue
 
         label, fn = MENU[idx]
-        _dispatch_menu_choice(label, fn, config_results)
+        _dispatch_menu_choice(label, fn)
 
 
 if __name__ == "__main__":

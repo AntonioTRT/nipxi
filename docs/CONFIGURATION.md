@@ -162,7 +162,9 @@ The default assumes a single NI 6363 at `Dev1`. Update if your DAQ resource name
 
 ### Inspecting the database manually
 
-**Recommended tool: [DB Browser for SQLite](https://sqlitebrowser.org/)** (free, GUI) -- open `data_output/<mode>/nipxi_<mode>.db` directly, browse `measurements`/`station_state`/`run_summary`/`event_log` as tables, and run ad hoc SQL from its "Execute SQL" tab. The `sqlite3` CLI works too for quick one-off queries (`sqlite3 data_output/development/nipxi_dev.db`) if you don't want to install anything.
+**From within `test.py`: MENU item 12, "Database Tools"** -- a submenu (`test.py::test_database_tools()`) that reads the real project database read-only: View Latest Run / View Latest Event Log / View Latest Measurements / View Station State / Database Statistics, plus the original storage-layer and SQLite-foundation regression self-tests (relocated here from their own former top-level MENU entries -- see `docs/architecture.md` Section 23g/23h). No new read path -- built entirely on `DataStorage`'s existing `get_last_run_summary()`/`get_recent_events()`/`get_measurements()`/`get_last_execution_state()`.
+
+**Recommended external tool: [DB Browser for SQLite](https://sqlitebrowser.org/)** (free, GUI) -- open `data_output/<mode>/nipxi_<mode>.db` directly, browse `measurements`/`station_state`/`run_summary`/`event_log` as tables, and run ad hoc SQL from its "Execute SQL" tab. The `sqlite3` CLI works too for quick one-off queries (`sqlite3 data_output/development/nipxi_dev.db`) if you don't want to install anything.
 
 **Example queries:**
 ```sql
@@ -249,6 +251,8 @@ BATTERY_CHANNELS = {
 `utils/device_validator.py::_check_battery_groups()` validates at startup that every `BATTERY_CHANNELS` key is covered by exactly one `BATTERY_GROUPS` range (replaces the removed `_check_battery_types()`, which validated the now-deleted `battery_type` field).
 
 **Important:** Verify that `relay_address` matches the physical relay wiring on the BLOSS Hub PCB. Mismatch will connect the wrong battery to the SMU/DAQ.
+
+**`enabled` is reused, not duplicated, for NTC scanning:** `test.py::test_sensors()`'s DAQ-based NTC channel scan (MENU item 10, Test 6) iterates exactly the positions where `enabled: True` here and reads each one's `daq_ntc_ch` -- disabling a position (e.g. while its wiring is unconfirmed) automatically removes it from that scan with no separate configuration variable to keep in sync. See `docs/architecture.md` Section 23a.
 
 ### BATTERY_GROUPS
 
