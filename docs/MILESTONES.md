@@ -745,6 +745,96 @@ identified before real Charge Battery implementation.
 
 ---
 
+## Milestone II: Summary
+
+**Status:** COMPLETE
+
+Milestone II covers every "Milestone II: ..." entry above -- Monitor
+Battery, the Menu Restructuring Review, the Safety Monitor Simulator, the
+Relay + PSU Safety Verification Pattern, the Timing/Delay/Settling
+Analysis + Interruptible Wait Mechanism, and the BATTERY_CONFIGS ->
+SafetyMonitor Integration. This entry is the closing summary; each linked
+section above still holds the full technical detail.
+
+### Delivered
+
+- Database architecture (`data/storage.py`, `data/sqlite_manager.py`,
+  `station_state` table -- see `docs/DATABASE_ROADMAP.md`, Milestone 2 entry
+  above)
+- ExecutionFrame architecture (`docs/architecture.md` Section 18a)
+- Proto Test migration (Milestone 2 entry above)
+- Monitor Battery implementation (`docs/architecture.md` Section 20)
+- Hardware traceability (`docs/architecture.md` Section 22)
+- Battery traceability (`docs/architecture.md` Section 19)
+- Relay safety architecture (`docs/architecture.md` Section 21, 24)
+- PSU safety architecture (`docs/architecture.md` Section 25, 26)
+- Safety Monitor Simulator (`docs/architecture.md` Section 23e)
+- BATTERY_CONFIGS integration with SafetyMonitor (`docs/architecture.md`
+  Section 28)
+
+### Validated
+
+- Real hardware (Hardware Discovery, SMU/DMM Functional Validation, both
+  Numato relay matrices, Proto Test Execution -- Milestone 1/Milestone 2
+  above)
+- SQLite persistence (`test_sqlite`, `station_state`/`test_records`)
+- Recovery architecture (`station_state` last-known-position display; full
+  cycle/state recovery engine remains on `docs/TODO.md`, not yet built)
+- Execution UI (`ExecutionFrame`/`render_execution_frame()`)
+- Safety flows (Relay + PSU Safety Verification Pattern, Interruptible Wait
+  Mechanism, BATTERY_CONFIGS-aware `SafetyMonitor`, all exercised via the
+  Safety Monitor Simulator's four workflow walkthroughs)
+
+### Not yet done (carried into Milestone III, not a Milestone II gap)
+
+- Real Charge/Discharge/Cycle Battery current sourcing -- `SMU.set_charge_mode()`/
+  `set_discharge_mode()`/`output_enable()`/`measure()` beyond bench DC
+  voltage sourcing, and `DAQ.read_all_batteries()` multi-channel acquisition,
+  remain placeholders (see `docs/TODO.md`).
+- NTC temperature read (`t_c = None` in `ChargeCycle`/`DischargeCycle`/
+  `MonitorBatterySequence`).
+- Physical rack validation of Monitor Battery on real Group A hardware
+  (verified with mocked hardware only so far).
+
+---
+
+## Milestone III: Battery Charge/Discharge Workflows
+
+**Status:** STARTING
+
+**Scope:** Implement and validate the first real current-sourcing battery
+modes -- Charge Battery, Discharge Battery, and Cycle Battery -- reusing
+the Battery Type/Group/Position selection, confirmation screen, and
+traceability logging Monitor Battery established (Milestone II), and
+built on the safety foundation Milestone II closed out: the Relay + PSU
+Safety Verification Pattern, the Interruptible Wait Mechanism, and the
+now-battery-aware `SafetyMonitor`/`ChargeCycle`/`DischargeCycle`. The
+Safety Monitor Simulator (`docs/architecture.md` Section 23e) is the
+designated development-reference blueprint for this work -- its simulated
+step sequence should be matched (and updated if it diverges) as each real
+workflow is implemented, per the `docs/TODO.md` item tracking this.
+
+### Planned objectives
+
+- `hardware/smu.py::SMU.set_charge_mode()`/`set_discharge_mode()`/
+  `output_enable()`/`measure()` implemented for real current sourcing/
+  sinking on a single battery channel (see `docs/TODO.md`'s `[MUST]` item
+  for the full contract: configuration-verification readback, PSU Safety
+  Verification Pattern, `interruptible_sleep()` for any real dwell,
+  `try/finally` covering that dwell).
+- `hardware/daq.py::DAQ.read_all_batteries()` real multi-channel
+  synchronized acquisition, replacing the current stub.
+- Charge Battery / Discharge Battery / Cycle Battery wired into the live
+  MENU submenu (currently explicit placeholders per the Menu Restructuring
+  Review), using `ChargeCycle`/`DischargeCycle` with `battery_cfg` passed
+  through end to end.
+- NTC (or PXIe-4353) temperature read wired into `ChargeCycle`/
+  `DischargeCycle`/`MonitorBatterySequence`, replacing `t_c = None`.
+- Physical rack validation of a single real charge/discharge cycle before
+  scaling to all 8 channels.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

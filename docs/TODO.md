@@ -264,7 +264,11 @@ first real-rack hardware bring-up milestone record.
   `test_control/proto_test_sequence.py` also gained `print()`-based console
   progress (relay/phase/measurements), since `test.py` never configures a
   logging handler for this workflow.
-- **Milestone II data/UI architecture (in progress)** -- Phase 1:
+- **Milestone II data/UI architecture** -- Milestone II closed with Phases
+  1-2 delivered (see `docs/MILESTONES.md` "Milestone II: Summary"); Phase 3
+  (`ProtoTestSequence` migration) and Phase 4 (Historical Results
+  Viewer/`UI Preview Test`) remain open work items, tracked below, not a
+  Milestone II gap. Phase 1:
   `measurements` extended into the authoritative historical result store
   for every test type (`test_type`/`relay`/`phase_detail`/SMU-DMM columns,
   additive migration, `data/storage.py::DataStorage.record_measurement()`);
