@@ -553,6 +553,39 @@ via a mocked smoke test with no unhandled exceptions; `Database Tools`'
 inspection views confirmed against the real development database;
 `preflight_check()`/`validate_devices()` unaffected.
 
+## Milestone II: Safety Monitor Simulator -- Full Workflow Walkthrough
+
+Follow-up enhancement to the Menu Restructuring Review above: the Safety
+Monitor Simulator (Part 2 of `test_safety_monitor()`) became an
+interactive, step-by-step **operational walkthrough** -- not just safety
+decisions, but the full sequence a real workflow executes. The operator
+now selects one workflow (Monitor/Charge/Discharge/Cycle Battery) from a
+menu, then the simulator walks every action in order (load configuration,
+resolve group/position/relay routing, close relay, configure/enable PSU,
+acquire measurement, run the REAL `SafetyMonitor` check, update
+`ExecutionFrame`, store measurement, evaluate phase transitions, ...),
+pausing for Enter between each step. Each step displays Workflow/Current
+Phase/Current Step/Description, then Voltage/Current/Temperature/Safety
+Evaluation/Decision/Next Action.
+
+This is now designated the **development reference implementation** for
+Charge/Discharge/Cycle Battery -- future developers should be able to map
+the displayed step sequence directly onto production code (see
+`docs/architecture.md` Section 23e). `_monitor_battery_walkthrough_steps()`
+mirrors the already-implemented `MonitorBatterySequence.run()` exactly, so
+it doubles as a worked example of simulator-step-to-real-code
+correspondence. Step counts: Monitor Battery 16, Charge Battery 16,
+Discharge Battery 14, Cycle Battery 31 (charge phase + transition +
+discharge phase, aborting at step 28/31 on the deliberately-injected
+overtemperature fault).
+
+Verified: `py_compile` clean; each of the four workflows run end-to-end
+via a mocked smoke test (Monitor/Charge/Discharge complete all steps
+PASS; Cycle correctly aborts and reports PASS for "correctly aborted");
+console output format confirmed against the requested display spec;
+confirmed by code inspection that no step anywhere imports or calls
+`HardwareManager`/`DataStorage`/`RelayFactory`/any `hardware/*.py` driver.
+
 ---
 
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the

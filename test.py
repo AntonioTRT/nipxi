@@ -2193,173 +2193,374 @@ def test_sensors():
 # =============================================================================
 #
 # Part 2 of this menu item (below the unit tests) is a workflow-oriented
-# SIMULATOR: it walks the same phase-by-phase shape Monitor Battery/Charge
-# Battery/Discharge Battery/Cycle Battery use (relay close -> phase
-# transitions -> relay open), calling the REAL SafetyMonitor.check()/
-# is_safe_to_switch_relay() logic against SIMULATED measurements -- no
-# hardware, no relay, no database writes. See docs/architecture.md "Safety
-# Monitor Workflow Simulator" -- this is deliberately the first step toward
-# a development/validation harness for exercising Charge/Discharge logic
-# before it is ever run against real hardware.
+# WALKTHROUGH SIMULATOR -- the development reference implementation for
+# Monitor/Charge/Discharge/Cycle Battery (see docs/architecture.md "Safety
+# Monitor Workflow Simulator"). After the operator picks one workflow, it
+# steps through the OPERATIONAL SEQUENCE that workflow's real code executes
+# (or will execute, for Charge/Discharge/Cycle -- not yet implemented on
+# real hardware) -- not just the safety decisions, but every action in
+# order: load config, resolve group/position/relay routing, close relay,
+# configure/enable the PSU, acquire a measurement, run the REAL
+# SafetyMonitor check, update ExecutionFrame, store the measurement,
+# evaluate phase transitions, and so on. Future developers implementing
+# Charge/Discharge/Cycle Battery for real should be able to read this
+# module's step lists and map each entry directly onto production code.
+#
+# Every step pauses for the operator (Enter to continue) so the sequence
+# can be observed one action at a time. NOTHING here touches hardware, a
+# relay, an instrument, or a database -- these are development-only
+# console messages: no measurements/event_log/run_summary/station_state
+# row is ever written by this simulator.
 
-def _simulate_step(monitor, phase: str, state: str, voltage_v: float, current_a: float,
-                    temp_c: float = None, relay_switch_check: bool = False):
+def _render_and_check_step(monitor, workflow_name: str, phase: str, step_num: int, total_steps: int,
+                            description: str, voltage_v: float = None, current_a: float = None,
+                            temp_c: float = None, run_safety_check: bool = False,
+                            relay_switch_check: bool = False, next_action: str = "",
+                            note: str = None, pause: bool = True):
     """
-    Print one simulated workflow step and run the REAL SafetyMonitor
-    check(s) against the simulated values -- never touches hardware or a
-    database, only console output plus the real safety logic. Returns
+    Render one workflow step (Workflow/Current Phase/Current Step/
+    Description, then Voltage/Current/Temperature/Safety Evaluation/
+    Decision/Next Action) and, if requested, run the REAL SafetyMonitor
+    check(s) against the simulated values. Steps that only describe an
+    operational action (load config, resolve routing, update
+    ExecutionFrame, ...) pass no voltage/current/temp and neither check
+    flag -- they display "N/A" and a CONTINUE decision, exactly like any
+    other step, since the walkthrough's point is showing the FULL
+    sequence, not only the steps with a safety check.
+
+    Never touches hardware/relay/instrument/database -- console output
+    plus test_control/safety_monitor.py's real logic only. Returns
     (safe: bool, reason: str | None).
     """
-    print(f"\n  Phase: {phase}")
-    print(f"  State: {state}")
-    temp_display = "N/A" if temp_c is None else f"{temp_c:.1f} degC"
-    print(f"  Simulated Measurement: V={voltage_v:.3f} V  I={current_a:.3f} A  T={temp_display}")
-
-    if relay_switch_check:
-        rs_ok = monitor.is_safe_to_switch_relay(current_a)
-        print(f"  Safety Check: is_safe_to_switch_relay(I={current_a:.3f} A) -> {rs_ok}")
-        if not rs_ok:
-            reason = f"Relay switch blocked -- current {current_a:.3f} A not near zero"
-            print(f"  WARNING: {reason}")
-            print("  Decision: ABORT")
-            return False, reason
-
-    s = monitor.check(voltage_v=voltage_v, current_a=current_a, temp_c=temp_c)
-    reason_note = f"  reason={s.reason}" if not s.safe else ""
-    print(f"  Safety Check: check(V={voltage_v:.3f}, I={current_a:.3f}, T={temp_c}) "
-          f"-> safe={s.safe}{reason_note}")
-    if s.safe:
-        print("  Decision: CONTINUE")
-    else:
-        print(f"  WARNING: {s.reason}")
-        print("  Decision: ABORT")
-    return s.safe, (None if s.safe else s.reason)
-
-
-def _run_workflow_simulation(monitor, workflow_name: str, steps: list, expect_abort: bool = False):
-    """
-    Walk `steps` (phase/state/voltage_v/current_a/temp_c/relay_switch_check
-    dicts) in order via _simulate_step(), stopping immediately on the first
-    unsafe result -- the same "stop at first failure, never continue"
-    discipline ProtoTestSequence/MonitorBatterySequence/the relay safety
-    self-test all already use. `expect_abort=True` marks a scenario that
-    deliberately injects an unsafe reading to demonstrate the abort path --
-    aborting there is the CORRECT outcome, not a failure.
-    """
     print(f"\n{'-' * 60}")
-    print(f"  Workflow Simulation: {workflow_name}")
+    print(f"Workflow     : {workflow_name}")
+    print(f"Current Phase: {phase}")
+    print(f"Current Step : {step_num}/{total_steps}")
+    print(f"Description  : {description}")
     print(f"{'-' * 60}")
-    config_ref = "test_control/safety_monitor.py (simulated measurements, no hardware)"
 
-    for step in steps:
-        safe, reason = _simulate_step(
-            monitor, step["phase"], step["state"], step["voltage_v"], step["current_a"],
-            step.get("temp_c"), relay_switch_check=step.get("relay_switch_check", False),
+    v_display = "N/A" if voltage_v is None else f"{voltage_v:.3f} V"
+    i_display = "N/A" if current_a is None else f"{current_a:.3f} A"
+    t_display = "N/A" if temp_c is None else f"{temp_c:.1f} degC"
+    print(f"Voltage      : {v_display}")
+    print(f"Current      : {i_display}")
+    print(f"Temperature  : {t_display}")
+
+    safe, reason = True, None
+    if relay_switch_check:
+        rs_ok = monitor.is_safe_to_switch_relay(current_a if current_a is not None else 0.0)
+        print(f"Safety Evaluation: is_safe_to_switch_relay(I={i_display}) -> {rs_ok}")
+        if not rs_ok:
+            safe = False
+            reason = f"Relay switch blocked -- current {current_a:.3f} A not near zero"
+    elif run_safety_check:
+        s = monitor.check(voltage_v=voltage_v, current_a=current_a, temp_c=temp_c)
+        detail = f"  reason={s.reason}" if not s.safe else ""
+        print(f"Safety Evaluation: check(V={voltage_v:.3f}, I={current_a:.3f}, T={temp_c}) "
+              f"-> safe={s.safe}{detail}")
+        if not s.safe:
+            safe, reason = False, s.reason
+    else:
+        print("Safety Evaluation: N/A (no SafetyMonitor check performed at this step)")
+
+    if safe:
+        print("Decision     : CONTINUE")
+    else:
+        print(f"Decision     : ABORT -- {reason}")
+    print(f"Next Action  : {next_action}")
+    if note:
+        print(f"Note         : {note}")
+
+    if pause:
+        try:
+            input("\nPress Enter for next step...")
+        except (KeyboardInterrupt, EOFError):
+            print()
+
+    return safe, reason
+
+
+def _run_workflow_walkthrough(monitor, workflow_name: str, steps: list, expect_abort: bool = False):
+    """
+    Walk `steps` (phase/description/voltage_v/current_a/temp_c/
+    run_safety_check/relay_switch_check/next_action/note dicts) in order
+    via _render_and_check_step(), stopping immediately on the first unsafe
+    result -- the same "stop at first failure, never continue" discipline
+    ProtoTestSequence/MonitorBatterySequence/the relay safety self-test all
+    already use. `expect_abort=True` marks a scenario that deliberately
+    injects an unsafe reading to demonstrate the abort path -- aborting
+    there is the CORRECT outcome, not a failure.
+    """
+    print(f"\n{'=' * 60}")
+    print(f"  {workflow_name} -- Workflow Simulation")
+    print(f"{'=' * 60}")
+    config_ref = "test_control/safety_monitor.py (simulated measurements, no hardware, no database)"
+    total = len(steps)
+
+    for i, step in enumerate(steps, 1):
+        safe, reason = _render_and_check_step(
+            monitor, workflow_name, step["phase"], i, total, step["description"],
+            voltage_v=step.get("voltage_v"), current_a=step.get("current_a"), temp_c=step.get("temp_c"),
+            run_safety_check=step.get("run_safety_check", False),
+            relay_switch_check=step.get("relay_switch_check", False),
+            next_action=step.get("next_action", ""), note=step.get("note"),
         )
         if not safe:
             if expect_abort:
                 return _ok("Safety Monitor Simulation", workflow_name, config_ref,
-                           f"Correctly aborted at phase '{step['phase']}' -- {reason}")
+                           f"Correctly aborted at step {i}/{total} ('{step['description']}') -- {reason}")
             return _fail("Safety Monitor Simulation", workflow_name, config_ref,
-                         f"Unexpected abort at phase '{step['phase']}' -- {reason}")
+                         f"Unexpected abort at step {i}/{total} ('{step['description']}') -- {reason}")
 
     if expect_abort:
         return _fail("Safety Monitor Simulation", workflow_name, config_ref,
-                     "Expected an abort during this scenario, but every phase passed")
+                     "Expected an abort during this scenario, but every step passed")
     return _ok("Safety Monitor Simulation", workflow_name, config_ref,
-               f"All {len(steps)} phases completed -- PASS")
+               f"All {total} steps completed -- PASS")
 
 
-def _monitor_battery_simulation_steps():
-    """Mirrors test_control/monitor_battery_sequence.py::MonitorBatterySequence's
-    actual phase shape: relay close -> repeated monitoring samples -> relay open."""
+def _monitor_battery_walkthrough_steps():
+    """
+    Operational sequence mirroring test.py::_run_monitor_battery() +
+    test_control/monitor_battery_sequence.py::MonitorBatterySequence.run()
+    -- load config through two monitoring samples to operator-requested
+    shutdown. This IS the real, already-implemented workflow's shape.
+    """
+    dev_note = ("Development-only simulation -- NOT written to measurements/"
+                "event_log/run_summary/station_state.")
     return [
-        {"phase": "PRE-CHECK",   "state": "IDLE",      "voltage_v": 3.70, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True},
-        {"phase": "RELAY_CLOSE", "state": "ACTIVE",    "voltage_v": 3.70, "current_a": 0.0, "temp_c": 25.0},
-        {"phase": "MONITORING",  "state": "ACTIVE",    "voltage_v": 3.71, "current_a": 0.0, "temp_c": 25.2},
-        {"phase": "MONITORING",  "state": "ACTIVE",    "voltage_v": 3.69, "current_a": 0.0, "temp_c": 25.1},
-        {"phase": "RELAY_OPEN",  "state": "COMPLETED", "voltage_v": 3.69, "current_a": 0.0, "temp_c": 25.1, "relay_switch_check": True},
+        {"phase": "INIT", "description": "Load battery configuration",
+         "next_action": "Resolve battery group"},
+        {"phase": "INIT", "description": "Resolve battery group",
+         "next_action": "Resolve battery position"},
+        {"phase": "INIT", "description": "Resolve battery position",
+         "next_action": "Resolve relay routing"},
+        {"phase": "INIT", "description": "Resolve relay routing",
+         "next_action": "Close relay 3"},
+        {"phase": "RELAY_ROUTING", "description": "Close relay 3",
+         "voltage_v": 3.70, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True,
+         "next_action": "Acquire voltage measurement"},
+        {"phase": "MONITORING", "description": "Acquire voltage measurement",
+         "voltage_v": 3.71, "current_a": 0.0, "temp_c": 25.2,
+         "next_action": "Run SafetyMonitor checks"},
+        {"phase": "MONITORING", "description": "Run SafetyMonitor checks",
+         "voltage_v": 3.71, "current_a": 0.0, "temp_c": 25.2, "run_safety_check": True,
+         "next_action": "Update ExecutionFrame"},
+        {"phase": "MONITORING", "description": "Update ExecutionFrame",
+         "next_action": "Store measurement"},
+        {"phase": "MONITORING", "description": "Store measurement", "note": dev_note,
+         "next_action": "Repeat monitoring loop"},
+        {"phase": "MONITORING", "description": "Repeat monitoring loop",
+         "next_action": "Acquire voltage measurement"},
+        {"phase": "MONITORING", "description": "Acquire voltage measurement",
+         "voltage_v": 3.69, "current_a": 0.0, "temp_c": 25.1,
+         "next_action": "Run SafetyMonitor checks"},
+        {"phase": "MONITORING", "description": "Run SafetyMonitor checks",
+         "voltage_v": 3.69, "current_a": 0.0, "temp_c": 25.1, "run_safety_check": True,
+         "next_action": "Update ExecutionFrame"},
+        {"phase": "MONITORING", "description": "Update ExecutionFrame",
+         "next_action": "Store measurement"},
+        {"phase": "MONITORING", "description": "Store measurement", "note": dev_note,
+         "next_action": "Operator stop (Ctrl+C) or continue loop"},
+        {"phase": "SHUTDOWN", "description": "Operator requests stop (Ctrl+C simulated)",
+         "next_action": "Open relay 3"},
+        {"phase": "SHUTDOWN", "description": "Open relay 3",
+         "voltage_v": 3.69, "current_a": 0.0, "temp_c": 25.1, "relay_switch_check": True,
+         "next_action": "Monitoring session complete"},
     ]
 
 
-def _charge_battery_simulation_steps():
-    """Simulated INTENDED shape for the not-yet-implemented Charge Battery
-    workflow (CC -> CV taper -> cutoff), reusing the already-configured
-    real charge constants (Settings.CHARGE_VOLTAGE_V/CHARGE_CURRENT_A/
-    CHARGE_CUTOFF_A) -- no new hardcoded values invented for this."""
+def _charge_phase_steps(cycle_number: int = None):
+    """
+    Simulated INTENDED operational sequence for the not-yet-implemented
+    Charge Battery workflow (relay close -> configure/enable PSU -> CC
+    charge -> CV taper -> cutoff -> PSU disable -> relay open), reusing
+    the already-configured real charge constants
+    (Settings.CHARGE_VOLTAGE_V/CHARGE_CURRENT_A/CHARGE_CUTOFF_A) -- no new
+    hardcoded values invented. `cycle_number`, if given, prefixes each
+    description (for reuse inside the Cycle Battery walkthrough below).
+    """
+    prefix = f"[Cycle {cycle_number}] " if cycle_number else ""
+    dev_note = ("Development-only simulation -- NOT written to measurements/"
+                "event_log/run_summary/station_state.")
     return [
-        {"phase": "PRE-CHECK",      "state": "IDLE",      "voltage_v": 3.60, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True},
-        {"phase": "RELAY_CLOSE",    "state": "ACTIVE",    "voltage_v": 3.60, "current_a": 0.0, "temp_c": 25.0},
-        {"phase": "CC_CHARGE",      "state": "ACTIVE",    "voltage_v": 3.95, "current_a": Settings.CHARGE_CURRENT_A, "temp_c": 27.0},
-        {"phase": "CV_TAPER",       "state": "ACTIVE",    "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": Settings.CHARGE_CURRENT_A * 0.3, "temp_c": 28.0},
-        {"phase": "CUTOFF_DETECTED","state": "ACTIVE",    "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": Settings.CHARGE_CUTOFF_A, "temp_c": 27.5},
-        {"phase": "RELAY_OPEN",     "state": "COMPLETED", "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": 0.0, "temp_c": 27.0, "relay_switch_check": True},
+        {"phase": "INIT", "description": prefix + "Load battery configuration",
+         "next_action": "Resolve relay routing"},
+        {"phase": "INIT", "description": prefix + "Resolve relay routing",
+         "next_action": "Close relay"},
+        {"phase": "RELAY_ROUTING", "description": prefix + "Close relay",
+         "voltage_v": 3.60, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True,
+         "next_action": "Configure PSU limits"},
+        {"phase": "CONFIG",
+         "description": prefix + f"Configure PSU limits (V={Settings.CHARGE_VOLTAGE_V:.2f} V, "
+                                  f"I_limit={Settings.CHARGE_CURRENT_A:.3f} A)",
+         "next_action": "Enable PSU output"},
+        {"phase": "CC_CHARGE", "description": prefix + "Enable PSU output",
+         "voltage_v": 3.70, "current_a": 0.0, "temp_c": 25.0,
+         "next_action": "Acquire measurements"},
+        {"phase": "CC_CHARGE", "description": prefix + "Acquire measurements",
+         "voltage_v": 3.95, "current_a": Settings.CHARGE_CURRENT_A, "temp_c": 27.0,
+         "next_action": "Run SafetyMonitor checks"},
+        {"phase": "CC_CHARGE", "description": prefix + "Run SafetyMonitor checks",
+         "voltage_v": 3.95, "current_a": Settings.CHARGE_CURRENT_A, "temp_c": 27.0,
+         "run_safety_check": True, "next_action": "Update ExecutionFrame"},
+        {"phase": "CC_CHARGE", "description": prefix + "Update ExecutionFrame",
+         "next_action": "Store measurement"},
+        {"phase": "CC_CHARGE", "description": prefix + "Store measurement", "note": dev_note,
+         "next_action": "Evaluate CC/CV transition"},
+        {"phase": "CC_CHARGE", "description": prefix + "Evaluate CC/CV transition",
+         "next_action": "Continue charge (CV taper)"},
+        {"phase": "CV_TAPER", "description": prefix + "Continue charge",
+         "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": Settings.CHARGE_CURRENT_A * 0.3,
+         "temp_c": 28.0, "next_action": "Acquire measurements"},
+        {"phase": "CV_TAPER", "description": prefix + "Acquire measurements",
+         "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": Settings.CHARGE_CUTOFF_A, "temp_c": 27.5,
+         "next_action": "Run SafetyMonitor checks"},
+        {"phase": "CV_TAPER", "description": prefix + "Run SafetyMonitor checks",
+         "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": Settings.CHARGE_CUTOFF_A, "temp_c": 27.5,
+         "run_safety_check": True, "next_action": "Evaluate cutoff condition"},
+        {"phase": "CUTOFF_DETECTED",
+         "description": prefix + f"Evaluate cutoff condition (I <= {Settings.CHARGE_CUTOFF_A:.3f} A)",
+         "next_action": "Disable PSU output"},
+        {"phase": "SHUTDOWN", "description": prefix + "Disable PSU output",
+         "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": 0.0, "temp_c": 27.0,
+         "next_action": "Open relay"},
+        {"phase": "SHUTDOWN", "description": prefix + "Open relay",
+         "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": 0.0, "temp_c": 27.0,
+         "relay_switch_check": True, "next_action": "Charge phase complete"},
     ]
 
 
-def _discharge_battery_simulation_steps():
-    """Simulated INTENDED shape for the not-yet-implemented Discharge
-    Battery workflow (CC discharge -> cutoff), reusing
+def _discharge_phase_steps(cycle_number: int = None, inject_fault: bool = False):
+    """
+    Simulated INTENDED operational sequence for the not-yet-implemented
+    Discharge Battery workflow (relay close -> configure/enable PSU sink
+    -> CC discharge -> cutoff -> PSU disable -> relay open), reusing
     Settings.DISCHARGE_CURRENT_A.
 
     NOTE: Settings.DISCHARGE_CUTOFF_V (3.0 V) is itself BELOW
     Settings.BAT_VOLTAGE_MIN (3.5 V, the value SafetyMonitor.check()
     actually enforces) -- a pre-existing configuration inconsistency
-    already tracked in docs/TODO.md ("decide DISCHARGE_CUTOFF_V vs
-    BAT_VOLTAGE_MIN -- which is correct?"). Using DISCHARGE_CUTOFF_V
-    directly here would make this simulation always abort on Undervoltage,
-    which would misrepresent the simulator as broken rather than surfacing
-    a Settings inconsistency outside this task's scope. The cutoff step
-    below therefore stops at whichever value is actually enforced today
-    (max(DISCHARGE_CUTOFF_V, BAT_VOLTAGE_MIN) + a small margin) -- fixing
-    the underlying Settings values is tracked separately in docs/TODO.md,
-    not silently changed here.
+    already tracked in docs/TODO.md. Using DISCHARGE_CUTOFF_V directly
+    here would make every discharge simulation always abort on
+    Undervoltage; the cutoff step below stops at whichever value is
+    actually enforced today (max(DISCHARGE_CUTOFF_V, BAT_VOLTAGE_MIN) + a
+    small margin) instead -- fixing the underlying Settings values is
+    tracked separately, not silently changed here.
+
+    `inject_fault=True` deliberately raises the mid-discharge simulated
+    temperature above Settings.BAT_TEMP_MAX_C, so the walkthrough aborts
+    at that step's "Run SafetyMonitor checks" instead of ever reaching
+    cutoff/shutdown -- used by the Cycle Battery walkthrough below to
+    demonstrate the fault/abort path explicitly.
     """
+    prefix = f"[Cycle {cycle_number}] " if cycle_number else ""
+    dev_note = ("Development-only simulation -- NOT written to measurements/"
+                "event_log/run_summary/station_state.")
     cutoff_v = max(Settings.DISCHARGE_CUTOFF_V, Settings.BAT_VOLTAGE_MIN) + 0.05
+    mid_temp = (Settings.BAT_TEMP_MAX_C + 5.0) if inject_fault else 27.0
     return [
-        {"phase": "PRE-CHECK",      "state": "IDLE",      "voltage_v": 4.10, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True},
-        {"phase": "RELAY_CLOSE",    "state": "ACTIVE",    "voltage_v": 4.10, "current_a": 0.0, "temp_c": 25.0},
-        {"phase": "CC_DISCHARGE",   "state": "ACTIVE",    "voltage_v": 3.80, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 26.0},
-        {"phase": "CC_DISCHARGE",   "state": "ACTIVE",    "voltage_v": 3.60, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 27.0},
-        {"phase": "CUTOFF_DETECTED","state": "ACTIVE",    "voltage_v": cutoff_v, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 27.0},
-        {"phase": "RELAY_OPEN",     "state": "COMPLETED", "voltage_v": cutoff_v, "current_a": 0.0, "temp_c": 26.5, "relay_switch_check": True},
+        {"phase": "INIT", "description": prefix + "Resolve relay routing (discharge)",
+         "next_action": "Close relay"},
+        {"phase": "RELAY_ROUTING", "description": prefix + "Close relay",
+         "voltage_v": 4.10, "current_a": 0.0, "temp_c": 25.0, "relay_switch_check": True,
+         "next_action": "Configure PSU limits"},
+        {"phase": "CONFIG",
+         "description": prefix + f"Configure PSU limits (I_discharge={Settings.DISCHARGE_CURRENT_A:.3f} A sink)",
+         "next_action": "Enable PSU sink"},
+        {"phase": "CC_DISCHARGE", "description": prefix + "Enable PSU sink",
+         "voltage_v": 4.10, "current_a": 0.0, "temp_c": 25.0, "next_action": "Acquire measurements"},
+        {"phase": "CC_DISCHARGE", "description": prefix + "Acquire measurements",
+         "voltage_v": 3.80, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 26.0,
+         "next_action": "Run SafetyMonitor checks"},
+        {"phase": "CC_DISCHARGE", "description": prefix + "Run SafetyMonitor checks",
+         "voltage_v": 3.80, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 26.0,
+         "run_safety_check": True, "next_action": "Update ExecutionFrame"},
+        {"phase": "CC_DISCHARGE", "description": prefix + "Update ExecutionFrame",
+         "next_action": "Store measurement"},
+        {"phase": "CC_DISCHARGE", "description": prefix + "Store measurement", "note": dev_note,
+         "next_action": "Continue discharge"},
+        {"phase": "CC_DISCHARGE", "description": prefix + "Continue discharge",
+         "voltage_v": 3.60, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": mid_temp,
+         "next_action": "Acquire measurements"},
+        {"phase": "CC_DISCHARGE", "description": prefix + "Acquire measurements",
+         "voltage_v": 3.60, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": mid_temp,
+         "next_action": "Run SafetyMonitor checks"},
+        {"phase": "CC_DISCHARGE", "description": prefix + "Run SafetyMonitor checks",
+         "voltage_v": 3.60, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": mid_temp,
+         "run_safety_check": True, "next_action": "Evaluate cutoff condition"},
+        {"phase": "CUTOFF_DETECTED", "description": prefix + "Evaluate cutoff condition (V <= cutoff)",
+         "next_action": "Disable PSU sink"},
+        {"phase": "SHUTDOWN", "description": prefix + "Disable PSU sink",
+         "voltage_v": cutoff_v, "current_a": 0.0, "temp_c": 26.5, "next_action": "Open relay"},
+        {"phase": "SHUTDOWN", "description": prefix + "Open relay",
+         "voltage_v": cutoff_v, "current_a": 0.0, "temp_c": 26.5, "relay_switch_check": True,
+         "next_action": "Discharge phase complete"},
     ]
 
 
-def _cycle_battery_simulation_steps_with_fault():
-    """One charge phase followed by a discharge phase that deliberately
-    injects an overtemperature reading -- demonstrates the abort decision
-    path a real Cycle Battery workflow must also take."""
-    steps = list(_charge_battery_simulation_steps())
-    steps.append({"phase": "CYCLE_COUNT", "state": "ACTIVE",
-                  "voltage_v": Settings.CHARGE_VOLTAGE_V, "current_a": 0.0, "temp_c": 27.0})
-    steps.append({"phase": "CC_DISCHARGE", "state": "ACTIVE",
-                  "voltage_v": 3.80, "current_a": Settings.DISCHARGE_CURRENT_A, "temp_c": 26.0})
-    steps.append({"phase": "CC_DISCHARGE", "state": "ACTIVE",
-                  "voltage_v": 3.60, "current_a": Settings.DISCHARGE_CURRENT_A,
-                  "temp_c": Settings.BAT_TEMP_MAX_C + 5.0})  # deliberately injected fault
+def _cycle_battery_walkthrough_steps():
+    """One full charge phase, a transition, then a discharge phase that
+    deliberately injects an overtemperature fault -- demonstrates the
+    complete Cycle Battery shape (charge -> transition -> discharge ->
+    completion) AND the fault/abort path a real implementation must also
+    take, in one continuous walkthrough."""
+    steps = _charge_phase_steps(cycle_number=1)
+    steps.append({"phase": "TRANSITION",
+                  "description": "Transition from charge to discharge (cycle_count += 1)",
+                  "next_action": "Begin discharge phase"})
+    steps.extend(_discharge_phase_steps(cycle_number=1, inject_fault=True))
     return steps
 
 
-def _simulate_all_workflows(monitor):
-    """Runs all four workflow simulations and returns their TestResult list."""
-    return [
-        _run_workflow_simulation(monitor, "Monitor Battery", _monitor_battery_simulation_steps()),
-        _run_workflow_simulation(monitor, "Charge Battery (simulated -- not yet implemented on real hardware)",
-                                 _charge_battery_simulation_steps()),
-        _run_workflow_simulation(monitor, "Discharge Battery (simulated -- not yet implemented on real hardware)",
-                                 _discharge_battery_simulation_steps()),
-        _run_workflow_simulation(monitor, "Cycle Battery (simulated -- injected overtemperature fault)",
-                                 _cycle_battery_simulation_steps_with_fault(), expect_abort=True),
-    ]
+def _select_safety_simulation_workflow():
+    """
+    Workflow-selection menu for the Safety Monitor Simulator. Returns
+    "monitor"/"charge"/"discharge"/"cycle", or None if the operator
+    cancels/skips.
+    """
+    print("\nSafety Monitor Workflow Simulator")
+    print("1. Monitor Battery")
+    print("2. Charge Battery")
+    print("3. Discharge Battery")
+    print("4. Cycle Battery")
+    print("0. Skip")
+    try:
+        raw = input("\nSelect workflow: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return None
+    return {"1": "monitor", "2": "charge", "3": "discharge", "4": "cycle"}.get(raw)
+
+
+def _run_selected_workflow_walkthrough(monitor, choice: str):
+    """Dispatch one selected workflow to _run_workflow_walkthrough() with
+    its step list. Returns a single TestResult, or None if `choice` is
+    invalid (already validated by _select_safety_simulation_workflow())."""
+    if choice == "monitor":
+        return _run_workflow_walkthrough(monitor, "Monitor Battery",
+                                         _monitor_battery_walkthrough_steps())
+    if choice == "charge":
+        return _run_workflow_walkthrough(
+            monitor, "Charge Battery (simulated -- blueprint for future implementation)",
+            _charge_phase_steps())
+    if choice == "discharge":
+        return _run_workflow_walkthrough(
+            monitor, "Discharge Battery (simulated -- blueprint for future implementation)",
+            _discharge_phase_steps())
+    if choice == "cycle":
+        return _run_workflow_walkthrough(
+            monitor, "Cycle Battery (simulated -- injected overtemperature fault)",
+            _cycle_battery_walkthrough_steps(), expect_abort=True)
+    return None
 
 
 def test_safety_monitor():
     """
     Part 1: exercise test_control/safety_monitor.SafetyMonitor's pure logic
     directly -- overvoltage, undervoltage, overcurrent, overtemperature,
-    relay switch guard. Part 2 (below): a step-by-step workflow simulator
-    -- see the module comment above this function.
+    relay switch guard. Part 2 (below): an interactive, operator-selected
+    workflow walkthrough -- see the module comment above this function.
     """
     config_ref = "test_control/safety_monitor.py"
     results    = []
@@ -2439,8 +2640,14 @@ def test_safety_monitor():
         results.append(_fail("Safety Monitor", "relay switch guard", config_ref,
                              f"below threshold: {below}, above threshold: {above}"))
 
-    # Part 2: workflow simulation -- see module comment above this function.
-    results.extend(_simulate_all_workflows(monitor))
+    # Part 2: operator-selected workflow walkthrough -- see module comment
+    # above this function. Skipped entirely if the operator cancels/skips
+    # the selection menu (choice is None).
+    choice = _select_safety_simulation_workflow()
+    if choice is not None:
+        result = _run_selected_workflow_walkthrough(monitor, choice)
+        if result is not None:
+            results.append(result)
 
     return results
 

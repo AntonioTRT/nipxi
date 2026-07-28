@@ -174,16 +174,22 @@ the bottom, with a pointer to where the real documentation lives
 
 - [ ] Add a `--dry-run` / `PXI_SIMULATE` mode exercising test logic without
   hardware (builds on `hardware/simulated.py` above).
-- [ ] Expand `test.py::test_safety_monitor()`'s Part 2 workflow simulator
-  (see `docs/architecture.md` Section 23e) into a full development/
-  validation harness for Charge/Discharge Battery logic, to exercise it
-  ahead of deploying against real hardware -- this is the explicitly
-  planned next step after the menu restructuring review. Candidates:
-  more injected-fault scenarios (overcurrent, undervoltage, relay-switch
-  guard mid-workflow), wiring the same simulated values through
-  `ExecutionFrame`/`render_execution_frame()` for a full mock execution
-  screen, or driving the simulator from `BATTERY_CONFIGS`' actual per-type
+- [ ] Continue expanding `test.py::test_safety_monitor()`'s Part 2 workflow
+  walkthrough (see `docs/architecture.md` Section 23e, now the designated
+  development reference implementation for Charge/Discharge/Cycle Battery)
+  into a full development/validation harness ahead of deploying against
+  real hardware. Candidates: more injected-fault scenarios (overcurrent,
+  undervoltage, relay-switch guard mid-workflow), wiring the same
+  simulated per-step values through `ExecutionFrame`/`render_execution_frame()`
+  for a full mock execution screen (natural pairing with the UI Test menu
+  item), or driving the walkthrough from `BATTERY_CONFIGS`' actual per-type
   limits instead of only `Settings.BAT_*`.
+- [ ] When Charge/Discharge/Cycle Battery are actually implemented, map
+  each real code path back onto `test.py::_charge_phase_steps()`/
+  `_discharge_phase_steps()`/`_cycle_battery_walkthrough_steps()` and
+  confirm the simulator's step sequence still matches -- update the
+  simulator if the real implementation's sequence diverges, so it remains
+  an accurate reference rather than a stale blueprint.
 - [ ] Create `flowcharts/vi_flowchart.md` (referenced in `docs/architecture.md`
   but does not exist yet).
 - [ ] Set up a remote Git repository and update `README.md` with the URL.
@@ -342,6 +348,24 @@ first real-rack hardware bring-up milestone record.
   entry smoke-tested with no unhandled exceptions, Database Tools views
   confirmed against the real development database. See
   `docs/architecture.md` Section 23 and `docs/MILESTONES.md`.
+- **Safety Monitor Simulator -- full workflow walkthrough** -- follow-up
+  enhancement: Part 2 of `test_safety_monitor()` became an interactive,
+  operator-selected (`1. Monitor` / `2. Charge` / `3. Discharge` /
+  `4. Cycle`), step-by-step operational walkthrough -- not just safety
+  decisions, but every action a real workflow executes (load config,
+  resolve group/position/relay routing, close relay, configure/enable
+  PSU, acquire measurement, run the real `SafetyMonitor` check, update
+  `ExecutionFrame`, store measurement, evaluate transitions, ...), pausing
+  for Enter between steps. Each step renders Workflow/Current Phase/
+  Current Step/Description plus Voltage/Current/Temperature/Safety
+  Evaluation/Decision/Next Action. Now designated the development
+  reference implementation for Charge/Discharge/Cycle Battery --
+  `_monitor_battery_walkthrough_steps()` mirrors the real, already-
+  implemented `MonitorBatterySequence.run()` exactly. Step counts:
+  Monitor 16, Charge 16, Discharge 14, Cycle 31 (aborts at step 28/31 on
+  its injected overtemperature fault). No hardware/relay/instrument/
+  database access anywhere in the code path -- confirmed by inspection.
+  See `docs/architecture.md` Section 23e and `docs/MILESTONES.md`.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies
