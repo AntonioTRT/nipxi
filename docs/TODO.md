@@ -63,7 +63,13 @@ the bottom, with a pointer to where the real documentation lives
   It MUST ALSO follow the PSU Safety Verification Pattern (docs/architecture.md
   Section 25) -- call `SMU.force_output_off_and_verify()` before configuring/
   enabling output, the same way `source_dc_voltage_point()` already does,
-  rather than reinventing the pre-check.
+  rather than reinventing the pre-check. Any real dwell this work introduces
+  (a CC-CV hold, an inter-phase settle) MUST use
+  `utils/cancellation.py::interruptible_sleep()` (docs/architecture.md
+  Section 27) rather than a plain `time.sleep()`, and MUST place the
+  `try/finally` guarding `emergency_output_off()` so it covers that dwell
+  too -- see `ChargeCycle`/`DischargeCycle`'s fix in that same section for
+  the exact latent-bug shape to avoid.
 - [MUST] `DAQ.read_all_batteries()`/`verify_zero_current()` -- still
   placeholders (multi-channel synchronized acquisition). `DAQ.read_channel()`
   (single-channel read) IS implemented and real now -- moved out of
@@ -404,6 +410,32 @@ first real-rack hardware bring-up milestone record.
   (SMU) tests confirming the exact 8-step/PSU-equivalent command sequence,
   plus a full non-hardware MENU regression with no failures. See
   `docs/architecture.md` Sections 24-26 and `docs/MILESTONES.md`.
+- **Interruptible Wait Mechanism** -- full timing/delay/timeout/polling/
+  settling-time analysis (`docs/TIMING_ANALYSIS.md`) found several real
+  dwells (`SMU.source_dc_voltage_point()`'s `hold_s`, `ChargeCycle`/
+  `DischargeCycle`'s `STABILIZATION_S`) held hardware energized with NO
+  cancellation checkpoint inside the wait -- most importantly
+  `Settings.PROTO_TEST_DWELL_S`, a temporary 5s value standing in for an
+  intended 120s production value (a ~2-minute Ctrl+C blind spot at that
+  value). New `utils/cancellation.py::interruptible_sleep(duration_s,
+  token=None, poll_interval_s=0.2)` -- a reusable drop-in `time.sleep()`
+  replacement that checks cancellation every `poll_interval_s`;
+  `token=None` preserves exact prior behavior. Wired into
+  `source_dc_voltage_point()` (new `token` parameter, threaded from
+  `ProtoTestSequence`), `ChargeCycle`/`DischargeCycle`'s stabilization and
+  per-sample sleeps, and `MonitorBatterySequence.run()`'s sample interval.
+  A real latent bug was found and fixed while wiring this in:
+  `ChargeCycle`/`DischargeCycle`'s `STABILIZATION_S` sleep lived OUTSIDE
+  the `try/finally` guarding `emergency_output_off()` -- harmless while
+  uninterruptible, a live gap the moment it became cancellable; fixed by
+  moving the `try/finally` to start right after `output_enable()`.
+  `source_dc_voltage_point()` also gained an explicit
+  `except OperationCancelledError: raise` so a mid-hold cancellation is
+  never wrapped into a generic `SMUError`. Verified with mocked
+  cancellation firing mid-dwell at all three call sites (each cancelled in
+  a few hundred ms, not the full configured duration) and a normal
+  non-cancelled run confirmed to preserve exact prior timing. See
+  `docs/architecture.md` Section 27.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies

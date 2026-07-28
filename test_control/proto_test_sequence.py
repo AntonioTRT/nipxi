@@ -161,6 +161,7 @@ class ProtoTestSequence:
                     voltage_range_v=self.s.BAT_VOLTAGE_MAX,
                     hold_s=dwell_s,
                     during_hold=_read_dmm,
+                    token=token,
                 )
 
                 dmm_v = reading["during_hold_result"]

@@ -63,11 +63,10 @@ one source of truth for the resource string (config/devices.py, not
 config/settings.py).
 """
 
-import time
-
 from config.settings import Settings
 from hardware.base import HardwareBase
-from utils.errors import SMUError, SMUStateVerificationError
+from utils.cancellation import interruptible_sleep
+from utils.errors import OperationCancelledError, SMUError, SMUStateVerificationError
 
 
 class SMU(HardwareBase):
@@ -468,7 +467,7 @@ class SMU(HardwareBase):
 
     def source_dc_voltage_point(self, voltage_v: float, current_limit_a: float,
                                  voltage_range_v: float, hold_s: float = 0.0,
-                                 during_hold=None) -> dict:
+                                 during_hold=None, token=None) -> dict:
         """
         Source a single static DC voltage point and confirm it electrically.
 
@@ -516,6 +515,24 @@ class SMU(HardwareBase):
         driver knowing anything about what `during_hold` is or does. Its
         return value is included in the result dict as
         `"during_hold_result"` (None if `during_hold` was not given).
+
+        `token` (default None -- existing callers unaffected), if given, is
+        threaded into `utils.cancellation.interruptible_sleep()` for the
+        `hold_s` wait -- see docs/architecture.md "Interruptible Wait
+        Mechanism" / docs/TIMING_ANALYSIS.md. Without this, `hold_s` held
+        output energized for the full configured duration with NO
+        cancellation checkpoint at all -- the single highest-priority gap
+        identified by that review, since `Settings.PROTO_TEST_DWELL_S` is a
+        temporary 5s value standing in for an intended 120s production
+        value. `OperationCancelledError` raised by the interruptible wait
+        propagates through this method UNCHANGED (never wrapped into
+        `SMUError` -- see the `except OperationCancelledError: raise`
+        clause below) so callers that specifically catch
+        `OperationCancelledError` (e.g. `ProtoTestSequence.run()`) still
+        see it as a cancellation, not a generic failure. The `finally`
+        block below still always runs -- output is disabled and verified
+        OFF whether this method returns normally, raises `SMUError`, or is
+        cancelled mid-hold.
 
         PSU Safety Verification Pattern (see docs/architecture.md):
         BEFORE any configuration is attempted, this method now calls
@@ -605,9 +622,15 @@ class SMU(HardwareBase):
                 # behavior change.
                 if during_hold is not None:
                     during_hold_result = during_hold()
-                if hold_s > 0:
-                    time.sleep(hold_s)
+                interruptible_sleep(hold_s, token=token)
         except SMUStateVerificationError:
+            raise
+        except OperationCancelledError:
+            # A deliberate operator cancellation during the hold -- never
+            # wrap this into SMUError; callers (e.g. ProtoTestSequence.run())
+            # specifically catch OperationCancelledError to distinguish a
+            # cancellation from a real fault. The finally block below still
+            # disables and verifies output regardless.
             raise
         except Exception as e:
             raise SMUError(

@@ -59,12 +59,11 @@ Monitor-specific relay-only shutdown path.
 """
 
 import logging
-import time
 
 from config.settings import Settings
 from test_control.execution_screen import ExecutionFrame, render_execution_frame
 from test_control.safety_monitor import SafetyMonitor
-from utils.cancellation import check_cancellation
+from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import SafetyViolationError, RelayError, OperationCancelledError
 from utils.stop_reason import StopReason
 
@@ -177,7 +176,13 @@ class MonitorBatterySequence:
                 )
                 render_execution_frame(frame)
 
-                time.sleep(sample_interval_s)
+                # Interruptible -- see utils/cancellation.py::interruptible_sleep()
+                # / docs/architecture.md "Interruptible Wait Mechanism". Previously
+                # a plain time.sleep(); cancellation was already checked at the top
+                # of the next loop iteration either way, so this tightens worst-case
+                # Ctrl+C latency from ~sample_interval_s down to ~poll_interval_s
+                # without changing normal (non-cancelled) timing.
+                interruptible_sleep(sample_interval_s, token=token)
 
         except OperationCancelledError as e:
             # Deliberate operator action, not a fault -- monitoring is

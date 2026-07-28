@@ -658,6 +658,57 @@ non-hardware MENU smoke test (all 13 top-level entries) and the Monitor
 Battery/Safety Monitor Simulator mocked smoke tests re-run with no
 regressions.
 
+## Milestone II: Timing/Delay/Settling Analysis + Interruptible Wait Mechanism
+
+Full timing/delay/timeout/polling/settling-time analysis performed across
+every hardware category (`docs/TIMING_ANALYSIS.md`), ahead of real
+Charge/Discharge Battery implementation. Top finding: several real dwells
+held hardware energized for their full configured duration with **no
+cancellation checkpoint inside the wait itself** -- most importantly
+`SMU.source_dc_voltage_point()`'s `hold_s` (used by `ProtoTestSequence`
+via `Settings.PROTO_TEST_DWELL_S`, a temporary 5s value standing in for an
+intended 120s production value -- at 120s, an uncancellable dwell would be
+a ~2-minute Ctrl+C blind spot) and `ChargeCycle`/`DischargeCycle`'s
+pre-loop `STABILIZATION_S` (5.0s).
+
+**Fix:** new `utils/cancellation.py::interruptible_sleep(duration_s, token=None,
+poll_interval_s=0.2)` -- a reusable drop-in replacement for `time.sleep()`
+that checks for cancellation every `poll_interval_s` (default 0.2s)
+instead of blocking uninterrupted. `token=None` preserves the exact prior
+`time.sleep()` behavior (zero change for callers that don't pass one);
+cancelled-mid-wait bounds worst-case Ctrl+C latency to ~`poll_interval_s`
+instead of the full duration; normal (non-cancelled) total wait time is
+unchanged.
+
+Wired into every real dwell identified by the review: `SMU.
+source_dc_voltage_point()`'s `hold_s` (new `token` parameter, threaded
+through from `ProtoTestSequence.run()`), `ChargeCycle`/`DischargeCycle`'s
+`STABILIZATION_S` and per-sample `dt` sleeps, and `MonitorBatterySequence.
+run()`'s `sample_interval_s`.
+
+**A real latent bug was found and fixed** while wiring this in:
+`ChargeCycle`/`DischargeCycle`'s `STABILIZATION_S` sleep was located
+OUTSIDE the `try/finally` guarding `smu.emergency_output_off()` --
+harmless while the sleep was uninterruptible, but a live gap the moment
+it became cancellable (a cancellation during stabilization would have
+skipped the PMU shutdown entirely). Fixed by moving the `try/finally` to
+start immediately after `output_enable()`, covering the stabilization
+wait and the sampling loop both. `SMU.source_dc_voltage_point()`'s
+exception handling also gained an explicit `except OperationCancelledError:
+raise` (mirroring its existing `SMUStateVerificationError` clause) so a
+mid-hold cancellation is never silently wrapped into a generic `SMUError`.
+
+Verified: `interruptible_sleep()` unit-tested in isolation (no-token /
+never-cancelled / cancelled-mid-wait, all three behaviors confirmed);
+`source_dc_voltage_point(hold_s=10.0)` cancelled after ~0.2s with output
+still confirmed OFF; `ChargeCycle.run()` cancelled 0.1s into a 5.0s
+`STABILIZATION_S` window with `emergency_output_off()` confirmed called;
+`MonitorBatterySequence.run()` cancelled ~0.3s into a 2.0s
+`sample_interval_s` window with safe-cancel shutdown confirmed; a normal
+(non-cancelled) `hold_s=0.6` run confirmed to still take the full ~0.6s;
+full non-hardware MENU regression (13 entries) re-run with no failures.
+See `docs/architecture.md` Section 27.
+
 ---
 
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the

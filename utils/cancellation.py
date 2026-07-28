@@ -95,3 +95,66 @@ def check_cancellation(token):
     """
     if token is not None:
         token.check()
+
+
+def interruptible_sleep(duration_s: float, token=None, poll_interval_s: float = 0.2):
+    """
+    Reusable interruptible wait -- a drop-in replacement for `time.sleep(duration_s)`
+    that checks `token` for a cancellation request every `poll_interval_s`
+    seconds instead of blocking for the full duration uninterrupted.
+
+    Why this exists (see docs/architecture.md "Interruptible Wait Mechanism"
+    and docs/TIMING_ANALYSIS.md): several real dwells in this codebase --
+    hardware/smu.py::SMU.source_dc_voltage_point()'s `hold_s`,
+    test_control/charge_cycle.py/discharge_cycle.py's `STABILIZATION_S` --
+    held hardware energized (PSU output enabled, relay closed) for the
+    full configured duration with NO cancellation checkpoint at all, so a
+    Ctrl+C during one of those windows was not noticed until the sleep
+    completed. `Settings.PROTO_TEST_DWELL_S` is explicitly the
+    highest-priority instance of this (a temporary 5s value standing in
+    for an intended 120s production value) -- at 120s, an uninterrupted
+    `time.sleep()` there would be a ~2-minute cancellation blind spot.
+
+    Behavior:
+      - `token=None` (the default, matching every other cancellation
+        checkpoint in this codebase): sleeps the FULL `duration_s` via a
+        single `time.sleep()` call, byte-for-byte the same as before this
+        function existed -- existing callers that don't pass a token see
+        zero behavior change.
+      - `token` given: checks `check_cancellation(token)` BEFORE the first
+        sleep slice (so a cancellation already requested before the wait
+        even begins is caught immediately, never sleeping at all) and
+        again before every subsequent slice, sleeping in increments of at
+        most `poll_interval_s` until either `duration_s` has fully
+        elapsed (normal return, identical total wait time to a plain
+        `time.sleep(duration_s)`) or a cancellation is detected (raises
+        `OperationCancelledError` immediately, bounding worst-case
+        latency to ~`poll_interval_s` instead of the full duration).
+      - `duration_s <= 0`: returns immediately, no-op -- matches
+        `time.sleep()`'s own behavior for a non-positive duration, and
+        keeps every existing caller that passes `hold_s=0.0` (the default)
+        unaffected.
+
+    Must only be used for a dwell BETWEEN atomic hardware operations, same
+    as `check_cancellation()` itself -- never wrap a single atomic
+    command/verify round trip in this (e.g. never use this inside
+    hardware/relay_eth.py's Telnet response wait, which is deliberately
+    NOT interruptible -- interrupting mid-command would leave relay state
+    less certain, not safer). This function itself never touches any
+    hardware -- it is a pure timing primitive, reusable by any future
+    Charge/Discharge/Cycle Battery workflow exactly as it is by the
+    callers wired in today.
+    """
+    if duration_s <= 0:
+        return
+    if token is None:
+        time.sleep(duration_s)
+        return
+
+    deadline = time.monotonic() + duration_s
+    while True:
+        check_cancellation(token)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(poll_interval_s, remaining))

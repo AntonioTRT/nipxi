@@ -10,7 +10,7 @@ import logging
 import time
 from config.settings import Settings
 from test_control.safety_monitor import SafetyMonitor
-from utils.cancellation import check_cancellation
+from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import SafetyViolationError
 
 
@@ -42,17 +42,23 @@ class DischargeCycle:
         )
         self.smu.output_enable()
 
-        time.sleep(self.s.STABILIZATION_S)
-
-        t_start = time.monotonic()
-        dt = 1.0 / self.s.SAMPLE_RATE_HZ
-
         # PMU fail-safe: emergency_output_off() runs exactly once regardless
-        # of how this loop exits -- normal completion, timeout, a safety
+        # of how this block exits -- normal completion, timeout, a safety
         # violation, a cancellation, or any unhandled exception. See
         # hardware/smu.py module docstring and docs/architecture.md "PMU
         # Safety Philosophy".
+        #
+        # The try/finally now starts here, BEFORE the stabilization wait --
+        # see charge_cycle.py::ChargeCycle.run() for the full rationale
+        # (same latent gap, same fix, same reasoning).
         try:
+            # Interruptible -- see charge_cycle.py::ChargeCycle.run().
+            # Normal (non-cancelled) timing unchanged.
+            interruptible_sleep(self.s.STABILIZATION_S, token=token)
+
+            t_start = time.monotonic()
+            dt = 1.0 / self.s.SAMPLE_RATE_HZ
+
             while True:
                 check_cancellation(token)
 
@@ -77,7 +83,8 @@ class DischargeCycle:
                     self.log.info("Discharge complete on channel %d (V=%.3f)", channel, v)
                     return True
 
-                time.sleep(dt)
+                # Interruptible -- see charge_cycle.py::ChargeCycle.run().
+                interruptible_sleep(dt, token=token)
         finally:
             if not self.smu.emergency_output_off(f"end of discharge cycle on channel {channel}"):
                 self.log.critical(

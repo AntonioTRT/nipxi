@@ -10,7 +10,7 @@ import logging
 import time
 from config.settings import Settings
 from test_control.safety_monitor import SafetyMonitor
-from utils.cancellation import check_cancellation
+from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import SafetyViolationError, TimeoutError
 
 
@@ -50,19 +50,33 @@ class ChargeCycle:
         )
         self.smu.output_enable()
 
-        time.sleep(self.s.STABILIZATION_S)
-
-        t_start = time.monotonic()
-        dt = 1.0 / self.s.SAMPLE_RATE_HZ
-
         # PMU fail-safe: emergency_output_off() runs exactly once regardless
-        # of how this loop exits -- normal completion, timeout, a safety
+        # of how this block exits -- normal completion, timeout, a safety
         # violation, a cancellation, or any unhandled exception (e.g.
         # self.daq raising). "Unknown PMU state = unsafe state" applies to
         # every exit path, not just the ones we anticipated. See
         # hardware/smu.py module docstring and docs/architecture.md "PMU
         # Safety Philosophy".
+        #
+        # The try/finally now starts here, BEFORE the stabilization wait --
+        # previously it started after that wait completed, so a
+        # cancellation raised DURING stabilization would have skipped
+        # emergency_output_off() entirely, leaving output enabled. This was
+        # latent (a plain time.sleep() could never raise) until the
+        # stabilization wait below became interruptible -- fixed as part of
+        # that same change. See docs/architecture.md "Interruptible Wait
+        # Mechanism" / docs/TIMING_ANALYSIS.md.
         try:
+            # Interruptible: previously an uninterrupted time.sleep() with
+            # NO cancellation checkpoint at all for the full
+            # STABILIZATION_S duration, output already energized. Normal
+            # (non-cancelled) timing is unchanged -- this still waits the
+            # full STABILIZATION_S before the first sample.
+            interruptible_sleep(self.s.STABILIZATION_S, token=token)
+
+            t_start = time.monotonic()
+            dt = 1.0 / self.s.SAMPLE_RATE_HZ
+
             while True:
                 # Checkpoint: between atomic hardware operations only --
                 # never inside the DAQ read or the safety check below.
@@ -90,7 +104,11 @@ class ChargeCycle:
                     self.log.info("Charge complete on channel %d (V=%.3f, I=%.4f)", channel, v, i)
                     return True
 
-                time.sleep(dt)
+                # Interruptible: previously bounded cancellation latency to
+                # ~one dt via the checkpoint at the top of the next
+                # iteration; now checked at ~poll_interval_s granularity
+                # during the sleep itself too. Normal timing unchanged.
+                interruptible_sleep(dt, token=token)
         finally:
             if not self.smu.emergency_output_off(f"end of charge cycle on channel {channel}"):
                 self.log.critical(
