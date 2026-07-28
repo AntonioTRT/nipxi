@@ -22,7 +22,7 @@ class ChargeCycle:
         self.s = settings
         self.log = logging.getLogger("nipxi.charge")
 
-    def run(self, channel: int, data_collector, token=None) -> bool:
+    def run(self, channel: int, data_collector, token=None, battery_cfg: dict = None) -> bool:
         """
         Run one complete CC-CV charge on `channel`.
         Calls data_collector.record(channel, sample) for each sample.
@@ -35,8 +35,26 @@ class ChargeCycle:
         iteration. Never checked mid-sequence inside a single hardware
         operation (see the module docstring's referenced safety sequence
         rules).
+
+        `battery_cfg` (a config/devices.py BATTERY_CONFIGS[...] entry),
+        if given, supplies the commanded charge current
+        (max_charge_current_a) and CV voltage (voltage_max_v) instead of
+        the global Settings.CHARGE_CURRENT_A/CHARGE_VOLTAGE_V, and is
+        forwarded to self.safety so SafetyMonitor.check() enforces the
+        same battery-specific limits. battery_cfg=None preserves prior
+        (global-Settings-only) behavior exactly. The CV-taper cutoff
+        current (CHARGE_CUTOFF_A) has no BATTERY_CONFIGS equivalent and
+        remains a global Settings constant -- a deliberate scope boundary,
+        not an oversight (see docs/architecture.md).
         """
         self.log.info("Starting charge cycle on channel %d", channel)
+
+        current_a = self.s.CHARGE_CURRENT_A
+        voltage_limit_v = self.s.CHARGE_VOLTAGE_V
+        if battery_cfg is not None:
+            current_a = battery_cfg.get("max_charge_current_a", current_a)
+            voltage_limit_v = battery_cfg.get("voltage_max_v", voltage_limit_v)
+        self.safety.set_battery_limits(battery_cfg)
 
         # Checkpoint: skip entirely if cancellation was already requested
         # before this cycle started (e.g. during the previous channel's
@@ -45,8 +63,8 @@ class ChargeCycle:
         check_cancellation(token)
 
         self.smu.set_charge_mode(
-            current_a=self.s.CHARGE_CURRENT_A,
-            voltage_limit_v=self.s.CHARGE_VOLTAGE_V,
+            current_a=current_a,
+            voltage_limit_v=voltage_limit_v,
         )
         self.smu.output_enable()
 
@@ -93,14 +111,14 @@ class ChargeCycle:
                 # TODO: get temperature from NTC channel
                 t_c = None
 
-                status = self.safety.check(v, i, t_c)
+                status = self.safety.check(v, i, t_c, mode="charge")
                 if not status.safe:
                     raise SafetyViolationError(f"Channel {channel}: {status.reason}")
 
                 data_collector.record(channel, {"elapsed_s": elapsed, "voltage_v": v, "current_a": i, "temp_c": t_c, "phase": "charge"})
 
                 # End of charge: CV taper current drops below cutoff
-                if v >= self.s.CHARGE_VOLTAGE_V and abs(i) <= self.s.CHARGE_CUTOFF_A:
+                if v >= voltage_limit_v and abs(i) <= self.s.CHARGE_CUTOFF_A:
                     self.log.info("Charge complete on channel %d (V=%.3f, I=%.4f)", channel, v, i)
                     return True
 

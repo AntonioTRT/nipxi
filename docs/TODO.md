@@ -119,10 +119,10 @@ the bottom, with a pointer to where the real documentation lives
   spec (typical: 30 min OCV rest at room temperature).
 - [ ] `data/report.py` -- implement the test summary report: capacity (Ah)
   per channel per cycle, V/I vs time plot, export to `data_output/reports/`.
-- [ ] Wire `BATTERY_CONFIGS` into `safety_monitor.py`/`charge_cycle.py`/
+- [x] Wire `BATTERY_CONFIGS` into `safety_monitor.py`/`charge_cycle.py`/
   `discharge_cycle.py` so per-battery limits actually apply instead of the
-  single global `BAT_VOLTAGE_MAX`/etc. See `docs/architecture.md` Section 11
-  ("Operational Limit Resolution" / planned `LimitResolver`, doc-only today).
+  single global `BAT_VOLTAGE_MAX`/etc. DONE -- see "Completed (Summary)"
+  below and `docs/architecture.md` Section 28.
 - [ ] Cycle/state recovery engine (`docs/DATABASE_ROADMAP.md` Section 4) --
   `is_recovery_enabled()` config hook and a `station_state` table now exist
   (`data/storage.py`, added for Proto Test Execution, Milestone 2 -- see
@@ -201,8 +201,8 @@ the bottom, with a pointer to where the real documentation lives
   undervoltage, relay-switch guard mid-workflow), wiring the same
   simulated per-step values through `ExecutionFrame`/`render_execution_frame()`
   for a full mock execution screen (natural pairing with the UI Test menu
-  item), or driving the walkthrough from `BATTERY_CONFIGS`' actual per-type
-  limits instead of only `Settings.BAT_*`.
+  item). (Driving the walkthrough from `BATTERY_CONFIGS`' actual per-type
+  limits is DONE -- see `docs/architecture.md` Section 28.)
 - [ ] When Charge/Discharge/Cycle Battery are actually implemented, map
   each real code path back onto `test.py::_charge_phase_steps()`/
   `_discharge_phase_steps()`/`_cycle_battery_walkthrough_steps()` and
@@ -436,6 +436,28 @@ first real-rack hardware bring-up milestone record.
   a few hundred ms, not the full configured duration) and a normal
   non-cancelled run confirmed to preserve exact prior timing. See
   `docs/architecture.md` Section 27.
+- **BATTERY_CONFIGS -> SafetyMonitor Integration** -- architecture review
+  (`docs/SAFETY_MONITOR_BATTERY_LIMITS_REVIEW.md`) found `SafetyMonitor`/
+  `ChargeCycle`/`DischargeCycle` battery-type-blind: despite `BATTERY_CONFIGS`
+  already holding per-battery (HUB/SB) limits and battery selection already
+  existing, safety checks and commanded setpoints only ever read shared
+  global `Settings.BAT_*`/`CHARGE_*`/`DISCHARGE_*` constants (SB had up to
+  ~12.5x headroom versus its own configured limits, HUB ~1.9x). Fixed with
+  an optional, backward-compatible `battery_cfg` parameter: `SafetyMonitor`
+  (constructor + `set_battery_limits()`, four private limit resolvers, a new
+  `mode`="charge"/"discharge" parameter on `check()`), `ChargeCycle.run()`/
+  `DischargeCycle.run()` (resolve commanded PSU current/voltage from
+  `battery_cfg`, call `safety.set_battery_limits()`, pass `mode` into every
+  check, use the resolved voltage in the EOC/EOD threshold), and
+  `BatteryTestSequence.run()` (threaded through for completeness).
+  `battery_cfg=None` preserves exact prior global-Settings-only behavior.
+  `CHARGE_CUTOFF_A` (no `BATTERY_CONFIGS` equivalent) deliberately stays
+  global. Safety Monitor Simulator (`test.py`) gained a battery-type
+  selection step so its walkthroughs are also battery-aware. Verified: HUB/
+  SB now trip at their own distinct current/voltage limits; all four
+  simulator workflows re-run PASS for HUB, SB, and skip. Closes the last
+  significant safety-architecture gap before real Charge Battery
+  implementation. See `docs/architecture.md` Section 28.
 - **SMU configuration verification (post-Milestone-1 hardening)** --
   `source_dc_voltage_point()` now reads back `voltage_level`/`current_limit`/
   `output_enabled` from the NI-DCPower session after `commit()` and verifies
@@ -546,8 +568,10 @@ first real-rack hardware bring-up milestone record.
   Section 9.
 - **Operational Limit Resolution philosophy** -- `BATTERY_CONFIGS` is
   capabilities/recommended ranges only, never sole operational authority
-  (planned `LimitResolver`, documentation only). See `docs/architecture.md`
-  Section 11.
+  (planned `LimitResolver`, documentation only at the time this was
+  written). Superseded in part by the actual `SafetyMonitor`/`ChargeCycle`/
+  `DischargeCycle` integration below -- see `docs/architecture.md` Section
+  11 (original philosophy) and Section 28 (the implemented integration).
 - **`data/sqlite_manager.py`** -- minimal foundation (`create_database()`,
   `initialize_schema()`, `insert_test_record()`, `get_last_record()`),
   verified passing without PXI hardware attached.

@@ -40,10 +40,16 @@ class BatteryTestSequence:
         self.s = settings
         self.log = logging.getLogger("nipxi.test")
 
-    def run(self, channels: list[int] = None, token=None):
+    def run(self, channels: list[int] = None, token=None, battery_cfg: dict = None):
         """
         Run a full charge+discharge cycle on each channel.
         `channels` defaults to settings.ACTIVE_CHANNELS.
+
+        `battery_cfg` (a config/devices.py BATTERY_CONFIGS[...] entry), if
+        given, is forwarded unchanged to self.charge.run()/
+        self.discharge.run() so both cycles (and SafetyMonitor, via their
+        own set_battery_limits() calls) use battery-specific limits.
+        battery_cfg=None preserves prior (global-Settings-only) behavior.
 
         `token` (see utils/cancellation.py) is checked once before each
         channel starts (never mid-channel here -- the finer-grained
@@ -87,7 +93,7 @@ class BatteryTestSequence:
                 self.relay.close(ch)
 
                 # Charge step first (standardizes SOC per protocol recommendation)
-                self.charge.run(ch, self.data, token)
+                self.charge.run(ch, self.data, token, battery_cfg=battery_cfg)
 
                 # Verify zero current between charge and discharge
                 # (SMU is already disabled inside charge_cycle.run)
@@ -96,7 +102,7 @@ class BatteryTestSequence:
                     continue
 
                 # Discharge step
-                self.discharge.run(ch, self.data, token)
+                self.discharge.run(ch, self.data, token, battery_cfg=battery_cfg)
 
             except OperationCancelledError as e:
                 # Deliberate operator action, not a fault -- distinct log

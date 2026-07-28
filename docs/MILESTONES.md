@@ -711,6 +711,40 @@ See `docs/architecture.md` Section 27.
 
 ---
 
+## Milestone II: BATTERY_CONFIGS -> SafetyMonitor Integration
+
+Architecture review (`docs/SAFETY_MONITOR_BATTERY_LIMITS_REVIEW.md`) found
+that `SafetyMonitor`/`ChargeCycle`/`DischargeCycle` were battery-type-blind:
+despite `config/devices.py::BATTERY_CONFIGS` already holding per-battery
+(HUB/SB) voltage/current/temperature limits and battery selection already
+existing in the UI, safety checks and commanded charge/discharge setpoints
+still only read the shared global `Settings.BAT_*`/`CHARGE_*`/`DISCHARGE_*`
+constants -- quantified as up to ~12.5x headroom for SB and ~1.9x for HUB
+versus their own configured limits.
+
+**Fix:** `SafetyMonitor` gained an optional `battery_cfg` (constructor and
+`set_battery_limits()`), four private limit resolvers, and a `mode`
+("charge"/"discharge") parameter on `check()` to pick the matching current
+limit -- `battery_cfg=None` (default) preserves the exact prior
+global-Settings-only behavior. `ChargeCycle.run()`/`DischargeCycle.run()`
+gained an optional `battery_cfg` parameter: when given, it resolves the
+commanded PSU current/voltage from `BATTERY_CONFIGS` instead of global
+`Settings`, calls `safety.set_battery_limits(battery_cfg)`, and passes the
+matching `mode` into every safety check. `BatteryTestSequence` threads
+`battery_cfg` through for completeness. The Safety Monitor Simulator
+(`test.py`) gained a battery-type selection step so its displayed/enforced
+limits also come from the selected `BATTERY_CONFIGS` entry.
+
+Verified: HUB and SB now trip `SafetyMonitor.check()` at their own distinct
+current limits (previously indistinguishable under the shared global
+ceiling); `battery_cfg=None` reproduces prior behavior exactly; all four
+Safety Monitor Simulator workflows (Monitor/Charge/Discharge/Cycle) re-run
+PASS for HUB, SB, and "skip battery selection". See `docs/architecture.md`
+Section 28. This closes the last significant safety-architecture gap
+identified before real Charge Battery implementation.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

@@ -8,6 +8,13 @@ Rules (per BLOSS Hub spec and VI flowchart):
     - Current must not exceed BAT_CURRENT_MAX
     - Temperature must stay below BAT_TEMP_MAX_C
     - Relay must NOT switch while current > ZERO_CURRENT_THRESHOLD_A
+
+Battery-aware limits (config/devices.py BATTERY_CONFIGS): when a
+battery_cfg dict is supplied (constructor or set_battery_limits()),
+voltage/current/temperature limits are resolved from it instead of the
+global Settings.BAT_* constants -- see docs/architecture.md,
+"BATTERY_CONFIGS -> SafetyMonitor Integration". battery_cfg=None (the
+default) preserves the exact prior global-Settings-only behavior.
 """
 
 import logging
@@ -22,25 +29,81 @@ class SafetyStatus:
 
 
 class SafetyMonitor:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, battery_cfg: dict = None):
         self.s = settings
+        self.battery_cfg = battery_cfg
         self.log = logging.getLogger("nipxi.safety")
 
-    def check(self, voltage_v: float, current_a: float, temp_c) -> SafetyStatus:
+    def set_battery_limits(self, battery_cfg: dict = None):
+        """
+        Set (or clear, with None) the active battery configuration
+        (a config/devices.py BATTERY_CONFIGS[...] entry) used to resolve
+        limits in check(). Passing None reverts to global Settings.BAT_*
+        values -- the same behavior as never having called this at all.
+        """
+        self.battery_cfg = battery_cfg
+
+    def _voltage_max(self) -> float:
+        if self.battery_cfg is not None and "voltage_max_v" in self.battery_cfg:
+            return self.battery_cfg["voltage_max_v"]
+        return self.s.BAT_VOLTAGE_MAX
+
+    def _voltage_min(self) -> float:
+        if self.battery_cfg is not None and "voltage_min_v" in self.battery_cfg:
+            return self.battery_cfg["voltage_min_v"]
+        return self.s.BAT_VOLTAGE_MIN
+
+    def _temp_max(self) -> float:
+        if self.battery_cfg is not None and "max_temp_c" in self.battery_cfg:
+            return self.battery_cfg["max_temp_c"]
+        return self.s.BAT_TEMP_MAX_C
+
+    def _current_max(self, mode: str = None) -> float:
+        """
+        Resolve the max allowable |current_a| for this battery_cfg/mode.
+        mode="charge"/"discharge" selects the matching battery_cfg field.
+        mode=None (battery_cfg present) falls back to the more restrictive
+        (min) of charge/discharge limits, so an omitted mode is never
+        accidentally more permissive than either. No battery_cfg -> the
+        global Settings.BAT_CURRENT_MAX, unchanged from prior behavior.
+        """
+        if self.battery_cfg is None:
+            return self.s.BAT_CURRENT_MAX
+        if mode == "charge" and "max_charge_current_a" in self.battery_cfg:
+            return self.battery_cfg["max_charge_current_a"]
+        if mode == "discharge" and "max_discharge_current_a" in self.battery_cfg:
+            return self.battery_cfg["max_discharge_current_a"]
+        charge_i = self.battery_cfg.get("max_charge_current_a")
+        discharge_i = self.battery_cfg.get("max_discharge_current_a")
+        candidates = [i for i in (charge_i, discharge_i) if i is not None]
+        if candidates:
+            return min(candidates)
+        return self.s.BAT_CURRENT_MAX
+
+    def check(self, voltage_v: float, current_a: float, temp_c, mode: str = None) -> SafetyStatus:
         # temp_c may be None when NTC read is not yet wired in
-        """Check a single measurement point against all limits."""
+        """
+        Check a single measurement point against all limits.
+        mode="charge"/"discharge" (optional) selects the battery_cfg
+        current limit matching the active operation -- see _current_max().
+        Has no effect when no battery_cfg is set.
+        """
+        v_max = self._voltage_max()
+        v_min = self._voltage_min()
+        i_max = self._current_max(mode)
+        t_max = self._temp_max()
 
-        if voltage_v > self.s.BAT_VOLTAGE_MAX:
-            return SafetyStatus(False, f"Overvoltage: {voltage_v:.3f} V > {self.s.BAT_VOLTAGE_MAX} V")
+        if voltage_v > v_max:
+            return SafetyStatus(False, f"Overvoltage: {voltage_v:.3f} V > {v_max} V")
 
-        if voltage_v < self.s.BAT_VOLTAGE_MIN:
-            return SafetyStatus(False, f"Undervoltage: {voltage_v:.3f} V < {self.s.BAT_VOLTAGE_MIN} V")
+        if voltage_v < v_min:
+            return SafetyStatus(False, f"Undervoltage: {voltage_v:.3f} V < {v_min} V")
 
-        if abs(current_a) > self.s.BAT_CURRENT_MAX:
-            return SafetyStatus(False, f"Overcurrent: {abs(current_a):.3f} A > {self.s.BAT_CURRENT_MAX} A")
+        if abs(current_a) > i_max:
+            return SafetyStatus(False, f"Overcurrent: {abs(current_a):.3f} A > {i_max} A")
 
-        if temp_c is not None and temp_c > self.s.BAT_TEMP_MAX_C:
-            return SafetyStatus(False, f"Overtemperature: {temp_c:.1f} C > {self.s.BAT_TEMP_MAX_C} C")
+        if temp_c is not None and temp_c > t_max:
+            return SafetyStatus(False, f"Overtemperature: {temp_c:.1f} C > {t_max} C")
 
         return SafetyStatus(True)
 
