@@ -490,30 +490,51 @@ BATTERY_CHANNELS = {
 # to get the 1-based position *within* the group (e.g. global position 11
 # in Group B -> position_start=9 -> in-group position 11-9+1 = 3).
 # =============================================================================
+# "smu"/"dmm"/"daq" are name-keys into SMU_ASSIGNMENTS/DMM_CONFIGS/DAQ_CONFIGS
+# below -- same reference-by-name pattern "relay_matrix" already uses against
+# ETHERNET_DEVICES, not a second copy of any hardware config. None means "no
+# device of this role assigned to this group yet" (same meaning as
+# "relay_matrix": None for groups C/D): hardware_for_group() below returns
+# None for that role rather than guessing a default, and callers must refuse
+# to activate hardware for a role that resolves to None. Only MAIN_DMM/
+# MAIN_DAQ physically exist today, so every group currently shares them --
+# multiple DMMs/DAQs is a future scaling step, same as multiple SMUs.
 BATTERY_GROUPS = {
     "A": {
         "relay_matrix":   "MATRIX_NUMATO_201",
         "position_start": 1,
         "position_end":   8,
         "enabled":        True,
+        "smu":            "PRIMARY_SMU",
+        "dmm":            "MAIN_DMM",
+        "daq":            "MAIN_DAQ",
     },
     "B": {
         "relay_matrix":   "MATRIX_NUMATO_202",
         "position_start": 9,
         "position_end":   16,
         "enabled":        False,   # matrix exists in config, not yet wired for battery routing
+        "smu":            None,    # no SMU assigned to this group yet
+        "dmm":            "MAIN_DMM",
+        "daq":            "MAIN_DAQ",
     },
     "C": {
         "relay_matrix":   None,    # no relay matrix assigned yet
         "position_start": 17,
         "position_end":   24,
         "enabled":        False,
+        "smu":            None,
+        "dmm":            None,
+        "daq":            None,
     },
     "D": {
         "relay_matrix":   None,    # no relay matrix assigned yet
         "position_start": 25,
         "position_end":   32,
         "enabled":        False,
+        "smu":            None,
+        "dmm":            None,
+        "daq":            None,
     },
 }
 
@@ -541,6 +562,36 @@ def group_for_position(global_position: int):
         if grp["position_start"] <= global_position <= grp["position_end"]:
             return name
     return None
+
+
+def hardware_for_group(group: str) -> dict:
+    """
+    Centralized hardware-resolution model: Group -> Relay Matrix -> SMU ->
+    DMM -> DAQ. The single place every workflow (Monitor Battery, Monitor
+    Battery Scan, Charge/Discharge/Cycle Battery, the future Workflow
+    Simulator) resolves which physical devices a group uses -- no workflow
+    should look up SMU_ASSIGNMENTS/DMM_CONFIGS/DAQ_CONFIGS/ETHERNET_DEVICES
+    directly or pick a device positionally (e.g. next(iter(...))).
+
+    Returns a dict with one "<role>_name"/"<role>_cfg" pair per role
+    (relay_matrix/smu/dmm/daq). A role's cfg is None if BATTERY_GROUPS[group]
+    has no device assigned for it (e.g. Group C/D today) -- this is never
+    silently substituted with another device; callers must check for None
+    and refuse to activate hardware for that role.
+
+    Raises KeyError if `group` is not a key in BATTERY_GROUPS.
+    """
+    grp = BATTERY_GROUPS[group]
+    return {
+        "relay_matrix_name": grp["relay_matrix"],
+        "relay_matrix_cfg":  ETHERNET_DEVICES.get(grp["relay_matrix"]),
+        "smu_name": grp["smu"],
+        "smu_cfg":  SMU_ASSIGNMENTS.get(grp["smu"]),
+        "dmm_name": grp["dmm"],
+        "dmm_cfg":  DMM_CONFIGS.get(grp["dmm"]),
+        "daq_name": grp["daq"],
+        "daq_cfg":  DAQ_CONFIGS.get(grp["daq"]),
+    }
 
 # Relay matrix -- serial (COM port) -- MAIN_MATRIX / COM13.
 #

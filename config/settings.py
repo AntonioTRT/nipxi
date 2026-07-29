@@ -132,6 +132,26 @@ class Settings:
     PROTO_TEST_DWELL_S = 5   # s -- per-relay dwell time
 
     # -------------------------------------------------------------------------
+    # Monitor Battery Scan (test_control/monitor_battery_scan_sequence.py) --
+    # relay/DMM/DAQ path validation, no charging. Unconfirmed placeholders --
+    # real hardware behavior (relay settling time, DMM read jitter) is not
+    # yet characterized; this workflow exists to characterize it, not to
+    # enforce it. Configurable per docs/architecture.md, not hardcoded into
+    # the sequence's measurement logic.
+    # -------------------------------------------------------------------------
+    RELAY_SETTLE_TIME_S    = 0.2  # s -- delay after every relay open/close before reading the DMM
+    MONITOR_SCAN_SAMPLES   = 3    # count -- DMM samples averaged per voltage reading
+
+    # How long a position's relay is held closed AFTER the initial settled
+    # voltage/DAQ reading, to observe relay/measurement stability over time
+    # before moving to the next position -- see the CLOSED-state monitoring
+    # dwell in test_control/monitor_battery_scan_sequence.py. Sampled every
+    # MONITOR_SCAN_DWELL_SAMPLE_INTERVAL_S via interruptible_sleep(), never a
+    # blocking sleep() -- cancellation is checked every interval.
+    MONITOR_SCAN_DWELL_TIME_S            = 30   # s -- total monitoring dwell per position
+    MONITOR_SCAN_DWELL_SAMPLE_INTERVAL_S = 5    # s -- DMM/DAQ sample period during the dwell
+
+    # -------------------------------------------------------------------------
     # PXI rack -- simulation mode only. VISA resource strings (slot numbers)
     # live in config/devices.py (SMU_ASSIGNMENTS / DAQ_CONFIG / DMM_CONFIG)
     # ONLY -- that is their single source of truth. They used to be

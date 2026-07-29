@@ -1,10 +1,13 @@
 """
 Monitor Battery sequence -- Run Main Test's first battery-centric mode
 (Milestone II). Read-only battery monitoring: NO charging, NO discharging.
-Mirrors test_control/proto_test_sequence.py::ProtoTestSequence's structure
-deliberately (same constructor shape, same safety-exception handling, same
-storage/event-logging/ExecutionFrame usage) -- this is the second real
-consumer of the Milestone II infrastructure, not a parallel design.
+
+Built on test_control/battery_operation_sequence.py::BatteryOperationSequence,
+which owns the relay/ExecutionFrame/DataStorage/SafetyMonitor/cancellation
+skeleton shared with MonitorBatteryScanSequence (and, going forward,
+Charge/Discharge/Cycle Battery) -- this file supplies only Monitor Battery's
+own sampling loop on top of it, not a parallel implementation of that
+skeleton.
 
 TEMPORARY IMPLEMENTATION -- voltage source is the DMM, not the DAQ:
     The original DAQ-per-channel voltage read (hardware/daq.py::
@@ -39,11 +42,11 @@ Per relay/channel:
        into `measurements`, reusing the ORIGINAL voltage_v/current_a/
        temp_c columns (the same ones charge/discharge cycles already
        write), not the SMU/DMM-specific columns Proto Test populates.
-    4. ExecutionFrame.from_live()/render_execution_frame() -- the same
-       shared renderer, using its battery_voltage/battery_current/
-       battery_temp fields (added alongside the existing smu_*/dmm_*
-       fields specifically for this DAQ-only-in-the-final-architecture,
-       no-sourcing case).
+    4. ExecutionFrame.from_live()/render_execution_frame() (via
+       BatteryOperationSequence._render_frame()) -- the same shared
+       renderer, using its battery_voltage/battery_current/battery_temp
+       fields (added alongside the existing smu_*/dmm_* fields specifically
+       for this DAQ-only-in-the-final-architecture, no-sourcing case).
     5. Running voltage statistics (start/end/min/max/average/sample count)
        are tracked in-memory across the loop and written to `run_summary`
        via finish_run_summary() on every exit path -- the same "one row per
@@ -58,14 +61,10 @@ single safety-shutdown entry point for every mode, rather than a
 Monitor-specific relay-only shutdown path.
 """
 
-import logging
-
 from config.settings import Settings
-from test_control.execution_screen import ExecutionFrame, render_execution_frame
+from test_control.battery_operation_sequence import BatteryOperationSequence
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
-from utils.errors import SafetyViolationError, RelayError, OperationCancelledError
-from utils.stop_reason import StopReason
 
 
 class _VoltageStats:
@@ -108,15 +107,10 @@ class _VoltageStats:
         }
 
 
-class MonitorBatterySequence:
+class MonitorBatterySequence(BatteryOperationSequence):
     def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings):
-        self.smu = smu
-        self.dmm = dmm
-        self.relay = relay
-        self.safety = safety
-        self.storage = storage
-        self.s = settings
-        self.log = logging.getLogger("nipxi.monitor_battery")
+        super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
+                          source="monitor_battery", dmm=dmm)
 
     def run(self, channel: int, relay_address: int, sample_interval_s: float = 2.0, token=None):
         """
@@ -136,11 +130,10 @@ class MonitorBatterySequence:
         summary written to run_summary on exit.
         """
         self.log.info("Monitor Battery starting. Channel: %d  Relay: %d", channel, relay_address)
-        run_summary = self.storage.get_run_summary(self.storage.run_id)
-        run_number = run_summary["id"] if run_summary else None
+        run_number = self._run_number()
         stats = _VoltageStats()
 
-        try:
+        def _loop():
             check_cancellation(token)
             self.relay.close(relay_address)
             self.storage.log_event(
@@ -167,14 +160,11 @@ class MonitorBatterySequence:
                     voltage_v=voltage_v, current_a=current_a, temp_c=temp_c,
                 )
 
-                frame = ExecutionFrame.from_live(
-                    run_number=run_number, run_id=self.storage.run_id, test_type="monitor",
-                    channel=channel, relay=relay_address, state="ACTIVE", phase_detail="MONITORING",
+                self._render_frame(
+                    test_type="monitor", channel=channel, relay_address=relay_address,
+                    run_number=run_number, state="ACTIVE", phase_detail="MONITORING",
                     battery_voltage=voltage_v, battery_current=current_a, battery_temp=temp_c,
-                    recent_measurements=self.storage.get_measurements(run_id=self.storage.run_id),
-                    recent_events=self.storage.get_recent_events(run_id=self.storage.run_id),
                 )
-                render_execution_frame(frame)
 
                 # Interruptible -- see utils/cancellation.py::interruptible_sleep()
                 # / docs/architecture.md "Interruptible Wait Mechanism". Previously
@@ -184,60 +174,9 @@ class MonitorBatterySequence:
                 # without changing normal (non-cancelled) timing.
                 interruptible_sleep(sample_interval_s, token=token)
 
-        except OperationCancelledError as e:
-            # Deliberate operator action, not a fault -- monitoring is
-            # EXPECTED to end this way.
-            self.log.warning("Monitor Battery cancelled: %s", e)
-            self.storage.log_event(
-                level="INFO", source="monitor_battery", channel=channel, relay=relay_address,
-                message="Monitoring stopped by operator",
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.CANCELLED)
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.CANCELLED, result="STOPPED_BY_OPERATOR",
-                **stats.as_run_summary_fields(),
-            )
-            self.safety.safe_cancel_shutdown(self.smu, self.relay, str(e))
-            raise
-
-        except SafetyViolationError as e:
-            self.log.error("Safety violation while monitoring channel %d: %s", channel, e)
-            self.storage.log_event(
-                level="ERROR", source="monitor_battery", channel=channel, relay=relay_address,
-                message=f"Safety violation -- {e}",
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.SAFETY_VIOLATION)
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.SAFETY_VIOLATION, result="FAIL",
-                **stats.as_run_summary_fields(),
-            )
-            self.safety.emergency_stop(self.smu, self.relay, str(e))
-            raise
-
-        except RelayError as e:
-            self.log.error("Relay verification fault while monitoring channel %d: %s", channel, e)
-            self.storage.log_event(
-                level="ERROR", source="monitor_battery", channel=channel, relay=relay_address,
-                message=f"Relay verification fault -- {e}",
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.FAILED)
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.FAILED, result="FAIL",
-                **stats.as_run_summary_fields(),
-            )
-            self.safety.emergency_stop(self.smu, self.relay, str(e))
-            raise
-
-        except Exception as e:
-            self.log.error("Unexpected error while monitoring channel %d: %s", channel, e, exc_info=True)
-            self.storage.log_event(
-                level="ERROR", source="monitor_battery", channel=channel, relay=relay_address,
-                message=f"Unexpected error -- {e}",
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.FAILED)
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.FAILED, result="FAIL",
-                **stats.as_run_summary_fields(),
-            )
-            self.safety.emergency_stop(self.smu, self.relay, str(e))
-            raise
+        self.run_guarded(
+            _loop, channel=channel, relay_address=relay_address,
+            label="Monitor Battery", verb="monitoring",
+            cancel_message="Monitoring stopped by operator",
+            extra_run_summary_fields_fn=stats.as_run_summary_fields,
+        )

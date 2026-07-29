@@ -87,7 +87,10 @@ CREATE TABLE IF NOT EXISTS measurements (
     smu_measured_i                REAL,
     dmm_measured_v                REAL,
     output_enabled_readback       INTEGER,
-    in_compliance                 INTEGER
+    in_compliance                 INTEGER,
+    daq_channel_0_raw             REAL,
+    voltage_min_v                 REAL,
+    voltage_max_v                 REAL
 );
 """
 
@@ -113,6 +116,18 @@ _MEASUREMENT_EXTRA_COLUMNS = [
     "smu_measured_v", "smu_measured_i",
     "dmm_measured_v",
     "output_enabled_readback", "in_compliance",
+    # Monitor Battery Scan (relay/DMM/DAQ path validation, no charging) --
+    # a single, fixed-physical-channel raw AI reading (hardware/daq.py::
+    # DAQ.read_channel()), stored unconverted since the DAQ channel-mapping
+    # architecture is not yet approved (see test_control/
+    # monitor_battery_scan_sequence.py). NULL for every other test_type.
+    "daq_channel_0_raw",
+    # Multi-sample DMM reading stats (Monitor Battery Scan) -- voltage_v
+    # carries the average of MONITOR_SCAN_SAMPLES readings; these carry the
+    # min/max of that same sample set, for relay-isolation/hardware-
+    # characterization analysis. NULL for every other test_type (and NULL
+    # here too if only a single sample was taken).
+    "voltage_min_v", "voltage_max_v",
 ]
 
 _MEASUREMENT_ALL_COLUMNS = _COLUMNS + _MEASUREMENT_EXTRA_COLUMNS
@@ -267,6 +282,9 @@ _MEASUREMENT_MIGRATION_COLUMNS = [
     ("dmm_measured_v", "REAL"),
     ("output_enabled_readback", "INTEGER"),
     ("in_compliance", "INTEGER"),
+    ("daq_channel_0_raw", "REAL"),
+    ("voltage_min_v", "REAL"),
+    ("voltage_max_v", "REAL"),
 ]
 
 _STATION_STATE_MIGRATION_COLUMNS = [
@@ -522,7 +540,8 @@ class DataStorage(StorageBackend):
         current_a, temp_c, commanded_v, commanded_current_limit_a,
         smu_readback_v, smu_readback_current_limit_a, smu_measured_v,
         smu_measured_i, dmm_measured_v, output_enabled_readback,
-        in_compliance -- any field omitted is stored NULL (rendered as
+        in_compliance, daq_channel_0_raw, voltage_min_v, voltage_max_v --
+        any field omitted is stored NULL (rendered as
         "N/A" by the UI layer, never by this method). Unknown keys are
         ignored rather than raising, same policy as
         record_execution_state().

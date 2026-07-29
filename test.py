@@ -3457,23 +3457,48 @@ def _select_battery_position(group: str):
     return pos
 
 
-def _confirm_monitor_battery(battery_type: str, battery_cfg: dict, group: str, position: int):
-    print("\n" + "=" * 60)
-    print("Confirm Configuration")
-    print("=" * 60)
-    print(f"Mode                  : Monitor Battery")
-    print(f"Battery Type          : {battery_type}")
-    print(f"Capacity              : {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
-    print(f"Group                 : {group}")
-    print(f"Position              : {position} (Group {group} Position {position})")
-    print(f"Max Voltage           : {battery_cfg['voltage_max_v']:.2f} V")
-    print(f"Min Voltage           : {battery_cfg['voltage_min_v']:.2f} V")
-    print(f"Max Charge Current    : {battery_cfg['max_charge_current_a']:.3f} A")
-    print(f"Max Discharge Current : {battery_cfg['max_discharge_current_a']:.3f} A")
-    print(f"Max Temperature       : {battery_cfg['max_temp_c']:.1f} C")
-    print("=" * 60)
-    answer = input("\nContinue? (Y/N): ").strip().upper()
-    return answer == "Y"
+def _missing_hardware_roles(hw: dict, required_roles=("relay_matrix", "smu", "dmm", "daq")):
+    """Return the subset of `required_roles` whose config/devices.py::
+    hardware_for_group() cfg resolved to None -- i.e. no device assigned to
+    that role for this group. Never silently substitute another device for
+    a missing role; the caller must abort before any hardware activation."""
+    return [role for role in required_roles if hw[f"{role}_cfg"] is None]
+
+
+def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
+                        group: str, positions_label: str, hw: dict,
+                        extra_lines=None):
+    """
+    Single operator confirmation screen shared by every hardware-activating
+    workflow (Monitor Battery, Monitor Battery Scan, and future Charge/
+    Discharge/Cycle Battery + Workflow Simulator) -- see
+    config/devices.py::hardware_for_group() for how `hw` (its return dict)
+    is resolved. No workflow builds its own hardware summary/confirmation
+    format; this is the one place that does. `extra_lines` is for
+    workflow-specific detail (e.g. battery limits) appended below the
+    hardware summary.
+
+    Returns True if the operator pressed ENTER (continue), False if the
+    operator pressed C (cancel). Cancelling here happens before any relay/
+    PSU/measurement action -- callers must not touch hardware until this
+    returns True.
+    """
+    print("\n" + "-" * 60)
+    print("Operation Summary")
+    print("-" * 60)
+    print(f"\nOperation:\n{operation}")
+    print(f"\nBattery Type:\n{battery_type}  ({battery_cfg['capacity_ah'] * 1000:.0f} mAh)")
+    print(f"\nGroup:\n{group}")
+    print(f"\nPositions:\n{positions_label}")
+    print(f"\nRelay Matrix:\n{hw['relay_matrix_name'] or '(none assigned)'}")
+    print(f"\nSMU:\n{hw['smu_name'] or '(none assigned)'}")
+    print(f"\nDMM:\n{hw['dmm_name'] or '(none assigned)'}")
+    print(f"\nDAQ:\n{hw['daq_name'] or '(none assigned)'}")
+    for line in (extra_lines or []):
+        print(line)
+    print("\n" + "-" * 60)
+    answer = input("Press ENTER to continue, or C to cancel: ").strip().upper()
+    return answer != "C"
 
 
 def _run_monitor_battery():
@@ -3510,8 +3535,15 @@ def _run_monitor_battery():
     if position is None:
         return
 
-    if not _confirm_monitor_battery(battery_type, battery_cfg, group, position):
-        print("\nCancelled -- no relay activated.")
+    # Hardware assignment resolved from config/devices.py::BATTERY_GROUPS via
+    # the single centralized resolver -- no positional SMU_ASSIGNMENTS/
+    # DAQ_CONFIG/DMM_CONFIG lookup here (see docs/architecture.md "Hardware
+    # Resolution Model").
+    hw = dev_cfg.hardware_for_group(group)
+    missing = _missing_hardware_roles(hw)
+    if missing:
+        print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
         return
 
     channel = dev_cfg.resolve_group_position(group, position)
@@ -3521,27 +3553,32 @@ def _run_monitor_battery():
         return
     relay_address = ch_cfg["relay_address"]
 
-    relay_cfg = dev_cfg.NUMATO_RELAY_MATRIX_CONFIG
+    positions_label = f"{position} (Group {group} Position {position})"
+    extra_lines = [
+        f"\nMax Voltage:\n{battery_cfg['voltage_max_v']:.2f} V   "
+        f"Min Voltage: {battery_cfg['voltage_min_v']:.2f} V",
+        f"\nMax Charge Current:\n{battery_cfg['max_charge_current_a']:.3f} A   "
+        f"Max Discharge Current: {battery_cfg['max_discharge_current_a']:.3f} A",
+        f"\nMax Temperature:\n{battery_cfg['max_temp_c']:.1f} C",
+    ]
+    if not _confirm_operation("Monitor Battery", battery_type, battery_cfg, group,
+                               positions_label, hw, extra_lines=extra_lines):
+        print("\nCancelled -- no relay activated.")
+        return
+
+    relay_cfg = hw["relay_matrix_cfg"]
+    smu_name, smu_cfg = hw["smu_name"], hw["smu_cfg"]
     # TEMPORARY: voltage source is the DMM, not the DAQ (see
-    # test_control/monitor_battery_sequence.py module docstring) -- dmm_cfg
-    # is passed explicitly so HardwareManager actually constructs/connects
-    # it, same as run_proto_test_execution() already does.
-    dmm_cfg = dev_cfg.DMM_CONFIG
-    dmm_name = dev_cfg.find_config_name(dev_cfg.DMM_CONFIGS, dmm_cfg)
-    # SMU/DAQ resolved explicitly here (previously left to HardwareManager's
-    # internal defaults) purely so the hardware-identity snapshot below
-    # matches, 1:1, the exact cfg dicts HardwareManager actually builds its
-    # drivers from -- same values as the prior defaults, no behavior change.
-    smu_name, smu_cfg = next(iter(dev_cfg.SMU_ASSIGNMENTS.items()))
-    daq_cfg = dev_cfg.DAQ_CONFIG
-    daq_name = dev_cfg.find_config_name(dev_cfg.DAQ_CONFIGS, daq_cfg)
+    # test_control/monitor_battery_sequence.py module docstring).
+    dmm_name, dmm_cfg = hw["dmm_name"], hw["dmm_cfg"]
+    daq_name, daq_cfg = hw["daq_name"], hw["daq_cfg"]
     print("\nSelected Hardware\n")
     print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
     print(f"DMM (temporary voltage source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
 
-    hw = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
+    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
     try:
-        hw.connect_all()
+        hw_mgr.connect_all()
     except HardwareInitError as e:
         print(f"[FAIL] Hardware initialization failed: {e}")
         return
@@ -3568,7 +3605,7 @@ def _run_monitor_battery():
             **hardware_snapshot,
         )
         storage.log_event(level="INFO", source="monitor_battery", message="Run started")
-        storage.log_event(level="INFO", source="monitor_battery", message="Mode selected: Monitor")
+        storage.log_event(level="INFO", source="monitor_battery", message="Operation selected: Monitor Battery")
         storage.log_event(level="INFO", source="monitor_battery", message=f"Battery selected: {battery_type}")
         storage.log_event(level="INFO", source="monitor_battery",
                            message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
@@ -3578,6 +3615,12 @@ def _run_monitor_battery():
                            message=f"Position selected: {position} (Group {group} Position {position})")
         storage.log_event(level="INFO", source="monitor_battery",
                            message="Configuration snapshot recorded")
+        storage.log_event(level="INFO", source="monitor_battery", message="Hardware assignment resolved")
+        storage.log_event(level="INFO", source="monitor_battery", message=f"Relay matrix selected: {hw['relay_matrix_name']}")
+        storage.log_event(level="INFO", source="monitor_battery", message=f"SMU selected: {smu_name}")
+        storage.log_event(level="INFO", source="monitor_battery", message=f"DMM selected: {dmm_name}")
+        storage.log_event(level="INFO", source="monitor_battery", message=f"DAQ selected: {daq_name}")
+        storage.log_event(level="INFO", source="monitor_battery", message="Operator confirmed execution")
         # Hardware identity traceability -- BEFORE relay activation/monitor
         # start, same requirement as the battery-config snapshot above (see
         # docs/architecture.md "Hardware Identity Traceability").
@@ -3593,7 +3636,7 @@ def _run_monitor_battery():
         try:
             safety = SafetyMonitor(Settings)
             sequence = MonitorBatterySequence(
-                smu=hw.smu, dmm=hw.dmm, relay=hw.relay, safety=safety,
+                smu=hw_mgr.smu, dmm=hw_mgr.dmm, relay=hw_mgr.relay, safety=safety,
                 storage=storage, settings=Settings,
             )
             try:
@@ -3616,7 +3659,164 @@ def _run_monitor_battery():
         except Exception as e:
             print(f"[WARNING] Storage close failed: {e}")
         try:
-            hw.disconnect_all()
+            hw_mgr.disconnect_all()
+        except Exception as shutdown_err:
+            print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+            print("           Hardware may still be energized -- "
+                  "physically disconnect power if this cannot be resolved immediately.")
+
+
+def _run_monitor_battery_scan():
+    """
+    Monitor Battery Scan -- intermediate hardware-path validation required
+    before Milestone III Charge Battery workflows. Sequentially connects
+    every battery position in the selected group through the relay matrix
+    and verifies only one battery is visible to the measurement system at
+    a time (relay isolation, DMM path, DAQ path). NO charging, NO
+    discharging -- the PSU/SMU is never commanded to source or sink
+    anything; HardwareManager still connects it (and forces its output off
+    at startup, independent of this workflow) purely so the shared safety-
+    shutdown path (SafetyMonitor.emergency_stop()/safe_cancel_shutdown())
+    has an SMU to confirm OFF, exactly as Monitor Battery already does.
+
+    Workflow: Select Battery Type -> Select Battery Group (= Scan Scope,
+    since only "Single Group" is supported today) -> Confirmation ->
+    Configuration Snapshot -> Hardware Traceability Snapshot -> Sequential
+    Relay Scan -> Safe Shutdown. Reuses the exact same Milestone II
+    infrastructure as _run_monitor_battery() (DataStorage, HardwareManager,
+    CancellationToken/Ctrl+C handling, ExecutionFrame) via
+    test_control/monitor_battery_scan_sequence.py::MonitorBatteryScanSequence.
+    """
+    print("MONITOR BATTERY SCAN -- relay/DMM/DAQ path validation (no charging)")
+
+    import signal
+    from data.storage import DataStorage
+    from test_control.hardware_manager import HardwareManager
+    from test_control.monitor_battery_scan_sequence import MonitorBatteryScanSequence
+    from test_control.safety_monitor import SafetyMonitor
+    from utils.cancellation import CancellationToken
+    from utils.errors import HardwareInitError, OperationCancelledError
+
+    battery_type = _select_battery_type()
+    if battery_type is None:
+        return
+    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
+
+    group = _select_battery_group()
+    if group is None:
+        return
+
+    grp_cfg = dev_cfg.BATTERY_GROUPS[group]
+    size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
+    positions_in_group = list(range(1, size + 1))
+    print(f"\nScan Scope: Single Group -- Group {group}, all positions 1-{size}")
+
+    # Hardware assignment resolved from config/devices.py::BATTERY_GROUPS via
+    # the single centralized resolver -- see docs/architecture.md "Hardware
+    # Resolution Model".
+    hw = dev_cfg.hardware_for_group(group)
+    missing = _missing_hardware_roles(hw)
+    if missing:
+        print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
+        return
+
+    positions_label = f"1-{size}"
+    extra_lines = ["\nCharging:\nNONE -- PSU/SMU output is never enabled"]
+    if not _confirm_operation("Monitor Battery Scan", battery_type, battery_cfg, group,
+                               positions_label, hw, extra_lines=extra_lines):
+        print("\nCancelled -- no relay activated.")
+        return
+
+    relay_cfg = hw["relay_matrix_cfg"]
+    dmm_name, dmm_cfg = hw["dmm_name"], hw["dmm_cfg"]
+    smu_name, smu_cfg = hw["smu_name"], hw["smu_cfg"]
+    daq_name, daq_cfg = hw["daq_name"], hw["daq_cfg"]
+    print("\nSelected Hardware\n")
+    print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
+    print(f"DMM:\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
+    print(f"DAQ:\n  {dev_cfg.device_display_name(daq_cfg)}\n  {daq_cfg.get('resource', '')}\n")
+    print("PSU/SMU: connected for safety-shutdown only -- output never enabled.\n")
+
+    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
+    try:
+        hw_mgr.connect_all()
+    except HardwareInitError as e:
+        print(f"[FAIL] Hardware initialization failed: {e}")
+        return
+
+    storage = DataStorage(settings=Settings)
+    storage.open()
+
+    try:
+        # Configuration Snapshot + Hardware Traceability Snapshot -- BEFORE
+        # any relay activation, same requirement as _run_monitor_battery().
+        hardware_snapshot = _hardware_snapshot_fields(
+            smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
+        )
+        storage.start_run_summary(
+            test_type="monitor_scan",
+            battery_type=battery_type,
+            battery_voltage_max_v=battery_cfg["voltage_max_v"],
+            battery_voltage_min_v=battery_cfg["voltage_min_v"],
+            battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
+            battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
+            capacity_ah=battery_cfg["capacity_ah"],
+            **hardware_snapshot,
+        )
+        storage.log_event(level="INFO", source="monitor_battery_scan", message="Run started")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message="Operation selected: Monitor Battery Scan")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Battery selected: {battery_type}")
+        storage.log_event(level="INFO", source="monitor_battery_scan",
+                           message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Group selected: {group}")
+        storage.log_event(level="INFO", source="monitor_battery_scan",
+                           message=f"Scan scope: Single Group -- Group {group}, positions 1-{size}")
+        storage.log_event(level="INFO", source="monitor_battery_scan",
+                           message="Configuration snapshot recorded")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message="Hardware assignment resolved")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Relay matrix selected: {hw['relay_matrix_name']}")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"SMU selected: {smu_name}")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"DMM selected: {dmm_name}")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"DAQ selected: {daq_name}")
+        storage.log_event(level="INFO", source="monitor_battery_scan", message="Operator confirmed execution")
+        for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
+            storage.log_event(level="INFO", source="monitor_battery_scan", message=message)
+
+        token = CancellationToken(owner="test.py:_run_monitor_battery_scan")
+        previous_sigint_handler = signal.signal(
+            signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+        )
+        print("\nPress Ctrl+C to stop the scan safely.\n")
+
+        try:
+            safety = SafetyMonitor(Settings)
+            sequence = MonitorBatteryScanSequence(
+                smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.daq, relay=hw_mgr.relay, safety=safety,
+                storage=storage, settings=Settings,
+            )
+            try:
+                sequence.run(
+                    battery_type=battery_type, group=group,
+                    positions_in_group=positions_in_group, token=token,
+                )
+                print("\nMonitor Battery Scan complete -- see event log / measurements for results.")
+            except OperationCancelledError:
+                print("\nMonitor Battery Scan stopped by operator -- hardware is in a verified safe state.")
+            except KeyboardInterrupt:
+                print("\nMonitor Battery Scan interrupted by user (Ctrl+C).")
+            except Exception as e:
+                print(f"\n[FAIL] Monitor Battery Scan aborted: {e}")
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+
+    finally:
+        try:
+            storage.close()
+        except Exception as e:
+            print(f"[WARNING] Storage close failed: {e}")
+        try:
+            hw_mgr.disconnect_all()
         except Exception as shutdown_err:
             print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
             print("           Hardware may still be energized -- "
@@ -3626,15 +3826,17 @@ def _run_monitor_battery():
 def run_main_test():
     """
     Run Main Test -- battery-centric operator workflow entry point
-    (Milestone II Monitor Battery blueprint). Submenu: only Monitor
-    Battery is implemented; Charge/Discharge/Cycle Battery are
-    placeholders reserved for future work.
+    (Milestone II Monitor Battery blueprint). Submenu: Monitor Battery and
+    Monitor Battery Scan are implemented; Charge/Discharge/Cycle Battery
+    are placeholders reserved for future work (Monitor Battery Scan is the
+    required intermediate validation step before Charge Battery).
     """
     print("RUN MAIN TEST")
     print("\n1. Monitor Battery")
     print("2. Charge Battery")
     print("3. Discharge Battery")
     print("4. Cycle Battery")
+    print("5. Monitor Battery Scan (relay/DMM/DAQ path validation, no charging)")
     choice = input("\nSelect mode: ").strip()
 
     if choice == "1":
@@ -3645,6 +3847,8 @@ def run_main_test():
         print("\nDischarge Battery -- not yet implemented.")
     elif choice == "4":
         print("\nCycle Battery -- not yet implemented.")
+    elif choice == "5":
+        _run_monitor_battery_scan()
     else:
         print("\nInvalid selection.")
 

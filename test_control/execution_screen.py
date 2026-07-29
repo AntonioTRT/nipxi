@@ -82,6 +82,19 @@ class ExecutionFrame:
     energy: float = None
     cycle_count: int = None
 
+    # Monitor Battery Scan (relay/DMM/DAQ path validation, no charging) --
+    # see test_control/monitor_battery_scan_sequence.py. N/A for every other
+    # test type.
+    battery_type: str = None
+    group: str = None
+    position_in_group: int = None
+    relay_state: str = None       # "OPEN"/"CLOSED", the commanded+verified state
+    daq_channel_0_raw: float = None
+    current_step: str = None
+    scan_progress: str = None     # e.g. "3/8"
+    dwell_progress: str = None    # e.g. "15/30 s", during the CLOSED monitoring dwell
+    dwell_remaining_s: float = None
+
     # Recent measurements -- list of dicts, same row shape whether it came
     # from an in-memory buffer (live) or data/storage.py::DataStorage.
     # get_measurements() (historical). Required from day one -- not an
@@ -102,13 +115,17 @@ class ExecutionFrame:
                   state=None, phase_detail=None, smu_voltage=None, smu_current=None,
                   dmm_voltage=None, battery_voltage=None, battery_current=None,
                   battery_temp=None, capacity=None, energy=None, cycle_count=None,
+                  battery_type=None, group=None, position_in_group=None,
+                  relay_state=None, daq_channel_0_raw=None, current_step=None,
+                  scan_progress=None, dwell_progress=None, dwell_remaining_s=None,
                   recent_measurements=None, recent_events=None) -> "ExecutionFrame":
         """
         Build a frame from live, in-memory values during a real execution
-        (Proto Test Execution / Monitor Battery today; future Battery
-        Charge/Discharge/cycle execution the same way). Callers pass
-        exactly the values they have -- any field not applicable to the
-        current test type is left at its None default, never invented.
+        (Proto Test Execution / Monitor Battery / Monitor Battery Scan
+        today; future Battery Charge/Discharge/cycle execution the same
+        way). Callers pass exactly the values they have -- any field not
+        applicable to the current test type is left at its None default,
+        never invented.
         """
         return cls(
             run_number=run_number, run_id=run_id, test_type=test_type,
@@ -117,6 +134,10 @@ class ExecutionFrame:
             battery_voltage=battery_voltage, battery_current=battery_current,
             battery_temp=battery_temp,
             capacity=capacity, energy=energy, cycle_count=cycle_count,
+            battery_type=battery_type, group=group, position_in_group=position_in_group,
+            relay_state=relay_state, daq_channel_0_raw=daq_channel_0_raw,
+            current_step=current_step, scan_progress=scan_progress,
+            dwell_progress=dwell_progress, dwell_remaining_s=dwell_remaining_s,
             recent_measurements=list(recent_measurements) if recent_measurements else [],
             recent_events=list(recent_events) if recent_events else [],
         )
@@ -182,6 +203,9 @@ class ExecutionFrame:
             capacity=run_summary.get("capacity_ah"),
             energy=run_summary.get("energy_wh"),
             cycle_count=run_summary.get("cycle_count"),
+            battery_type=run_summary.get("battery_type"),
+            daq_channel_0_raw=latest.get("daq_channel_0_raw"),
+            current_step=latest.get("phase_detail"),
             recent_measurements=recent,
             recent_events=events,
         )
@@ -232,6 +256,18 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
     print(f"State          : {_fmt(frame.state)}")
     print(f"Phase Detail   : {_fmt(frame.phase_detail)}")
     print()
+    if frame.battery_type is not None or frame.group is not None or frame.scan_progress is not None:
+        print("Scan Context")
+        print("-" * 60)
+        print(f"Battery Type   : {_fmt(frame.battery_type)}")
+        print(f"Group          : {_fmt(frame.group)}")
+        print(f"Position       : {_fmt(frame.position_in_group)}")
+        print(f"Relay State    : {_fmt(frame.relay_state)}")
+        print(f"Current Step   : {_fmt(frame.current_step)}")
+        print(f"Scan Progress  : {_fmt(frame.scan_progress)}")
+        print(f"Dwell Progress : {_fmt(frame.dwell_progress)}")
+        print(f"Remaining Time : {_fmt(frame.dwell_remaining_s)}" + ("" if frame.dwell_remaining_s is None else " s"))
+        print()
     print("Current Measurements")
     print("-" * 60)
     print(f"SMU Voltage    : {_fmt_volts(frame.smu_voltage)}")
@@ -240,6 +276,7 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
     print(f"Battery Voltage: {_fmt_volts(frame.battery_voltage)}")
     print(f"Battery Current: {_fmt_amps(frame.battery_current)}")
     print(f"Battery Temp   : {_fmt(frame.battery_temp)}" + ("" if frame.battery_temp is None else " C"))
+    print(f"DAQ Ch0 Raw    : {_fmt(frame.daq_channel_0_raw, '.6f')}" + ("" if frame.daq_channel_0_raw is None else " V (raw)"))
     print()
     print("Battery Metrics")
     print("-" * 60)
