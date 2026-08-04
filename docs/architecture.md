@@ -2234,4 +2234,223 @@ No further stale assumptions, incorrect defaults, invalid configuration flows, t
 - Confirm `BATTERY_CONFIGS`' HUB/SB voltage/current/temperature limits against the real BLOSS Hub/SB datasheet (currently `# unconfirmed placeholder`).
 - The physical rack validation run itself.
 
+---
+
+## 42. Pre-Hardware-Validation MUST-FIX Closure
+
+Performed in direct response to a pre-hardware-validation architecture FAQ
+review (`docs/FAQ.md`, committed separately) that inspected the codebase
+question-by-question and flagged several RED (not handled) and YELLOW
+(partially handled) findings. This session closed the four highest-priority
+items that review identified, all verified via mocked regression tests (no
+physical hardware access performed or required for this closure work).
+
+### 1. Reverse Polarity Protection
+
+Closes FAQ Section 10's RED findings ("no reverse-polarity detection or
+classification anywhere," "no pre-output-enable voltage sanity check" --
+previously the single highest-priority gap the FAQ review identified, given
+batteries were about to be connected for real).
+
+- New `Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V = -0.5` V
+  (`config/settings.py`, placed immediately after
+  `ZERO_CURRENT_THRESHOLD_A`), with a comment explaining why the threshold
+  sits below 0.0 V rather than at it: a small negative reading can occur
+  from ordinary ADC/DMM offset noise on a near-zero (deeply discharged or
+  disconnected) cell, so the threshold must sit safely below that noise
+  floor to avoid false-tripping on a merely-discharged-but-intact cell.
+- New `ReversePolarityError(SafetyViolationError)` (`utils/errors.py`) --
+  deliberately a `SafetyViolationError` subclass so it is caught by
+  `BatteryOperationSequence.run_guarded()`'s EXISTING `SafetyViolationError`
+  branch and triggers the identical `SafetyMonitor.emergency_stop()`
+  shutdown (PMU off + all relays forced open, `StopReason.SAFETY_VIOLATION`
+  recorded in `run_summary`/`event_log`) -- no new shutdown path was
+  introduced for this.
+- New `BatteryOperationSequence._check_battery_polarity(voltage_v, *,
+  channel, relay_address)` -- logs an ERROR-level event via
+  `self.storage.log_event(...)` and then raises `ReversePolarityError` if
+  `voltage_v <= Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V`.
+- Both `ChargeSequence.run()` and `DischargeSequence.run()` now call, in
+  this exact order immediately after `relay.close()`/
+  `record_execution_state(state="ACTIVE")` and strictly BEFORE
+  `set_charge_mode()`/`set_discharge_mode()`/`output_enable()`:
+  `interruptible_sleep(self.s.STABILIZATION_S, token=token)` ->
+  `pre_enable_v = self.dmm.measure_dc_voltage()` ->
+  `self._check_battery_polarity(pre_enable_v, channel=channel,
+  relay_address=relay_address)`. The SMU output is never enabled if this
+  raises.
+
+**Verification:** a mocked regression test asserts a DMM reading of -3.5 V
+raises `ReversePolarityError` before `smu.set_charge_mode()`/
+`output_enable()` are ever called (`not smu.set_charge_mode.called`, etc.);
+a plausible positive reading proceeds normally through to a completed
+charge.
+
+**Residual, intentional scope limit (documented as YELLOW in
+docs/FAQ.md):** this check answers "is it safe to enable the SMU," not
+"what is physically wrong with the battery" -- a reversed cell, a
+disconnected lead, a genuinely damaged/over-discharged cell, and a wiring
+fault all read identically and all raise the same `ReversePolarityError`.
+No attempt to disambiguate these was made this session; deferred pending
+real-hardware operational experience.
+
+### 2. Battery-Type Validation
+
+Closes FAQ Section 5's "what happens if a group references a non-existent
+battery type" finding (previously a bare, uncaught `KeyError` risk, not
+reachable via any operator input today but not defensively guarded either).
+
+- `utils/validators.py::validate_group_test_config()`'s Stage 2 (Battery
+  Limits Validation) now has an explicit
+  `if battery_type not in dev_cfg.BATTERY_CONFIGS: raise
+  ConfigurationError(...)` check, BEFORE the
+  `battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]` lookup that used to
+  be able to raise a bare `KeyError`.
+- The two other code paths that read `BATTERY_CONFIGS[battery_type]`
+  directly without going through `validate_group_test_config()` --
+  `test.py::_run_monitor_battery()` and `_run_monitor_battery_scan()` --
+  each got the identical explicit check, printed as a `[FAIL]` message in
+  the same style as the pre-existing "has no battery_type configured"
+  check immediately above it in both functions.
+
+**Verification:** a mocked regression test monkeypatches a group's
+`battery_type` to an unknown string and confirms `validate_group_test_config()`
+now raises `ConfigurationError` (not `KeyError`).
+
+**Residual, intentional scope limit (documented as YELLOW in
+docs/FAQ.md):** the Safety Monitor Simulator's `_select_safety_simulation_group()`
+and its two callers (test.py:2623, test.py:2769) still do a bare
+`BATTERY_CONFIGS[cfg["battery_type"]]` lookup with no equivalent guard.
+Simulator/demo-only code -- no hardware activation, no real battery, no
+safety consequence -- noted, not fixed, this session.
+
+### 3. Timeout Traceability
+
+Closes the "`StopReason.TIMEOUT` defined but never used" finding (FAQ
+Sections 3-4's timeout questions, and Section 12's technical-debt/risk
+list).
+
+- `BatteryOperationSequence.run_guarded()` now has a dedicated `except
+  NIPXITimeoutError` branch, placed after the `RelayError` branch and
+  before the generic `except Exception` branch, that records
+  `StopReason.TIMEOUT` (not the generic `StopReason.FAILED`) in both
+  `record_execution_state()` and `finish_run_summary()`. Shutdown behavior
+  (`safety.emergency_stop()`) is unchanged/identical to every other fault
+  path -- only the recorded stop_reason differs.
+
+**Verification:** a mocked regression test runs a `ChargeSequence` with
+`CHARGE_TIMEOUT_S=0.0` and confirms `StopReason.TIMEOUT` now appears in both
+the `record_execution_state` and `finish_run_summary` mock call args
+(previously would have been `FAILED`).
+
+**Scope boundary:** applies to `ChargeSequence`/`DischargeSequence` (both
+built on `BatteryOperationSequence`) only. Does NOT apply to the legacy
+`charge_cycle.py`/`discharge_cycle.py`/`ChargeCycle`/`DischargeCycle`
+classes, which are non-`BatteryOperationSequence` code already documented
+elsewhere (Section 33) as superseded.
+
+### 4. Database Startup Hardening
+
+Closes FAQ Section 7's "what happens if the database is unavailable"
+findings (previously: an uncaught `sqlite3.Error`/`OSError` from
+`storage.open()` or `start_run_summary()` would propagate as a raw,
+operator-unfriendly traceback, though hardware safety itself was never
+compromised since teardown lived in an outer `finally`).
+
+- New `test.py::_open_storage_guarded(hw_mgr=None)` -- wraps
+  `DataStorage(settings=Settings)` + `.open()` in `try/except (OSError,
+  sqlite3.Error)`, prints a clean `[FAIL] Database unavailable -- could not
+  open storage: {e}` message (no raw traceback shown to the operator), and
+  disconnects `hw_mgr` if given. Returns `None` on failure; callers check
+  `if storage is None: return`. Diagnostic detail is preserved because
+  `DataStorage.open()` (`data/storage.py`) already calls
+  `self.log.error(...)` with the exception before re-raising -- this
+  change only replaces what the OPERATOR sees, not what is logged.
+- New `test.py::_start_run_summary_guarded(storage, test_type, **fields)`
+  -- wraps `storage.start_run_summary(...)` in `try/except sqlite3.Error`,
+  prints an equivalent clean `[FAIL]` message, and returns `True`/`False`;
+  callers check `if not _start_run_summary_guarded(...): return`.
+- All FOUR real workflow entry points now use these helpers instead of
+  calling `storage.open()`/`storage.start_run_summary()` directly:
+  `_run_monitor_battery()`, `_run_monitor_battery_scan()`,
+  `_run_charge_or_discharge()` (shared by Charge Battery / Discharge
+  Battery), and `run_proto_test_execution()`. The read-only
+  `_open_real_storage_readonly()` database-viewer tool was deliberately
+  left untouched -- it's a read-only inspection tool, not a real test
+  workflow, and carries no hardware risk.
+
+**Verification:** mocked regression tests confirm `_open_storage_guarded()`
+returns `None` and calls `hw_mgr.disconnect_all()` when `DataStorage.open()`
+raises `sqlite3.OperationalError`; `_start_run_summary_guarded()` returns
+`False` (no exception propagates) when `start_run_summary()` raises
+`sqlite3.Error`, and `True` on success.
+
+**Residual, intentional scope limit (documented as YELLOW in
+docs/FAQ.md):** per-write calls made DURING a test --
+`record_measurement()`/`record_execution_state()`/`log_event()` -- remain
+unwrapped; an in-flight SQLite failure mid-test still propagates as an
+unhandled exception (though it is still caught by `run_guarded()`'s
+generic `except Exception` branch, so hardware safety shutdown still runs
+-- only the clean-`[FAIL]`-messaging benefit is missing for that specific
+failure mode). Not addressed this session; startup-time failures were the
+priority.
+
+### Documentation updated
+
+`docs/FAQ.md` Sections 3, 4, 5, 6, 7, 10, and 12 were updated to reflect
+all of the above -- statuses changed from Not/Partially Implemented to
+Implemented (or Partially Implemented, where a residual gap is explicitly
+named), evidence re-cited against the real file:line locations in the
+current code, and Section 12's GREEN/YELLOW/RED tally and Top-10 lists
+re-derived from the entries actually changed (not blindly incremented).
+`docs/TODO.md` gained a "Pre-Hardware-Validation MUST-FIX Closure" entry
+under Completed (Summary) and a matching "(residual, low priority)"
+subsection under Remaining Work for the two deferred items.
+`docs/MILESTONES.md` gained Milestone IX recording this closure.
+
+### Final Readiness Assessment for Real Hardware Validation
+
+**Software blockers: none.** All four MUST-FIX items identified by the
+pre-hardware-validation FAQ review are closed and verified by mocked
+regression test. No new software defect was found or introduced while
+closing them.
+
+**Hardware blockers (unchanged, carried forward from Milestone VIII /
+Section 41 -- not re-investigated this session, per explicit instruction
+that this closure work is software-documentation-only):**
+- Confirm `PRIMARY_SMU`'s real current rating against the physical
+  PXIe-4141's datasheet (Group A is currently declared for SB specifically
+  because of this).
+- Confirm relay channel numbers and DAQ channel aliases against real
+  NI-MAX wiring.
+- Confirm `BATTERY_CONFIGS`' HUB/SB voltage/current/temperature limits
+  against the real BLOSS Hub/SB datasheet (currently `# unconfirmed
+  placeholder`).
+- Confirm the SMU output stage's and Numato relay module's actual
+  fail-safe behavior under power loss (docs/FAQ.md Section 9 -- "the
+  least-characterized risk in the system," per Section 17).
+- Confirm, on the bench, the actual real-hardware voltage/current
+  signature of a reversed-polarity connection, and whether the new -0.5 V
+  threshold is well-chosen against real readings.
+- The physical rack validation run itself.
+
+**Decision: GO for the Real Hardware Validation milestone.** The four
+software MUST-FIX items are closed; no software blocker remains. The
+following RED items are explicitly, deliberately deferred -- not
+blockers for this milestone gate, per the user's explicit instruction that
+DAQ/NTC/`CycleSequence`/runtime power-loss-and-incomplete-run recovery work
+is out of scope for this gate:
+- Power-loss / incomplete-run recovery (docs/FAQ.md Section 9) -- no
+  startup check for an incomplete `run_summary` row exists; explicitly and
+  accurately documented as deferred, not a silent gap.
+- Reverse-polarity / damaged-battery / disconnected-lead / wiring-fault
+  disambiguation (docs/FAQ.md Section 10) -- intentionally out of scope
+  for the safety-gate check closed this session.
+- The Safety Monitor Simulator's unguarded `battery_type` lookup
+  (docs/FAQ.md Section 5) -- simulator/demo-only, no hardware risk.
+
+None of these three deferred items block Group A + a real SB battery on
+one relay-selected channel, the validation scope Milestone VIII already
+recommended and this session does not change.
+
 **Recommendations:** validate `ChargeSequence`/`DischargeSequence` against Group A + a real SB battery first (the only fully-validated software configuration today); do not attempt HUB until a group is reassigned to a higher-current SMU; do not start `CycleSequence` until at least one real charge and one real discharge have completed successfully on real hardware.

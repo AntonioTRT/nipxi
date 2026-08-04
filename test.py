@@ -3540,6 +3540,64 @@ def _select_battery_position(group: str):
     return pos
 
 
+def _open_storage_guarded(hw_mgr=None):
+    """
+    Open DataStorage with clean, operator-facing [FAIL] messaging instead
+    of a raw traceback if the database is unavailable at startup (file
+    permissions, disk full, locked file, corrupt schema, etc.) -- see
+    docs/architecture.md "Database Startup Hardening". Full diagnostic
+    detail is still preserved: DataStorage.open() already calls
+    self.log.error(...) with the exception before re-raising (see
+    data/storage.py) -- this only replaces what the OPERATOR sees, not
+    what is logged.
+
+    Returns the opened DataStorage on success, or None on failure. On
+    failure, if `hw_mgr` (an already-connected HardwareManager) is given,
+    it is disconnected before returning -- no hardware is left connected
+    just because the database could not be opened.
+    """
+    import sqlite3
+    from data.storage import DataStorage
+
+    storage = DataStorage(settings=Settings)
+    try:
+        storage.open()
+    except (OSError, sqlite3.Error) as e:
+        print(f"\n[FAIL] Database unavailable -- could not open storage: {e}")
+        print("       See logs for full diagnostic detail. Aborting, no hardware activated.")
+        if hw_mgr is not None:
+            try:
+                hw_mgr.disconnect_all()
+            except Exception as shutdown_err:
+                print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+                print("           Hardware may still be energized -- "
+                      "physically disconnect power if this cannot be resolved immediately.")
+        return None
+    return storage
+
+
+def _start_run_summary_guarded(storage, test_type: str, **fields) -> bool:
+    """
+    Call DataStorage.start_run_summary() with clean [FAIL] messaging
+    instead of a raw traceback if the database becomes unavailable between
+    open() and here (e.g. the underlying file/volume disappears). Returns
+    True on success, False on failure -- callers must abort (no relay
+    activation/PSU output) on False, exactly as on any other Stage
+    validation failure. Diagnostic detail is preserved via normal
+    exception logging further up the call stack (Python's default
+    traceback capture in the caller's own except Exception handling, if
+    any) -- this only replaces the operator-facing message.
+    """
+    import sqlite3
+    try:
+        storage.start_run_summary(test_type=test_type, **fields)
+        return True
+    except sqlite3.Error as e:
+        print(f"\n[FAIL] Database unavailable -- could not start run_summary: {e}")
+        print("       See logs for full diagnostic detail. Aborting, no hardware activated.")
+        return False
+
+
 def _missing_hardware_roles(hw: dict, required_roles=("relay_matrix", "smu", "dmm", "daq")):
     """Return the subset of `required_roles` whose config/devices.py::
     hardware_for_group() cfg resolved to None -- i.e. no device assigned to
@@ -3608,7 +3666,6 @@ def _run_monitor_battery():
     print("MONITOR BATTERY")
 
     import signal
-    from data.storage import DataStorage
     from test_control.hardware_manager import HardwareManager
     from test_control.monitor_battery_sequence import MonitorBatterySequence
     from test_control.safety_monitor import SafetyMonitor
@@ -3641,6 +3698,11 @@ def _run_monitor_battery():
     if battery_type is None:
         print(f"\n[FAIL] Group {group} has no battery_type configured -- "
               f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
+        return
+    if battery_type not in dev_cfg.BATTERY_CONFIGS:
+        print(f"\n[FAIL] Group {group} references unknown battery_type {battery_type!r} -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}] and BATTERY_CONFIGS. "
+              f"Aborting, no hardware activated.")
         return
     battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
@@ -3681,8 +3743,9 @@ def _run_monitor_battery():
         print(f"[FAIL] Hardware initialization failed: {e}")
         return
 
-    storage = DataStorage(settings=Settings)
-    storage.open()
+    storage = _open_storage_guarded(hw_mgr)
+    if storage is None:
+        return
 
     try:
         # CRITICAL traceability requirement: every selected-configuration
@@ -3692,8 +3755,8 @@ def _run_monitor_battery():
         hardware_snapshot = _hardware_snapshot_fields(
             smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
         )
-        storage.start_run_summary(
-            test_type="monitor",
+        if not _start_run_summary_guarded(
+            storage, test_type="monitor",
             battery_type=battery_type,
             battery_voltage_max_v=battery_cfg["voltage_max_v"],
             battery_voltage_min_v=battery_cfg["voltage_min_v"],
@@ -3701,7 +3764,8 @@ def _run_monitor_battery():
             battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
             capacity_ah=battery_cfg["capacity_ah"],
             **hardware_snapshot,
-        )
+        ):
+            return
         storage.log_event(level="INFO", source="monitor_battery", message="Run started")
         storage.log_event(level="INFO", source="monitor_battery", message="Operation selected: Monitor Battery")
         storage.log_event(level="INFO", source="monitor_battery", message=f"Battery selected: {battery_type}")
@@ -3790,7 +3854,6 @@ def _run_monitor_battery_scan():
     print("MONITOR BATTERY SCAN -- relay/DMM/DAQ path validation (no charging)")
 
     import signal
-    from data.storage import DataStorage
     from test_control.hardware_manager import HardwareManager
     from test_control.monitor_battery_scan_sequence import MonitorBatteryScanSequence
     from test_control.safety_monitor import SafetyMonitor
@@ -3823,6 +3886,11 @@ def _run_monitor_battery_scan():
         print(f"\n[FAIL] Group {group} has no battery_type configured -- "
               f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
         return
+    if battery_type not in dev_cfg.BATTERY_CONFIGS:
+        print(f"\n[FAIL] Group {group} references unknown battery_type {battery_type!r} -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}] and BATTERY_CONFIGS. "
+              f"Aborting, no hardware activated.")
+        return
     battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
     positions_label = f"1-{size}"
@@ -3849,8 +3917,9 @@ def _run_monitor_battery_scan():
         print(f"[FAIL] Hardware initialization failed: {e}")
         return
 
-    storage = DataStorage(settings=Settings)
-    storage.open()
+    storage = _open_storage_guarded(hw_mgr)
+    if storage is None:
+        return
 
     try:
         # Configuration Snapshot + Hardware Traceability Snapshot -- BEFORE
@@ -3858,8 +3927,8 @@ def _run_monitor_battery_scan():
         hardware_snapshot = _hardware_snapshot_fields(
             smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
         )
-        storage.start_run_summary(
-            test_type="monitor_scan",
+        if not _start_run_summary_guarded(
+            storage, test_type="monitor_scan",
             battery_type=battery_type,
             battery_voltage_max_v=battery_cfg["voltage_max_v"],
             battery_voltage_min_v=battery_cfg["voltage_min_v"],
@@ -3867,7 +3936,8 @@ def _run_monitor_battery_scan():
             battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
             capacity_ah=battery_cfg["capacity_ah"],
             **hardware_snapshot,
-        )
+        ):
+            return
         storage.log_event(level="INFO", source="monitor_battery_scan", message="Run started")
         storage.log_event(level="INFO", source="monitor_battery_scan", message="Operation selected: Monitor Battery Scan")
         storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Battery selected: {battery_type}")
@@ -3957,7 +4027,6 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     print(operation.upper())
 
     import signal
-    from data.storage import DataStorage
     from test_control.hardware_manager import HardwareManager
     from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken
@@ -4033,8 +4102,9 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         print(f"[FAIL] Hardware initialization failed: {e}")
         return
 
-    storage = DataStorage(settings=Settings)
-    storage.open()
+    storage = _open_storage_guarded(hw_mgr)
+    if storage is None:
+        return
 
     try:
         # CRITICAL traceability requirement: every selected-configuration
@@ -4043,8 +4113,8 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         hardware_snapshot = _hardware_snapshot_fields(
             smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
         )
-        storage.start_run_summary(
-            test_type=source,
+        if not _start_run_summary_guarded(
+            storage, test_type=source,
             battery_type=battery_type,
             battery_voltage_max_v=battery_cfg["voltage_max_v"],
             battery_voltage_min_v=battery_cfg["voltage_min_v"],
@@ -4052,7 +4122,8 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
             capacity_ah=battery_cfg["capacity_ah"],
             **hardware_snapshot,
-        )
+        ):
+            return
         storage.log_event(level="INFO", source=source, message="Run started")
         storage.log_event(level="INFO", source=source, message=f"Operation selected: {operation}")
         storage.log_event(level="INFO", source=source, message=f"Battery selected: {battery_type}")
@@ -4197,7 +4268,6 @@ def run_proto_test_execution():
     print("PROTO TEST EXECUTION -- infrastructure validation (no battery connected)")
 
     import signal
-    from data.storage import DataStorage
     from test_control.hardware_manager import HardwareManager
     from test_control.proto_test_sequence import ProtoTestSequence
     from test_control.safety_monitor import SafetyMonitor
@@ -4239,8 +4309,9 @@ def run_proto_test_execution():
         print(f"[FAIL] Hardware initialization failed: {e}")
         return
 
-    storage = DataStorage(settings=Settings)
-    storage.open()
+    storage = _open_storage_guarded(hw)
+    if storage is None:
+        return
 
     try:
         last_state = storage.get_last_execution_state()

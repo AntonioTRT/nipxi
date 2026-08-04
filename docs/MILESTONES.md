@@ -1215,11 +1215,118 @@ the real datasheet, then run the physical validation itself.
 
 ### Recommended next milestone
 
-**Milestone IX: Real Hardware Validation** -- validate `ChargeSequence`/
-`DischargeSequence` against Group A + a real SB battery (the only fully
-software-validated configuration today) on one relay-selected channel,
-before scaling to more channels, attempting HUB, or starting
-`CycleSequence`.
+**Milestone IX: Pre-Hardware-Validation MUST-FIX Closure** (below), a
+software-documentation-only gate check performed in response to a
+pre-hardware-validation architecture FAQ review, followed by **Milestone X:
+Real Hardware Validation** -- validate `ChargeSequence`/`DischargeSequence`
+against Group A + a real SB battery (the only fully software-validated
+configuration today) on one relay-selected channel, before scaling to more
+channels, attempting HUB, or starting `CycleSequence`.
+
+---
+
+## Milestone IX: Pre-Hardware-Validation MUST-FIX Closure
+
+**Status:** ACHIEVED
+
+**Scope:** a pre-hardware-validation architecture FAQ review
+(`docs/FAQ.md`, inspecting the codebase question-by-question) flagged
+several RED (not handled) and YELLOW (partially handled) findings ahead of
+Milestone X. This milestone closed the four highest-priority ones,
+documentation-and-code-only, verified by mocked regression tests -- no
+physical hardware access performed.
+
+### Objectives achieved
+
+- **Reverse Polarity Protection.** New `Settings.
+  REVERSE_POLARITY_VOLTAGE_THRESHOLD_V` (-0.5 V) and
+  `ReversePolarityError(SafetyViolationError)`; new
+  `BatteryOperationSequence._check_battery_polarity()`, called by both
+  `ChargeSequence.run()`/`DischargeSequence.run()` with a DMM reading taken
+  while the SMU output is still disabled, strictly before
+  `set_charge_mode()`/`set_discharge_mode()`/`output_enable()`. Subclasses
+  `SafetyViolationError` so it flows through the existing
+  `run_guarded()`/`emergency_stop()` shutdown path unchanged -- no new
+  shutdown logic. Previously the single highest-priority gap identified by
+  the FAQ review, given batteries were about to be connected for real.
+- **Battery-Type Validation.** `validate_group_test_config()`'s Stage 2,
+  plus `test.py::_run_monitor_battery()`/`_run_monitor_battery_scan()`'s
+  direct lookups, now all raise a typed `ConfigurationError`/`[FAIL]`
+  message instead of a bare, uncaught `KeyError` for an unrecognized
+  `battery_type`.
+- **Timeout Traceability.** `BatteryOperationSequence.run_guarded()` gained
+  a dedicated `except NIPXITimeoutError` branch recording
+  `StopReason.TIMEOUT` (previously fell through to the generic
+  `except Exception` branch and was recorded as `StopReason.FAILED`).
+  Applies to `ChargeSequence`/`DischargeSequence` only; the legacy
+  `charge_cycle.py`/`discharge_cycle.py` path is unaffected (already
+  superseded).
+- **Database Startup Hardening.** New `test.py::
+  _open_storage_guarded()`/`_start_run_summary_guarded()` helpers wrap
+  `DataStorage.open()`/`start_run_summary()` with clean, operator-facing
+  `[FAIL]` messaging instead of a raw traceback, used by all four real
+  workflow entry points. Diagnostic detail unchanged -- still logged via
+  `DataStorage`'s own `self.log.error(...)` calls; only what the operator
+  sees at the terminal changed.
+
+### Architectural decisions made
+
+- `ReversePolarityError` deliberately answers "is it safe to enable the
+  SMU," not "what is wrong with the battery" -- disambiguating reversed
+  vs. disconnected vs. damaged vs. wiring-fault was explicitly ruled out
+  of scope for this milestone, carried forward as a residual, low-priority
+  YELLOW item.
+- The Safety Monitor Simulator's own unguarded `battery_type` lookup
+  (`_select_safety_simulation_group()` and its two callers) was
+  deliberately left unfixed -- simulator/demo-only code, no hardware
+  activation, no safety consequence, lower priority than the three real
+  workflow paths that were fixed.
+- Per-write database calls made DURING a test
+  (`record_measurement()`/`record_execution_state()`/`log_event()`) were
+  deliberately left unwrapped this milestone -- startup-time failures
+  (`open()`/`start_run_summary()`) were the priority; a mid-test failure
+  is still caught by `run_guarded()`'s generic exception handler and still
+  triggers a full safety shutdown, only the clean-`[FAIL]`-messaging
+  benefit is missing for that specific failure mode.
+
+### Verification
+
+All four closures verified by mocked regression test (not physical
+hardware): reverse polarity -- a -3.5 V DMM reading raises
+`ReversePolarityError` before `smu.set_charge_mode()`/`output_enable()`
+are ever called; a plausible positive reading proceeds normally to a
+completed charge. Battery-type validation -- monkeypatching an unknown
+`battery_type` raises `ConfigurationError`, not `KeyError`. Timeout
+traceability -- a `ChargeSequence` run with `CHARGE_TIMEOUT_S=0.0` records
+`StopReason.TIMEOUT` in both `record_execution_state`/`finish_run_summary`
+mock call args. Database hardening -- `_open_storage_guarded()` returns
+`None` and disconnects hardware on a simulated `sqlite3.OperationalError`;
+`_start_run_summary_guarded()` returns `False` on a simulated
+`sqlite3.Error`, `True` on success.
+
+### Milestone readiness decision
+
+**GO for Milestone X: Real Hardware Validation.** No software blocker
+remains -- all four MUST-FIX items are closed. Remaining blockers are all
+hardware-access tasks, unchanged from Milestone VIII: confirm
+`PRIMARY_SMU`'s real current rating, confirm relay/DAQ channel numbers
+against real wiring, confirm `BATTERY_CONFIGS` against the real datasheet,
+confirm the SMU/relay power-loss fail-safe behavior, confirm the real
+electrical signature of a reversed-polarity connection against the new
+-0.5 V threshold, then run the physical validation itself. Three RED items
+are explicitly, deliberately deferred and are NOT blockers for this gate,
+per explicit instruction that DAQ/NTC/`CycleSequence`/runtime power-loss-
+and-incomplete-run recovery work is out of scope: power-loss/incomplete-run
+recovery, reverse-polarity/damaged-battery disambiguation, and the
+simulator's unguarded `battery_type` lookup. See docs/architecture.md
+Section 42 for full detail and docs/FAQ.md for the underlying review.
+
+### Recommended next milestone
+
+**Milestone X: Real Hardware Validation** -- unchanged from Milestone
+VIII's recommendation -- validate `ChargeSequence`/`DischargeSequence`
+against Group A + a real SB battery on one relay-selected channel, before
+scaling to more channels, attempting HUB, or starting `CycleSequence`.
 
 ---
 

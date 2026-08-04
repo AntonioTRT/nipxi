@@ -130,6 +130,19 @@ def validate_group_test_config(group: str) -> dict:
         )
 
     # -- Stage 2: Battery Limits Validation ---------------------------------
+    # An unknown battery_type (e.g. a typo in BATTERY_GROUPS[group]
+    # ["battery_type"]) must never reach a bare BATTERY_CONFIGS[battery_type]
+    # KeyError -- that would be an uncaught, operator-unfriendly crash
+    # instead of the same ConfigurationError/"no hardware activated" path
+    # every other Stage 2 failure takes. See docs/architecture.md "Battery
+    # Type Validation".
+    if battery_type not in dev_cfg.BATTERY_CONFIGS:
+        raise ConfigurationError(
+            f"Group {group!r}: battery_type {battery_type!r} is not a known "
+            f"BATTERY_CONFIGS entry -- see config/devices.py::BATTERY_GROUPS"
+            f"[{group!r}] and config/devices.py::BATTERY_CONFIGS."
+        )
+
     # BATTERY_CONFIGS values are ceilings/floors, never required operating
     # points -- a setpoint below the limit is always fine; a setpoint above
     # it is always a ConfigurationError, never silently clamped.

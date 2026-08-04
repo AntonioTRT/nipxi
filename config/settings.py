@@ -107,6 +107,16 @@ class Settings:
     # -------------------------------------------------------------------------
     ZERO_CURRENT_THRESHOLD_A = 0.01  # A - "current is zero" threshold for relay safety
 
+    # Pre-output-enable reverse-polarity sanity check (ChargeSequence/
+    # DischargeSequence -- see docs/architecture.md "Reverse Polarity
+    # Protection"). A correctly-connected, intact Li-ion cell never reads
+    # negative. A small negative reading can still occur from ADC/DMM
+    # offset noise on a near-zero (deeply discharged or disconnected)
+    # cell, so the threshold is set safely below that noise floor rather
+    # than at 0.0 V -- anything at or below it is treated as physically
+    # implausible for a correctly-connected cell, not noise.
+    REVERSE_POLARITY_VOLTAGE_THRESHOLD_V = -0.5  # V - at/below this -> ReversePolarityError
+
     # -------------------------------------------------------------------------
     # SMU configuration-readback verification (hardware/smu.py)
     #

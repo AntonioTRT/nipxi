@@ -361,15 +361,15 @@ is out of scope except where explicitly noted.
 
 **Status:** Implemented
 
-**Answer:** The loop is bounded by `CHARGE_TIMEOUT_S` — once `elapsed > CHARGE_TIMEOUT_S`, `NIPXITimeoutError` is raised, which is NOT explicitly named in `run_guarded()`'s except clauses but IS caught by its generic `except Exception` branch, running the full safety shutdown (SMU off, relay open_all, run_summary FAIL, event logged).
+**Answer:** The loop is bounded by `CHARGE_TIMEOUT_S` — once `elapsed > CHARGE_TIMEOUT_S`, `NIPXITimeoutError` is raised. `run_guarded()` now has a dedicated `except NIPXITimeoutError` branch (placed after `RelayError`, before the generic `except Exception`) that records `StopReason.TIMEOUT` — not the generic `FAILED` — in both `record_execution_state()` and `finish_run_summary()`, then runs the identical `safety.emergency_stop()` shutdown as every other fault path.
 
 **Evidence:**
 - test_control/charge_sequence.py:148-152 — timeout raise
-- test_control/battery_operation_sequence.py:147-159 — generic exception handling
+- test_control/battery_operation_sequence.py:183-199 — `run_guarded()`'s dedicated `except NIPXITimeoutError` branch, recording `StopReason.TIMEOUT`
 
-**Risks:** `NIPXITimeoutError` is reported with the generic "Unexpected error" log wording rather than a dedicated "Timeout" wording, since `run_guarded()` has no dedicated `except NIPXITimeoutError` branch — `StopReason.TIMEOUT` exists (utils/stop_reason.py:23) but is never actually assigned; a timeout is recorded as `StopReason.FAILED` instead.
+**Risks:** None identified — closed this session. Verified via a mocked regression test: a `ChargeSequence` run with `CHARGE_TIMEOUT_S=0.0` now shows `StopReason.TIMEOUT` in both `record_execution_state` and `finish_run_summary` mock call args (previously would have been `FAILED`).
 
-**Recommendation:** Add an explicit `except NIPXITimeoutError` branch to `run_guarded()` that records `StopReason.TIMEOUT` instead of `FAILED`, for accurate traceability. This was noted as a known gap in the codebase's own docstrings (utils/stop_reason.py's module docstring) for the legacy path and evidently persists in the new one.
+**Recommendation:** None. (Previously recommended: add an explicit `except NIPXITimeoutError` branch to `run_guarded()` — done.)
 
 ### Q: Is there a maximum charge timeout?
 
@@ -459,14 +459,15 @@ is out of scope except where explicitly noted.
 
 **Status:** Implemented
 
-**Answer:** Bounded by `DISCHARGE_TIMEOUT_S`; raises `NIPXITimeoutError`, caught by `run_guarded()`'s generic exception branch (same gap noted in Section 3: recorded as `StopReason.FAILED`, not `TIMEOUT`).
+**Answer:** Bounded by `DISCHARGE_TIMEOUT_S`; raises `NIPXITimeoutError`, now caught by `run_guarded()`'s dedicated `except NIPXITimeoutError` branch (same fix as Section 3 — `BatteryOperationSequence.run_guarded()` is shared by both sequences), recording `StopReason.TIMEOUT` instead of `FAILED`.
 
 **Evidence:**
 - test_control/discharge_sequence.py:159-163
+- test_control/battery_operation_sequence.py:183-199
 
-**Risks:** Same `StopReason.TIMEOUT` traceability gap as charge.
+**Risks:** None identified — closed this session (same fix as Section 3, since both sequences share `run_guarded()`).
 
-**Recommendation:** Same as Section 3's charge-timeout recommendation — apply identically to discharge.
+**Recommendation:** None. Note: this fix applies only to `ChargeSequence`/`DischargeSequence` (built on `BatteryOperationSequence`) — the legacy `charge_cycle.py`/`discharge_cycle.py`/`ChargeCycle`/`DischargeCycle` classes are a separate, superseded code path and are unaffected.
 
 ### Q: Is there a maximum discharge timeout?
 
@@ -517,15 +518,17 @@ is out of scope except where explicitly noted.
 
 **Status:** Implemented
 
-**Answer:** `validate_group_test_config()`'s Stage 2 does `dev_cfg.BATTERY_CONFIGS[battery_type]` — if `battery_type` isn't `None` (caught earlier by Stage 1) but also isn't a valid key (e.g. a typo), this raises a bare `KeyError`, NOT a typed NIPXI exception. This is a real gap: `test.py`'s catch clause only names `GroupConfigurationError`/`ConfigurationError`/`HardwareConfigurationError`, so an uncaught `KeyError` here would propagate as an unhandled exception in `test.py::_run_charge_or_discharge()`'s caller (before the `try/except` around `validate_group_test_config()` at test.py:3992-3996 — actually IS caught there since that's a plain `try/except (GroupConfigurationError, ConfigurationError, HardwareConfigurationError)`, meaning a bare `KeyError` would NOT be caught and would propagate up to the menu loop).
+**Answer:** `validate_group_test_config()`'s Stage 2 now checks `battery_type not in dev_cfg.BATTERY_CONFIGS` explicitly, BEFORE the `battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]` lookup, and raises a typed `ConfigurationError` with a clear message if the battery type is unknown — the bare, uncaught `KeyError` this used to produce can no longer occur through this path. `test.py::_run_charge_or_discharge()`'s existing `except (GroupConfigurationError, ConfigurationError, HardwareConfigurationError)` now catches it cleanly (`[FAIL] ConfigurationError: ...`, no hardware activated). The two other code paths that read `BATTERY_CONFIGS[battery_type]` directly without going through `validate_group_test_config()` — `test.py::_run_monitor_battery()` and `_run_monitor_battery_scan()` — each got the identical explicit guard, printed as a `[FAIL]` message in the same style as the pre-existing "has no battery_type configured" check right above it.
 
 **Evidence:**
-- utils/validators.py:136 — `battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]` (no existence check)
-- test.py:3992-3996 — only catches the three named validation exceptions
+- utils/validators.py:139-144 — explicit `if battery_type not in dev_cfg.BATTERY_CONFIGS: raise ConfigurationError(...)`, before the line-149 lookup
+- test.py:3702-3706 — `_run_monitor_battery()`'s identical guard
+- test.py:3889-3893 — `_run_monitor_battery_scan()`'s identical guard
+- Verified via a mocked regression test: monkeypatching a group's `battery_type` to an unknown string now raises `ConfigurationError` (not `KeyError`) from `validate_group_test_config()`.
 
-**Risks:** In practice this can only occur via a configuration authoring error in `config/devices.py` itself (only "HUB"/"SB" exist as `BATTERY_CONFIGS` keys, and `BATTERY_GROUPS[...]["battery_type"]` is hand-authored to match) — not reachable via any operator input today, since battery type is never operator-supplied. But it is not defensively guarded.
+**Risks:** None identified for the three real workflow paths above — closed this session. Residual gap (documented, out of scope for this session): the Safety Monitor Simulator's `_select_safety_simulation_group()` and its two callers (test.py:2623, test.py:2769) still do a bare `BATTERY_CONFIGS[cfg["battery_type"]]` lookup with no equivalent guard. It is simulator/demo-only code (no hardware activation, no real battery, no safety consequence) but is the same class of gap.
 
-**Recommendation:** Add an explicit existence check in `validate_group_test_config()` (`if battery_type not in dev_cfg.BATTERY_CONFIGS: raise GroupConfigurationError(...)`) before Stage 2 proceeds, so a future config-authoring typo fails with a clear, typed, caught error rather than a bare `KeyError`.
+**Recommendation:** Apply the same explicit existence check to `_select_safety_simulation_group()`/its callers (test.py:2623, 2769) for consistency, at low priority given it carries no hardware risk.
 
 ### Q: What happens if a group references a non-existent SMU?
 
@@ -634,9 +637,9 @@ is out of scope except where explicitly noted.
 **Evidence:**
 - test.py:3992-3996
 
-**Risks:** As noted in Section 5, a bare `KeyError` from an unrecognized `battery_type` string would NOT be caught by this specific except clause and would propagate as an unhandled exception — still prevents hardware activation, but with an ugly traceback rather than a clean `[FAIL]` message.
+**Risks:** None identified — closed this session. (Previously: a bare `KeyError` from an unrecognized `battery_type` string would not have been caught by this except clause; `validate_group_test_config()` now raises a typed `ConfigurationError` for this case instead, see Section 5.)
 
-**Recommendation:** See Section 5's recommendation (typed exception for unknown battery_type).
+**Recommendation:** None.
 
 ### Q: Can hardware activation occur before validation is complete?
 
@@ -727,16 +730,17 @@ is out of scope except where explicitly noted.
 
 **Status:** Implemented
 
-**Answer:** `open()` catches `(OSError, sqlite3.Error)`, logs ERROR, and RE-RAISES — this propagates uncaught out of `test.py::_run_charge_or_discharge()` (no try/except around `storage.open()` there), meaning a database-open failure crashes the operator workflow with a traceback rather than a clean `[FAIL]` message. Critically, this happens AFTER `hw_mgr.connect_all()` has already succeeded (test.py:4029-4037) — hardware is connected but the run cannot proceed cleanly if storage fails to open, and the `finally` block still calls `hw_mgr.disconnect_all()` so hardware is safely torn down regardless.
+**Answer:** `open()` still catches `(OSError, sqlite3.Error)`, logs ERROR, and re-raises (data/storage.py) — but every real workflow entry point now calls a new helper, `test.py::_open_storage_guarded(hw_mgr=None)`, instead of `DataStorage(...).open()` directly. It wraps that same open() call in `try/except (OSError, sqlite3.Error)`, prints a clean `[FAIL] Database unavailable -- could not open storage: {e}` (no raw traceback shown to the operator), disconnects `hw_mgr` if given, and returns `None` on failure — callers check `if storage is None: return` immediately. Diagnostic detail is preserved because `DataStorage.open()` already logs the exception via `self.log.error(...)` before re-raising; this change only replaces what the OPERATOR sees, not what is logged. All four real workflow entry points use it: `_run_monitor_battery()`, `_run_monitor_battery_scan()`, `_run_charge_or_discharge()`, and `run_proto_test_execution()`.
 
 **Evidence:**
-- data/storage.py:351-372
-- test.py:4036-4037 — no try/except around `storage.open()`
-- test.py:4106-4116 — `finally` block still disconnects hardware unconditionally
+- test.py:3543-3576 — `_open_storage_guarded()` definition
+- test.py:4105-4107 — `_run_charge_or_discharge()` using it (`if storage is None: return`)
+- test.py:3746-3747, 3920-3921, 4312-4314 — the other three entry points using the same helper
+- Verified via a mocked regression test: `_open_storage_guarded()` returns `None` and calls `hw_mgr.disconnect_all()` when `DataStorage.open()` raises `sqlite3.OperationalError`.
 
-**Risks:** An unhandled exception with a raw traceback is a worse operator experience than a clean `[FAIL]` message, but hardware safety (relay/SMU shutdown) is NOT compromised since it's in the outer `finally`.
+**Risks:** None identified — closed this session for the four real workflow entry points. The read-only `_open_real_storage_readonly()` database-viewer tool was deliberately left untouched (it's an inspection tool, not a real test workflow, no hardware risk).
 
-**Recommendation:** Wrap `storage.open()` in a try/except that prints a clean `[FAIL]` message and still runs the hardware-disconnect `finally`, for operator-experience parity with the validation-failure path.
+**Recommendation:** None.
 
 ### Q: What happens if the database becomes unavailable during a test?
 
@@ -754,17 +758,20 @@ is out of scope except where explicitly noted.
 
 ### Q: What happens if run_summary creation fails?
 
-**Status:** Not Implemented (no dedicated handling)
+**Status:** Implemented
 
-**Answer:** `start_run_summary()` has no try/except around its `execute()`/`commit()` calls — a failure raises `sqlite3.Error` uncaught. In `test.py::_run_charge_or_discharge()`, this call happens inside the outer `try:` block (test.py:4039-4046) whose only `except`-equivalent is the `finally` at test.py:4106 — there's no explicit `except` catching this, so it propagates as an unhandled exception, caught only by Python itself unwinding to the `finally` (storage.close(), hw_mgr.disconnect_all()) and then out of the function entirely (no clean operator message).
+**Answer:** `start_run_summary()` itself is unchanged (still no try/except around its own `execute()`/`commit()`), but every real workflow entry point now calls it through a new helper, `test.py::_start_run_summary_guarded(storage, test_type, **fields)`, which wraps the call in `try/except sqlite3.Error`, prints a clean `[FAIL] Database unavailable -- could not start run_summary: {e}` message, and returns `True`/`False` — callers check `if not _start_run_summary_guarded(...): return` immediately, before any `log_event()` calls or hardware activation that would otherwise follow. No exception propagates to an unhandled traceback anymore.
 
 **Evidence:**
-- data/storage.py:617-647 — `start_run_summary()`
-- test.py:4039-4116 — `try:`/`finally:` structure, no intermediate `except`
+- data/storage.py:617-647 — `start_run_summary()` (unchanged)
+- test.py:3579-3598 — `_start_run_summary_guarded()` definition
+- test.py:4116-4126 — `_run_charge_or_discharge()` using it (`if not _start_run_summary_guarded(...): return`)
+- test.py:3758-3759, 3930-3931 — the other two entry points using the same helper
+- Verified via a mocked regression test: `_start_run_summary_guarded()` returns `False` (no exception propagates) when `start_run_summary()` raises `sqlite3.Error`, and `True` on success.
 
-**Risks:** An unhandled exception with a raw traceback, though hardware safety is preserved (the `finally` still runs `hw_mgr.disconnect_all()`).
+**Risks:** None identified — closed this session for the four real workflow entry points.
 
-**Recommendation:** Wrap `start_run_summary()` (and the block of `storage.log_event()` calls that follow it) in a try/except that logs cleanly and aborts the operation gracefully.
+**Recommendation:** None.
 
 ### Q: What happens if measurement logging fails?
 
@@ -1100,132 +1107,162 @@ is out of scope except where explicitly noted.
 
 ### Q: What happens if a battery is connected with reversed polarity?
 
-**Status:** Not Implemented
+**Status:** Implemented
 
-**Answer:** No code anywhere in this codebase (charge_sequence.py, discharge_sequence.py, safety_monitor.py, hardware/smu.py) contains any logic that specifically detects or classifies reversed battery polarity. A reversed battery would present as an anomalous voltage/current reading to `SafetyMonitor.check()` and/or the SMU's own compliance behavior — but there is no dedicated "reverse polarity" detection, error type, or handling path. This was confirmed absent by search of every safety- and measurement-related file reviewed.
+**Answer:** `ChargeSequence.run()`/`DischargeSequence.run()` now take a DMM reading with the SMU output still disabled — immediately after `relay.close()`/`record_execution_state(state="ACTIVE")` and BEFORE `set_charge_mode()`/`set_discharge_mode()`/`output_enable()` — via `interruptible_sleep(STABILIZATION_S)` then `pre_enable_v = self.dmm.measure_dc_voltage()`, then `BatteryOperationSequence._check_battery_polarity(pre_enable_v, ...)`. If `pre_enable_v <= Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V` (-0.5 V), a new `ReversePolarityError(SafetyViolationError)` is raised — an ERROR-level event is logged first via `storage.log_event(...)` — and the SMU output is never enabled. `ReversePolarityError` subclasses `SafetyViolationError`, so it flows through `run_guarded()`'s existing `SafetyViolationError` branch, triggering the identical `SafetyMonitor.emergency_stop()` shutdown (PMU off + all relays forced open, `StopReason.SAFETY_VIOLATION` recorded) — no new shutdown path was introduced.
 
 **Evidence:**
-- test_control/safety_monitor.py — `check()`'s only checks are absolute voltage/current/temperature range comparisons (lines 96-106), none polarity-aware
-- No occurrence of "polarity"/"reverse" found in test_control/, hardware/, or utils/ during this review
+- config/settings.py:118 — `REVERSE_POLARITY_VOLTAGE_THRESHOLD_V = -0.5`
+- utils/errors.py:32-47 — `ReversePolarityError(SafetyViolationError)` class + docstring
+- test_control/battery_operation_sequence.py:83-114 — `_check_battery_polarity()`
+- test_control/charge_sequence.py:143-148, test_control/discharge_sequence.py:154-160 — call sequence before `set_charge_mode()`/`set_discharge_mode()`/`output_enable()`
+- Verified via a mocked regression test: a DMM reading of -3.5V causes `ReversePolarityError` before `smu.set_charge_mode()`/`output_enable()` are ever called (asserted not called); a plausible positive reading proceeds normally to a completed charge.
 
-**Risks:** Depending on the SMU's DC_CURRENT sourcing behavior with a reverse-polarity load, the actual electrical outcome (possible negative voltage reading, possible compliance event, possible normal-looking but wrong-sign reading) is unconfirmed against real hardware — this is a genuine, uncharacterized gap.
+**Risks:** None for the "is it safe to enable the SMU" question. Residual gap (see below): the check does not distinguish a reversed cell from a disconnected lead, a genuinely damaged/over-discharged cell, or a wiring fault — all read identically and raise the same `ReversePolarityError`. This is intentional scope for this check (safety gate, not root-cause diagnosis).
 
-**Recommendation:** See the dedicated recommendation at the end of this section.
+**Recommendation:** None for this entry; see the disambiguation gap noted later in this section.
 
 ### Q: Can reversed polarity be detected before enabling the SMU?
 
-**Status:** Not Implemented
+**Status:** Implemented
 
-**Answer:** No — there is no pre-output-enable voltage/polarity check anywhere in `ChargeSequence`/`DischargeSequence`. The first real measurement (DMM/SMU) occurs only AFTER `output_enable()` and the stabilization wait, inside the sampling loop.
+**Answer:** Yes — see above. The DMM reading and `_check_battery_polarity()` check both happen strictly before `set_charge_mode()`/`set_discharge_mode()`/`output_enable()` in both `ChargeSequence.run()` and `DischargeSequence.run()`.
 
 **Evidence:**
-- test_control/charge_sequence.py:131-159 — `set_charge_mode()` → `output_enable()` → stabilization wait → first `measure()` call, with no pre-enable voltage read
+- test_control/charge_sequence.py:143-148 — `interruptible_sleep()` → `measure_dc_voltage()` → `_check_battery_polarity()` → `set_charge_mode()` → `output_enable()`
+- test_control/discharge_sequence.py:154-160 — same ordering for discharge
 
-**Risks:** If a reversed battery causes an unsafe electrical condition at output_enable() time, there is no chance to catch it before that happens electrically — only after, via the first post-enable measurement/safety check.
+**Risks:** None identified — closed this session.
 
-**Recommendation:** See below.
+**Recommendation:** None.
 
 ### Q: Is there hardware protection against reverse polarity?
 
 **Status:** Not Implemented (not addressed by software; unknown/unconfirmed at the hardware level)
 
-**Answer:** No hardware-level reverse-polarity protection (e.g. a series diode, polarity-sensing relay interlock) is referenced anywhere in `config/devices.py`'s hardware inventory or `hardware/relay_eth.py`/`hardware/smu.py`. Whether the physical wiring/connector design provides any mechanical/electrical reverse-polarity protection is a hardware question outside this codebase's scope, and is not documented as confirmed either way.
+**Answer:** Unchanged this session — no hardware-level reverse-polarity protection (e.g. a series diode, polarity-sensing relay interlock) is referenced anywhere in `config/devices.py`'s hardware inventory or `hardware/relay_eth.py`/`hardware/smu.py`. This is a hardware-datasheet/harness-design question outside this codebase's scope; the new software-side check (see above) is a mitigation for the electrical-enable decision, not a claim about physical hardware protection.
 
 **Evidence:** No relevant reference found in config/devices.py's PXI_SLOTS/BATTERY_CHANNELS entries or hardware/ driver files.
 
-**Risks:** Unconfirmed — this is a bench/hardware validation question, not a software gap.
+**Risks:** Unconfirmed — this remains a bench/hardware validation question, not a software gap. Carried forward as a hardware blocker for the Real Hardware Validation milestone gate (see docs/architecture.md's readiness assessment).
 
-**Recommendation:** Confirm with the physical connector/harness design documentation (outside this codebase) whether any keying or protection exists; if not, this is a strong argument for adding the software-side pre-check recommended below.
+**Recommendation:** Confirm with the physical connector/harness design documentation (outside this codebase) whether any keying or protection exists.
 
 ### Q: Is there software validation for reverse polarity?
 
-**Status:** Not Implemented — see above; confirmed absent.
+**Status:** Implemented — see "What happens if a battery is connected with reversed polarity?" above.
 
-**Recommendation:** See below.
+**Recommendation:** None.
 
 ### Q: What voltage reading is expected from a reversed battery?
 
-**Status:** Not Implemented (not analyzed in code — this is an electrical/hardware question)
+**Status:** Not Implemented (not analyzed in code — this remains an electrical/hardware question)
 
-**Answer:** No code documents or predicts the expected reading. Given the SMU's DC_CURRENT sourcing/sinking configuration described in hardware/smu.py (symmetric voltage compliance, `set_discharge_mode()`'s own docstring notes on compliance behavior), a reversed battery would likely present as a negative-sign voltage reading relative to what's expected, but this is inferred from the driver's general electrical model, not something confirmed against real hardware or asserted anywhere in code.
+**Answer:** Unchanged this session — no code documents or predicts the expected reading beyond the new safety threshold (`Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V = -0.5 V`, chosen to sit below plausible ADC/DMM offset noise on a near-zero cell per its own comment in config/settings.py) at/below which the SMU is refused. What the ACTUAL real-hardware reading of a reversed cell is has not been characterized on the bench.
 
-**Evidence:** hardware/smu.py:294-321 (set_discharge_mode() docstring, general compliance discussion, not polarity-specific)
+**Evidence:** config/settings.py:110-118 (threshold + rationale comment); hardware/smu.py:294-321 (general compliance discussion, not polarity-specific)
 
-**Risks:** Unconfirmed electrical behavior.
+**Risks:** Unconfirmed electrical behavior — hardware blocker, not a software gap.
 
-**Recommendation:** Characterize this on the bench (with appropriate current limiting) before relying on any inferred behavior.
+**Recommendation:** Characterize this on the bench (with appropriate current limiting) before relying on any inferred behavior; confirm -0.5 V is an appropriate threshold once real readings are available.
 
 ### Q: Does the system classify reverse polarity as a safety event?
 
-**Status:** Not Implemented
+**Status:** Implemented
 
-**Answer:** No — there is no reverse-polarity-specific classification. If a reversed battery produces a voltage/current reading outside `SafetyMonitor.check()`'s configured range, it would be classified generically as "Overvoltage"/"Undervoltage"/"Overcurrent" (whichever threshold is crossed) — the SAME classification as any other out-of-range condition, not a distinct "reverse polarity" event.
+**Answer:** Yes — `ReversePolarityError` is a distinct, named subclass of `SafetyViolationError`. It is not merely the generic "Overvoltage"/"Undervoltage" classification; the raised message explicitly states "pre-enable voltage sanity check failed... at/below reverse-polarity threshold... SMU will NOT be enabled," giving operators an immediately actionable diagnosis distinct from a generic range violation.
 
-**Evidence:** test_control/safety_monitor.py:83-108 — check()'s only classifications
+**Evidence:**
+- utils/errors.py:32-47 — `ReversePolarityError(SafetyViolationError)`
+- test_control/battery_operation_sequence.py:104-114 — distinct message text
 
-**Risks:** An operator reviewing logs would see a generic voltage/current fault message, not an explicit "reversed battery" diagnosis — slower root-cause identification.
+**Risks:** None identified — closed this session.
 
-**Recommendation:** See below.
+**Recommendation:** None.
 
 ### Q: Is reverse polarity logged in traceability?
 
-**Status:** Not Implemented — only generically, as whatever safety violation message the anomalous reading happens to trigger (see above); no dedicated "reverse polarity detected" event_log entry exists anywhere.
+**Status:** Implemented — `_check_battery_polarity()` logs an ERROR-level event via `self.storage.log_event(level="ERROR", source=self.source, channel=channel, relay=relay_address, message=message)` before raising `ReversePolarityError`, and `run_guarded()`'s `SafetyViolationError` branch logs a second event_log entry and records `StopReason.SAFETY_VIOLATION` in `run_summary`.
 
-**Recommendation:** See below.
+**Evidence:** test_control/battery_operation_sequence.py:109-114 (dedicated log_event call), 155-167 (run_guarded's SafetyViolationError branch)
+
+**Risks:** None identified — closed this session.
+
+**Recommendation:** None.
 
 ### Q: What happens if reverse polarity is detected during charging?
 
-**Status:** Not Implemented — no detection exists; whatever electrical symptom results would be handled by the generic `SafetyMonitor.check()` path exactly as any other anomalous reading (see Section 3).
+**Status:** Implemented — see "What happens if a battery is connected with reversed polarity?" above; identical mechanism for `ChargeSequence`.
 
-**Recommendation:** See below.
+**Evidence:** test_control/charge_sequence.py:143-148
+
+**Recommendation:** None.
 
 ### Q: What happens if reverse polarity is detected during discharging?
 
-**Status:** Not Implemented — same as above, for discharge (Section 4).
+**Status:** Implemented — same mechanism for `DischargeSequence`.
 
-**Recommendation:** See below.
+**Evidence:** test_control/discharge_sequence.py:154-160
+
+**Recommendation:** None.
 
 ### Q: Is relay activation blocked when reverse polarity is detected?
 
-**Status:** Not Implemented — since there is no pre-activation polarity check (see above), relay activation is never blocked for this reason; the relay is always closed before any measurement occurs.
+**Status:** Not Implemented (by design — unchanged)
 
-**Recommendation:** See below.
+**Answer:** No — the relay is still always closed BEFORE the polarity check runs (the check needs the relay closed to take a real DMM reading of the connected battery). What is blocked is the SMU output enable that follows. This is intentional: the check answers "is it safe to apply the SMU output," not "should the relay ever connect to this battery."
+
+**Evidence:** test_control/charge_sequence.py:143-148 — relay closed, then stabilization wait, then DMM read, then polarity check, then (if it passes) `set_charge_mode()`/`output_enable()`
+
+**Risks:** None identified — closing the relay to a reversed/disconnected/damaged battery with the SMU output disabled carries no meaningful electrical risk; this is the correct ordering.
+
+**Recommendation:** None.
 
 ### Q: Is SMU output blocked when reverse polarity is detected?
 
-**Status:** Not Implemented — same reasoning; `output_enable()` has no polarity precondition.
+**Status:** Implemented
 
-**Recommendation:** See below.
+**Answer:** Yes — `_check_battery_polarity()` runs strictly before `set_charge_mode()`/`set_discharge_mode()`/`output_enable()`; a `ReversePolarityError` prevents all three from ever being called. Verified via mocked regression test (`not smu.set_charge_mode.called`, etc.).
+
+**Evidence:** test_control/charge_sequence.py:143-148, test_control/discharge_sequence.py:154-160
+
+**Risks:** None identified — closed this session.
+
+**Recommendation:** None.
 
 ### Q: Is operator intervention required after reverse polarity detection?
 
-**Status:** Not Implemented — since there is no dedicated detection, there is no dedicated intervention requirement either; only whatever generic safety-violation abort occurs (which does always stop the test and require the operator to start a new run).
+**Status:** Implemented — same as any other `SafetyViolationError`: the operation aborts entirely (`emergency_stop()` runs, `run_summary` records `SAFETY_VIOLATION`/FAIL), and the operator must start a new run/confirmation flow from the top — there is no auto-retry.
 
-**Recommendation:** See below.
+**Evidence:** test_control/battery_operation_sequence.py:155-167
+
+**Recommendation:** None.
 
 ### Q: Can a damaged battery be mistakenly interpreted as reverse polarity?
 
-**Status:** Not Implemented (no classification exists for either, so neither can be distinguished from the other)
+**Status:** Partially Implemented
 
-**Answer:** Since neither "reverse polarity" nor "damaged battery" has a dedicated code-level classification, both would currently present identically as a generic `SafetyStatus(False, "Overvoltage/Undervoltage/Overcurrent: ...")` message — the system cannot distinguish these failure modes from each other, or from a simple wiring fault, today.
+**Answer:** Yes, deliberately so, and this is documented as intentional scope rather than an oversight: `_check_battery_polarity()`'s own docstring states it "does not attempt to distinguish a reversed cell from a disconnected lead or a genuinely damaged cell; only that none of those are safe to apply the SMU output to." A damaged/over-discharged cell reading at or below -0.5 V raises the exact same `ReversePolarityError` as a genuinely reversed connection — the check answers "is it safe to enable the SMU," not "what is wrong with the battery." This is a residual, intentional gap.
 
-**Evidence:** test_control/safety_monitor.py:83-108 — single undifferentiated classification scheme
+**Evidence:**
+- test_control/battery_operation_sequence.py:96-100 — `_check_battery_polarity()` docstring stating this explicitly
+- utils/errors.py:43-47 — `ReversePolarityError` docstring, same statement
 
-**Risks:** Diagnostic ambiguity for operators/maintenance.
+**Risks:** Diagnostic ambiguity for operators/maintenance persists — a `ReversePolarityError` in the logs means "unsafe to enable," not "definitely a reversed cell." Low safety risk (the SMU is correctly kept off either way); moderate root-cause-diagnosis friction.
 
-**Recommendation:** See below.
+**Recommendation:** If real-hardware validation shows this ambiguity causes meaningful operational friction, consider a secondary diagnostic (e.g. comparing the pre-enable reading's magnitude against the battery's nominal open-circuit voltage range) to suggest "likely reversed" vs. "likely damaged/disconnected" in the log message — out of scope for this session, deferred per explicit instruction.
 
 ### Q: How does the system distinguish: disconnected battery / reversed battery / deeply discharged battery / wiring fault?
 
-**Status:** Not Implemented
+**Status:** Partially Implemented
 
-**Answer:** It does not, currently. All four would most likely surface as an `SafetyViolationError` with a generic voltage-range message (or, for a disconnected battery, potentially a near-zero or floating reading that may or may not trip a threshold depending on the SMU's open-circuit behavior in DC_CURRENT mode — unconfirmed). No code path differentiates root cause.
+**Answer:** It still does not distinguish among these four causes — all four that produce a pre-enable reading at or below -0.5 V now share the single `ReversePolarityError` classification (an improvement over the prior generic Overvoltage/Undervoltage message, but not a root-cause diagnosis). This is intentional, documented scope for this session's fix, not an oversight.
 
-**Evidence:** test_control/safety_monitor.py:83-108
+**Evidence:** test_control/battery_operation_sequence.py:96-100 — docstring explicitly disclaiming disambiguation
 
-**Risks:** Significant diagnostic/operational risk during hardware validation and field use — operators cannot tell from the logged reason alone what physically went wrong.
+**Risks:** Same diagnostic-ambiguity risk as above — deferred, not a blocker for hardware validation (the check's job is safety, not diagnosis).
 
-**Recommendation:** See below (final section recommendation).
+**Recommendation:** Same as above — deferred pending real-hardware operational experience.
 
 ### Q: What happens if the measured voltage is outside the physically possible range for the selected battery type?
 
@@ -1235,19 +1272,25 @@ is out of scope except where explicitly noted.
 
 **Evidence:** test_control/safety_monitor.py:96-100
 
-**Risks:** No distinction between "slightly below floor" and "physically impossible" readings, which would help distinguish a genuine safety violation from a wiring/polarity fault.
+**Risks:** Below the new -0.5 V pre-enable threshold, a reading is now caught distinctly (as `ReversePolarityError`) before the SMU is ever enabled; above that threshold but still outside `voltage_min_v`/`voltage_max_v`, readings remain classified generically as Overvoltage/Undervoltage. No distinction exists between "slightly below floor" and "physically impossible but above -0.5V" readings.
 
-**Recommendation:** See below.
+**Recommendation:** None new — covered by this session's fix for the below-threshold case; the residual generic-classification gap above threshold is low-priority.
 
 ### Q: Should reverse polarity generate: SafetyViolationError / HardwareConfigurationError / a dedicated error type? (recommendation)
 
-**Status:** Not Implemented (design recommendation)
+**Status:** Implemented
 
-**Answer/Recommendation:** A dedicated error type is warranted — e.g. a new `ReversePolarityError(SafetyViolationError)` (subclassing `SafetyViolationError` so it is still caught by `run_guarded()`'s existing safety-violation branch and triggers the identical `emergency_stop()` shutdown, but carries a distinct, diagnosable name/message). The detection logic itself should live in `SafetyMonitor.check()` (or a pre-output-enable check called before `output_enable()`) as an explicit rule: e.g. "measured voltage is negative, or measured voltage is far below `voltage_min_v` in a way inconsistent with a discharged-but-intact cell" → raise `ReversePolarityError` instead of the generic undervoltage message. This gives operators an immediately actionable diagnosis distinct from "battery is just low" or "wiring is loose."
+**Answer:** Implemented exactly as previously recommended — `ReversePolarityError(SafetyViolationError)` now exists in `utils/errors.py`, subclassing `SafetyViolationError` so it is caught by `run_guarded()`'s existing safety-violation branch and triggers the identical `emergency_stop()` shutdown, while carrying a distinct, diagnosable name/message. The detection logic lives in `BatteryOperationSequence._check_battery_polarity()`, called from `ChargeSequence.run()`/`DischargeSequence.run()` immediately before `set_charge_mode()`/`set_discharge_mode()`/`output_enable()`, with the SMU output disabled.
 
-**Evidence:** N/A — forward-looking recommendation.
+**Evidence:**
+- utils/errors.py:32-47 — `ReversePolarityError(SafetyViolationError)`
+- config/settings.py:118 — `REVERSE_POLARITY_VOLTAGE_THRESHOLD_V`
+- test_control/battery_operation_sequence.py:83-114 — `_check_battery_polarity()`
+- test_control/charge_sequence.py:143-148, discharge_sequence.py:154-160 — call sites, before SMU enable
 
-**Recommendation:** Implement `ReversePolarityError(SafetyViolationError)` in utils/errors.py; add a pre-output-enable voltage sanity check (DMM read with SMU output still disabled) in `ChargeSequence`/`DischargeSequence` before `set_charge_mode()`/`output_enable()`; classify a clearly-negative or physically-implausible reading distinctly from ordinary over/undervoltage. This is the single highest-value safety addition identified by this review, given batteries will imminently be connected for hardware validation.
+**Risks:** None for the safety-gate function this implements. Residual, intentional: no disambiguation between reversed/damaged/disconnected/wiring-fault (see above) — deferred, not a blocker.
+
+**Recommendation:** None. This was the single highest-value safety addition identified by the prior review and is now closed.
 
 ---
 
@@ -1330,47 +1373,49 @@ is out of scope except where explicitly noted.
 
 ## SECTION 12 — PRE-HARDWARE VALIDATION CONCLUSION
 
+*Updated this session to reflect the closure of four MUST-FIX items: reverse polarity protection, battery-type validation, timeout traceability, and database startup hardening. See docs/architecture.md "Pre-Hardware-Validation MUST-FIX Closure" for the consolidated writeup. Sections 1-4, 6, 8, 9, 11 below Section 12 headers are unaffected by this session's changes; only the tallies and lists below have been re-derived from the entries actually changed above.*
+
 ### Classification Summary
 
-**GREEN (already handled) — 34 items**, including: relay single-activation interlock and verification, SMU output enable/disable verification, measure() NaN/None handling, per-sample safety checks (voltage/current/temperature) for both charge and discharge, cancellation checkpoints and safe-cancel shutdown, group/battery/hardware-capability pre-validation (3-stage pipeline) before any hardware touch, safety-event shutdown consistency (emergency vs. cancel), hardware startup safety re-verification on every restart, discharge cutoff floor-priority clamp, database commit-per-write durability, and documentation accuracy of the recovery gap in docs/DATABASE_ROADMAP.md.
+**GREEN (already handled) — 42 items**, including everything previously green PLUS this session's five closures: (1) reverse-polarity pre-output-enable voltage sanity check with a dedicated `ReversePolarityError(SafetyViolationError)` classification, distinct traceability logging, and confirmed SMU-output blocking (Section 10); (2) explicit `battery_type` existence validation in `validate_group_test_config()` and in the two direct-lookup `test.py` paths (`_run_monitor_battery()`, `_run_monitor_battery_scan()`), eliminating the bare `KeyError` (Section 5); (3) `StopReason.TIMEOUT` now actually assigned via `run_guarded()`'s dedicated `except NIPXITimeoutError` branch (Sections 3-4); (4) `storage.open()`/`start_run_summary()` now wrapped in clean, operator-facing `[FAIL]` handling (`_open_storage_guarded()`/`_start_run_summary_guarded()`) across all four real workflow entry points, with hardware safely disconnected on failure (Section 7).
 
-**YELLOW (partially handled) — 16 items**, including: `StopReason.TIMEOUT` never actually assigned (timeouts recorded as FAILED), unknown-`battery_type` bare `KeyError` not caught by a typed exception, database write failures in `record_measurement()`/`start_run_summary()` not wrapped for clean operator-facing errors, Ctrl+C during the final shutdown/teardown window not protected, cross-group concurrent execution not interlocked (no known real risk today, single-process CLI), SafetyMonitor coverage not exhaustively re-audited across every `test.py` commissioning workflow, and the general residual "hardware may still be energized" risk under total communication loss (always logged CRITICAL, never silently hidden, but not fully closable in software).
+**YELLOW (partially handled) — 14 items**, including: reverse-polarity/damaged-battery/disconnected-lead/wiring-fault disambiguation still does not exist (all four now share the single `ReversePolarityError` classification instead of a generic message — an improvement, but still not a root-cause diagnosis; intentionally deferred, Section 10); the Safety Monitor Simulator's `_select_safety_simulation_group()` and its two callers (test.py:2623, 2769) still do a bare `BATTERY_CONFIGS[...]` lookup with no existence guard (simulator/demo-only, no hardware risk; Section 5); database write failures in `record_measurement()`/`record_execution_state()`/`log_event()` (per-write, mid-test) remain unwrapped, unlike the now-guarded `storage.open()`/`start_run_summary()` (Section 7); Ctrl+C during the final shutdown/teardown window not protected; cross-group concurrent execution not interlocked (no known real risk today, single-process CLI); SafetyMonitor coverage not exhaustively re-audited across every `test.py` commissioning workflow; and the general residual "hardware may still be energized" risk under total communication loss (always logged CRITICAL, never silently hidden, but not fully closable in software).
 
-**RED (not handled) — 20 items**, concentrated almost entirely in two areas: (1) **reverse polarity / wiring-fault classification** — no detection, no dedicated error type, no distinction between disconnected/reversed/damaged/deeply-discharged battery conditions anywhere in the codebase; and (2) **power-loss / incomplete-run recovery** — no startup check for an incomplete `run_summary` row, no distinction between "still running" and "abandoned," no resume/recovery logic (though this is explicitly and accurately documented as deferred, not a silent gap).
+**RED (not handled) — 14 items**, now concentrated almost entirely in **power-loss / incomplete-run recovery** — no startup check for an incomplete `run_summary` row, no distinction between "still running" and "abandoned," no resume/recovery logic (explicitly and accurately documented as deferred, not a silent gap) — plus the unconfirmed hardware fail-safe questions (SMU output stage and Numato relay module behavior on power loss, physical reverse-polarity protection in the harness/connector design). The reverse-polarity-detection RED cluster from the prior review is now closed (moved to GREEN, with two narrow residual items moved to YELLOW above).
 
 ### Top 10 Risks
 
-1. **No reverse-polarity detection or classification anywhere** — a reversed battery, a disconnected battery, and a damaged battery are all indistinguishable at the code level; each surfaces as a generic overvoltage/undervoltage message. This is the single highest-priority gap given imminent real-hardware/real-battery validation.
-2. **No pre-output-enable voltage sanity check** — `ChargeSequence`/`DischargeSequence` enable SMU output before ever reading the battery's actual voltage with output disabled.
-3. **Power-loss/incomplete-run detection does not exist** — an interrupted run is indistinguishable from an in-progress one in the database; no startup check exists.
-4. **`StopReason.TIMEOUT` is defined but never assigned** — charge/discharge timeouts are recorded as generic `FAILED`, losing a diagnostically useful distinction.
-5. **Unconfirmed hardware fail-safe behavior on power loss** — whether the SMU output stage and Numato relay module fail open when their own power is lost is undocumented and unconfirmed against any datasheet (flagged in docs/architecture.md as "least-characterized risk in the system").
-6. **A second Ctrl+C during the final hardware-teardown window is unprotected** — could interrupt `disconnect_all()`/`emergency_stop()` mid-sequence; `atexit` backstops mitigate but don't eliminate this.
-7. **Database write failures in `record_measurement()`/`start_run_summary()` are not wrapped for clean error handling** — an in-flight SQLite failure propagates as an unhandled exception with a raw traceback rather than a clean operator message (though hardware safety shutdown still runs via the generic exception path).
-8. **No foreign-key/referential-integrity enforcement between `measurements`/`event_log`/`station_state` and `run_summary`** — an orphaned row is possible in principle (not observed in practice, since the current code always calls `start_run_summary()` first).
-9. **A total communication-loss failure during emergency shutdown can leave hardware energized** — logged CRITICAL, never hidden, but not closable by software alone; requires a hardware-level fail-safe.
-10. **SafetyMonitor coverage across every `test.py` hardware-commissioning workflow (SMU Functional Validation, Relay Ethernet Test, Proto Test Execution, Monitor Battery/Scan) was not exhaustively re-audited in this review** — only Charge/Discharge Battery's path was confirmed to have complete SafetyMonitor coverage.
+1. **Power-loss/incomplete-run detection does not exist** — an interrupted run is indistinguishable from an in-progress one in the database; no startup check exists. (Unchanged — explicitly out of scope for this session.)
+2. **Unconfirmed hardware fail-safe behavior on power loss** — whether the SMU output stage and Numato relay module fail open when their own power is lost is undocumented and unconfirmed against any datasheet (flagged in docs/architecture.md as "least-characterized risk in the system"). (Unchanged — hardware bench-test item, not software.)
+3. **Reverse-polarity/damaged-battery/disconnected-lead disambiguation does not exist** — all now correctly raise `ReversePolarityError` (closed: the SMU is never unsafely enabled), but an operator cannot tell which of the four physical conditions actually occurred from the log message alone. Intentionally deferred per this session's scope.
+4. **A second Ctrl+C during the final hardware-teardown window is unprotected** — could interrupt `disconnect_all()`/`emergency_stop()` mid-sequence; `atexit` backstops mitigate but don't eliminate this. (Unchanged.)
+5. **Database write failures in `record_measurement()`/`record_execution_state()`/`log_event()` are still not wrapped for clean error handling** — an in-flight SQLite failure mid-test propagates as an unhandled exception with a raw traceback rather than a clean operator message (though hardware safety shutdown still runs via the generic exception path). Narrower than before: `storage.open()`/`start_run_summary()` are now guarded.
+6. **No foreign-key/referential-integrity enforcement between `measurements`/`event_log`/`station_state` and `run_summary`** — an orphaned row is possible in principle (not observed in practice). (Unchanged.)
+7. **A total communication-loss failure during emergency shutdown can leave hardware energized** — logged CRITICAL, never hidden, but not closable by software alone; requires a hardware-level fail-safe. (Unchanged.)
+8. **SafetyMonitor coverage across every `test.py` hardware-commissioning workflow (SMU Functional Validation, Relay Ethernet Test, Proto Test Execution, Monitor Battery/Scan) was not exhaustively re-audited in this review.** (Unchanged.)
+9. **The Safety Monitor Simulator's `battery_type` lookup (test.py:2623, 2769) has no existence guard**, unlike the three real workflow paths fixed this session — simulator-only, no hardware risk, low priority.
+10. **Unconfirmed physical/mechanical reverse-polarity protection in the battery connector/harness design**, outside this codebase — a hardware/bench-test question, not a code gap.
 
 ### Top 10 Open Questions
 
 1. Does the PXI chassis / Numato relay module retain independent power when the host PC loses power? (Unconfirmed — docs/architecture.md's own "least-characterized risk.")
 2. Do the SMU cards (NI-4141/4139/4130) fail open (de-energize output) on card power loss? (Unconfirmed.)
-3. What is the actual, real-hardware voltage/current signature of a reversed-polarity battery connection on this specific SMU configuration? (Not characterized — bench test needed.)
+3. What is the actual, real-hardware voltage/current signature of a reversed-polarity battery connection on this specific SMU configuration, and is the -0.5 V `REVERSE_POLARITY_VOLTAGE_THRESHOLD_V` threshold well-chosen against real readings? (Not characterized — bench test needed.)
 4. Is there any physical/mechanical reverse-polarity protection in the battery connector/harness design, outside this codebase? (Unknown from code alone.)
 5. What SQLite `PRAGMA journal_mode`/`synchronous` setting is actually in effect (default, unconfigured), and is it adequate for this system's power-loss durability requirements?
-6. Should `ReversePolarityError` be a `SafetyViolationError` subclass (as recommended) or a wholly separate exception hierarchy branch?
-7. Is concurrent multi-process execution against different battery groups (A vs. B) ever intended to be supported, and if so, what interlock is needed?
-8. What is the intended behavior when an operator restarts the application and a previous run's `run_summary.end_time` is NULL — should this block new runs on that same channel/position specifically, or just warn globally?
-9. Should the SMU's electrical mode (`output_function`/`source_mode`) be periodically re-verified during the sampling loop, or is one-time configuration verification sufficient given real-hardware behavior?
-10. Has SafetyMonitor coverage been confirmed complete for every non-Charge/Discharge hardware-touching workflow in test.py (commissioning tests, Monitor Battery, Monitor Battery Scan)?
+6. Is concurrent multi-process execution against different battery groups (A vs. B) ever intended to be supported, and if so, what interlock is needed?
+7. What is the intended behavior when an operator restarts the application and a previous run's `run_summary.end_time` is NULL — should this block new runs on that same channel/position specifically, or just warn globally?
+8. Should the SMU's electrical mode (`output_function`/`source_mode`) be periodically re-verified during the sampling loop, or is one-time configuration verification sufficient given real-hardware behavior?
+9. Has SafetyMonitor coverage been confirmed complete for every non-Charge/Discharge hardware-touching workflow in test.py (commissioning tests, Monitor Battery, Monitor Battery Scan)?
+10. Is a secondary heuristic (e.g. comparing pre-enable voltage magnitude against nominal open-circuit range) worth adding to distinguish "likely reversed" from "likely damaged/disconnected" in the `ReversePolarityError` message, once real-hardware operational experience is available?
 
 ### Recommended Actions Before Hardware Validation
 
-1. Implement a pre-output-enable voltage sanity check (DMM read with SMU output disabled) in `ChargeSequence`/`DischargeSequence`, and a dedicated `ReversePolarityError(SafetyViolationError)` classification for a clearly negative/implausible reading.
-2. Add an explicit existence check for `battery_type` in `validate_group_test_config()` to eliminate the bare-`KeyError` gap.
-3. Wire `StopReason.TIMEOUT` through `run_guarded()`'s exception handling (or a dedicated `except NIPXITimeoutError` branch) so timeouts are recorded distinctly from generic failures.
-4. Wrap `storage.open()`/`start_run_summary()` calls in `test.py::_run_charge_or_discharge()` with clean try/except error reporting, consistent with the validation-failure path's `[FAIL]` messaging.
-5. Confirm (bench test, not code) the power-loss fail-safe behavior of the SMU output stage and Numato relay module — this directly affects what safety claims can honestly be made before batteries are connected.
+1. ~~Implement a pre-output-enable voltage sanity check... and a dedicated `ReversePolarityError`...~~ **Done this session.**
+2. ~~Add an explicit existence check for `battery_type`...~~ **Done this session** for all three real workflow paths (`validate_group_test_config()`, `_run_monitor_battery()`, `_run_monitor_battery_scan()`); simulator path (test.py:2623, 2769) intentionally deferred as low-priority/no-hardware-risk.
+3. ~~Wire `StopReason.TIMEOUT` through `run_guarded()`'s exception handling...~~ **Done this session.**
+4. ~~Wrap `storage.open()`/`start_run_summary()` calls... with clean try/except error reporting...~~ **Done this session** for all four real workflow entry points (`_run_monitor_battery()`, `_run_monitor_battery_scan()`, `_run_charge_or_discharge()`, `run_proto_test_execution()`).
+5. Confirm (bench test, not code) the power-loss fail-safe behavior of the SMU output stage and Numato relay module — this directly affects what safety claims can honestly be made before batteries are connected. **Still outstanding — hardware-side, cannot be closed in software.**
 
 ### Recommended Actions After Hardware Validation
 

@@ -26,7 +26,10 @@ import logging
 
 from test_control.safety_monitor import SafetyMonitor
 from test_control.execution_screen import ExecutionFrame, render_execution_frame
-from utils.errors import SafetyViolationError, RelayError, OperationCancelledError
+from utils.errors import (
+    SafetyViolationError, RelayError, OperationCancelledError, ReversePolarityError,
+    NIPXITimeoutError,
+)
 from utils.stop_reason import StopReason
 
 
@@ -76,6 +79,39 @@ class BatteryOperationSequence:
             **extra_fields,
         )
         render_execution_frame(frame)
+
+    def _check_battery_polarity(self, voltage_v: float, *, channel: int, relay_address: int):
+        """
+        Pre-output-enable reverse-polarity sanity check -- called with the
+        SMU output still disabled, after the relay has closed and a DMM
+        reading has settled, before set_charge_mode()/set_discharge_mode()/
+        output_enable() ever run:
+
+            Relay Selection -> Battery Voltage Measurement (DMM) ->
+            Sanity Validation -> SMU Enable
+
+        A correctly-connected, intact Li-ion cell never reads at or below
+        Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V (see that setting's
+        comment for why the threshold sits below 0.0 V rather than at it).
+        Raises ReversePolarityError -- caught by run_guarded()'s existing
+        SafetyViolationError branch -- with the SMU output never having been
+        enabled at all. Does not attempt to distinguish a reversed cell from
+        a disconnected lead or a genuinely damaged cell; only that none of
+        those are safe to apply the SMU output to.
+        """
+        threshold = self.s.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V
+        if voltage_v <= threshold:
+            message = (
+                f"Channel {channel}: pre-enable voltage sanity check failed -- "
+                f"measured {voltage_v:.3f} V (at/below reverse-polarity threshold "
+                f"{threshold:.3f} V) with SMU output disabled. SMU will NOT be enabled."
+            )
+            self.log.error(message)
+            self.storage.log_event(
+                level="ERROR", source=self.source, channel=channel, relay=relay_address,
+                message=message,
+            )
+            raise ReversePolarityError(message)
 
     def run_guarded(self, fn, *, channel, relay_address, label, verb, cancel_message,
                      extra_run_summary_fields_fn=lambda: {}):
@@ -139,6 +175,24 @@ class BatteryOperationSequence:
             self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.FAILED)
             self.storage.finish_run_summary(
                 stop_reason=StopReason.FAILED, result="FAIL",
+                **extra_run_summary_fields_fn(),
+            )
+            self.safety.emergency_stop(self.smu, self.relay, str(e))
+            raise
+
+        except NIPXITimeoutError as e:
+            # Classified as StopReason.TIMEOUT, not the generic FAILED --
+            # see docs/architecture.md "Timeout Traceability". Shutdown
+            # sequence is identical to every other fault (emergency_stop()),
+            # only the recorded stop_reason/execution_state differ.
+            self.log.error("Timeout while %s channel %d: %s", verb, channel, e)
+            self.storage.log_event(
+                level="ERROR", source=self.source, channel=channel, relay=relay_address,
+                message=f"Timeout -- {e}",
+            )
+            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.TIMEOUT)
+            self.storage.finish_run_summary(
+                stop_reason=StopReason.TIMEOUT, result="FAIL",
                 **extra_run_summary_fields_fn(),
             )
             self.safety.emergency_stop(self.smu, self.relay, str(e))

@@ -218,6 +218,48 @@ the bottom, with a pointer to where the real documentation lives
   deferred from the `NUM_CHANNELS` -> `BATTERY_POSITIONS` rename (would
   touch `test_control/` files outside that change's scope).
 
+### Pre-Hardware-Validation MUST-FIX Closure (residual, low priority)
+
+- [x] Reverse polarity protection -- **DONE.** New `ReversePolarityError
+  (SafetyViolationError)` (`utils/errors.py`), new
+  `Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V` (-0.5 V,
+  `config/settings.py`), new `BatteryOperationSequence._check_battery_polarity()`
+  called from `ChargeSequence.run()`/`DischargeSequence.run()` with the SMU
+  output still disabled, immediately before `set_charge_mode()`/
+  `set_discharge_mode()`/`output_enable()`. See docs/architecture.md
+  "Pre-Hardware-Validation MUST-FIX Closure" and docs/FAQ.md Section 10.
+- [x] Battery-type validation -- **DONE.** `validate_group_test_config()`
+  and the two direct-lookup paths (`_run_monitor_battery()`,
+  `_run_monitor_battery_scan()`) all now raise a typed
+  `ConfigurationError`/`[FAIL]` message instead of a bare `KeyError` for an
+  unrecognized `battery_type`. See docs/FAQ.md Section 5.
+- [x] `StopReason.TIMEOUT` traceability -- **DONE.**
+  `BatteryOperationSequence.run_guarded()` has a dedicated
+  `except NIPXITimeoutError` branch recording `StopReason.TIMEOUT` instead
+  of the generic `FAILED`. Applies to `ChargeSequence`/`DischargeSequence`
+  only (legacy `charge_cycle.py`/`discharge_cycle.py` unaffected, already
+  superseded). See docs/FAQ.md Sections 3-4.
+- [x] Database startup hardening -- **DONE.** New `test.py::
+  _open_storage_guarded()`/`_start_run_summary_guarded()` helpers wrap
+  `DataStorage.open()`/`start_run_summary()` with clean `[FAIL]`
+  messaging instead of a raw traceback, used by all four real workflow
+  entry points (`_run_monitor_battery()`, `_run_monitor_battery_scan()`,
+  `_run_charge_or_discharge()`, `run_proto_test_execution()`). See
+  docs/FAQ.md Section 7.
+- [ ] (Low priority, no hardware risk) Reverse-polarity/damaged-battery/
+  disconnected-lead/wiring-fault disambiguation -- `_check_battery_polarity()`
+  deliberately does not distinguish these; all raise the same
+  `ReversePolarityError`. Intentionally deferred -- the check's job is the
+  SMU-enable safety gate, not root-cause diagnosis. See docs/FAQ.md
+  Section 10's "Can a damaged battery be mistakenly interpreted as reverse
+  polarity?" entry.
+- [ ] (Low priority, no hardware risk) Apply the same `battery_type`
+  existence guard added to the three real workflow paths to the Safety
+  Monitor Simulator's `_select_safety_simulation_group()` and its two
+  callers (`test.py:2623`, `test.py:2769`), which still do a bare
+  `BATTERY_CONFIGS[cfg["battery_type"]]` lookup. Simulator/demo-only, no
+  hardware activation -- deferred, not a blocker.
+
 ### Configuration
 
 - [MUST] Confirm relay channel numbers match physical wiring on the BLOSS
@@ -323,6 +365,23 @@ Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
 
+- **Pre-Hardware-Validation MUST-FIX Closure** -- closed the four
+  highest-priority gaps a pre-hardware-validation architecture FAQ review
+  (`docs/FAQ.md`) identified: reverse polarity protection (new
+  `ReversePolarityError(SafetyViolationError)`, pre-output-enable DMM
+  sanity check in `ChargeSequence`/`DischargeSequence`), battery-type
+  validation (typed `ConfigurationError` instead of a bare `KeyError` for
+  an unrecognized `battery_type`, in all three real lookup paths), timeout
+  traceability (`StopReason.TIMEOUT` now actually assigned via a dedicated
+  `run_guarded()` exception branch), and database startup hardening
+  (`_open_storage_guarded()`/`_start_run_summary_guarded()` clean `[FAIL]`
+  messaging across all four real workflow entry points). Verified via
+  mocked regression tests, not physical hardware. Two narrow, intentional
+  residual gaps carried forward (see "Pre-Hardware-Validation MUST-FIX
+  Closure (residual, low priority)" above): reverse-polarity/damaged-
+  battery disambiguation, and the Safety Monitor Simulator's unguarded
+  `battery_type` lookup. See docs/architecture.md "Pre-Hardware-Validation
+  MUST-FIX Closure" and docs/MILESTONES.md Milestone IX.
 - **Simulator & Reference-Blueprint Reconciliation + Pre-Hardware-Validation
   Readiness** -- final software-focused milestone before Real Hardware
   Validation. Found and fixed real drift: the Safety Monitor Simulator's

@@ -62,13 +62,18 @@ pre-existing gap ChargeCycle/DischargeCycle/MonitorBatterySequence all
 carry (SafetyMonitor.check() tolerates temp_c=None; this is a documented,
 tracked gap in docs/TODO.md, not a silent omission).
 
-Timeout: unlike ChargeCycle.run() (which returns False on timeout, with no
-further shutdown/persistence guarantee -- see docs/TODO.md's TIMEOUT
-wiring gap), a charge timeout here raises NIPXITimeoutError so it flows
-through BatteryOperationSequence.run_guarded()'s existing generic-exception
-handling -- the same relay-open/PMU-off/run_summary/event_log path every
-other fault already gets, reusing that machinery rather than inventing a
-parallel timeout-specific shutdown.
+Timeout: a charge timeout here raises NIPXITimeoutError, classified as
+StopReason.TIMEOUT (not the generic FAILED) in run_summary/event_log/
+final status reporting -- see docs/architecture.md "Timeout Traceability".
+
+Reverse Polarity Protection (docs/architecture.md "Reverse Polarity
+Protection"): after the relay closes and settles, but before
+set_charge_mode()/output_enable() ever run, a DMM reading is taken with
+the SMU output still disabled and checked against
+Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V (see
+BatteryOperationSequence._check_battery_polarity()). A reading at/below
+that threshold raises ReversePolarityError -- a SafetyViolationError
+subclass -- before the SMU is ever enabled.
 """
 
 import time
@@ -77,7 +82,7 @@ from config.settings import Settings
 from test_control.battery_operation_sequence import BatteryOperationSequence
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
-from utils.errors import NIPXITimeoutError, SafetyViolationError
+from utils.errors import NIPXITimeoutError, SafetyViolationError, ReversePolarityError
 
 
 class ChargeSequence(BatteryOperationSequence):
@@ -127,6 +132,17 @@ class ChargeSequence(BatteryOperationSequence):
                         f"({current_a:.3f} A / {voltage_limit_v:.3f} V CV target)",
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state="ACTIVE")
+
+            # Pre-output-enable reverse-polarity sanity check -- Relay
+            # Selection -> Battery Voltage Measurement (DMM) -> Sanity
+            # Validation -> SMU Enable. The SMU output is still disabled at
+            # this point (HardwareManager.connect_all() leaves it OFF, and
+            # set_charge_mode()/output_enable() have not been called yet) --
+            # see BatteryOperationSequence._check_battery_polarity() and
+            # docs/architecture.md "Reverse Polarity Protection".
+            interruptible_sleep(self.s.STABILIZATION_S, token=token)
+            pre_enable_v = self.dmm.measure_dc_voltage()
+            self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
 
             self.smu.set_charge_mode(current_a=current_a, voltage_limit_v=voltage_limit_v)
             self.smu.output_enable()

@@ -29,6 +29,25 @@ class SafetyViolationError(NIPXIError):
     """Raised when a safety limit is exceeded. Triggers emergency stop."""
 
 
+class ReversePolarityError(SafetyViolationError):
+    """
+    Raised by the pre-output-enable voltage sanity check (ChargeSequence/
+    DischargeSequence -- see docs/architecture.md "Reverse Polarity
+    Protection") when the DMM reads a voltage at or below
+    Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V with the SMU output still
+    disabled. Deliberately a SafetyViolationError subclass -- it is caught
+    by BatteryOperationSequence.run_guarded()'s existing SafetyViolationError
+    branch and triggers the identical SafetyMonitor.emergency_stop() shutdown
+    (PMU off + all relays forced open, run_summary/event_log recorded as
+    SAFETY_VIOLATION) -- no separate shutdown path was introduced for this.
+    Distinct from a generic Overvoltage/Undervoltage SafetyStatus message so
+    operators get an immediately actionable diagnosis instead of "battery is
+    just low"/"wiring is loose". Not a diagnosis of WHY the voltage is
+    negative (reversed cell vs. a genuinely damaged cell vs. a wiring fault
+    all read identically) -- only that connecting the SMU would be unsafe.
+    """
+
+
 class OperationCancelledError(NIPXIError):
     """
     Raised when a cancellation checkpoint (see utils/cancellation.py) finds

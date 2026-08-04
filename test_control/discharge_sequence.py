@@ -55,10 +55,14 @@ Temperature remains None -- NTC is not wired into this sequence, the same
 pre-existing gap DischargeCycle/ChargeCycle/MonitorBatterySequence all
 carry (SafetyMonitor.check() tolerates temp_c=None).
 
-Timeout: raises NIPXITimeoutError (rather than DischargeCycle.run()'s
-`return False`) so it flows through BatteryOperationSequence.
-run_guarded()'s existing generic-exception handling -- see
-charge_sequence.py's module docstring for the identical rationale.
+Timeout: a discharge timeout here raises NIPXITimeoutError, classified as
+StopReason.TIMEOUT (not the generic FAILED) -- see charge_sequence.py's
+module docstring for the identical rationale, and docs/architecture.md
+"Timeout Traceability".
+
+Reverse Polarity Protection: see charge_sequence.py's module docstring --
+identical pre-output-enable DMM sanity check here, before
+set_discharge_mode()/output_enable().
 """
 
 import time
@@ -67,7 +71,7 @@ from config.settings import Settings
 from test_control.battery_operation_sequence import BatteryOperationSequence
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
-from utils.errors import NIPXITimeoutError, SafetyViolationError
+from utils.errors import NIPXITimeoutError, SafetyViolationError, ReversePolarityError
 
 
 class DischargeSequence(BatteryOperationSequence):
@@ -143,6 +147,14 @@ class DischargeSequence(BatteryOperationSequence):
                         f"{cutoff_v:.3f} V EOD cutoff)",
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state="ACTIVE")
+
+            # Pre-output-enable reverse-polarity sanity check -- Relay
+            # Selection -> Battery Voltage Measurement (DMM) -> Sanity
+            # Validation -> SMU Enable. See ChargeSequence.run()'s identical
+            # rationale and BatteryOperationSequence._check_battery_polarity().
+            interruptible_sleep(self.s.STABILIZATION_S, token=token)
+            pre_enable_v = self.dmm.measure_dc_voltage()
+            self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
 
             self.smu.set_discharge_mode(current_a=current_a, voltage_limit_v=compliance_voltage_v)
             self.smu.output_enable()
