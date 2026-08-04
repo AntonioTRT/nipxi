@@ -2064,6 +2064,8 @@ This keeps `hardware_for_group()`'s return shape, `resolve_group_position()`, an
 
 ## 39. Battery Group Test Configuration Architecture
 
+**SUPERSEDED IN PART by Section 40.** This section's "Resolving the battery-type-inference tension" subsection below describes battery type as operator-selected-and-cross-checked. That has since been corrected: battery type is no longer operator input at all, in any workflow -- it is read directly from the group. Section 40 is authoritative on this point; the rest of this section (the conceptual distinction between `BATTERY_CONFIGS` and `test_setpoints`, the SMU capability data, the validation pipeline's Stage 2/3 logic) is unchanged and still accurate. Kept here, not rewritten, as a record of the intermediate design and why it changed.
+
 **Objective:** formalize each `BATTERY_GROUPS` entry into a complete, self-contained operational test definition -- one place defines battery type, hardware assignment, and test configuration, without a parallel config system.
 
 ### The conceptual distinction this section formalizes
@@ -2132,3 +2134,39 @@ Direct calls to `validate_group_test_config()` confirmed all three stages indepe
 ### Multi-group scalability assessment (Phase 5)
 
 Adding Group B/C/D as real, usable configurations now requires **only data** -- populate `battery_type`/`test_setpoints` alongside the hardware roles already anticipated -- zero code changes to `hardware_for_group()`, `resolve_group_position()`, `validate_group_test_config()`, or either sequence class. The DAQ-channel-collision risk (Section 38) is unrelated to and unaffected by this change. Future DAQ integration is likewise unaffected -- `test_setpoints` never touches DAQ. Operator workflow gains one new possible abort (`GroupConfigurationError` on a battery-type/group mismatch) and a clearer confirmation screen (setpoints now shown as "commanded", distinct from the battery's own limits) -- no regression to Monitor Battery/Monitor Battery Scan, which are untouched by this section's changes.
+
+---
+
+## 40. Architectural Correction: Battery Type Is Never Operator Input
+
+**Corrects Section 39's "Resolving the battery-type-inference tension" subsection.** That design let the operator still explicitly select a battery type, with the group's own declaration used only as a cross-check (raising `GroupConfigurationError` on a mismatch). This has been corrected: **battery type is not, and must never become, operator input, in any workflow.** It is engineering-configured entirely within `config/devices.py::BATTERY_GROUPS[group]["battery_type"]`, read directly, with no operator prompt and no cross-check to perform (there is nothing left to cross-check against).
+
+### The corrected model
+
+- **`BATTERY_CONFIGS[type]`** -- battery characteristics and safety limits (`max_charge_current_a`, `max_discharge_current_a`, `voltage_max_v`, `voltage_min_v`, `max_temp_c`, `nominal_voltage_v`, `capacity_ah`). Defines what the battery *allows*. Unchanged by this correction.
+- **`BATTERY_GROUPS[group]`** -- the complete operational test definition: `relay_matrix`/`smu`/`dmm`/`daq` (hardware), `position_start`/`position_end` (positions), `battery_type` (which battery this group is engineering-configured for), `test_setpoints` (`charge_current_a`/`charge_voltage_v`/`discharge_current_a`/`discharge_cutoff_v` -- the chosen recipe). Defines *how the test will actually run*.
+- **Operator responsibility: select Group. Only.** Battery type, charge/discharge current, charge voltage, and cutoff voltage are all engineering-controlled settings the operator never chooses at runtime -- they come from whichever group was selected.
+
+### Why this is not the same as the previous "declaration + cross-check" design
+
+The previous design still asked the operator "which battery?" -- just with a safety net catching a wrong answer. The corrected model removes the question entirely: there is no battery-type prompt anywhere in the real execution workflows (Monitor Battery, Monitor Battery Scan, Charge Battery, Discharge Battery). This is a stronger form of "config/devices.py is the single source of truth" than the prior design achieved -- battery type genuinely has exactly one place it can come from, with no runtime input path that could diverge from it, rather than two paths (operator input, group declaration) kept in sync by a validation check.
+
+### Implementation
+
+- **Removed:** `test.py::_select_battery_type()` -- deleted entirely (confirmed unused by any remaining caller before removal, not just unreferenced by convention).
+- **`test.py::_select_battery_group()`** is now explicitly documented as the *only* selection prompt for any battery workflow.
+- **`_run_monitor_battery()`**: order changed from (select battery type -> select group -> select position) to (select group -> select position -> resolve hardware -> **derive battery type from `dev_cfg.group_test_config(group)["battery_type"]`**, aborting with a clear `[FAIL]` before any hardware activation if the group has none configured).
+- **`_run_monitor_battery_scan()`**: same reordering.
+- **`_run_charge_or_discharge()`** (Charge/Discharge Battery): battery type is now returned by `validate_group_test_config(group)` itself (see below) rather than resolved separately before calling it.
+- **`utils/validators.py::validate_group_test_config(group)`** -- signature changed from `(group, battery_type)` to `(group)`. Stage 1 no longer takes or checks an operator-supplied battery type; it reads `BATTERY_GROUPS[group]["battery_type"]` directly and raises `GroupConfigurationError` only if that's `None` (group not yet configured). Return value changed from `test_setpoints` alone to `{"battery_type": ..., "test_setpoints": ...}`, since callers now need both from this single call. Stages 2 (Battery Limits) and 3 (Hardware Capability) are otherwise unchanged -- they always compared setpoints against `BATTERY_CONFIGS[battery_type]`/the SMU's capability using whatever `battery_type` was in scope, and that value is simply sourced differently now.
+- **`_confirm_operation()`**: signature unchanged (still displays `battery_type`/`battery_cfg`) -- only the label changed, to "Battery Type (engineering-configured for this group)", so the operator sees what will run without it implying a choice they made.
+
+### What was deliberately NOT changed
+
+- **`test.py::_select_safety_simulation_battery()`** (used only by the Safety Monitor Simulator, `test_safety_monitor()`) still lets a developer pick a battery type to preview `SafetyMonitor`'s behavior against. This is a hardware-free, database-free walkthrough/exploration tool for comparing behavior across battery types side by side -- not a real execution workflow, and not something a real operator uses to run a test. Changing it to derive from a group would defeat its purpose (seeing how the simulator behaves for HUB vs. SB in the same session). Left untouched, deliberately, not overlooked.
+- `BATTERY_CONFIGS` itself -- untouched, exactly as intended.
+- The three-stage validation pipeline's Stage 2/3 logic -- unchanged, only Stage 1's source of `battery_type` changed.
+
+### Verification
+
+Direct calls confirm `validate_group_test_config('A')` returns `{"battery_type": "SB", "test_setpoints": {...}}` with no parameter beyond `group`; Group B/an unknown group both still raise `GroupConfigurationError` at the same point as before. Scripted smoke tests (mocked `input()`, declining the confirmation screen before any hardware touch) confirm all three real workflows -- Monitor Battery, Monitor Battery Scan, Charge Battery -- now prompt for Group and Position only, never battery type, and the confirmation screen correctly displays the group-derived battery type and (for Charge/Discharge) the commanded setpoints. `py_compile` clean; no remaining reference to `_select_battery_type` anywhere in `test.py`.

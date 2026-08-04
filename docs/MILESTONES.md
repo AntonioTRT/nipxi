@@ -1093,6 +1093,60 @@ this pipeline has already confirmed valid, not an unvalidated one.
 
 ---
 
+## Milestone VII: Architectural Correction -- Battery Type Is Never Operator Input
+
+**Status:** ACHIEVED
+
+**Scope:** corrected Milestone VI's group architecture -- battery type is
+no longer operator input in any real workflow, only engineering
+configuration read from the selected group.
+
+### Objectives achieved
+
+- `test.py::_select_battery_type()` removed entirely (confirmed unused
+  first). Monitor Battery, Monitor Battery Scan, Charge Battery, and
+  Discharge Battery all now prompt for Group (and, where applicable,
+  Position) only -- no battery-type prompt anywhere in real execution.
+- `utils/validators.py::validate_group_test_config()` simplified from
+  `(group, battery_type)` to `(group)` -- battery type is read directly
+  from `BATTERY_GROUPS[group]["battery_type"]`, no cross-check against
+  operator input remains (there is no operator input to check against).
+- Confirmation screens updated to label battery type as
+  "engineering-configured for this group", clarifying what's actually
+  being confirmed.
+- `_select_safety_simulation_battery()` (Safety Monitor Simulator)
+  deliberately left unchanged -- a dev/exploration tool, not a real
+  workflow.
+
+### Architectural decisions made
+
+- Battery type has exactly one source (`BATTERY_GROUPS[group]
+  ["battery_type"]`) with no runtime input path that could diverge from
+  it -- stronger than the prior "declaration + cross-check" design, which
+  still had two paths (operator input, group declaration) kept in sync by
+  validation.
+- `BATTERY_CONFIGS` remains untouched -- battery characteristics/limits
+  only.
+- Operator responsibility is now exactly: select Group.
+
+### Verification
+
+Scripted smoke tests (mocked `input()`, declining before any hardware
+touch) confirm all three real workflows prompt for Group/Position only;
+`validate_group_test_config('A')` returns the derived battery type with no
+parameter beyond `group`; Group B and an unknown group both still raise
+`GroupConfigurationError` at the same point as before. `py_compile` clean;
+no remaining reference to `_select_battery_type` in `test.py`. See
+docs/architecture.md Section 40.
+
+### Recommended next milestone
+
+**Milestone VIII: physical rack validation**, unchanged from Milestone
+VI's recommendation -- validate `ChargeSequence`/`DischargeSequence`
+against Group A + a real SB battery.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

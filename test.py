@@ -3403,31 +3403,19 @@ def _hardware_snapshot_fields(smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, da
     return fields
 
 
-def _select_battery_type():
-    """Explicit, operator-controlled battery type selection (never inferred
-    from BATTERY_CHANNELS -- see docs/architecture.md "Battery Type
-    Selection")."""
-    names = list(dev_cfg.BATTERY_CONFIGS.keys())
-    print("\nSelect Battery Type")
-    for i, name in enumerate(names, start=1):
-        cfg = dev_cfg.BATTERY_CONFIGS[name]
-        print(f"  {i}. {name}  ({cfg['capacity_ah'] * 1000:.0f} mAh, "
-              f"{cfg['nominal_voltage_v']:.1f} V nominal)")
-    choice = input("\nBattery type: ").strip()
-    try:
-        idx = int(choice) - 1
-        if 0 <= idx < len(names):
-            return names[idx]
-    except ValueError:
-        pass
-    print("Invalid selection.")
-    return None
-
-
 def _select_battery_group():
-    """Battery group selection -- each group is a distinct relay-matrix
+    """
+    Battery group selection -- each group is a distinct relay-matrix
     routing section (see config/devices.py::BATTERY_GROUPS), not a purely
-    logical grouping. Only groups with enabled=True can be selected."""
+    logical grouping. Only groups with enabled=True can be selected.
+
+    Group is the ONLY thing the operator selects for any battery workflow
+    (Monitor Battery, Monitor Battery Scan, Charge Battery, Discharge
+    Battery). Battery type, hardware assignment, and test setpoints are
+    all engineering-configured per group and derived from it, never
+    separately chosen at runtime -- see docs/architecture.md "Battery
+    Group Test Configuration Architecture".
+    """
     names = list(dev_cfg.BATTERY_GROUPS.keys())
     print("\nSelect Battery Group")
     for name in names:
@@ -3475,13 +3463,19 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
                         extra_lines=None):
     """
     Single operator confirmation screen shared by every hardware-activating
-    workflow (Monitor Battery, Monitor Battery Scan, and future Charge/
-    Discharge/Cycle Battery + Workflow Simulator) -- see
-    config/devices.py::hardware_for_group() for how `hw` (its return dict)
-    is resolved. No workflow builds its own hardware summary/confirmation
-    format; this is the one place that does. `extra_lines` is for
-    workflow-specific detail (e.g. battery limits) appended below the
-    hardware summary.
+    workflow (Monitor Battery, Monitor Battery Scan, Charge/Discharge
+    Battery, and future Cycle Battery) -- see config/devices.py::
+    hardware_for_group() for how `hw` (its return dict) is resolved. No
+    workflow builds its own hardware summary/confirmation format; this is
+    the one place that does. `extra_lines` is for workflow-specific detail
+    (e.g. battery limits) appended below the hardware summary.
+
+    `battery_type`/`battery_cfg` are always derived from the selected
+    group's own engineering configuration (config/devices.py::
+    BATTERY_GROUPS[group]["battery_type"]) -- never operator input. This
+    screen displays them so the operator can see and confirm what will
+    run, but the only decision being confirmed here is "proceed with this
+    group's configuration," not "which battery."
 
     Returns True if the operator pressed ENTER (continue), False if the
     operator pressed C (cancel). Cancelling here happens before any relay/
@@ -3492,7 +3486,8 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
     print("Operation Summary")
     print("-" * 60)
     print(f"\nOperation:\n{operation}")
-    print(f"\nBattery Type:\n{battery_type}  ({battery_cfg['capacity_ah'] * 1000:.0f} mAh)")
+    print(f"\nBattery Type (engineering-configured for this group):\n"
+          f"{battery_type}  ({battery_cfg['capacity_ah'] * 1000:.0f} mAh)")
     print(f"\nGroup:\n{group}")
     print(f"\nPositions:\n{positions_label}")
     print(f"\nRelay Matrix:\n{hw['relay_matrix_name'] or '(none assigned)'}")
@@ -3509,13 +3504,16 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
 def _run_monitor_battery():
     """
     Monitor Battery -- read-only battery monitoring, no charging, no
-    discharging. Workflow: Select Battery Type -> Select Battery Group ->
-    Select Battery Position -> Confirmation Screen -> Configuration
-    Snapshot Logged -> Relay Close -> Start Monitoring. Uses the same
-    Milestone II infrastructure Proto Test Execution already validated
-    (DataStorage: measurements/run_summary/event_log/station_state,
-    ExecutionFrame/render_execution_frame()) via
-    test_control/monitor_battery_sequence.py::MonitorBatterySequence.
+    discharging. Workflow: Select Battery Group -> Select Battery Position
+    -> Confirmation Screen -> Configuration Snapshot Logged -> Relay Close
+    -> Start Monitoring. Battery type is engineering-configured per group
+    (config/devices.py::BATTERY_GROUPS[group]["battery_type"]), never an
+    operator choice -- see docs/architecture.md "Battery Group Test
+    Configuration Architecture". Uses the same Milestone II infrastructure
+    Proto Test Execution already validated (DataStorage: measurements/
+    run_summary/event_log/station_state, ExecutionFrame/
+    render_execution_frame()) via test_control/monitor_battery_sequence.py::
+    MonitorBatterySequence.
     """
     print("MONITOR BATTERY")
 
@@ -3526,11 +3524,6 @@ def _run_monitor_battery():
     from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken
     from utils.errors import HardwareInitError, OperationCancelledError
-
-    battery_type = _select_battery_type()
-    if battery_type is None:
-        return
-    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
     group = _select_battery_group()
     if group is None:
@@ -3550,6 +3543,16 @@ def _run_monitor_battery():
         print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
               f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
         return
+
+    # Battery type is engineering-configured per group, never an operator
+    # choice -- see config/devices.py::group_test_config() / docs/
+    # architecture.md "Battery Group Test Configuration Architecture".
+    battery_type = dev_cfg.group_test_config(group)["battery_type"]
+    if battery_type is None:
+        print(f"\n[FAIL] Group {group} has no battery_type configured -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
+        return
+    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
     channel = dev_cfg.resolve_group_position(group, position)
     ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
@@ -3684,12 +3687,14 @@ def _run_monitor_battery_scan():
     shutdown path (SafetyMonitor.emergency_stop()/safe_cancel_shutdown())
     has an SMU to confirm OFF, exactly as Monitor Battery already does.
 
-    Workflow: Select Battery Type -> Select Battery Group (= Scan Scope,
-    since only "Single Group" is supported today) -> Confirmation ->
+    Workflow: Select Battery Group (= Scan Scope, since only "Single
+    Group" is supported today) -> Select Position Range -> Confirmation ->
     Configuration Snapshot -> Hardware Traceability Snapshot -> Sequential
-    Relay Scan -> Safe Shutdown. Reuses the exact same Milestone II
-    infrastructure as _run_monitor_battery() (DataStorage, HardwareManager,
-    CancellationToken/Ctrl+C handling, ExecutionFrame) via
+    Relay Scan -> Safe Shutdown. Battery type is engineering-configured
+    per group, never an operator choice -- see docs/architecture.md
+    "Battery Group Test Configuration Architecture". Reuses the exact same
+    Milestone II infrastructure as _run_monitor_battery() (DataStorage,
+    HardwareManager, CancellationToken/Ctrl+C handling, ExecutionFrame) via
     test_control/monitor_battery_scan_sequence.py::MonitorBatteryScanSequence.
     """
     print("MONITOR BATTERY SCAN -- relay/DMM/DAQ path validation (no charging)")
@@ -3701,11 +3706,6 @@ def _run_monitor_battery_scan():
     from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken
     from utils.errors import HardwareInitError, OperationCancelledError
-
-    battery_type = _select_battery_type()
-    if battery_type is None:
-        return
-    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
     group = _select_battery_group()
     if group is None:
@@ -3725,6 +3725,15 @@ def _run_monitor_battery_scan():
         print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
               f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
         return
+
+    # Battery type is engineering-configured per group, never an operator
+    # choice -- see config/devices.py::group_test_config().
+    battery_type = dev_cfg.group_test_config(group)["battery_type"]
+    if battery_type is None:
+        print(f"\n[FAIL] Group {group} has no battery_type configured -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
+        return
+    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
     positions_label = f"1-{size}"
     extra_lines = ["\nCharging:\nNONE -- PSU/SMU output is never enabled"]
@@ -3831,16 +3840,22 @@ def _run_monitor_battery_scan():
 def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_line_fn):
     """
     Shared workflow for Charge Battery / Discharge Battery -- both are the
-    same skeleton as _run_monitor_battery() (select battery type -> select
-    group -> select position -> resolve hardware via hardware_for_group()
+    same skeleton as _run_monitor_battery() (select group -> select
+    position -> resolve hardware via hardware_for_group() -> validate
+    group test configuration (derives battery type from the group -- see
+    docs/architecture.md "Battery Group Test Configuration Architecture")
     -> confirmation screen -> traceability -> ChargeSequence/
     DischargeSequence.run()) with only the sequence class, event-log
-    source name, and confirmation-screen battery-limit line differing --
+    source name, and confirmation-screen setpoint line differing --
     factored here once rather than duplicating the whole workflow twice.
     Built on BatteryOperationSequence (test_control/
     battery_operation_sequence.py) via `sequence_cls` -- never
     TestExecutor/BatteryTestSequence, and never a second workflow
     architecture (see docs/architecture.md Section 35).
+
+    Battery type is NOT operator input here -- it is derived from the
+    selected group via validate_group_test_config() below, which reads
+    config/devices.py::BATTERY_GROUPS[group]["battery_type"] directly.
 
     DAQ is intentionally NOT a required hardware role here (unlike Monitor
     Battery Scan, which validates the DAQ path) -- ChargeSequence/
@@ -3862,11 +3877,6 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     )
     from utils.validators import validate_group_test_config
 
-    battery_type = _select_battery_type()
-    if battery_type is None:
-        return
-    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
-
     group = _select_battery_group()
     if group is None:
         return
@@ -3885,13 +3895,18 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     # Battery Group Test Configuration Architecture validation pipeline --
     # Group Configuration -> Battery Limits -> Hardware Capability -- runs
     # BEFORE anything below touches hardware (no HardwareManager
-    # constructed yet). See docs/architecture.md "Battery Group Test
-    # Configuration Architecture" / utils/validators.py.
+    # constructed yet). Battery type is derived here from the group's own
+    # engineering configuration, never from operator input -- see
+    # docs/architecture.md "Battery Group Test Configuration Architecture"
+    # / utils/validators.py.
     try:
-        test_setpoints = validate_group_test_config(group, battery_type)
+        validated = validate_group_test_config(group)
     except (GroupConfigurationError, ConfigurationError, HardwareConfigurationError) as e:
         print(f"\n[FAIL] {type(e).__name__}: {e}\nAborting, no hardware activated.")
         return
+    battery_type = validated["battery_type"]
+    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
+    test_setpoints = validated["test_setpoints"]
 
     channel = dev_cfg.resolve_group_position(group, position)
     ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)

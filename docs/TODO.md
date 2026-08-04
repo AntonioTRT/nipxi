@@ -316,6 +316,24 @@ Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
 
+- **Architectural correction: battery type is never operator input** --
+  corrects the prior session's "declaration + cross-check" design (Section
+  39), which still let the operator pick a battery type with the group's
+  declaration only as a safety net. Battery type is now read exclusively
+  from `config/devices.py::BATTERY_GROUPS[group]["battery_type"]` in every
+  real workflow (Monitor Battery, Monitor Battery Scan, Charge Battery,
+  Discharge Battery) -- no battery-type prompt exists anywhere in them.
+  `test.py::_select_battery_type()` deleted (confirmed unused first).
+  `utils/validators.py::validate_group_test_config()` signature simplified
+  from `(group, battery_type)` to `(group)`, now returning
+  `{"battery_type", "test_setpoints"}` together; the mismatch-check logic
+  it used to need no longer applies (nothing to mismatch against).
+  Operator now selects Group only, for every battery workflow. The Safety
+  Monitor Simulator's own battery-type picker
+  (`_select_safety_simulation_battery()`) is deliberately unchanged -- a
+  dev/exploration tool, not a real execution workflow. See
+  docs/architecture.md Section 40.
+
 - **Battery Group Test Configuration Architecture** -- formalized each
   `BATTERY_GROUPS` entry into a complete, self-contained operational test
   definition. Added `"battery_type"` (a declaration the operator's explicit

@@ -35,13 +35,14 @@ NOT carried forward from ChargeCycle (see the same Harvest Plan section):
       DataStorage.record_measurement()/BatteryOperationSequence.
       _render_frame(), the same Milestone II schema/UI Monitor Battery uses.
 
-Battery type is a REQUIRED, explicit parameter (`battery_cfg`) -- never
-inferred from channel/group/position/relay (docs/architecture.md Section
-30 "Discharge Cutoff Policy" states this policy for both charge and
-discharge; there is no ChargeCycle-style battery_cfg=None fallback here,
-since Charge Battery's operator workflow always selects a battery type
-before this sequence is ever constructed -- see test.py's
-_select_battery_type()).
+`battery_cfg` is a REQUIRED parameter -- there is no ChargeCycle-style
+battery_cfg=None fallback here. Battery type is NEVER operator input --
+it is derived entirely from the selected group's own engineering
+configuration (config/devices.py::BATTERY_GROUPS[group]["battery_type"])
+by the caller (test.py, via utils/validators.py::
+validate_group_test_config()) before this class is ever constructed. See
+docs/architecture.md Section 40 "Architectural Correction: Battery Type
+Is Never Operator Input".
 
 `battery_cfg` (BATTERY_CONFIGS[type]) vs. `test_setpoints`
 (BATTERY_GROUPS[group]["test_setpoints"]) -- these are two different

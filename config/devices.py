@@ -535,15 +535,14 @@ BATTERY_CHANNELS = {
 # (above) + which battery this group is wired/qualified for + the actual
 # charge/discharge recipe to run. IMPORTANT distinctions:
 #
-#   - "battery_type" here is a DECLARATION, not an inference shortcut. The
-#     operator's own explicit battery-type selection (test.py::
-#     _select_battery_type()) is UNCHANGED and still mandatory for every
-#     workflow -- battery type is never inferred from group/position/
-#     channel/relay (see "Discharge Cutoff Policy" in docs/architecture.md).
-#     This field lets utils/validators.py::validate_group_test_config()
-#     cross-check the operator's selection against what this group is
-#     actually configured for, raising GroupConfigurationError on a
-#     mismatch -- a consistency guard, never a silent override.
+#   - "battery_type" here is the SOLE source of battery type for every real
+#     workflow (Monitor Battery, Monitor Battery Scan, Charge/Discharge
+#     Battery) -- there is no operator battery-type prompt anywhere; the
+#     operator selects a Group (and Position, where applicable) only.
+#     utils/validators.py::validate_group_test_config() reads this field
+#     directly and raises GroupConfigurationError if it's None (group not
+#     yet configured for any battery). See docs/architecture.md Section 40
+#     "Architectural Correction: Battery Type Is Never Operator Input".
 #   - "test_setpoints" are the CHOSEN operating point for this group's test
 #     protocol -- NOT battery limits (those live in BATTERY_CONFIGS above
 #     and are never duplicated here). A setpoint may legitimately be well

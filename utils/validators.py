@@ -60,7 +60,7 @@ _REQUIRED_TEST_SETPOINTS = (
 )
 
 
-def validate_group_test_config(group: str, battery_type: str) -> dict:
+def validate_group_test_config(group: str) -> dict:
     """
     Three-stage validation pipeline for a Charge/Discharge Battery request,
     run BEFORE any hardware is touched (no HardwareManager constructed, no
@@ -69,25 +69,28 @@ def validate_group_test_config(group: str, battery_type: str) -> dict:
         Group Configuration -> Battery Limits Validation ->
         Hardware Capability Validation -> (caller proceeds to) Execution
 
-    `battery_type` is always the operator's own explicit selection (see
-    test.py::_select_battery_type()) -- this function never infers it from
-    `group`. It cross-checks the selection against config/devices.py
-    BATTERY_GROUPS[group]["battery_type"] (that group's own declaration of
-    what it is wired/qualified to test) as a consistency guard -- a
-    mismatch is a configuration error, never a silent override.
+    Battery type is NEVER an operator choice and never a second source of
+    truth -- it is read here directly from config/devices.py
+    BATTERY_GROUPS[group]["battery_type"], the group's own engineering
+    declaration of what it is wired/qualified to test. There is no
+    operator-supplied battery_type parameter to cross-check against (see
+    docs/architecture.md "Battery Group Test Configuration Architecture" --
+    an earlier revision of this function took battery_type as a parameter
+    and cross-checked it against the group's declaration; that entire
+    concept was removed, not just the check, once battery type stopped
+    being operator input at all).
 
-    Returns BATTERY_GROUPS[group]["test_setpoints"] once every stage
-    passes -- the caller (test.py) threads this into ChargeSequence/
+    Returns `{"battery_type": ..., "test_setpoints": ...}` once every
+    stage passes -- the caller (test.py) uses `battery_type` to resolve
+    `BATTERY_CONFIGS` and threads `test_setpoints` into ChargeSequence/
     DischargeSequence.run() unchanged. Raises, and never silently
     substitutes a safer value:
 
-        GroupConfigurationError    -- group unknown, a required hardware
+        GroupConfigurationError    -- group unknown, or a required hardware
                                        role/battery_type/test_setpoints is
-                                       missing, or the selected battery
-                                       type doesn't match this group's own
-                                       declared battery_type.
+                                       missing.
         ConfigurationError         -- a configured setpoint exceeds the
-                                       selected battery's own safety limit
+                                       group's own battery's safety limit
                                        (config/devices.py BATTERY_CONFIGS).
         HardwareConfigurationError -- a configured setpoint exceeds the
                                        capability of the SMU assigned to
@@ -111,17 +114,11 @@ def validate_group_test_config(group: str, battery_type: str) -> dict:
             f"see config/devices.py::BATTERY_GROUPS[{group!r}]."
         )
 
-    expected_type = grp.get("battery_type")
-    if expected_type is None:
+    battery_type = grp.get("battery_type")
+    if battery_type is None:
         raise GroupConfigurationError(
             f"Group {group!r} has no battery_type configured -- "
             f"see config/devices.py::BATTERY_GROUPS[{group!r}]."
-        )
-    if expected_type != battery_type:
-        raise GroupConfigurationError(
-            f"Group {group!r} is configured for battery type {expected_type!r}, "
-            f"but {battery_type!r} was selected -- select {expected_type!r}, or "
-            f"choose a different group."
         )
 
     test_setpoints = grp.get("test_setpoints")
@@ -184,4 +181,4 @@ def validate_group_test_config(group: str, battery_type: str) -> dict:
                 f"{hw['smu_name']}'s rated capability ({smu_max_a:.3f} A)."
             )
 
-    return test_setpoints
+    return {"battery_type": battery_type, "test_setpoints": test_setpoints}
