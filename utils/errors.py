@@ -78,3 +78,39 @@ class DeviceConfigError(ValidationError):
     mismatch, unknown factory type, etc). Always raised before any
     hardware communication is attempted.
     """
+
+
+class GroupConfigurationError(ValidationError):
+    """
+    Raised by utils/validators.py::validate_group_test_config() when a
+    config/devices.py BATTERY_GROUPS[...] entry is missing required
+    information (a hardware role, battery_type, test_setpoints) or when
+    the operator's explicitly-selected battery type does not match the
+    group's own declared battery_type. Always raised before any hardware
+    communication is attempted -- see docs/architecture.md "Battery Group
+    Test Configuration Architecture".
+    """
+
+
+class ConfigurationError(ValidationError):
+    """
+    Raised by utils/validators.py::validate_group_test_config() when a
+    group's configured test setpoint (charge/discharge current, charge
+    voltage, discharge cutoff) would exceed the selected battery's own
+    absolute safety limit (config/devices.py BATTERY_CONFIGS). Test
+    setpoints are a chosen operating point, never automatically clamped to
+    a safer value -- a violation here always aborts before any hardware
+    communication is attempted.
+    """
+
+
+class HardwareConfigurationError(ValidationError):
+    """
+    Raised by utils/validators.py::validate_group_test_config() when a
+    group's configured test setpoint would exceed the capability of the
+    hardware assigned to run it (e.g. an SMU's rated max current -- see
+    config/devices.py PXI_SLOTS[...]["max_current_a"]). Distinct from
+    ConfigurationError (which compares against the BATTERY's own limit,
+    not the hardware's) -- always raised before any hardware
+    communication is attempted.
+    """

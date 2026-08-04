@@ -2004,29 +2004,6 @@ This defect was inherited unchanged from the harvested `DischargeCycle.run()` (s
 
 ---
 
-## 38. Battery Group Assignment Architecture -- Review and Recommendations
-
-Reviewed `BATTERY_GROUPS`, `BATTERY_CHANNELS`, `BATTERY_CONFIGS`, `hardware_for_group()`, and the current A-D assignments, per this review's Phase 7. No redesign performed or recommended -- the existing architecture (groups as relay-routing sections, `hardware_for_group()` as the single resolver, `resolve_group_position()`/`group_for_position()` as the group<->global-position translation) is sound and should be extended, not replaced.
-
-**Concrete gap found: `BATTERY_CHANNELS` only covers global positions 1-8.** Its dict comprehension is hardcoded `for i in range(1, 9)`, independent of `BATTERY_GROUPS`' `position_start`/`position_end` ranges (Group B alone claims positions 9-16). If Group B were enabled today without first extending `BATTERY_CHANNELS`, `resolve_group_position("B", n)` would correctly compute a global position (e.g. 11), but `BATTERY_CHANNELS.get(11)` would return `None` -- already handled gracefully (`test.py` checks for this and aborts with `[FAIL]`, never a crash), but it means Group B cannot actually be used yet even if `enabled` were flipped to `True`.
-
-**Sharper, previously-undocumented risk found: naively extending `BATTERY_CHANNELS`' existing per-position DAQ-channel formula to Group B would collide with Group A on the shared `MAIN_DAQ`.** `BATTERY_CHANNELS[i]`'s `daq_voltage_ch`/`daq_current_ch`/`daq_ntc_ch` are computed as `Dev1/ai{i-1}` / `ai{i+7}` / `ai{i+15}` -- for positions 1-8 this maps to `ai0-7`/`ai8-15`/`ai16-23` (24 channels on `MAIN_DAQ`). `BATTERY_GROUPS["B"]["daq"]` is currently `"MAIN_DAQ"` (the same device as Group A) -- extending the *same formula* to positions 9-16 would compute `ai8-15`/`ai16-23`/`ai24-31`, directly **overlapping Group A's current and NTC channel ranges on the identical physical DAQ**. This is silent and easy to miss (no error until real channel data from two "different" positions turns out to be reading the same physical wire).
-
-**Recommendation (extend existing architecture, already partially present):** `config/devices.py::PXI_SLOTS` already has commented-out entries for `EXPANSION_DAQ` (PXIe-6368, slot 17) and `PRECISION_DAQ` (PXIe-6365, slot 18) -- hardware anticipated for exactly this scaling step but not yet installed/enabled. When Group B is wired for real:
-1. Enable `EXPANSION_DAQ` in `PXI_SLOTS` (uncomment, confirm real installation).
-2. Set `BATTERY_GROUPS["B"]["daq"] = "EXPANSION_DAQ"` instead of `"MAIN_DAQ"` -- giving Group B its own physical channel space, not a shared/overlapping one.
-3. Extend `BATTERY_CHANNELS` for positions 9-16 using the same per-position formula shape (`ai{n-1}`/`ai{n+7}`/`ai{n+15}`) but with `n` re-based to 1-8 *within* Group B (i.e. `position_in_group`, not the raw global position `i`) -- so Group B's channels are `ai0-7`/`ai8-15`/`ai16-23` on `EXPANSION_DAQ`, mirroring Group A's layout on its own device rather than continuing the global numbering onto a shared one.
-4. Do the same for Groups C/D with `PRECISION_DAQ` (or a further additional DAQ) once real relay matrices/SMUs exist for them -- `relay_matrix`/`smu`/`dmm`/`daq` are already `None` placeholders for both, so this is additive, not a rename.
-
-This keeps `hardware_for_group()`'s return shape, `resolve_group_position()`, and every caller (`test.py`, `ChargeSequence`/`DischargeSequence`/`MonitorBatterySequence`) completely unchanged -- only `PXI_SLOTS`/`BATTERY_GROUPS`/`BATTERY_CHANNELS` data grows, exactly matching this project's established "config is the single source of truth, extend the data not the code" pattern.
-
-**Other recommendations (lower priority, no urgent action needed):**
-- **Group scalability:** the `hardware_for_group()`/`BATTERY_GROUPS` shape already scales cleanly to N groups with zero code changes -- the only real work is the DAQ-channel-collision point above, plus confirming each new group's SMU has adequate current capacity for `BATTERY_CONFIGS` (see Section 37's PRIMARY_SMU finding -- this should be checked for every group's assigned SMU as it's wired, not just Group A after the fact).
-- **Battery assignment workflow:** `_select_battery_type()`/`_select_battery_group()`/`_select_battery_position()` are already clean, explicit, and consistently reused by every workflow (Monitor/Monitor Scan/Charge/Discharge) -- no change needed. One minor usability gap: `_select_battery_group()` shows "(no relay matrix installed yet)" for a disabled group but doesn't distinguish *why* a group might be unusable once `enabled=True` but a specific role (e.g. `smu`) is still `None` (Group B today: `relay_matrix` is real, `smu` is `None`) -- `_missing_hardware_roles()` already catches this correctly at confirmation time with a clear `[FAIL]` message, so this is a display polish opportunity, not a gap in the safety-relevant path.
-- **Station usability:** no change recommended -- the confirmation screen already shows resolved hardware per role, and a missing role aborts before any hardware activation.
-- **Future multi-group execution (running Group A and Group B concurrently):** not yet a concern -- `HardwareManager`/`ChargeSequence`/`DischargeSequence` are single-group/single-channel per invocation today, and nothing in this review found an assumption that would block a future operator from running two groups' sequences in separate processes/invocations, since each resolves its own hardware via `hardware_for_group()` independently. True concurrent multi-group execution (one process, multiple simultaneous sequences) is a larger future design question (thread-safety of `DataStorage`/shared `run_id`, etc.) -- out of scope for this review, not identified as blocking anything planned now.
-- **Configuration consistency:** `BATTERY_GROUPS`' comment block already documents the `None`-means-unassigned convention well; the one gap (the DAQ-channel-collision risk above) is now documented here and in `docs/TODO.md`.
-
 ### Safety review (Phase 3) -- answers
 
 1. **Can hardware remain energized unintentionally?** No PMU-energized case found (every exit path -- success, timeout, safety violation, cancellation, unexpected error -- ends in a verified `emergency_output_off()`, either the sequence's own `finally` or `run_guarded()`'s `safety.emergency_stop()`/`safe_cancel_shutdown()`, both idempotent-safe to call twice). The relay-left-closed gap (Bug 1) was real but is not "energized" in the PMU-output sense -- the SMU output was already confirmed off; the relay simply stayed connected to a de-energized output. Fixed regardless, since it violates the isolation principle.
@@ -2057,3 +2034,101 @@ If this is accurate for the real (not just simulated) PXIe-4141 hardware, `_conf
 ### Verification performed this review
 
 `py_compile` clean on all touched files (`hardware/smu.py`, `test_control/charge_sequence.py`, `test_control/discharge_sequence.py`, `test.py`). Mocked end-to-end smoke tests re-run after both fixes: `ChargeSequence`/`DischargeSequence` happy paths (EOC/EOD reached, `relay.open()` confirmed called once, `run_summary` `COMPLETED`/`PASS`); forced-overcurrent safety-abort path (`SafetyViolationError` raised, `relay.open_all()` confirmed called, singular `relay.open()` confirmed NOT called, `run_summary` `SAFETY_VIOLATION`/`FAIL`). Compliance-window arithmetic and default `compliance_limit_symmetry` confirmed directly against `nidcpower`'s real driver (`simulate=True`), not assumed from documentation memory.
+
+---
+
+## 38. Battery Group Assignment Architecture -- Review and Recommendations
+
+Reviewed `BATTERY_GROUPS`, `BATTERY_CHANNELS`, `BATTERY_CONFIGS`, `hardware_for_group()`, and the current A-D assignments, per this review's Phase 7. No redesign performed or recommended -- the existing architecture (groups as relay-routing sections, `hardware_for_group()` as the single resolver, `resolve_group_position()`/`group_for_position()` as the group<->global-position translation) is sound and should be extended, not replaced.
+
+**Concrete gap found: `BATTERY_CHANNELS` only covers global positions 1-8.** Its dict comprehension is hardcoded `for i in range(1, 9)`, independent of `BATTERY_GROUPS`' `position_start`/`position_end` ranges (Group B alone claims positions 9-16). If Group B were enabled today without first extending `BATTERY_CHANNELS`, `resolve_group_position("B", n)` would correctly compute a global position (e.g. 11), but `BATTERY_CHANNELS.get(11)` would return `None` -- already handled gracefully (`test.py` checks for this and aborts with `[FAIL]`, never a crash), but it means Group B cannot actually be used yet even if `enabled` were flipped to `True`.
+
+**Sharper, previously-undocumented risk found: naively extending `BATTERY_CHANNELS`' existing per-position DAQ-channel formula to Group B would collide with Group A on the shared `MAIN_DAQ`.** `BATTERY_CHANNELS[i]`'s `daq_voltage_ch`/`daq_current_ch`/`daq_ntc_ch` are computed as `Dev1/ai{i-1}` / `ai{i+7}` / `ai{i+15}` -- for positions 1-8 this maps to `ai0-7`/`ai8-15`/`ai16-23` (24 channels on `MAIN_DAQ`). `BATTERY_GROUPS["B"]["daq"]` is currently `"MAIN_DAQ"` (the same device as Group A) -- extending the *same formula* to positions 9-16 would compute `ai8-15`/`ai16-23`/`ai24-31`, directly **overlapping Group A's current and NTC channel ranges on the identical physical DAQ**. This is silent and easy to miss (no error until real channel data from two "different" positions turns out to be reading the same physical wire).
+
+**Recommendation (extend existing architecture, already partially present):** `config/devices.py::PXI_SLOTS` already has commented-out entries for `EXPANSION_DAQ` (PXIe-6368, slot 17) and `PRECISION_DAQ` (PXIe-6365, slot 18) -- hardware anticipated for exactly this scaling step but not yet installed/enabled. When Group B is wired for real:
+1. Enable `EXPANSION_DAQ` in `PXI_SLOTS` (uncomment, confirm real installation).
+2. Set `BATTERY_GROUPS["B"]["daq"] = "EXPANSION_DAQ"` instead of `"MAIN_DAQ"` -- giving Group B its own physical channel space, not a shared/overlapping one.
+3. Extend `BATTERY_CHANNELS` for positions 9-16 using the same per-position formula shape (`ai{n-1}`/`ai{n+7}`/`ai{n+15}`) but with `n` re-based to 1-8 *within* Group B (i.e. `position_in_group`, not the raw global position `i`) -- so Group B's channels are `ai0-7`/`ai8-15`/`ai16-23` on `EXPANSION_DAQ`, mirroring Group A's layout on its own device rather than continuing the global numbering onto a shared one.
+4. Do the same for Groups C/D with `PRECISION_DAQ` (or a further additional DAQ) once real relay matrices/SMUs exist for them -- `relay_matrix`/`smu`/`dmm`/`daq` are already `None` placeholders for both, so this is additive, not a rename.
+
+This keeps `hardware_for_group()`'s return shape, `resolve_group_position()`, and every caller (`test.py`, `ChargeSequence`/`DischargeSequence`/`MonitorBatterySequence`) completely unchanged -- only `PXI_SLOTS`/`BATTERY_GROUPS`/`BATTERY_CHANNELS` data grows, exactly matching this project's established "config is the single source of truth, extend the data not the code" pattern.
+
+**Other recommendations (lower priority, no urgent action needed):**
+- **Group scalability:** the `hardware_for_group()`/`BATTERY_GROUPS` shape already scales cleanly to N groups with zero code changes -- the only real work is the DAQ-channel-collision point above, plus confirming each new group's SMU has adequate current capacity for `BATTERY_CONFIGS` (see this session's PRIMARY_SMU finding -- this should be checked for every group's assigned SMU as it's wired, not just Group A after the fact).
+- **Battery assignment workflow:** `_select_battery_type()`/`_select_battery_group()`/`_select_battery_position()` are already clean, explicit, and consistently reused by every workflow (Monitor/Monitor Scan/Charge/Discharge) -- no change needed. One minor usability gap: `_select_battery_group()` shows "(no relay matrix installed yet)" for a disabled group but doesn't distinguish *why* a group might be unusable once `enabled=True` but a specific role (e.g. `smu`) is still `None` (Group B today: `relay_matrix` is real, `smu` is `None`) -- `_missing_hardware_roles()` already catches this correctly at confirmation time with a clear `[FAIL]` message, so this is a display polish opportunity, not a gap in the safety-relevant path.
+- **Station usability:** no change recommended -- the confirmation screen already shows resolved hardware per role, and a missing role aborts before any hardware activation.
+- **Future multi-group execution (running Group A and Group B concurrently):** not yet a concern -- `HardwareManager`/`ChargeSequence`/`DischargeSequence` are single-group/single-channel per invocation today, and nothing in this review found an assumption that would block a future operator from running two groups' sequences in separate processes/invocations, since each resolves its own hardware via `hardware_for_group()` independently. True concurrent multi-group execution (one process, multiple simultaneous sequences) is a larger future design question (thread-safety of `DataStorage`/shared `run_id`, etc.) -- out of scope for this review, not identified as blocking anything planned now.
+- **Configuration consistency:** `BATTERY_GROUPS`' comment block already documents the `None`-means-unassigned convention well; the one gap (the DAQ-channel-collision risk above) is now documented here and in `docs/TODO.md`.
+
+---
+
+## 39. Battery Group Test Configuration Architecture
+
+**Objective:** formalize each `BATTERY_GROUPS` entry into a complete, self-contained operational test definition -- one place defines battery type, hardware assignment, and test configuration, without a parallel config system.
+
+### The conceptual distinction this section formalizes
+
+`BATTERY_CONFIGS[type]` is, and remains, **battery safety limits** -- absolute ceilings/floors describing what the battery can tolerate, used only for enforcement (`SafetyMonitor`) and validation. It has never been, and must never become, a source of *commanded setpoints*. Before this session, `ChargeSequence`/`DischargeSequence` violated this distinction in practice: they read `battery_cfg["max_charge_current_a"]`/`voltage_max_v` etc. directly as the commanded PSU setpoint, conflating "the most this battery can take" with "what we command it to." A group's `test_setpoints` (new, below) is the **chosen operating point** for that group's protocol -- which may legitimately sit well below the battery's own limit (a conservative/slow-rate recipe), and is never required to equal it.
+
+### Resolving the battery-type-inference tension
+
+This project has a standing, safety-motivated rule: battery type is always an explicit operator choice, never inferred from group/position/channel/relay (`test.py::_select_battery_type()`, restated in Section 30). Adding `battery_type` to `BATTERY_GROUPS` could easily have violated this. It does not, by design: `BATTERY_GROUPS[group]["battery_type"]` is a **declaration** of which battery that group/station is wired and qualified to test -- not a substitute for selection. The operator still always explicitly picks a battery type; `utils/validators.py::validate_group_test_config()` then cross-checks the selection against the group's declaration and raises `GroupConfigurationError` on a mismatch. Selection remains mandatory; a wrong pick is caught, never silently resolved.
+
+### The new structure (additive, no new file)
+
+```python
+BATTERY_GROUPS = {
+    "A": {
+        "relay_matrix": "MATRIX_NUMATO_201", "position_start": 1, "position_end": 8,
+        "enabled": True, "smu": "PRIMARY_SMU", "dmm": "MAIN_DMM", "daq": "MAIN_DAQ",
+        "battery_type": "SB",                 # declaration, not inference (see above)
+        "test_setpoints": {                   # the chosen recipe, not a limit
+            "charge_current_a": 0.05, "charge_voltage_v": 4.2,
+            "discharge_current_a": 0.08, "discharge_cutoff_v": 3.0,
+        },
+    },
+    # B/C/D: "battery_type": None, "test_setpoints": None -- not yet configured,
+    # same "None = unassigned" convention already used for hardware roles.
+}
+```
+
+`config/devices.py::group_test_config(group)` -- new, pure accessor (mirrors `hardware_for_group()`'s shape) returning `{"battery_type", "test_setpoints"}`. It never validates; it just reads.
+
+**Hardware capability data, also new and additive:** `PXI_SLOTS[...]["max_current_a"]` on every SMU entry, threaded through `SMU_ASSIGNMENTS`'s existing per-field reshape (a real gap found and fixed during implementation -- see "Implementation finding" below). Confirmed via `nidcpower`'s own simulated model data (the same method used in Section 37, not assumed from memory): `PRIMARY_SMU`/PXIe-4141 = 0.1 A, `HIGH_POWER_SMU`/PXIe-4139 = 3.0 A, `AUX_SMU_1`/`AUX_SMU_2`/PXI-4130 = 1.0 A (all per-channel current_level_range ceilings).
+
+**Why Group A is declared for SB, not HUB:** `PRIMARY_SMU`'s 0.1 A cap is below HUB's own limits (0.525/1.05 A) entirely, and even below SB's own discharge limit (0.16 A) -- so Group A's `test_setpoints` were deliberately chosen as a conservative recipe (0.05 A charge / 0.08 A discharge) that fits inside PRIMARY_SMU's real capability while staying under SB's limits, rather than commanding SB's own max. This makes Group A a fully valid, three-stage-validated configuration today; HUB requires reassigning Group A's `smu` to a higher-current card first (a wiring decision, not made here -- see `docs/TODO.md`).
+
+### Validation architecture (Phase 3)
+
+`utils/validators.py::validate_group_test_config(group, battery_type) -> dict` -- the pipeline, run by `test.py::_run_charge_or_discharge()` immediately after `hardware_for_group()`'s missing-role check and before `HardwareManager` is constructed (no relay, no PSU touched on any failure):
+
+```
+Group Configuration  ->  Battery Limits Validation  ->  Hardware Capability Validation  ->  Execution
+```
+
+- **Stage 1 (Group Configuration):** group exists; `relay_matrix`/`smu`/`dmm` all resolve (reuses `hardware_for_group()`); `battery_type` is declared and matches the operator's selection; `test_setpoints` is present with all four required keys. Raises `GroupConfigurationError`.
+- **Stage 2 (Battery Limits Validation):** each setpoint compared against `BATTERY_CONFIGS[battery_type]` -- `charge_current_a <= max_charge_current_a`, `charge_voltage_v <= voltage_max_v`, `discharge_current_a <= max_discharge_current_a`, `discharge_cutoff_v >= voltage_min_v` (the floor -- see Section 30). Raises `ConfigurationError`, never silently clamps.
+- **Stage 3 (Hardware Capability Validation):** `charge_current_a`/`discharge_current_a` compared against the assigned SMU's `max_current_a` (skipped, not failed, if that field is absent -- a card without capability data is not blocking, matching this project's "unconfirmed, not unsafe" convention elsewhere). Raises `HardwareConfigurationError`.
+
+Returns the validated `test_setpoints` dict, threaded unchanged into `ChargeSequence.run(battery_cfg=..., test_setpoints=..., ...)` / `DischargeSequence.run(...)`.
+
+### Error handling (Phase 4)
+
+**Exception hierarchy** -- all three new exceptions subclass the existing `ValidationError` (itself a `NIPXIError`), the same pattern `DeviceConfigError` already established -- no parallel hierarchy:
+- `GroupConfigurationError` -- missing/mismatched group definition.
+- `ConfigurationError` -- setpoint exceeds the battery's own limit.
+- `HardwareConfigurationError` -- setpoint exceeds the assigned hardware's capability.
+
+**Validation flow:** all three stages run inside one `try` in `test.py`, before `HardwareManager(...)` is even constructed -- fail early, fail loud, by construction (there is no hardware object yet to touch). **Logging behavior:** the validator itself does not log (it's a pure function -- raise or return); `test.py` prints `f"[FAIL] {type(e).__name__}: {e}"` and returns immediately, matching every other pre-flight abort in this codebase (missing hardware role, `HardwareInitError`, etc.). **Operator-facing messages:** each raised exception's message names the exact group, the exact field, the exact configured value, and the exact limit/capability it exceeds (e.g. `"Group 'A': configured discharge_current_a (0.150 A) exceeds PRIMARY_SMU's rated capability (0.100 A)."`) -- never a generic "invalid configuration."
+
+### Implementation finding: a real propagation gap, caught by testing the validator, not assumed
+
+While wiring Stage 3, `hw["smu_cfg"]["max_current_a"]` came back `None` even though `PXI_SLOTS[5]["max_current_a"]` was set to `0.1`. Root cause: `SMU_ASSIGNMENTS` (what `hardware_for_group()` actually returns) is built by explicitly re-shaping each `PXI_SLOTS` entry field-by-field (`{"type": ..., "slot": cfg["slot"], "resource": cfg["resource"], ...}`), not by passing the dict through -- so a new field added to `PXI_SLOTS` silently does not appear in `SMU_ASSIGNMENTS`/`DAQ_CONFIGS`/`DMM_CONFIGS` unless that comprehension is also updated. Fixed by adding `"max_current_a": cfg.get("max_current_a")` to `SMU_ASSIGNMENTS`'s comprehension. **This is a structural trap worth remembering:** any future field added to a `PXI_SLOTS` entry needs a matching edit in whichever of the three derived-dict comprehensions applies, or it silently vanishes downstream with no error -- confirmed the hard way here (`validate_group_test_config()`'s Stage 3 test initially passed when it should have failed, because the capability data it needed wasn't actually there).
+
+### Verification
+
+Direct calls to `validate_group_test_config()` confirmed all three stages independently reachable and correctly ordered: Group A + SB passes; Group A + HUB raises `GroupConfigurationError` (mismatch); Group B raises `GroupConfigurationError` (missing hardware role); an unknown group raises `GroupConfigurationError`; a setpoint exceeding SB's own limit raises `ConfigurationError`; a setpoint within the battery limit but exceeding `PRIMARY_SMU`'s capability raises `HardwareConfigurationError` (only after the `SMU_ASSIGNMENTS` propagation fix above). Mocked end-to-end smoke tests re-run for both `ChargeSequence`/`DischargeSequence` with the new `test_setpoints` parameter -- `set_charge_mode()`/`set_discharge_mode()` confirmed called with the group's setpoint values (not `battery_cfg`'s), `relay.open()` confirmed called once on success, matching Section 37's already-established fix.
+
+### Multi-group scalability assessment (Phase 5)
+
+Adding Group B/C/D as real, usable configurations now requires **only data** -- populate `battery_type`/`test_setpoints` alongside the hardware roles already anticipated -- zero code changes to `hardware_for_group()`, `resolve_group_position()`, `validate_group_test_config()`, or either sequence class. The DAQ-channel-collision risk (Section 38) is unrelated to and unaffected by this change. Future DAQ integration is likewise unaffected -- `test_setpoints` never touches DAQ. Operator workflow gains one new possible abort (`GroupConfigurationError` on a battery-type/group mismatch) and a clearer confirmation screen (setpoints now shown as "commanded", distinct from the battery's own limits) -- no regression to Monitor Battery/Monitor Battery Scan, which are untouched by this section's changes.

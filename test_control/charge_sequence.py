@@ -43,6 +43,19 @@ since Charge Battery's operator workflow always selects a battery type
 before this sequence is ever constructed -- see test.py's
 _select_battery_type()).
 
+`battery_cfg` (BATTERY_CONFIGS[type]) vs. `test_setpoints`
+(BATTERY_GROUPS[group]["test_setpoints"]) -- these are two different
+things, per the Battery Group Test Configuration Architecture (see
+docs/architecture.md): `battery_cfg` is the battery's own absolute SAFETY
+LIMIT, used only to configure SafetyMonitor's runtime enforcement (never
+as the commanded setpoint). `test_setpoints` is the CHOSEN operating point
+for this run -- the actual commanded current/voltage -- already validated
+(by utils/validators.py::validate_group_test_config(), called by the
+caller before this class is ever constructed) to not exceed either the
+battery's limit or the assigned SMU's capability. This class trusts that
+validation already happened; it does not re-validate `test_setpoints`
+itself.
+
 Temperature remains None -- NTC is not wired into this sequence, the same
 pre-existing gap ChargeCycle/DischargeCycle/MonitorBatterySequence all
 carry (SafetyMonitor.check() tolerates temp_c=None; this is a documented,
@@ -71,12 +84,19 @@ class ChargeSequence(BatteryOperationSequence):
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
                           source="charge_battery", dmm=dmm)
 
-    def run(self, channel: int, relay_address: int, battery_cfg: dict, token=None) -> bool:
+    def run(self, channel: int, relay_address: int, battery_cfg: dict,
+            test_setpoints: dict, token=None) -> bool:
         """
-        Run one complete CC-CV charge on `channel`/`relay_address`, using
+        Run one complete CC-CV charge on `channel`/`relay_address`.
+
         `battery_cfg` (a config/devices.py BATTERY_CONFIGS[...] entry --
-        REQUIRED) to resolve the commanded current/CV voltage and the
-        SafetyMonitor limits.
+        REQUIRED) supplies only the SafetyMonitor's absolute safety limits
+        -- it is never read for the commanded setpoint (see module
+        docstring). `test_setpoints` (a config/devices.py
+        BATTERY_GROUPS[group]["test_setpoints"] entry -- REQUIRED, already
+        validated by the caller via utils/validators.py::
+        validate_group_test_config()) supplies the actual commanded
+        current/CV voltage.
 
         Returns True once EOC is reached. Raises SafetyViolationError,
         RelayError, NIPXITimeoutError, or OperationCancelledError on any
@@ -87,8 +107,8 @@ class ChargeSequence(BatteryOperationSequence):
         self.log.info("Charge Sequence starting. Channel: %d  Relay: %d", channel, relay_address)
         run_number = self._run_number()
 
-        current_a = battery_cfg["max_charge_current_a"]
-        voltage_limit_v = battery_cfg["voltage_max_v"]
+        current_a = test_setpoints["charge_current_a"]
+        voltage_limit_v = test_setpoints["charge_voltage_v"]
         self.safety.set_battery_limits(battery_cfg)
 
         def _run_charge():

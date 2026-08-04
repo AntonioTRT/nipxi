@@ -1030,6 +1030,69 @@ workflow is implemented, per the `docs/TODO.md` item tracking this.
 
 ---
 
+## Milestone VI: Battery Group Test Configuration Architecture
+
+**Status:** ACHIEVED
+
+**Scope:** formalized `BATTERY_GROUPS` into a complete, self-contained
+operational test definition per group -- battery type, hardware
+assignment, and test configuration in one place, without a parallel
+config system -- and added the validation pipeline this makes possible.
+
+### Objectives achieved
+
+- `BATTERY_GROUPS[group]` gained `"battery_type"` (a declaration the
+  operator's explicit selection is cross-checked against, never an
+  inference shortcut) and `"test_setpoints"` (the chosen charge/discharge
+  recipe, kept explicitly distinct from `BATTERY_CONFIGS`' safety limits).
+- New `config/devices.py::group_test_config()` accessor and
+  `PXI_SLOTS[...]["max_current_a"]` on every SMU entry (confirmed via
+  `nidcpower` simulation: `PRIMARY_SMU`=0.1A, `HIGH_POWER_SMU`=3.0A,
+  `AUX_SMU_1`/`AUX_SMU_2`=1.0A).
+- New three-stage validation pipeline (`utils/validators.py::
+  validate_group_test_config()`: Group Configuration -> Battery Limits ->
+  Hardware Capability) and three new exceptions, wired into
+  `test.py::_run_charge_or_discharge()` before any hardware is touched.
+- `ChargeSequence`/`DischargeSequence.run()` now take `test_setpoints` as
+  the commanded value; `battery_cfg` is used only for `SafetyMonitor`.
+- A real gap was found and fixed while implementing Stage 3: `PXI_SLOTS`
+  fields don't automatically propagate to `SMU_ASSIGNMENTS`/`DAQ_CONFIGS`/
+  `DMM_CONFIGS` (each reshapes its source dict field-by-field) -- caught by
+  testing the validator itself, not assumed correct.
+
+### Architectural decisions made
+
+- Battery type remains always explicit at selection time -- the group's
+  declaration is a consistency guard, never a substitute.
+- `BATTERY_CONFIGS` remains untouched -- battery safety limits only, never
+  a source of commanded setpoints, now enforced by validation as well as
+  by convention.
+- Group A declared for SB (not HUB) with a conservative recipe that fits
+  inside `PRIMARY_SMU`'s real 0.1A capability -- HUB still requires
+  reassigning a group's SMU to a higher-current card (not done here).
+- No new file, no parallel config system -- `config/devices.py` remains
+  the sole source of truth; everything added is additive fields plus one
+  new pure accessor and one new validator function.
+
+### Remaining work
+
+- HUB cannot yet be charge/discharge tested on any group -- needs a group
+  reassigned to `HIGH_POWER_SMU` or `AUX_SMU_1`/`AUX_SMU_2`.
+- Groups B/C/D still need real hardware, `battery_type`, and
+  `test_setpoints` before they're usable (data-only work once wired).
+- Physical rack validation of the whole pipeline remains open (mocked
+  hardware only so far).
+
+### Recommended next milestone
+
+**Milestone VII: physical rack validation** of `ChargeSequence`/
+`DischargeSequence` against Group A + a real SB battery, now that the full
+validation pipeline (group -> battery limits -> hardware capability) gates
+execution -- the first real hardware run should exercise a configuration
+this pipeline has already confirmed valid, not an unvalidated one.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

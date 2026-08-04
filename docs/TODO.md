@@ -172,21 +172,29 @@ the bottom, with a pointer to where the real documentation lives
   the first workflow in this project to actually source/sink current into a
   real cell -- treat as new, unvalidated territory (same caution
   `docs/MILESTONES.md` Milestone 1 flagged for this exact step).
-- [MUST] **Confirm PRIMARY_SMU (PXIe-4141) can actually deliver
-  BATTERY_CONFIGS' commanded currents before any real hardware test.**
-  Found during post-implementation validation (docs/architecture.md
-  Section 37): `nidcpower`'s own simulated PXIe-4141 model caps
-  `current_level_range` at 100 mA, but HUB needs up to 1.05 A discharge/
-  0.525 A charge and SB needs up to 0.16 A discharge -- all exceed 100 mA
-  except SB's 0.08 A charge current. If this holds for the real card,
-  `ChargeSequence`/`DischargeSequence` will raise `SMUError` immediately
-  against Group A's actual assigned SMU for nearly every real
-  charge/discharge combination. This is a hardware/wiring decision (verify
-  against the real PXIe-4141 datasheet, then reassign
-  `BATTERY_GROUPS["A"]["smu"]` to `HIGH_POWER_SMU`/PXIe-4139 or
-  `AUX_SMU_1`/PXI-4130 if confirmed insufficient) -- NOT something to
-  silently change in config without that confirmation. This is now the
-  single highest-priority item before any real hardware test.
+- [x] **Confirm PRIMARY_SMU (PXIe-4141) can actually deliver
+  BATTERY_CONFIGS' commanded currents before any real hardware test --
+  RESOLVED for Group A's current test_setpoints, not for HUB.** Found
+  during post-implementation validation (docs/architecture.md Section 37):
+  `nidcpower`'s own simulated PXIe-4141 model caps `current_level_range` at
+  100 mA. The Battery Group Test Configuration Architecture (Section 39)
+  resolved this for Group A by declaring it for SB with a conservative
+  recipe (0.05 A charge / 0.08 A discharge) that fits inside PRIMARY_SMU's
+  real capability, and by adding a Hardware Capability Validation stage
+  (`utils/validators.py::validate_group_test_config()`) that raises
+  `HardwareConfigurationError` before any hardware is touched if a future
+  edit to Group A's test_setpoints (or a future group) exceeds its
+  assigned SMU's `max_current_a`. **HUB still cannot run on Group A** --
+  its limits (0.525/1.05 A) exceed PRIMARY_SMU's 0.1 A cap entirely, no
+  conservative recipe fixes that; HUB needs `BATTERY_GROUPS["A"]["smu"]`
+  reassigned to `HIGH_POWER_SMU` (PXIe-4139, 3.0 A) or `AUX_SMU_1`/`AUX_SMU_2`
+  (PXI-4130, 1.0 A -- note HUB's 1.05 A discharge limit is marginally
+  *above* even this) -- a real wiring decision, not made here.
+- [ ] Reassign a group's SMU (or add a new group) so HUB can actually be
+  charge/discharge tested -- `HIGH_POWER_SMU` (PXIe-4139, confirmed 3.0 A
+  cap via nidcpower simulation) is the best-fit candidate; `AUX_SMU_1`/
+  `AUX_SMU_2` (PXI-4130, confirmed 1.0 A cap) are marginal for HUB's 1.05 A
+  discharge limit specifically. See docs/architecture.md Section 39.
 - [MUST] Migrate `MonitorBatterySequence` from its temporary DMM voltage
   source back to the final per-position DAQ architecture
   (`BATTERY_CHANNELS[i]["daq_voltage_ch"]`/`daq_current_ch"]`) once the
@@ -307,6 +315,34 @@ the bottom, with a pointer to where the real documentation lives
 Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
+
+- **Battery Group Test Configuration Architecture** -- formalized each
+  `BATTERY_GROUPS` entry into a complete, self-contained operational test
+  definition. Added `"battery_type"` (a declaration the operator's explicit
+  selection is cross-checked against -- never an inference shortcut, that
+  rule is unchanged) and `"test_setpoints"` (the chosen charge/discharge
+  recipe -- distinct from `BATTERY_CONFIGS`' safety limits, which
+  `ChargeSequence`/`DischargeSequence` had previously read directly as if
+  they were the commanded setpoint). New `config/devices.py::
+  group_test_config()` accessor (mirrors `hardware_for_group()`). New
+  `PXI_SLOTS[...]["max_current_a"]` on every SMU entry, confirmed via
+  `nidcpower` simulation (`PRIMARY_SMU`=0.1A, `HIGH_POWER_SMU`=3.0A,
+  `AUX_SMU_1`/`AUX_SMU_2`=1.0A) -- caught and fixed a real propagation gap
+  where `SMU_ASSIGNMENTS`'s field-by-field reshape silently dropped the new
+  field until its comprehension was updated too. New three-stage validation
+  pipeline `utils/validators.py::validate_group_test_config()` (Group
+  Configuration -> Battery Limits -> Hardware Capability), three new
+  exceptions (`GroupConfigurationError`/`ConfigurationError`/
+  `HardwareConfigurationError`, all subclassing the existing
+  `ValidationError`), wired into `test.py::_run_charge_or_discharge()`
+  before any hardware is touched. Group A declared for SB with a
+  conservative recipe fitting inside PRIMARY_SMU's real capability -- HUB
+  still cannot run on Group A (see the `[ ]` item above). `ChargeSequence`/
+  `DischargeSequence.run()` signatures gained a required `test_setpoints`
+  parameter; `battery_cfg` now used only for SafetyMonitor's limits, never
+  the commanded value. Verified: all three validation stages independently
+  reachable in the correct order; mocked end-to-end smoke tests re-run for
+  both sequences with the new parameter. See docs/architecture.md Section 39.
 
 - **Post-implementation validation of ChargeSequence/DischargeSequence --
   two real defects found and fixed** -- a thorough, adversarial review

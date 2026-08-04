@@ -100,6 +100,17 @@ PXI_SLOTS = {
         "channels_per_card": 1,   # physical NI-DCPower channel count on this card -- drives
                                   # device_display_name()'s "-Ch<n>" suffix (only shown for
                                   # multi-channel cards, where which channel matters)
+        # Rated max current magnitude this card can source/sink per channel --
+        # used by utils/validators.py::validate_group_test_config()'s Hardware
+        # Capability Validation stage (a test setpoint must never exceed this).
+        # CONFIRMED against nidcpower's own simulated model data (not assumed
+        # from memory): a simulated PXIe-4141 session rejects any
+        # current_level_range above 0.1 A. This mirrors the real card's rated
+        # capability (NI-DCPower's simulation targets are model-accurate), but
+        # has not been independently cross-checked against the physically
+        # installed unit's datasheet -- treat as strongly-supported, not yet
+        # "confirmed" in the same sense as a physically measured value.
+        "max_current_a": 0.1,
         "validation_notes": "The original VI plan (flowcharts/vi plan.md: '4140 smu') "
                              "anticipated an NI-4140 in this slot/role. Real rack "
                              "hardware is a PXIe-4141 instead -- a functionally "
@@ -128,6 +139,12 @@ PXI_SLOTS = {
         "channels":      [],
         "smu_channel":   "0",   # NI-DCPower channel name -- single-channel card, always "0"
         "channels_per_card": 1,
+        # CONFIRMED against nidcpower's own simulated model data: a simulated
+        # PXIe-4139 session rejects any current_level_range above 3.0 A. See
+        # PRIMARY_SMU's max_current_a comment above for the same caveat
+        # (model-accurate simulation, not yet cross-checked against this
+        # specific physically installed unit's datasheet).
+        "max_current_a": 3.0,
         "validation_notes": "Confirmed match to the original VI plan "
                              "(flowcharts/vi plan.md: '4139 smu'). Present, "
                              "connectable, and individually testable via test.py, "
@@ -155,6 +172,11 @@ PXI_SLOTS = {
         # property/method (voltage_level, output_enabled, measure(), etc.).
         "smu_channel":   "1",
         "channels_per_card": 2,   # physical NI-DCPower channel count on this card
+        # CONFIRMED against nidcpower's own simulated model data: a simulated
+        # PXI-4130 session rejects any current_level_range above 1.0 A per
+        # channel. See PRIMARY_SMU's max_current_a comment above for the same
+        # caveat.
+        "max_current_a": 1.0,
         "validation_notes": "Confirmed match to one of the two identical "
                              "'4130 smu' entries in the original VI plan "
                              "(flowcharts/vi plan.md). Same scaling note as "
@@ -176,6 +198,8 @@ PXI_SLOTS = {
         # rack validation: this unit is wired to channel 1, same as AUX_SMU_1.
         "smu_channel":   "1",
         "channels_per_card": 2,   # physical NI-DCPower channel count on this card
+        # Same as AUX_SMU_1 -- identical card model (PXI-4130).
+        "max_current_a": 1.0,
         "validation_notes": "Confirmed match to the second identical '4130 smu' "
                              "entry in the original VI plan (flowcharts/vi plan.md). "
                              "Same scaling note as AUX_SMU_1 above.",
@@ -332,6 +356,11 @@ SMU_ASSIGNMENTS = {
         "channels":          cfg.get("channels", []),
         "smu_channel":       cfg.get("smu_channel", "0"),
         "channels_per_card": cfg.get("channels_per_card", 1),
+        # Rated max current -- see PXI_SLOTS[...]["max_current_a"]'s own
+        # comment for provenance. Re-shaped through here like every other
+        # field above, not a second copy of PXI_SLOTS -- None if the source
+        # entry never set it (no capability data available for that card).
+        "max_current_a":     cfg.get("max_current_a"),
     }
     for cfg in _slots_by_category("smu").values()
 }
@@ -499,6 +528,35 @@ BATTERY_CHANNELS = {
 # to activate hardware for a role that resolves to None. Only MAIN_DMM/
 # MAIN_DAQ physically exist today, so every group currently shares them --
 # multiple DMMs/DAQs is a future scaling step, same as multiple SMUs.
+#
+# "battery_type"/"test_setpoints" (added for the Battery Group Test
+# Configuration Architecture -- see docs/architecture.md) make each group a
+# complete, self-contained operational test definition: hardware assignment
+# (above) + which battery this group is wired/qualified for + the actual
+# charge/discharge recipe to run. IMPORTANT distinctions:
+#
+#   - "battery_type" here is a DECLARATION, not an inference shortcut. The
+#     operator's own explicit battery-type selection (test.py::
+#     _select_battery_type()) is UNCHANGED and still mandatory for every
+#     workflow -- battery type is never inferred from group/position/
+#     channel/relay (see "Discharge Cutoff Policy" in docs/architecture.md).
+#     This field lets utils/validators.py::validate_group_test_config()
+#     cross-check the operator's selection against what this group is
+#     actually configured for, raising GroupConfigurationError on a
+#     mismatch -- a consistency guard, never a silent override.
+#   - "test_setpoints" are the CHOSEN operating point for this group's test
+#     protocol -- NOT battery limits (those live in BATTERY_CONFIGS above
+#     and are never duplicated here). A setpoint may legitimately be well
+#     below the battery's own max_charge_current_a/max_discharge_current_a
+#     (e.g. a conservative/slow-rate test recipe) -- see the values chosen
+#     for Group A below, deliberately kept within PRIMARY_SMU's own
+#     max_current_a (0.1 A) rather than at SB's actual 0.08/0.16 A limits.
+#     validate_group_test_config() enforces setpoint <= BATTERY_CONFIGS
+#     limit AND setpoint <= assigned SMU's max_current_a, in that order,
+#     before any hardware is touched.
+#   - None (both fields, for groups B/C/D below) means "not yet configured
+#     for any battery/test" -- the same "None = unassigned" convention
+#     already used for "relay_matrix"/"smu"/"dmm"/"daq" above.
 BATTERY_GROUPS = {
     "A": {
         "relay_matrix":   "MATRIX_NUMATO_201",
@@ -508,6 +566,23 @@ BATTERY_GROUPS = {
         "smu":            "PRIMARY_SMU",
         "dmm":            "MAIN_DMM",
         "daq":            "MAIN_DAQ",
+        # PRIMARY_SMU (PXIe-4141) is rated to only 0.1 A per channel (see its
+        # max_current_a above) -- far below HUB's own limits (0.525/1.05 A),
+        # so this group is declared for SB (0.08/0.16 A limits) with a
+        # further-reduced, conservative test recipe that stays inside
+        # PRIMARY_SMU's real capability. HUB requires reassigning this
+        # group's "smu" to HIGH_POWER_SMU or AUX_SMU_1/2 first (a hardware/
+        # wiring decision -- not done here, see docs/TODO.md).
+        "battery_type":   "SB",
+        "test_setpoints": {
+            "charge_current_a":    0.05,   # <= SB max_charge_current_a (0.08) and
+                                            #    <= PRIMARY_SMU max_current_a (0.1)
+            "charge_voltage_v":    4.2,    # == SB voltage_max_v (CV target)
+            "discharge_current_a": 0.08,   # <= SB max_discharge_current_a (0.16) and
+                                            #    <= PRIMARY_SMU max_current_a (0.1)
+            "discharge_cutoff_v":  3.0,    # == SB voltage_min_v (the safety floor --
+                                            #    see "Discharge Cutoff Policy")
+        },
     },
     "B": {
         "relay_matrix":   "MATRIX_NUMATO_202",
@@ -517,6 +592,8 @@ BATTERY_GROUPS = {
         "smu":            None,    # no SMU assigned to this group yet
         "dmm":            "MAIN_DMM",
         "daq":            "MAIN_DAQ",
+        "battery_type":   None,    # not yet configured for any battery/test
+        "test_setpoints": None,
     },
     "C": {
         "relay_matrix":   None,    # no relay matrix assigned yet
@@ -526,6 +603,8 @@ BATTERY_GROUPS = {
         "smu":            None,
         "dmm":            None,
         "daq":            None,
+        "battery_type":   None,
+        "test_setpoints": None,
     },
     "D": {
         "relay_matrix":   None,    # no relay matrix assigned yet
@@ -535,6 +614,8 @@ BATTERY_GROUPS = {
         "smu":            None,
         "dmm":            None,
         "daq":            None,
+        "battery_type":   None,
+        "test_setpoints": None,
     },
 }
 
@@ -591,6 +672,26 @@ def hardware_for_group(group: str) -> dict:
         "dmm_cfg":  DMM_CONFIGS.get(grp["dmm"]),
         "daq_name": grp["daq"],
         "daq_cfg":  DAQ_CONFIGS.get(grp["daq"]),
+    }
+
+
+def group_test_config(group: str) -> dict:
+    """
+    Companion resolver to hardware_for_group() -- returns this group's
+    declared battery_type and test_setpoints (see BATTERY_GROUPS' own
+    comments above for what these mean and don't mean). Both may be None
+    if the group has no battery/test configured yet.
+
+    This is a plain data accessor, not a validator -- it never raises and
+    never checks a setpoint against BATTERY_CONFIGS or hardware capability.
+    See utils/validators.py::validate_group_test_config() for that.
+
+    Raises KeyError if `group` is not a key in BATTERY_GROUPS.
+    """
+    grp = BATTERY_GROUPS[group]
+    return {
+        "battery_type": grp.get("battery_type"),
+        "test_setpoints": grp.get("test_setpoints"),
     }
 
 # Relay matrix -- serial (COM port) -- MAIN_MATRIX / COM13.

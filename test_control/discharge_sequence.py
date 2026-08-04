@@ -42,6 +42,15 @@ TestExecutor/BatteryTestSequence orchestration coupling.
 Battery type is a REQUIRED, explicit parameter (`battery_cfg`) -- never
 inferred from channel/group/position/relay.
 
+`battery_cfg` (BATTERY_CONFIGS[type]) vs. `test_setpoints`
+(BATTERY_GROUPS[group]["test_setpoints"]) -- two different things, per the
+Battery Group Test Configuration Architecture (see docs/architecture.md):
+`battery_cfg` supplies only the safety floor/SafetyMonitor limits, never
+the commanded setpoint. `test_setpoints` supplies the actual commanded
+discharge current and target cutoff -- already validated by the caller
+(utils/validators.py::validate_group_test_config()) before this class is
+constructed. This class trusts that validation; it does not repeat it.
+
 Temperature remains None -- NTC is not wired into this sequence, the same
 pre-existing gap DischargeCycle/ChargeCycle/MonitorBatterySequence all
 carry (SafetyMonitor.check() tolerates temp_c=None).
@@ -66,13 +75,18 @@ class DischargeSequence(BatteryOperationSequence):
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
                           source="discharge_battery", dmm=dmm)
 
-    def run(self, channel: int, relay_address: int, battery_cfg: dict, token=None) -> bool:
+    def run(self, channel: int, relay_address: int, battery_cfg: dict,
+            test_setpoints: dict, token=None) -> bool:
         """
-        Run one complete CC discharge on `channel`/`relay_address`, using
+        Run one complete CC discharge on `channel`/`relay_address`.
+
         `battery_cfg` (a config/devices.py BATTERY_CONFIGS[...] entry --
-        REQUIRED) to resolve the commanded discharge current, the target/
-        floor cutoff (see module docstring "Discharge Cutoff Policy"), and
-        the SafetyMonitor limits.
+        REQUIRED) supplies only the SafetyMonitor's absolute safety floor --
+        never the commanded setpoint (see module docstring). `test_setpoints`
+        (a config/devices.py BATTERY_GROUPS[group]["test_setpoints"] entry --
+        REQUIRED, already validated by the caller via utils/validators.py::
+        validate_group_test_config()) supplies the actual commanded
+        discharge current and target cutoff.
 
         Returns True once EOD is reached. Raises SafetyViolationError,
         RelayError, NIPXITimeoutError, or OperationCancelledError on any
@@ -81,11 +95,11 @@ class DischargeSequence(BatteryOperationSequence):
         self.log.info("Discharge Sequence starting. Channel: %d  Relay: %d", channel, relay_address)
         run_number = self._run_number()
 
-        current_a = battery_cfg["max_discharge_current_a"]
+        current_a = test_setpoints["discharge_current_a"]
         floor_v = battery_cfg["voltage_min_v"]
-        target_v = battery_cfg["voltage_min_v"]  # BATTERY_CONFIGS today defines only one
-                                                  # voltage per battery type -- see the
-                                                  # module docstring's Discharge Cutoff Policy.
+        target_v = test_setpoints["discharge_cutoff_v"]  # cycle objective, set by the group's
+                                                          # test recipe -- see module docstring's
+                                                          # Discharge Cutoff Policy.
         # SMU compliance ceiling -- DELIBERATELY NOT cutoff_v. NI-DCPower's
         # default compliance mode is SYMMETRIC: a DC_CURRENT session's
         # voltage_limit sets a +/-voltage_limit window, not a one-sided

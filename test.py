@@ -3856,7 +3856,11 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     from test_control.hardware_manager import HardwareManager
     from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken
-    from utils.errors import HardwareInitError, OperationCancelledError
+    from utils.errors import (
+        ConfigurationError, GroupConfigurationError, HardwareConfigurationError,
+        HardwareInitError, OperationCancelledError,
+    )
+    from utils.validators import validate_group_test_config
 
     battery_type = _select_battery_type()
     if battery_type is None:
@@ -3878,6 +3882,17 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
               f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
         return
 
+    # Battery Group Test Configuration Architecture validation pipeline --
+    # Group Configuration -> Battery Limits -> Hardware Capability -- runs
+    # BEFORE anything below touches hardware (no HardwareManager
+    # constructed yet). See docs/architecture.md "Battery Group Test
+    # Configuration Architecture" / utils/validators.py.
+    try:
+        test_setpoints = validate_group_test_config(group, battery_type)
+    except (GroupConfigurationError, ConfigurationError, HardwareConfigurationError) as e:
+        print(f"\n[FAIL] {type(e).__name__}: {e}\nAborting, no hardware activated.")
+        return
+
     channel = dev_cfg.resolve_group_position(group, position)
     ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
     if ch_cfg is None:
@@ -3889,7 +3904,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     extra_lines = [
         f"\nMax Voltage:\n{battery_cfg['voltage_max_v']:.2f} V   "
         f"Min Voltage: {battery_cfg['voltage_min_v']:.2f} V",
-        limit_line_fn(battery_cfg),
+        limit_line_fn(test_setpoints),
         f"\nMax Temperature:\n{battery_cfg['max_temp_c']:.1f} C",
     ]
     if not _confirm_operation(operation, battery_type, battery_cfg, group,
@@ -3967,7 +3982,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             try:
                 sequence.run(
                     channel=channel, relay_address=relay_address,
-                    battery_cfg=battery_cfg, token=token,
+                    battery_cfg=battery_cfg, test_setpoints=test_setpoints, token=token,
                 )
                 print(f"\n{operation} complete.")
             except OperationCancelledError:
@@ -3995,24 +4010,29 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
 def _run_charge_battery():
     """Charge Battery -- CC-CV charge via ChargeSequence (built on
     BatteryOperationSequence). See test_control/charge_sequence.py and
-    docs/architecture.md Sections 33/35."""
+    docs/architecture.md Sections 33/35/39. `limit_line_fn` receives the
+    group's validated test_setpoints (the commanded recipe), not
+    battery_cfg (the battery's own limit -- already shown separately by
+    _run_charge_or_discharge()'s Max/Min Voltage line)."""
     from test_control.charge_sequence import ChargeSequence
     _run_charge_or_discharge(
         "Charge Battery", ChargeSequence, "charge_battery",
-        lambda cfg: (f"\nCharge Current:\n{cfg['max_charge_current_a']:.3f} A   "
-                     f"CV Target: {cfg['voltage_max_v']:.2f} V"),
+        lambda setpoints: (f"\nCharge Current (commanded):\n{setpoints['charge_current_a']:.3f} A   "
+                            f"CV Target: {setpoints['charge_voltage_v']:.2f} V"),
     )
 
 
 def _run_discharge_battery():
     """Discharge Battery -- CC discharge via DischargeSequence (built on
     BatteryOperationSequence). See test_control/discharge_sequence.py and
-    docs/architecture.md Sections 30/33/35."""
+    docs/architecture.md Sections 30/33/35/39. `limit_line_fn` receives the
+    group's validated test_setpoints, not battery_cfg -- see
+    _run_charge_battery()'s docstring for the same rationale."""
     from test_control.discharge_sequence import DischargeSequence
     _run_charge_or_discharge(
         "Discharge Battery", DischargeSequence, "discharge_battery",
-        lambda cfg: (f"\nDischarge Current:\n{cfg['max_discharge_current_a']:.3f} A   "
-                     f"Cutoff (safety floor): {cfg['voltage_min_v']:.2f} V"),
+        lambda setpoints: (f"\nDischarge Current (commanded):\n{setpoints['discharge_current_a']:.3f} A   "
+                            f"Cutoff Target: {setpoints['discharge_cutoff_v']:.2f} V"),
     )
 
 
