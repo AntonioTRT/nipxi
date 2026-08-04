@@ -1,11 +1,25 @@
 # Database Roadmap
 
-**Status: planning document.** Nothing in this file is implemented yet except the
-mode-separated database *location* and the minimal `data/sqlite_manager.py` foundation
-(Section 1), which are real today. Everything else here — the repository classes, the
-new data categories, and cycle/state recovery — is future architecture, written down
-now so it gets designed deliberately instead of improvised later. See
+**Status: planning document, partially superseded by as-built schema.** Nothing in
+this file is implemented yet except the mode-separated database *location* and the
+minimal `data/sqlite_manager.py` foundation (Section 1), which are real today.
+Sections 3 (`station_state`) and 5.3 (`run_summary`)'s proposals were subsequently
+built, in a shape close to but not identical to what's sketched below -- see
+`docs/architecture.md` Sections 18/18a/20/22/28 and `docs/CONFIGURATION.md`'s
+"Data storage" section for the current, as-built `station_state`/`run_summary`/
+`event_log`/`measurements` schema, which is authoritative over this document for
+anything already built. Everything else here — the repository classes, the new
+data categories, and cycle/state recovery — remains future architecture, written
+down now so it gets designed deliberately instead of improvised later. See
 `docs/architecture.md` "System Modes" for how `SYSTEM_MODE` feeds into this.
+
+**Note (SMU/Discharge/Roadmap review, see `docs/architecture.md` Sections 29-35):**
+this review's changes (SMU implementation status, Discharge Cutoff Policy, DAQ
+telemetry strategy, SMU Functional Validation milestone, ChargeCycle/DischargeCycle
+harvest plan, revised roadmap) made **no changes to database schema or to this
+document's build order** -- the repository-split/recovery-engine roadmap below is
+unaffected and remains open work, independent of when Charge/Discharge Sequence
+ships.
 
 ---
 

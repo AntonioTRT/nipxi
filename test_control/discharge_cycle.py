@@ -34,21 +34,51 @@ class DischargeCycle:
 
         `battery_cfg` (a config/devices.py BATTERY_CONFIGS[...] entry),
         if given, supplies the commanded discharge current
-        (max_discharge_current_a) and cutoff voltage (voltage_min_v)
-        instead of the global Settings.DISCHARGE_CURRENT_A/
-        DISCHARGE_CUTOFF_V, and is forwarded to self.safety so
-        SafetyMonitor.check() enforces the same battery-specific limits.
-        battery_cfg=None preserves prior (global-Settings-only) behavior
-        exactly.
+        (max_discharge_current_a) and voltage floor (voltage_min_v)
+        instead of the global Settings.DISCHARGE_CURRENT_A/BAT_VOLTAGE_MIN,
+        and is forwarded to self.safety so SafetyMonitor.check() enforces
+        the same battery-specific limits. battery_cfg=None preserves prior
+        (global-Settings-only) behavior exactly.
+
+        Discharge Cutoff Policy (see docs/architecture.md Section 30):
+        DISCHARGE_CUTOFF_V (or a future battery_cfg "discharge_target_v")
+        is a cycle OBJECTIVE -- where this discharge intends to stop -- not
+        a safety limit. BAT_VOLTAGE_MIN / battery_cfg["voltage_min_v"] is
+        the battery's absolute safety FLOOR. These are two different
+        questions and are never treated as conflicting: the effective
+        cutoff used for end-of-discharge detection is clamped to never sit
+        below the active floor, so the safety limit always has priority
+        even if a target is ever misconfigured below it. Today's
+        BATTERY_CONFIGS entries only specify one voltage (voltage_min_v),
+        so target and floor resolve to the same value for HUB/SB -- the
+        clamp exists for the global-Settings-only fallback path (where
+        DISCHARGE_CUTOFF_V=3.0 V historically sat below BAT_VOLTAGE_MIN=
+        3.5 V) and for any future battery type whose target and floor
+        differ.
         """
         self.log.info("Starting discharge cycle on channel %d", channel)
 
         current_a = self.s.DISCHARGE_CURRENT_A
-        cutoff_v = self.s.DISCHARGE_CUTOFF_V
+        target_v = self.s.DISCHARGE_CUTOFF_V   # cycle objective, not the safety floor
+        floor_v = self.s.BAT_VOLTAGE_MIN        # absolute safety floor
         if battery_cfg is not None:
             current_a = battery_cfg.get("max_discharge_current_a", current_a)
-            cutoff_v = battery_cfg.get("voltage_min_v", cutoff_v)
+            floor_v = battery_cfg.get("voltage_min_v", floor_v)
+            target_v = battery_cfg.get("voltage_min_v", target_v)
         self.safety.set_battery_limits(battery_cfg)
+
+        # The safety floor always has priority: never let the discharge
+        # target sit below it. This is a defensive clamp, not the primary
+        # safety mechanism -- SafetyMonitor.check() (below, every sample)
+        # remains the authoritative abort path if voltage ever drops below
+        # the floor before this cutoff is reached.
+        cutoff_v = max(target_v, floor_v)
+        if target_v < floor_v:
+            self.log.warning(
+                "Channel %d: discharge target %.3f V is below the safety floor "
+                "%.3f V -- using the floor as the effective cutoff.",
+                channel, target_v, floor_v,
+            )
 
         check_cancellation(token)
 

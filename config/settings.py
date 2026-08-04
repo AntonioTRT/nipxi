@@ -53,10 +53,18 @@ class Settings:
     # docs/architecture.md "Battery Group / Position Architecture").
 
     # -------------------------------------------------------------------------
-    # Battery limits (Li-ion, per BLOSS Hub spec)
+    # Battery limits (Li-ion, per BLOSS Hub spec) -- these are the GLOBAL
+    # fallback limits used only when no battery_cfg (config/devices.py
+    # BATTERY_CONFIGS[...]) is supplied. Real charge/discharge work always
+    # selects an explicit battery type, so BATTERY_CONFIGS[...]["voltage_min_v"]
+    # is what actually governs in practice -- see docs/architecture.md
+    # "Discharge Cutoff Policy" (Section 30).
     # -------------------------------------------------------------------------
-    BAT_VOLTAGE_MAX = 4.7       # V  - absolute upper limit
-    BAT_VOLTAGE_MIN = 3.5       # V  - absolute lower limit (do not discharge below)
+    BAT_VOLTAGE_MAX = 4.7       # V  - absolute upper limit (safety ceiling)
+    BAT_VOLTAGE_MIN = 3.5       # V  - absolute lower limit (safety floor -- SafetyMonitor
+                                 #      enforces this independently of any cycle-level
+                                 #      discharge target; the system must never discharge
+                                 #      below this value, or the per-battery equivalent)
     BAT_CURRENT_MAX = 1.0       # A  - max charge/discharge current
     BAT_TEMP_MAX_C  = 45.0      # °C - safety cutoff temperature
     BAT_TEMP_MIN_C  = 20.0      # °C - minimum operating temperature
@@ -73,7 +81,19 @@ class Settings:
     # Discharge parameters (CC)
     # -------------------------------------------------------------------------
     DISCHARGE_CURRENT_A = 0.5   # A  - constant discharge current
-    DISCHARGE_CUTOFF_V  = 3.0   # V  - end-of-discharge voltage
+    DISCHARGE_CUTOFF_V  = 3.0   # V  - discharge TARGET (cycle objective -- where a
+                                 #      discharge cycle intends to stop). This is a
+                                 #      global fallback default, NOT the safety floor --
+                                 #      it is deliberately allowed to differ from
+                                 #      BAT_VOLTAGE_MIN above. DischargeCycle clamps the
+                                 #      effective cutoff to never go below whichever
+                                 #      voltage floor is active (BAT_VOLTAGE_MIN, or a
+                                 #      selected battery's own voltage_min_v), so the
+                                 #      safety limit always takes priority regardless of
+                                 #      this target. See docs/architecture.md Section 30
+                                 #      "Discharge Cutoff Policy" -- this value and
+                                 #      BAT_VOLTAGE_MIN are NOT in conflict; they answer
+                                 #      two different questions (objective vs. floor).
     DISCHARGE_TIMEOUT_S = 7200  # s  - max discharge time
 
     # -------------------------------------------------------------------------

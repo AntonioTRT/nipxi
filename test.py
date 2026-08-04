@@ -345,11 +345,17 @@ def test_configuration():
         results.append(_ok("Configuration", "Charge Voltage", ref,
                            f"{Settings.CHARGE_VOLTAGE_V} V <= {Settings.BAT_VOLTAGE_MAX} V"))
 
+    # DISCHARGE_CUTOFF_V is a discharge TARGET (cycle objective), not the
+    # safety floor -- BAT_VOLTAGE_MIN is. It is expected and fine for the
+    # target to sit below the global floor; DischargeCycle.run() clamps the
+    # effective cutoff to max(target, floor) so the safety limit always
+    # wins regardless. See docs/architecture.md Section 30 "Discharge
+    # Cutoff Policy" -- this is informational, not a misconfiguration.
     if Settings.DISCHARGE_CUTOFF_V < Settings.BAT_VOLTAGE_MIN:
-        results.append(_warn("Configuration", "Discharge Cutoff", ref,
-                             f"DISCHARGE_CUTOFF_V ({Settings.DISCHARGE_CUTOFF_V}) < "
-                             f"BAT_VOLTAGE_MIN ({Settings.BAT_VOLTAGE_MIN}) -- "
-                             "verify battery chemistry limits"))
+        results.append(_ok("Configuration", "Discharge Cutoff", ref,
+                           f"Target {Settings.DISCHARGE_CUTOFF_V} V < floor "
+                           f"{Settings.BAT_VOLTAGE_MIN} V -- floor takes priority "
+                           "(effective cutoff clamped to the floor by design)"))
     else:
         results.append(_ok("Configuration", "Discharge Cutoff", ref,
                            f"{Settings.DISCHARGE_CUTOFF_V} V"))
@@ -2461,16 +2467,15 @@ def _discharge_phase_steps(cycle_number: int = None, inject_fault: bool = False,
     given, drives the commanded/simulated discharge current
     (max_discharge_current_a) and cutoff voltage (voltage_min_v) --
     matching what DischargeCycle.run(battery_cfg=...) now actually
-    commands, and (as a side benefit) makes the previous
-    max(DISCHARGE_CUTOFF_V, BAT_VOLTAGE_MIN)+margin workaround unnecessary
-    for battery-aware runs: battery_cfg["voltage_min_v"] (3.0 V for both
-    HUB/SB) IS what SafetyMonitor.check() enforces once battery-aware, so
-    it matches Settings.DISCHARGE_CUTOFF_V (3.0 V) exactly, with no gap.
-    battery_cfg=None falls back to the global Settings.DISCHARGE_CURRENT_A
-    and to the pre-existing max(DISCHARGE_CUTOFF_V, BAT_VOLTAGE_MIN)+
-    margin workaround (Settings.DISCHARGE_CUTOFF_V (3.0 V) is itself below
-    Settings.BAT_VOLTAGE_MIN (3.5 V) -- tracked separately in
-    docs/TODO.md, not silently fixed here).
+    commands. battery_cfg=None falls back to the global
+    Settings.DISCHARGE_CURRENT_A and the same target-vs-floor clamp
+    DischargeCycle.run() itself applies: cutoff_v = max(DISCHARGE_CUTOFF_V,
+    BAT_VOLTAGE_MIN) -- no arbitrary margin. DISCHARGE_CUTOFF_V (a cycle
+    objective/target) sitting below BAT_VOLTAGE_MIN (the safety floor) is
+    expected, documented behavior, not a misconfiguration to work around --
+    see docs/architecture.md Section 30 "Discharge Cutoff Policy". The
+    floor always wins; this simulator mirrors that exactly so it stays an
+    accurate reference for the real implementation.
 
     `inject_fault=True` deliberately raises the mid-discharge simulated
     temperature above the active max_temp_c, so the walkthrough aborts at
@@ -2486,7 +2491,7 @@ def _discharge_phase_steps(cycle_number: int = None, inject_fault: bool = False,
         cutoff_v = battery_cfg["voltage_min_v"]
         temp_max = battery_cfg["max_temp_c"]
     else:
-        cutoff_v = max(Settings.DISCHARGE_CUTOFF_V, Settings.BAT_VOLTAGE_MIN) + 0.05
+        cutoff_v = max(Settings.DISCHARGE_CUTOFF_V, Settings.BAT_VOLTAGE_MIN)
         temp_max = Settings.BAT_TEMP_MAX_C
     mid_temp = (temp_max + 5.0) if inject_fault else 27.0
     return [
@@ -3823,13 +3828,202 @@ def _run_monitor_battery_scan():
                   "physically disconnect power if this cannot be resolved immediately.")
 
 
+def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_line_fn):
+    """
+    Shared workflow for Charge Battery / Discharge Battery -- both are the
+    same skeleton as _run_monitor_battery() (select battery type -> select
+    group -> select position -> resolve hardware via hardware_for_group()
+    -> confirmation screen -> traceability -> ChargeSequence/
+    DischargeSequence.run()) with only the sequence class, event-log
+    source name, and confirmation-screen battery-limit line differing --
+    factored here once rather than duplicating the whole workflow twice.
+    Built on BatteryOperationSequence (test_control/
+    battery_operation_sequence.py) via `sequence_cls` -- never
+    TestExecutor/BatteryTestSequence, and never a second workflow
+    architecture (see docs/architecture.md Section 35).
+
+    DAQ is intentionally NOT a required hardware role here (unlike Monitor
+    Battery Scan, which validates the DAQ path) -- ChargeSequence/
+    DischargeSequence use the DMM for voltage and the SMU's own measure()
+    for current (docs/architecture.md Section 31 "Telemetry Source
+    Strategy"), so this workflow must not be blocked by an unassigned or
+    unapproved DAQ.
+    """
+    print(operation.upper())
+
+    import signal
+    from data.storage import DataStorage
+    from test_control.hardware_manager import HardwareManager
+    from test_control.safety_monitor import SafetyMonitor
+    from utils.cancellation import CancellationToken
+    from utils.errors import HardwareInitError, OperationCancelledError
+
+    battery_type = _select_battery_type()
+    if battery_type is None:
+        return
+    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
+
+    group = _select_battery_group()
+    if group is None:
+        return
+
+    position = _select_battery_position(group)
+    if position is None:
+        return
+
+    hw = dev_cfg.hardware_for_group(group)
+    missing = _missing_hardware_roles(hw, required_roles=("relay_matrix", "smu", "dmm"))
+    if missing:
+        print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
+        return
+
+    channel = dev_cfg.resolve_group_position(group, position)
+    ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
+    if ch_cfg is None:
+        print(f"\n[FAIL] No BATTERY_CHANNELS entry for resolved position {channel} -- check config/devices.py.")
+        return
+    relay_address = ch_cfg["relay_address"]
+
+    positions_label = f"{position} (Group {group} Position {position})"
+    extra_lines = [
+        f"\nMax Voltage:\n{battery_cfg['voltage_max_v']:.2f} V   "
+        f"Min Voltage: {battery_cfg['voltage_min_v']:.2f} V",
+        limit_line_fn(battery_cfg),
+        f"\nMax Temperature:\n{battery_cfg['max_temp_c']:.1f} C",
+    ]
+    if not _confirm_operation(operation, battery_type, battery_cfg, group,
+                               positions_label, hw, extra_lines=extra_lines):
+        print("\nCancelled -- no relay activated.")
+        return
+
+    relay_cfg = hw["relay_matrix_cfg"]
+    smu_name, smu_cfg = hw["smu_name"], hw["smu_cfg"]
+    dmm_name, dmm_cfg = hw["dmm_name"], hw["dmm_cfg"]
+    daq_name, daq_cfg = hw["daq_name"], hw["daq_cfg"]
+    print("\nSelected Hardware\n")
+    print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
+    print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}\n  {smu_cfg.get('resource', '')}\n")
+    print(f"DMM (telemetry source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
+
+    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
+    try:
+        hw_mgr.connect_all()
+    except HardwareInitError as e:
+        print(f"[FAIL] Hardware initialization failed: {e}")
+        return
+
+    storage = DataStorage(settings=Settings)
+    storage.open()
+
+    try:
+        # CRITICAL traceability requirement: every selected-configuration
+        # fact is recorded via event_log BEFORE relay activation/PSU
+        # output -- same requirement as _run_monitor_battery().
+        hardware_snapshot = _hardware_snapshot_fields(
+            smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
+        )
+        storage.start_run_summary(
+            test_type=source,
+            battery_type=battery_type,
+            battery_voltage_max_v=battery_cfg["voltage_max_v"],
+            battery_voltage_min_v=battery_cfg["voltage_min_v"],
+            battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
+            battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
+            capacity_ah=battery_cfg["capacity_ah"],
+            **hardware_snapshot,
+        )
+        storage.log_event(level="INFO", source=source, message="Run started")
+        storage.log_event(level="INFO", source=source, message=f"Operation selected: {operation}")
+        storage.log_event(level="INFO", source=source, message=f"Battery selected: {battery_type}")
+        storage.log_event(level="INFO", source=source,
+                           message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
+        storage.log_event(level="INFO", source=source, message=f"Group selected: {group}")
+        storage.log_event(level="INFO", source=source,
+                           channel=channel, relay=relay_address,
+                           message=f"Position selected: {position} (Group {group} Position {position})")
+        storage.log_event(level="INFO", source=source, message="Configuration snapshot recorded")
+        storage.log_event(level="INFO", source=source, message="Hardware assignment resolved")
+        storage.log_event(level="INFO", source=source, message=f"Relay matrix selected: {hw['relay_matrix_name']}")
+        storage.log_event(level="INFO", source=source, message=f"SMU selected: {smu_name}")
+        storage.log_event(level="INFO", source=source, message=f"DMM selected: {dmm_name}")
+        storage.log_event(level="INFO", source=source, message=f"DAQ selected: {daq_name}")
+        storage.log_event(level="INFO", source=source, message="Operator confirmed execution")
+        for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
+            storage.log_event(level="INFO", source=source, message=message)
+
+        token = CancellationToken(owner=f"test.py:_run_charge_or_discharge:{source}")
+        previous_sigint_handler = signal.signal(
+            signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+        )
+        print(f"\nPress Ctrl+C to stop {operation.lower()} safely.\n")
+
+        try:
+            safety = SafetyMonitor(Settings)
+            sequence = sequence_cls(
+                smu=hw_mgr.smu, dmm=hw_mgr.dmm, relay=hw_mgr.relay, safety=safety,
+                storage=storage, settings=Settings,
+            )
+            try:
+                sequence.run(
+                    channel=channel, relay_address=relay_address,
+                    battery_cfg=battery_cfg, token=token,
+                )
+                print(f"\n{operation} complete.")
+            except OperationCancelledError:
+                print(f"\n{operation} stopped by operator -- hardware is in a verified safe state.")
+            except KeyboardInterrupt:
+                print(f"\n{operation} interrupted by user (Ctrl+C).")
+            except Exception as e:
+                print(f"\n[FAIL] {operation} aborted: {e}")
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+
+    finally:
+        try:
+            storage.close()
+        except Exception as e:
+            print(f"[WARNING] Storage close failed: {e}")
+        try:
+            hw_mgr.disconnect_all()
+        except Exception as shutdown_err:
+            print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+            print("           Hardware may still be energized -- "
+                  "physically disconnect power if this cannot be resolved immediately.")
+
+
+def _run_charge_battery():
+    """Charge Battery -- CC-CV charge via ChargeSequence (built on
+    BatteryOperationSequence). See test_control/charge_sequence.py and
+    docs/architecture.md Sections 33/35."""
+    from test_control.charge_sequence import ChargeSequence
+    _run_charge_or_discharge(
+        "Charge Battery", ChargeSequence, "charge_battery",
+        lambda cfg: (f"\nCharge Current:\n{cfg['max_charge_current_a']:.3f} A   "
+                     f"CV Target: {cfg['voltage_max_v']:.2f} V"),
+    )
+
+
+def _run_discharge_battery():
+    """Discharge Battery -- CC discharge via DischargeSequence (built on
+    BatteryOperationSequence). See test_control/discharge_sequence.py and
+    docs/architecture.md Sections 30/33/35."""
+    from test_control.discharge_sequence import DischargeSequence
+    _run_charge_or_discharge(
+        "Discharge Battery", DischargeSequence, "discharge_battery",
+        lambda cfg: (f"\nDischarge Current:\n{cfg['max_discharge_current_a']:.3f} A   "
+                     f"Cutoff (safety floor): {cfg['voltage_min_v']:.2f} V"),
+    )
+
+
 def run_main_test():
     """
     Run Main Test -- battery-centric operator workflow entry point
-    (Milestone II Monitor Battery blueprint). Submenu: Monitor Battery and
-    Monitor Battery Scan are implemented; Charge/Discharge/Cycle Battery
-    are placeholders reserved for future work (Monitor Battery Scan is the
-    required intermediate validation step before Charge Battery).
+    (Milestone II Monitor Battery blueprint). Submenu: Monitor Battery,
+    Charge Battery, Discharge Battery, and Monitor Battery Scan are
+    implemented; Cycle Battery (charge -> rest -> discharge composition)
+    remains a placeholder for future work -- see docs/architecture.md
+    Section 35 "Revised Roadmap".
     """
     print("RUN MAIN TEST")
     print("\n1. Monitor Battery")
@@ -3842,9 +4036,9 @@ def run_main_test():
     if choice == "1":
         _run_monitor_battery()
     elif choice == "2":
-        print("\nCharge Battery -- not yet implemented.")
+        _run_charge_battery()
     elif choice == "3":
-        print("\nDischarge Battery -- not yet implemented.")
+        _run_discharge_battery()
     elif choice == "4":
         print("\nCycle Battery -- not yet implemented.")
     elif choice == "5":

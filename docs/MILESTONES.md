@@ -798,9 +798,204 @@ section above still holds the full technical detail.
 
 ---
 
-## Milestone III: Battery Charge/Discharge Workflows
+## Milestone III: SMU Review, Discharge Cutoff Policy, and Roadmap Correction
 
-**Status:** STARTING
+**Status:** ACHIEVED
+
+**Scope:** before starting the Charge/Discharge Workflows milestone below, the
+current SMU implementation was re-verified directly from source (not assumed
+from the prior architecture review) to confirm what is and isn't real, and
+several architecture decisions were formalized and one live gap fixed.
+
+### Findings
+
+- `hardware/smu.py` re-confirmed: only `output_disable()`/
+  `verify_output_disabled()`/`emergency_output_off()`/`source_dc_voltage_point()`
+  are real; `set_charge_mode()`/`set_discharge_mode()`/`output_enable()`/
+  `measure()` remain stubs (log-only or fixed-zero return), unchanged since
+  the prior review. This confirms real SMU sourcing capability, not
+  ChargeSequence orchestration, is the correct next step. See
+  `docs/architecture.md` Section 29.
+- **Fix:** `DischargeCycle.run()` previously resolved its EOD cutoff voltage
+  without regard to the active safety floor. Now resolves a discharge TARGET
+  (`DISCHARGE_CUTOFF_V`/`battery_cfg["voltage_min_v"]`, a cycle objective)
+  separately from the battery's safety FLOOR (`BAT_VOLTAGE_MIN`/
+  `battery_cfg["voltage_min_v"]`) and clamps `cutoff_v = max(target_v,
+  floor_v)` -- the floor always has priority. This resolves the previously
+  open `docs/TODO.md` item asking "which is correct, `DISCHARGE_CUTOFF_V` or
+  `BAT_VOLTAGE_MIN`?" -- the answer is that they are not in conflict; they
+  answer different questions. See `docs/architecture.md` Section 30.
+
+### Architectural decisions made
+
+- **Discharge Cutoff Policy** -- documented as a formal policy (Section 30):
+  discharge target vs. absolute safety floor, floor always wins, battery
+  type always explicit (never inferred from group/position/channel/relay).
+- **DAQ Strategy** -- Charge/Discharge/Cycle Sequence development uses the
+  DMM as its telemetry source (mirroring Monitor Battery), not
+  `DAQ.read_all_batteries()` (unimplemented, channel mapping not approved).
+  This work must not be blocked by DAQ mapping work. See
+  `docs/architecture.md` Section 31.
+- **SMU Functional Validation (no load) milestone added** -- validates mode
+  configuration, output state transitions, readback, safety shutdown, and
+  command verification without a battery or load, once the missing SMU
+  methods are implemented, and explicitly before Charge/Discharge Sequence
+  is built on top of them. See `docs/architecture.md` Section 32.
+- **ChargeCycle/DischargeCycle harvest plan documented** (KEEP/MIGRATE/
+  REMOVE/RETIRE), no code migrated yet -- see `docs/architecture.md`
+  Section 33.
+- **ProtoTestSequence reviewed** -- confirmed it duplicates
+  `BatteryOperationSequence.run_guarded()`'s pattern independently;
+  migration recommended but not urgent, no refactor performed. See
+  `docs/architecture.md` Section 34.
+- **Roadmap reordered** (Section 35): review SMU -> complete SMU
+  functionality -> SMU Functional Validation (no load) -> validate results
+  -> harvest ChargeCycle/DischargeCycle -> ChargeSequence -> DischargeSequence
+  -> CycleSequence -> legacy retirement. `BatteryOperationSequence` remains
+  the target execution architecture throughout.
+
+### Verified
+
+`python -m py_compile` clean on every touched file (`config/settings.py`,
+`test_control/discharge_cycle.py`, `test.py`). No behavior change for any
+caller using a real, currently-configured `battery_cfg` (HUB/SB: target and
+floor are numerically identical today, `cutoff_v` unchanged). The
+global-Settings-only fallback path's effective cutoff changed from 3.0 V to
+3.5 V (the more conservative value) -- a deliberate, documented safety
+correction, not a regression.
+
+### Recommended next milestone (achieved -- see below)
+
+**Milestone IV: SMU Functional Validation (no load)** -- implement the
+missing `set_charge_mode()`/`set_discharge_mode()`/`output_enable()`/
+`measure()` methods for real, then validate them without a battery or load,
+per `docs/architecture.md` Section 32, before harvesting ChargeCycle/
+DischargeCycle logic into a real ChargeSequence.
+
+---
+
+## Milestone IV: SMU Implementation + ChargeSequence/DischargeSequence
+
+**Status:** ACHIEVED (no-load/mocked-hardware validation only -- physical
+rack validation with a real battery remains open, tracked in `docs/TODO.md`)
+
+**Scope:** implemented the four remaining SMU stub methods, performed no-load
+SMU Functional Validation, then (no major blocker found) implemented
+`ChargeSequence`/`DischargeSequence` on `BatteryOperationSequence` and wired
+them into the live MENU.
+
+### Objectives achieved
+
+- `hardware/smu.py::SMU.set_charge_mode()`/`set_discharge_mode()`/
+  `output_enable()`/`measure()` implemented for real via a new shared
+  `_configure_current_source()` helper, reusing `force_output_off_and_verify()`
+  (Section 25)/`_verify_config_readback()` (Section 12.6b) unchanged.
+  `set_discharge_mode()` configures a genuine current SINK (negative
+  `current_level`) at a positive voltage, never a negative-voltage source.
+- SMU Functional Validation (no load) performed against `nidcpower`'s real
+  `simulate=True` driver runtime -- the actual NI-DCPower driver is
+  installed in this environment, so validation exercised the real,
+  unmodified production code path rather than a hand-rolled mock.
+  Configuration/readback/verification, output-state transitions, and safety
+  shutdown all confirmed. One finding (default simulated model is unipolar,
+  rejecting negative current -- resolved by testing against a simulated
+  bipolar PXIe-4141, matching real production hardware) -- a test-harness
+  artifact, not a code defect.
+- New `test_control/charge_sequence.py::ChargeSequence` /
+  `test_control/discharge_sequence.py::DischargeSequence`, both on
+  `BatteryOperationSequence`, wired into `run_main_test()`'s Charge/
+  Discharge Battery menu entries (previously "not yet implemented").
+- `DischargeSequence` applies the Discharge Cutoff Policy (Milestone III,
+  Section 30) from the start -- target/floor clamp, floor always wins.
+- Verified with mocked end-to-end smoke tests: happy path to EOC/EOD with
+  correct `run_summary` finalization, and a forced-overcurrent safety-abort
+  path confirming `SafetyViolationError` -> `safety.emergency_stop()` ->
+  `run_summary` finalized `SAFETY_VIOLATION`/`FAIL`.
+
+### Architectural decisions made
+
+- `BatteryOperationSequence` preserved unmodified as the target execution
+  architecture -- `ChargeSequence`/`DischargeSequence` are subclasses,
+  exactly mirroring `MonitorBatterySequence`, not a new/parallel workflow
+  shape.
+- Telemetry: DMM for voltage, the SMU's own `measure()` for current -- no
+  DAQ dependency introduced, per the documented DAQ Strategy (Section 31).
+- Legacy `ChargeCycle`/`DischargeCycle`/`BatteryTestSequence`/`TestExecutor`
+  left unchanged and in place -- not retired this milestone (Section 35
+  roadmap step 9, later).
+
+### Remaining work
+
+- NTC temperature still not wired into either sequence (`t_c = None`).
+- `BATTERY_CONFIGS` limits remain unconfirmed placeholders.
+- No physical rack validation with a real battery yet -- mocked hardware
+  only. This will be the project's first real current-sourcing/-sinking
+  test into an actual cell; treat as new, unvalidated territory.
+- `CycleSequence` (charge -> rest -> discharge composition) not yet
+  implemented.
+
+### Recommended next milestone (superseded -- see below)
+
+**Milestone V: Physical rack validation of ChargeSequence/DischargeSequence**
+-- validate a single real charge and discharge cycle on one relay-selected
+channel with a real battery (or electronic load), before scaling to all 8
+channels or implementing CycleSequence.
+
+---
+
+## Milestone V: Post-Implementation Validation Review
+
+**Status:** ACHIEVED
+
+**Scope:** thorough, adversarial validation and architecture review of
+Milestone IV's `ChargeSequence`/`DischargeSequence`, performed before
+adding any new functionality, per the explicit instruction not to assume
+the implementation was correct.
+
+### Findings
+
+Two real defects found and fixed (full detail: `docs/architecture.md`
+Section 37):
+
+1. Neither sequence opened the relay on successful EOC/EOD completion --
+   fixed.
+2. `DischargeSequence` configured the SMU's compliance `voltage_limit` at
+   the EOD cutoff instead of a ceiling bounding the real battery voltage
+   range -- confirmed against `nidcpower`'s real driver that this would
+   have put the SMU in voltage compliance for virtually the entire
+   discharge (default compliance mode is symmetric, +/-voltage_limit) --
+   fixed to use `battery_cfg["voltage_max_v"]`.
+
+One hardware/config-level risk surfaced, not silently fixed: Group A's
+assigned SMU (`PRIMARY_SMU`/PXIe-4141) may be physically incapable of the
+currents `BATTERY_CONFIGS` commands (confirmed via `nidcpower`'s own
+simulated model data -- 100 mA max vs. up to 1.05 A required for HUB
+discharge). This requires a real datasheet/wiring confirmation, not a code
+change, and is now the top blocker before real hardware use (see
+`docs/TODO.md`).
+
+Architecture review (Phase 1) found no duplication, no legacy
+(`TestExecutor`/`BatteryTestSequence`) coupling, no `hardware_for_group()`
+bypass, and no battery-type inference -- the implementation is
+architecturally sound; the two bugs were logic/hardware-semantics defects
+within an otherwise correct structure.
+
+### Recommended next milestone
+
+**Milestone VI: confirm PRIMARY_SMU's real current capability** against
+the actual installed PXIe-4141 datasheet, and reassign
+`BATTERY_GROUPS["A"]["smu"]` if insufficient, before attempting physical
+rack validation of `ChargeSequence`/`DischargeSequence`. Once resolved,
+proceed to Battery Group Assignment Architecture review (see
+`docs/architecture.md` Section 38).
+
+---
+
+## Milestone III (superseded numbering -- see above): Battery Charge/Discharge Workflows
+
+**Status:** STARTING (objectives below superseded by the reordered roadmap in
+`docs/architecture.md` Section 35 -- SMU Functional Validation now comes
+before Charge/Discharge Sequence implementation, not concurrently with it)
 
 **Scope:** Implement and validate the first real current-sourcing battery
 modes -- Charge Battery, Discharge Battery, and Cycle Battery -- reusing
