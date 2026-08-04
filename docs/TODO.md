@@ -273,7 +273,7 @@ the bottom, with a pointer to where the real documentation lives
   `readall` readback already IS a direct physical confirmation, unlike a
   PSU's `output_enabled` attribute).
 - [ ] Continue expanding `test.py::test_safety_monitor()`'s Part 2 workflow
-  walkthrough (see `docs/architecture.md` Section 23e, now the designated
+  walkthrough (see `docs/architecture.md` Section 23e, the designated
   development reference implementation for Charge/Discharge/Cycle Battery)
   into a full development/validation harness ahead of deploying against
   real hardware. Candidates: more injected-fault scenarios (overcurrent,
@@ -282,12 +282,19 @@ the bottom, with a pointer to where the real documentation lives
   for a full mock execution screen (natural pairing with the UI Test menu
   item). (Driving the walkthrough from `BATTERY_CONFIGS`' actual per-type
   limits is DONE -- see `docs/architecture.md` Section 28.)
-- [ ] When Charge/Discharge/Cycle Battery are actually implemented, map
-  each real code path back onto `test.py::_charge_phase_steps()`/
-  `_discharge_phase_steps()`/`_cycle_battery_walkthrough_steps()` and
-  confirm the simulator's step sequence still matches -- update the
-  simulator if the real implementation's sequence diverges, so it remains
-  an accurate reference rather than a stale blueprint.
+- [x] Map real Charge/Discharge code paths back onto `test.py::
+  _charge_phase_steps()`/`_discharge_phase_steps()`/
+  `_cycle_battery_walkthrough_steps()` and confirm the simulator's step
+  sequence still matches -- **DONE.** Found real drift (simulator still
+  derived setpoints from `battery_cfg` limits -- the exact bug already
+  fixed in the real sequences -- and still let the operator pick a
+  battery type directly, which no longer happens anywhere else). Fixed:
+  simulator now takes `test_setpoints`, and `_select_safety_simulation_group()`
+  replaces `_select_safety_simulation_battery()`, deriving battery type
+  from the selected group exactly like the real workflows. **This item
+  must be re-checked any time ChargeSequence/DischargeSequence/a future
+  CycleSequence changes** -- simulator drift is not acceptable going
+  forward, not just this once. See docs/architecture.md Section 41.
 - [ ] Create `flowcharts/vi_flowchart.md` (referenced in `docs/architecture.md`
   but does not exist yet).
 - [ ] Set up a remote Git repository and update `README.md` with the URL.
@@ -315,6 +322,35 @@ the bottom, with a pointer to where the real documentation lives
 Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
+
+- **Simulator & Reference-Blueprint Reconciliation + Pre-Hardware-Validation
+  Readiness** -- final software-focused milestone before Real Hardware
+  Validation. Found and fixed real drift: the Safety Monitor Simulator's
+  `_charge_phase_steps()`/`_discharge_phase_steps()` still derived commanded
+  setpoints from `battery_cfg` limits (the exact conflation bug already
+  fixed in the real `ChargeSequence`/`DischargeSequence`) and still let the
+  operator pick a battery type directly (`_select_safety_simulation_battery()`),
+  which no longer happens anywhere else in the codebase. Both fixed: the
+  step generators now take `test_setpoints`; a new
+  `_select_safety_simulation_group()` derives battery type from a selected
+  group, exactly mirroring the real workflows. Stale "not-yet-implemented"/
+  legacy-class docstrings corrected. A second, separately-discovered
+  instance of the same drift class was found and fixed in `test_ui_preview()`
+  (the "UI Test" menu still called Charge/Discharge "not yet implemented" --
+  new demo screens added for both, Cycle correctly remains unimplemented).
+  DAQ readiness review found and closed one real interface gap:
+  `ChargeSequence`/`DischargeSequence`'s constructors didn't accept a `daq`
+  parameter at all even though their own base class supports one -- added
+  as an unused, optional placeholder so a future DAQ integration only needs
+  to change the two telemetry lines inside each sequence's sampling loop,
+  not any constructor or caller. No DAQ dependency introduced. Architecture
+  consistency review confirmed Monitor/Monitor Scan/Charge/Discharge/
+  Simulator now agree on group/battery/setpoint ownership, validation flow,
+  traceability flow, and execution flow. **Software architecture judged
+  ready for the Real Hardware Validation milestone** -- remaining blockers
+  are all hardware-access tasks (SMU current-capability confirmation,
+  relay/DAQ channel confirmation, `BATTERY_CONFIGS` datasheet confirmation),
+  not software defects. See docs/architecture.md Section 41.
 
 - **Architectural correction: battery type is never operator input** --
   corrects the prior session's "declaration + cross-check" design (Section

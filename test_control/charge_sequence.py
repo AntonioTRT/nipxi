@@ -81,9 +81,15 @@ from utils.errors import NIPXITimeoutError, SafetyViolationError
 
 
 class ChargeSequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings):
+    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None):
+        # `daq` (optional, default None) -- accepted and stored now so a
+        # future DAQ integration (Section 31 "Telemetry Source Strategy",
+        # deliberately deferred) only needs to change the two telemetry
+        # lines inside run()'s sampling loop, not this constructor or any
+        # caller that doesn't pass one. Not read anywhere in this class
+        # today -- DMM + SMU.measure() remain the active telemetry source.
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
-                          source="charge_battery", dmm=dmm)
+                          source="charge_battery", dmm=dmm, daq=daq)
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
             test_setpoints: dict, token=None) -> bool:

@@ -71,9 +71,12 @@ from utils.errors import NIPXITimeoutError, SafetyViolationError
 
 
 class DischargeSequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings):
+    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None):
+        # `daq` (optional, default None) -- see charge_sequence.py::
+        # ChargeSequence.__init__()'s identical comment. Not read anywhere
+        # in this class today.
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
-                          source="discharge_battery", dmm=dmm)
+                          source="discharge_battery", dmm=dmm, daq=daq)
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
             test_setpoints: dict, token=None) -> bool:

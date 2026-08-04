@@ -347,10 +347,12 @@ def test_configuration():
 
     # DISCHARGE_CUTOFF_V is a discharge TARGET (cycle objective), not the
     # safety floor -- BAT_VOLTAGE_MIN is. It is expected and fine for the
-    # target to sit below the global floor; DischargeCycle.run() clamps the
-    # effective cutoff to max(target, floor) so the safety limit always
-    # wins regardless. See docs/architecture.md Section 30 "Discharge
-    # Cutoff Policy" -- this is informational, not a misconfiguration.
+    # target to sit below the global floor; DischargeSequence.run() (and,
+    # for group-based test_setpoints, the Safety Monitor Simulator's own
+    # _discharge_phase_steps()) clamps the effective cutoff to
+    # max(target, floor) so the safety limit always wins regardless. See
+    # docs/architecture.md Section 30 "Discharge Cutoff Policy" -- this is
+    # informational, not a misconfiguration.
     if Settings.DISCHARGE_CUTOFF_V < Settings.BAT_VOLTAGE_MIN:
         results.append(_ok("Configuration", "Discharge Cutoff", ref,
                            f"Target {Settings.DISCHARGE_CUTOFF_V} V < floor "
@@ -2212,14 +2214,23 @@ def test_sensors():
 # Monitor/Charge/Discharge/Cycle Battery (see docs/architecture.md "Safety
 # Monitor Workflow Simulator"). After the operator picks one workflow, it
 # steps through the OPERATIONAL SEQUENCE that workflow's real code executes
-# (or will execute, for Charge/Discharge/Cycle -- not yet implemented on
-# real hardware) -- not just the safety decisions, but every action in
-# order: load config, resolve group/position/relay routing, close relay,
-# configure/enable the PSU, acquire a measurement, run the REAL
-# SafetyMonitor check, update ExecutionFrame, store the measurement,
-# evaluate phase transitions, and so on. Future developers implementing
-# Charge/Discharge/Cycle Battery for real should be able to read this
-# module's step lists and map each entry directly onto production code.
+# (Monitor/Charge/Discharge are implemented in software today -- see
+# test_control/monitor_battery_sequence.py, test_control/charge_sequence.py,
+# test_control/discharge_sequence.py; Cycle Battery remains genuinely
+# unimplemented, this walkthrough is its forward-looking blueprint only)
+# -- not just the safety decisions, but every action in order: load config,
+# resolve group/position/relay routing, close relay, configure/enable the
+# PSU, acquire a measurement, run the REAL SafetyMonitor check, update
+# ExecutionFrame, store the measurement, evaluate phase transitions, and so
+# on. As with the real workflows, this simulator selects a battery GROUP,
+# never a battery type directly -- battery type and test setpoints are
+# derived from the selected group via config/devices.py::
+# group_test_config(), exactly mirroring test.py::_run_charge_or_discharge()
+# (see docs/architecture.md "Architectural Correction: Battery Type Is
+# Never Operator Input"). This walkthrough must stay reconciled with the
+# real Charge/Discharge implementations as they evolve -- simulator drift
+# from the real architecture is not acceptable (see docs/architecture.md
+# "Simulator & Reference-Blueprint Reconciliation").
 #
 # Every step pauses for the operator (Enter to continue) so the sequence
 # can be observed one action at a time. NOTHING here touches hardware, a
@@ -2386,29 +2397,36 @@ def _monitor_battery_walkthrough_steps():
     ]
 
 
-def _charge_phase_steps(cycle_number: int = None, battery_cfg: dict = None):
+def _charge_phase_steps(cycle_number: int = None, test_setpoints: dict = None):
     """
-    Simulated INTENDED operational sequence for the not-yet-implemented
-    Charge Battery workflow (relay close -> configure/enable PSU -> CC
-    charge -> CV taper -> cutoff -> PSU disable -> relay open).
+    Simulated operational sequence mirroring the real, implemented Charge
+    Battery workflow (relay close -> configure/enable PSU -> CC charge ->
+    CV taper -> cutoff -> PSU disable -> relay open) -- see
+    test_control/charge_sequence.py::ChargeSequence.run().
 
-    `battery_cfg` (a config/devices.py BATTERY_CONFIGS[...] entry), if
-    given, drives the commanded/simulated voltage and current values
-    (max_charge_current_a/voltage_max_v) -- matching what
-    ChargeCycle.run(battery_cfg=...) now actually commands. battery_cfg=
-    None falls back to the global Settings.CHARGE_VOLTAGE_V/
-    CHARGE_CURRENT_A constants, unchanged from prior behavior. The
-    CV-taper cutoff current (CHARGE_CUTOFF_A) has no BATTERY_CONFIGS
-    equivalent and stays a global Settings constant -- see
-    charge_cycle.py::ChargeCycle.run(). `cycle_number`, if given, prefixes
-    each description (for reuse inside the Cycle Battery walkthrough
-    below).
+    `test_setpoints` (a config/devices.py BATTERY_GROUPS[group]
+    ["test_setpoints"] entry, resolved from the selected group via
+    group_test_config() -- NOT a BATTERY_CONFIGS entry), if given, drives
+    the commanded/simulated voltage and current values
+    (charge_current_a/charge_voltage_v) -- matching what
+    ChargeSequence.run() actually commands. This mirrors the real
+    distinction: BATTERY_CONFIGS is a safety limit, never a commanded
+    setpoint (see docs/architecture.md "Battery Group Test Configuration
+    Architecture") -- this function no longer reads battery_cfg at all,
+    exactly like the real ChargeSequence. test_setpoints=None falls back
+    to the global Settings.CHARGE_VOLTAGE_V/CHARGE_CURRENT_A constants,
+    unchanged fallback behavior. The CV-taper cutoff current
+    (CHARGE_CUTOFF_A) has no per-group equivalent and stays a global
+    Settings constant -- matching ChargeSequence.run() exactly (a
+    deliberate scope boundary, not an oversight). `cycle_number`, if
+    given, prefixes each description (for reuse inside the Cycle Battery
+    walkthrough below).
     """
     prefix = f"[Cycle {cycle_number}] " if cycle_number else ""
     dev_note = ("Development-only simulation -- NOT written to measurements/"
                 "event_log/run_summary/station_state.")
-    charge_v = battery_cfg["voltage_max_v"] if battery_cfg else Settings.CHARGE_VOLTAGE_V
-    charge_i = battery_cfg["max_charge_current_a"] if battery_cfg else Settings.CHARGE_CURRENT_A
+    charge_v = test_setpoints["charge_voltage_v"] if test_setpoints else Settings.CHARGE_VOLTAGE_V
+    charge_i = test_setpoints["charge_current_a"] if test_setpoints else Settings.CHARGE_CURRENT_A
     return [
         {"phase": "INIT", "description": prefix + "Load battery configuration",
          "next_action": "Resolve relay routing"},
@@ -2457,25 +2475,26 @@ def _charge_phase_steps(cycle_number: int = None, battery_cfg: dict = None):
     ]
 
 
-def _discharge_phase_steps(cycle_number: int = None, inject_fault: bool = False, battery_cfg: dict = None):
+def _discharge_phase_steps(cycle_number: int = None, inject_fault: bool = False,
+                            battery_cfg: dict = None, test_setpoints: dict = None):
     """
-    Simulated INTENDED operational sequence for the not-yet-implemented
+    Simulated operational sequence mirroring the real, implemented
     Discharge Battery workflow (relay close -> configure/enable PSU sink
-    -> CC discharge -> cutoff -> PSU disable -> relay open).
+    -> CC discharge -> cutoff -> PSU disable -> relay open) -- see
+    test_control/discharge_sequence.py::DischargeSequence.run().
 
-    `battery_cfg` (a config/devices.py BATTERY_CONFIGS[...] entry), if
-    given, drives the commanded/simulated discharge current
-    (max_discharge_current_a) and cutoff voltage (voltage_min_v) --
-    matching what DischargeCycle.run(battery_cfg=...) now actually
-    commands. battery_cfg=None falls back to the global
-    Settings.DISCHARGE_CURRENT_A and the same target-vs-floor clamp
-    DischargeCycle.run() itself applies: cutoff_v = max(DISCHARGE_CUTOFF_V,
-    BAT_VOLTAGE_MIN) -- no arbitrary margin. DISCHARGE_CUTOFF_V (a cycle
-    objective/target) sitting below BAT_VOLTAGE_MIN (the safety floor) is
-    expected, documented behavior, not a misconfiguration to work around --
-    see docs/architecture.md Section 30 "Discharge Cutoff Policy". The
-    floor always wins; this simulator mirrors that exactly so it stays an
-    accurate reference for the real implementation.
+    `test_setpoints` (a BATTERY_GROUPS[group]["test_setpoints"] entry)
+    supplies the commanded discharge current and the discharge TARGET
+    (`discharge_cutoff_v` -- a cycle objective, not the safety floor).
+    `battery_cfg` (a BATTERY_CONFIGS[...] entry) supplies only the safety
+    FLOOR (`voltage_min_v`) and `max_temp_c` -- exactly the same division
+    of responsibility DischargeSequence.run() itself uses (battery_cfg
+    is never read for a commanded setpoint). The effective cutoff is
+    clamped `max(target, floor)` -- the floor always wins, identical to
+    DischargeSequence.run() -- see docs/architecture.md "Discharge Cutoff
+    Policy". Both arguments default to the global Settings.
+    DISCHARGE_CURRENT_A/DISCHARGE_CUTOFF_V/BAT_VOLTAGE_MIN/BAT_TEMP_MAX_C
+    constants when not given, unchanged fallback behavior.
 
     `inject_fault=True` deliberately raises the mid-discharge simulated
     temperature above the active max_temp_c, so the walkthrough aborts at
@@ -2486,13 +2505,11 @@ def _discharge_phase_steps(cycle_number: int = None, inject_fault: bool = False,
     prefix = f"[Cycle {cycle_number}] " if cycle_number else ""
     dev_note = ("Development-only simulation -- NOT written to measurements/"
                 "event_log/run_summary/station_state.")
-    discharge_i = battery_cfg["max_discharge_current_a"] if battery_cfg else Settings.DISCHARGE_CURRENT_A
-    if battery_cfg:
-        cutoff_v = battery_cfg["voltage_min_v"]
-        temp_max = battery_cfg["max_temp_c"]
-    else:
-        cutoff_v = max(Settings.DISCHARGE_CUTOFF_V, Settings.BAT_VOLTAGE_MIN)
-        temp_max = Settings.BAT_TEMP_MAX_C
+    discharge_i = test_setpoints["discharge_current_a"] if test_setpoints else Settings.DISCHARGE_CURRENT_A
+    target_v = test_setpoints["discharge_cutoff_v"] if test_setpoints else Settings.DISCHARGE_CUTOFF_V
+    floor_v = battery_cfg["voltage_min_v"] if battery_cfg else Settings.BAT_VOLTAGE_MIN
+    cutoff_v = max(target_v, floor_v)  # the floor always wins -- see docstring above
+    temp_max = battery_cfg["max_temp_c"] if battery_cfg else Settings.BAT_TEMP_MAX_C
     mid_temp = (temp_max + 5.0) if inject_fault else 27.0
     return [
         {"phase": "INIT", "description": prefix + "Resolve relay routing (discharge)",
@@ -2534,18 +2551,28 @@ def _discharge_phase_steps(cycle_number: int = None, inject_fault: bool = False,
     ]
 
 
-def _cycle_battery_walkthrough_steps(battery_cfg: dict = None):
-    """One full charge phase, a transition, then a discharge phase that
+def _cycle_battery_walkthrough_steps(battery_cfg: dict = None, test_setpoints: dict = None):
+    """
+    One full charge phase, a transition, then a discharge phase that
     deliberately injects an overtemperature fault -- demonstrates the
     complete Cycle Battery shape (charge -> transition -> discharge ->
     completion) AND the fault/abort path a real implementation must also
-    take, in one continuous walkthrough. `battery_cfg` is forwarded to
-    both phases -- see _charge_phase_steps()/_discharge_phase_steps()."""
-    steps = _charge_phase_steps(cycle_number=1, battery_cfg=battery_cfg)
+    take, in one continuous walkthrough. `battery_cfg`/`test_setpoints`
+    are forwarded to both phases -- see _charge_phase_steps()/
+    _discharge_phase_steps().
+
+    Unlike Monitor/Charge/Discharge, CycleSequence itself does not exist
+    yet (see docs/TODO.md) -- this walkthrough remains a genuine
+    forward-looking blueprint for it, not a mirror of real code, though
+    it is built from the same reconciled charge/discharge step generators
+    the real ChargeSequence/DischargeSequence are mirrored by.
+    """
+    steps = _charge_phase_steps(cycle_number=1, test_setpoints=test_setpoints)
     steps.append({"phase": "TRANSITION",
                   "description": "Transition from charge to discharge (cycle_count += 1)",
                   "next_action": "Begin discharge phase"})
-    steps.extend(_discharge_phase_steps(cycle_number=1, inject_fault=True, battery_cfg=battery_cfg))
+    steps.extend(_discharge_phase_steps(cycle_number=1, inject_fault=True,
+                                         battery_cfg=battery_cfg, test_setpoints=test_setpoints))
     return steps
 
 
@@ -2569,26 +2596,39 @@ def _select_safety_simulation_workflow():
     return {"1": "monitor", "2": "charge", "3": "discharge", "4": "cycle"}.get(raw)
 
 
-def _select_safety_simulation_battery():
+def _select_safety_simulation_group():
     """
-    Battery-type selection menu for the Safety Monitor Simulator -- lists
-    every config/devices.py BATTERY_CONFIGS entry (HUB/SB) with its
-    capacity/max-charge/max-discharge current, so the operator can see
-    which limits the walkthrough will enforce. Returns the selected
-    battery-type name (a BATTERY_CONFIGS key), or None if the operator
-    cancels/skips (falls back to global Settings.BAT_* limits, unchanged
-    prior behavior).
+    Group-selection menu for the Safety Monitor Simulator -- mirrors the
+    real workflows exactly: the operator selects a battery GROUP, never a
+    battery type directly (see docs/architecture.md "Architectural
+    Correction: Battery Type Is Never Operator Input"). Only lists groups
+    that have both a declared battery_type and test_setpoints configured
+    (config/devices.py::group_test_config()) -- i.e. groups that could
+    actually run a real Charge/Discharge workflow today -- so this
+    simulator can never simulate a configuration that couldn't exist in
+    practice. Returns the selected group name, or None if the operator
+    cancels/skips (falls back to global Settings.BAT_*/CHARGE_*/
+    DISCHARGE_* constants, unchanged fallback behavior).
     """
-    names = list(dev_cfg.BATTERY_CONFIGS.keys())
-    print("\nSelect battery type for this simulation:")
-    for i, name in enumerate(names, 1):
-        cfg = dev_cfg.BATTERY_CONFIGS[name]
-        print(f"[{i}] {name}  (capacity={cfg['capacity_ah']:.2f} Ah, "
-              f"max_charge={cfg['max_charge_current_a']:.3f} A, "
-              f"max_discharge={cfg['max_discharge_current_a']:.3f} A)")
-    print("[0] Skip -- use global Settings.BAT_* limits")
+    candidates = [
+        name for name in dev_cfg.BATTERY_GROUPS
+        if dev_cfg.group_test_config(name)["battery_type"] is not None
+        and dev_cfg.group_test_config(name)["test_setpoints"] is not None
+    ]
+    print("\nSelect a battery group for this simulation (battery type and "
+          "test setpoints are derived from the group, exactly as the real "
+          "workflows do):")
+    for i, name in enumerate(candidates, 1):
+        cfg = dev_cfg.group_test_config(name)
+        battery_cfg = dev_cfg.BATTERY_CONFIGS[cfg["battery_type"]]
+        sp = cfg["test_setpoints"]
+        print(f"[{i}] Group {name}  (battery={cfg['battery_type']}, "
+              f"capacity={battery_cfg['capacity_ah']:.2f} Ah, "
+              f"charge={sp['charge_current_a']:.3f} A, "
+              f"discharge={sp['discharge_current_a']:.3f} A)")
+    print("[0] Skip -- use global Settings.BAT_*/CHARGE_*/DISCHARGE_* constants")
     try:
-        raw = input("\nSelect battery type: ").strip()
+        raw = input("\nSelect group: ").strip()
     except (KeyboardInterrupt, EOFError):
         print()
         return None
@@ -2596,35 +2636,40 @@ def _select_safety_simulation_battery():
         return None
     try:
         idx = int(raw) - 1
-        if 0 <= idx < len(names):
-            return names[idx]
+        if 0 <= idx < len(candidates):
+            return candidates[idx]
     except ValueError:
         pass
     return None
 
 
-def _run_selected_workflow_walkthrough(monitor, choice: str, battery_cfg: dict = None):
+def _run_selected_workflow_walkthrough(monitor, choice: str, battery_cfg: dict = None,
+                                        test_setpoints: dict = None):
     """Dispatch one selected workflow to _run_workflow_walkthrough() with
     its step list. Returns a single TestResult, or None if `choice` is
     invalid (already validated by _select_safety_simulation_workflow()).
-    `battery_cfg`, if given, is forwarded into the step generators so
-    displayed/enforced limits come from the selected battery configuration
-    instead of global Settings.BAT_*/CHARGE_*/DISCHARGE_* constants."""
+    `battery_cfg`/`test_setpoints`, if given (both derived from the same
+    selected group -- see _select_safety_simulation_group()), are forwarded
+    into the step generators so displayed/enforced values mirror the real
+    workflows instead of falling back to global Settings.BAT_*/CHARGE_*/
+    DISCHARGE_* constants."""
     if choice == "monitor":
         return _run_workflow_walkthrough(monitor, "Monitor Battery",
                                          _monitor_battery_walkthrough_steps())
     if choice == "charge":
         return _run_workflow_walkthrough(
-            monitor, "Charge Battery (simulated -- blueprint for future implementation)",
-            _charge_phase_steps(battery_cfg=battery_cfg))
+            monitor, "Charge Battery (simulated -- mirrors the real ChargeSequence)",
+            _charge_phase_steps(test_setpoints=test_setpoints))
     if choice == "discharge":
         return _run_workflow_walkthrough(
-            monitor, "Discharge Battery (simulated -- blueprint for future implementation)",
-            _discharge_phase_steps(battery_cfg=battery_cfg))
+            monitor, "Discharge Battery (simulated -- mirrors the real DischargeSequence)",
+            _discharge_phase_steps(battery_cfg=battery_cfg, test_setpoints=test_setpoints))
     if choice == "cycle":
         return _run_workflow_walkthrough(
-            monitor, "Cycle Battery (simulated -- injected overtemperature fault)",
-            _cycle_battery_walkthrough_steps(battery_cfg=battery_cfg), expect_abort=True)
+            monitor, "Cycle Battery (simulated -- blueprint for the not-yet-implemented "
+                     "CycleSequence, injected overtemperature fault)",
+            _cycle_battery_walkthrough_steps(battery_cfg=battery_cfg, test_setpoints=test_setpoints),
+            expect_abort=True)
     return None
 
 
@@ -2718,10 +2763,16 @@ def test_safety_monitor():
     # the selection menu (choice is None).
     choice = _select_safety_simulation_workflow()
     if choice is not None:
-        battery_type = _select_safety_simulation_battery()
-        battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type] if battery_type else None
+        group = _select_safety_simulation_group()
+        if group is not None:
+            cfg = dev_cfg.group_test_config(group)
+            battery_cfg = dev_cfg.BATTERY_CONFIGS[cfg["battery_type"]]
+            test_setpoints = cfg["test_setpoints"]
+        else:
+            battery_cfg = None
+            test_setpoints = None
         monitor.set_battery_limits(battery_cfg)
-        result = _run_selected_workflow_walkthrough(monitor, choice, battery_cfg)
+        result = _run_selected_workflow_walkthrough(monitor, choice, battery_cfg, test_setpoints)
         if result is not None:
             results.append(result)
 
@@ -3244,23 +3295,62 @@ def _demo_monitor_battery_frame():
     )
 
 
+def _demo_charge_battery_frame():
+    from test_control.execution_screen import ExecutionFrame
+    return ExecutionFrame.from_live(
+        run_number=12, run_id="DEMO-0012", test_type="charge",
+        channel=1, relay=1, state="ACTIVE", phase_detail="CC_CV",
+        smu_voltage=4.150000, smu_current=0.050000, dmm_voltage=4.150000,
+        battery_voltage=4.150000, battery_current=0.050000, battery_temp=None,
+        recent_measurements=[
+            {"channel": 1, "relay": 1, "smu_measured_v": 3.900000, "dmm_measured_v": 3.900000},
+            {"channel": 1, "relay": 1, "smu_measured_v": 4.150000, "dmm_measured_v": 4.150000},
+        ],
+        recent_events=[
+            {"timestamp": "2026-01-01T13:00:00", "message": "Relay 1 activated -- charging started (0.050 A / 4.200 V CV target)"},
+        ],
+    )
+
+
+def _demo_discharge_battery_frame():
+    from test_control.execution_screen import ExecutionFrame
+    return ExecutionFrame.from_live(
+        run_number=13, run_id="DEMO-0013", test_type="discharge",
+        channel=1, relay=1, state="ACTIVE", phase_detail="CC_DISCHARGE",
+        smu_voltage=3.500000, smu_current=-0.080000, dmm_voltage=3.500000,
+        battery_voltage=3.500000, battery_current=-0.080000, battery_temp=None,
+        recent_measurements=[
+            {"channel": 1, "relay": 1, "smu_measured_v": 3.800000, "dmm_measured_v": 3.800000},
+            {"channel": 1, "relay": 1, "smu_measured_v": 3.500000, "dmm_measured_v": 3.500000},
+        ],
+        recent_events=[
+            {"timestamp": "2026-01-01T14:00:00", "message": "Relay 1 activated -- discharging started (0.080 A sink, 4.200 V SMU compliance, 3.000 V EOD cutoff)"},
+        ],
+    )
+
+
 def test_ui_preview():
     """
     UI Test -- a safe UI development/review environment. Every option
     below constructs a demo ExecutionFrame (hardcoded sample data, no
     hardware, no database) and renders it through the real
     render_execution_frame() -- the identical renderer Proto Test
-    Execution/Monitor Battery use live. Charge/Discharge/Cycle Battery and
-    a Historical Results Viewer are reported honestly as "not yet
-    implemented" rather than faking a screen for a workflow/viewer that
-    doesn't exist yet.
+    Execution/Monitor Battery/Charge/Discharge Battery use live. Cycle
+    Battery and a Historical Results Viewer are reported honestly as "not
+    yet implemented" rather than faking a screen for a workflow/viewer
+    that doesn't exist yet -- Charge/Discharge Battery graduated out of
+    that bucket once ChargeSequence/DischargeSequence were implemented
+    (previously this menu lumped all three together as unimplemented,
+    which had gone stale).
     """
     from test_control.execution_screen import render_execution_frame
 
     options = [
         ("Proto Test Execution screen (demo data)",   _demo_proto_test_frame),
         ("Monitor Battery screen (demo data)",         _demo_monitor_battery_frame),
-        ("Charge/Discharge/Cycle Battery screens",     None),
+        ("Charge Battery screen (demo data)",          _demo_charge_battery_frame),
+        ("Discharge Battery screen (demo data)",       _demo_discharge_battery_frame),
+        ("Cycle Battery screen",                       None),
         ("Historical Results Viewer style screens",    None),
     ]
     print("\nUI Test -- static/demo data only. No hardware, no database writes.\n")
@@ -3990,9 +4080,13 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
 
         try:
             safety = SafetyMonitor(Settings)
+            # daq=hw_mgr.daq passed through even though ChargeSequence/
+            # DischargeSequence don't read it yet -- see their constructors'
+            # comments. Keeps the handle available for a future DAQ
+            # integration without requiring test.py to change again.
             sequence = sequence_cls(
-                smu=hw_mgr.smu, dmm=hw_mgr.dmm, relay=hw_mgr.relay, safety=safety,
-                storage=storage, settings=Settings,
+                smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.daq, relay=hw_mgr.relay,
+                safety=safety, storage=storage, settings=Settings,
             )
             try:
                 sequence.run(

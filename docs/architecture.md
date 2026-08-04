@@ -2170,3 +2170,68 @@ The previous design still asked the operator "which battery?" -- just with a saf
 ### Verification
 
 Direct calls confirm `validate_group_test_config('A')` returns `{"battery_type": "SB", "test_setpoints": {...}}` with no parameter beyond `group`; Group B/an unknown group both still raise `GroupConfigurationError` at the same point as before. Scripted smoke tests (mocked `input()`, declining the confirmation screen before any hardware touch) confirm all three real workflows -- Monitor Battery, Monitor Battery Scan, Charge Battery -- now prompt for Group and Position only, never battery type, and the confirmation screen correctly displays the group-derived battery type and (for Charge/Discharge) the commanded setpoints. `py_compile` clean; no remaining reference to `_select_battery_type` anywhere in `test.py`.
+
+---
+
+## 41. Simulator & Reference-Blueprint Reconciliation + Pre-Hardware-Validation Readiness
+
+Performed immediately before the Real Hardware Validation milestone, on the explicit finding that the Safety Monitor Simulator had drifted from the real implementation across the last several sessions of real architecture work. "Simulator drift from the real architecture is not acceptable" -- this section both fixes the drift found and establishes that this class of check must happen before hardware validation, not be discovered during it.
+
+### Drift found and corrected
+
+**1. Setpoint source.** `test.py::_charge_phase_steps()`/`_discharge_phase_steps()` derived their simulated commanded voltage/current from `battery_cfg["voltage_max_v"]`/`max_charge_current_a`/`max_discharge_current_a` -- **the exact limit-as-setpoint conflation bug that was found and fixed in the real `ChargeSequence`/`DischargeSequence` two sessions ago** (Section 37 Bug context). The simulator had continued modeling the *pre-fix* behavior the whole time, since nothing had gone back to reconcile it. Fixed: both functions now take `test_setpoints` (a `BATTERY_GROUPS[group]["test_setpoints"]` entry) for the commanded value; `battery_cfg` is used only where the real sequences use it -- the discharge safety floor and `max_temp_c` in `_discharge_phase_steps()`, nowhere at all in `_charge_phase_steps()` (which no longer takes `battery_cfg` as a parameter, matching `ChargeSequence.run()` exactly).
+
+**2. Battery-type selection model.** `_select_safety_simulation_battery()` let the operator pick a battery type directly from `BATTERY_CONFIGS` -- but no real workflow does this anymore (Section 40). Replaced with `_select_safety_simulation_group()`, which lists only groups that have both `battery_type` and `test_setpoints` configured (i.e. groups that could actually run a real workflow today) and derives both via `group_test_config()`, exactly mirroring `test.py::_run_charge_or_discharge()`. Group A/SB is the only real candidate today -- by design, the simulator can no longer simulate a configuration that couldn't exist in practice.
+
+**3. Stale status claims.** `_charge_phase_steps()`/`_discharge_phase_steps()`'s docstrings said *"Simulated INTENDED operational sequence for the **not-yet-implemented** ... workflow"* and referenced legacy `ChargeCycle.run(battery_cfg=...)`/`DischargeCycle.run(battery_cfg=...)` -- both wrong (Charge/Discharge are implemented, and the real classes are `ChargeSequence`/`DischargeSequence`). Corrected to describe the real, current implementation. The module-level comment introducing the simulator was corrected the same way (Monitor/Charge/Discharge implemented in software; only Cycle Battery remains a genuine forward-looking blueprint).
+
+**4. A second, separately-discovered instance of the same drift class:** `test.py::test_ui_preview()` (the "UI Test" menu) still lumped "Charge/Discharge/Cycle Battery screens" together as a single "not yet implemented" option. Charge and Discharge have been implemented for two sessions. Added `_demo_charge_battery_frame()`/`_demo_discharge_battery_frame()` (mirroring `_demo_monitor_battery_frame()`'s existing pattern -- real `ExecutionFrame`s with static demo data, rendered through the real `render_execution_frame()`, no hardware/database) and split the menu into separate Charge/Discharge (now implemented) and Cycle (still correctly "not yet implemented," since `CycleSequence` genuinely doesn't exist) entries.
+
+**5. A stale inline comment**, unrelated to the simulator: `test.py::test_configuration()`'s cross-check comment referenced only legacy `DischargeCycle.run()` for the target/floor clamp; corrected to also name `DischargeSequence.run()` (the real implementation) and the simulator's own now-reconciled `_discharge_phase_steps()`.
+
+### Verification
+
+Scripted smoke tests (mocked `input()`, clicking through every step) confirm: Charge Battery walkthrough for Group A displays `Configure PSU limits (V=4.20 V, I_limit=0.050 A)` -- Group A's real `test_setpoints`, not SB's `max_charge_current_a` (0.08 A); Discharge Battery walkthrough displays `I_discharge=0.080 A sink` -- Group A's real discharge setpoint; Cycle Battery walkthrough correctly aborts at the injected overtemperature fault (`50.0 C > 45.0 C`, SB's real `max_temp_c`); the "Skip" fallback still exercises the global `Settings.CHARGE_VOLTAGE_V`/`CHARGE_CURRENT_A` constants unchanged. UI Test's new Charge/Discharge demo screens render correctly via the real `render_execution_frame()`. `py_compile` clean; no remaining reference to `_select_safety_simulation_battery`, `ChargeCycle.run(battery_cfg`, or `DischargeCycle.run(battery_cfg` anywhere in the codebase.
+
+### Architecture consistency review (Phase 2) -- findings
+
+Monitor Battery, Monitor Battery Scan, `ChargeSequence`, `DischargeSequence`, and the (now-reconciled) Simulator all agree on: **group ownership** (group is the only real selection, everywhere); **battery ownership** (derived from the group via `group_test_config()`, everywhere); **setpoint ownership** (`test_setpoints` for commanded values, `BATTERY_CONFIGS` for limits only, everywhere setpoints exist at all -- Monitor/Monitor Scan have none, correctly). Two intentional, documented asymmetries, not inconsistencies: the Simulator does not run the three-stage `validate_group_test_config()` pipeline (it never touches hardware, so hardware-capability validation is moot, and its candidate list is already filtered to configured groups) and does not write any traceability record (by design, stated in its own module comment since Milestone II). **Execution flow order** was already correct before this session (the simulator's step *sequence* matched the real code's operation order); only the *values* flowing through that sequence were wrong.
+
+### Pre-hardware-validation review (Phase 3) -- other findings
+
+No further stale assumptions, incorrect defaults, invalid configuration flows, traceability gaps, or validation gaps were found beyond the drift already documented above. `docs/TODO.md`'s remaining `[MUST]` items before real hardware use (SMU current-capability confirmation for HUB, relay/DAQ channel number confirmation, `BATTERY_CONFIGS` datasheet confirmation, physical rack validation itself) are all inherently hardware-access tasks, not software defects -- correctly out of this session's scope.
+
+### DAQ readiness review (Phase 4)
+
+1. **Can DAQ be integrated later without major refactoring? Yes.** Telemetry acquisition in both `ChargeSequence.run()` and `DischargeSequence.run()` is two lines per sampling iteration (`smu_reading = self.smu.measure()`; `dmm_v = self.dmm.measure_dc_voltage()`) -- swapping to `daq.read_all_batteries()` touches only those lines, not the surrounding control flow, safety checks, traceability, or shutdown logic.
+2. **Are Monitor/Charge/Discharge prepared? Yes, with one gap closed this session.** `MonitorBatterySequence` already accepts no `daq` at all (DAQ was never in its constructor -- a pre-existing, separately-tracked gap, unrelated to this fix). `ChargeSequence`/`DischargeSequence`'s constructors did **not** accept a `daq` parameter at all, even though `BatteryOperationSequence` (their own base class) already supports one. Fixed: both constructors now take an optional `daq=None`, forwarded to the base class; `test.py::_run_charge_or_discharge()` now passes `daq=hw_mgr.daq` through (harmless -- neither class reads it yet). This is the minimal correction the task asked for: an interface placeholder, not a DAQ dependency.
+3. **Architectural blockers? None found.** The `measurements` table and `ExecutionFrame` already have DAQ-shaped columns/fields (`daq_channel_0_raw`) from earlier work, unused by Charge/Discharge today but already present in the schema.
+4. **Other placeholders adjusted?** Only the constructor fix above. Nothing else needed adjustment -- deliberately not touching `hardware/daq.py`'s stubs, not adding any DAQ call, per the explicit instruction not to introduce a DAQ dependency this session.
+
+### Technical debt classification (Phase 5)
+
+| Item | Classification |
+|---|---|
+| Simulator drift (setpoints, battery-type model, stale status claims) | **Must Fix Before Hardware Validation -- DONE this session** |
+| UI Test's stale "Charge/Discharge/Cycle not implemented" claim | **Must Fix Before Hardware Validation -- DONE this session** |
+| `ChargeSequence`/`DischargeSequence` missing `daq` constructor parameter | **Must Fix Before Hardware Validation -- DONE this session** (minimal placeholder only) |
+| Relay/DAQ channel number confirmation, `BATTERY_CONFIGS` datasheet confirmation, PRIMARY_SMU-vs-HUB reassignment | **Must Fix Before Hardware Validation** -- but inherently requires physical access, not a software task; cannot be closed in this session |
+| Physical rack validation of `ChargeSequence`/`DischargeSequence` itself | **Is** the next milestone, not debt |
+| `CycleSequence` implementation | **Can Wait Until After Hardware Validation** -- explicitly deferred this session; low complexity but should follow a proven hardware result, not precede it |
+| `ProtoTestSequence` migration onto `BatteryOperationSequence` | **Can Wait Until After Hardware Validation** -- already correctly triaged low-priority, unchanged |
+| Legacy `ChargeCycle`/`DischargeCycle`/`BatteryTestSequence`/`TestExecutor` retirement | **Can Wait Until After Hardware Validation** -- retire only once the new sequences are hardware-proven |
+| `hardware/simulated.py` wiring into `HardwareManager` | **Can Wait Until Production Runtime** |
+| DAQ integration, NTC integration | **Can Wait Until Production Runtime** (or later) -- explicit, standing decisions, unaffected by this session |
+| `main.py` replacement / continuous runtime | **Can Wait Until Production Runtime** -- explicitly out of scope |
+
+### Milestone readiness decision (Phase 7)
+
+**The software architecture is ready to leave the implementation phase and enter the Real Hardware Validation milestone.** Reasoning: every workflow (`Monitor`, `Monitor Scan`, `Charge`, `Discharge`) and the development reference blueprint (the Simulator) now agree on group ownership, battery ownership, setpoint ownership, validation flow, traceability flow, and execution flow -- verified by direct testing this session, not assumed. The two real defects found in the last review (relay-not-opened-on-success, discharge compliance-voltage) were already fixed and verified before this session began; this session found and fixed the simulator/UI-preview drift and closed the one missing DAQ-readiness interface gap. No further software-only blocker was found.
+
+**Blockers remaining (all hardware-access tasks, not software defects):**
+- Confirm `PRIMARY_SMU`'s real current rating against the physical PXIe-4141's datasheet (Group A is currently declared for SB specifically because of this).
+- Confirm relay channel numbers and DAQ channel aliases against real NI-MAX wiring.
+- Confirm `BATTERY_CONFIGS`' HUB/SB voltage/current/temperature limits against the real BLOSS Hub/SB datasheet (currently `# unconfirmed placeholder`).
+- The physical rack validation run itself.
+
+**Recommendations:** validate `ChargeSequence`/`DischargeSequence` against Group A + a real SB battery first (the only fully-validated software configuration today); do not attempt HUB until a group is reassigned to a higher-current SMU; do not start `CycleSequence` until at least one real charge and one real discharge have completed successfully on real hardware.

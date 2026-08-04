@@ -1147,6 +1147,82 @@ against Group A + a real SB battery.
 
 ---
 
+## Milestone VIII: Simulator & Reference-Blueprint Reconciliation + Pre-Hardware-Validation Readiness
+
+**Status:** ACHIEVED
+
+**Scope:** the final software-focused milestone before Real Hardware
+Validation. Reconciled the Safety Monitor Simulator with the real,
+current implementation, swept the rest of `test.py` for the same class of
+drift, reviewed DAQ readiness without introducing a DAQ dependency, and
+made a formal go/no-go decision on entering hardware validation.
+
+### Objectives achieved
+
+- **Simulator setpoint-source drift fixed.** `_charge_phase_steps()`/
+  `_discharge_phase_steps()` had continued deriving simulated commanded
+  values from `battery_cfg` limits -- the exact conflation bug already
+  found and fixed in the real `ChargeSequence`/`DischargeSequence` two
+  milestones ago. The simulator had never been updated to reflect that
+  fix. Now takes `test_setpoints` instead, matching the real sequences
+  exactly.
+- **Simulator battery-type-selection drift fixed.** `_select_safety_simulation_battery()`
+  (direct battery-type picker) replaced with `_select_safety_simulation_group()`
+  (group picker, battery type derived from it) -- the operator-input model
+  no real workflow uses anymore.
+- **Stale status claims corrected** -- "not-yet-implemented" language and
+  legacy `ChargeCycle`/`DischargeCycle` references removed from simulator
+  docstrings and the module-level comment introducing it.
+- **A second instance of the same drift class found and fixed**, outside
+  the simulator: `test_ui_preview()`'s "UI Test" menu still called
+  Charge/Discharge Battery "not yet implemented." New demo screens added
+  for both (mirroring the existing Monitor Battery demo-screen pattern);
+  Cycle Battery correctly remains "not yet implemented" (it genuinely is).
+- **DAQ readiness gap closed, without a DAQ dependency.** `ChargeSequence`/
+  `DischargeSequence`'s constructors didn't accept a `daq` handle at all,
+  even though their own base class (`BatteryOperationSequence`) already
+  supports one. Added as an unused, optional parameter -- a future DAQ
+  integration will only need to change two telemetry lines per sequence,
+  not any constructor or caller.
+- **Architecture consistency review** confirmed Monitor Battery, Monitor
+  Battery Scan, `ChargeSequence`, `DischargeSequence`, and the now-
+  reconciled Simulator all agree on group ownership, battery ownership,
+  setpoint ownership, validation flow, traceability flow, and execution
+  flow.
+
+### Verification
+
+Scripted smoke tests (mocked `input()`) confirm the Charge/Discharge/Cycle
+Battery walkthroughs now display Group A's real `test_setpoints` (not
+SB's `BATTERY_CONFIGS` limits), the Cycle walkthrough still correctly
+aborts at its injected overtemperature fault, and the "Skip" fallback
+still exercises the global `Settings.*` constants unchanged. UI Test's new
+Charge/Discharge demo screens render via the real `render_execution_frame()`.
+Full four-workflow regression (Monitor/Monitor Scan/Charge/Discharge,
+declining before hardware touch) re-run clean after the `daq=` constructor
+change. `py_compile` clean; no remaining reference to
+`_select_safety_simulation_battery`, `ChargeCycle.run(battery_cfg`, or
+`DischargeCycle.run(battery_cfg` anywhere in the codebase.
+
+### Milestone readiness decision
+
+**GO.** The software architecture is judged ready to leave the
+implementation phase and enter Real Hardware Validation. No further
+software-only blocker was found. Remaining blockers are all hardware-
+access tasks: confirm `PRIMARY_SMU`'s real current rating, confirm relay/
+DAQ channel numbers against real wiring, confirm `BATTERY_CONFIGS` against
+the real datasheet, then run the physical validation itself.
+
+### Recommended next milestone
+
+**Milestone IX: Real Hardware Validation** -- validate `ChargeSequence`/
+`DischargeSequence` against Group A + a real SB battery (the only fully
+software-validated configuration today) on one relay-selected channel,
+before scaling to more channels, attempting HUB, or starting
+`CycleSequence`.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the
