@@ -158,6 +158,17 @@ class MonitorBatterySequence(BatteryOperationSequence):
                     test_type="monitor", channel=channel, relay=relay_address,
                     phase_detail="MONITORING",
                     voltage_v=voltage_v, current_a=current_a, temp_c=temp_c,
+                    # Also populate dmm_measured_v (in addition to the original
+                    # voltage_v column) -- test_control/execution_screen.py::
+                    # render_execution_frame()'s "Recent Measurements" panel
+                    # only reads smu_measured_v/dmm_measured_v (the columns
+                    # ChargeSequence/DischargeSequence/ProtoTestSequence
+                    # populate), not voltage_v -- without this, every Monitor
+                    # Battery row in that panel renders "N/A" even though a
+                    # real DMM reading was taken. Found during pre-hardware-
+                    # validation review; smu_measured_v stays None since this
+                    # mode never sources/sinks through the SMU.
+                    dmm_measured_v=voltage_v,
                 )
 
                 self._render_frame(
