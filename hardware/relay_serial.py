@@ -115,12 +115,12 @@ class SerialRelay(RelayBase):
     # Relay operations
     # ------------------------------------------------------------------
 
-    def open(self, channel: int):
+    def _open_impl(self, channel: int):
         self._validate_channel(channel)
         self._send_cmd(self._cmd_open.format(ch=channel))
         self.log.debug("Relay open ch%d", channel)
 
-    def close(self, channel: int):
+    def _close_impl(self, channel: int):
         self._validate_channel(channel)
         self._send_cmd(self._cmd_close.format(ch=channel))
         self.log.debug("Relay close ch%d", channel)

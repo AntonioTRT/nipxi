@@ -393,7 +393,7 @@ class NumatoRelayMatrix(RelayBase):
     # Both compose the native primitives below and always verify by readback.
     # ------------------------------------------------------------------
 
-    def open(self, channel: int):
+    def _open_impl(self, channel: int):
         """
         De-energize relay for `channel` (1-based).
 
@@ -403,13 +403,17 @@ class NumatoRelayMatrix(RelayBase):
             2. Read back and verify all relays are OFF.
         Since the target state for open() IS all-off, step 2's verification
         is the final verification -- there is no further activation step.
+
+        Called only by RelayBase.open() (hardware/relay.py), which applies
+        the mandatory Settings.RELAY_SETTLE_TIME_S delay after this
+        returns -- this method itself never sleeps.
         """
         self._validate_channel(channel)
         self.log.info("Requested relay: %d  Action: OPEN", channel)
         self._force_all_off_and_verify()
         self.log.info("Verification: PASS (channel %d confirmed OFF, all others OFF)", channel)
 
-    def close(self, channel: int):
+    def _close_impl(self, channel: int):
         """
         Energize relay for `channel` (1-based).
 
@@ -426,6 +430,10 @@ class NumatoRelayMatrix(RelayBase):
                anything a single "relay read" cannot see).
             If any verification fails: raise RelayStateVerificationError
             and stop -- never continue.
+
+        Called only by RelayBase.close() (hardware/relay.py), which applies
+        the mandatory Settings.RELAY_SETTLE_TIME_S delay after this
+        returns -- this method itself never sleeps.
         """
         self._validate_channel(channel)
         relay0 = channel - 1

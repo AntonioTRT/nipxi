@@ -91,7 +91,7 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
                           source="monitor_battery_scan", dmm=dmm, daq=daq)
 
     def run(self, battery_type: str, group: str, positions_in_group: list, token=None,
-            settle_s: float = None, samples: int = None,
+            samples: int = None,
             dwell_s: float = None, dwell_interval_s: float = None):
         """
         Scan every position in `positions_in_group` (in-group, 1-based --
@@ -100,15 +100,18 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
         resolve_group_position()/BATTERY_CHANNELS -- the same resolution
         test.py's battery-selection flow already uses for Monitor Battery.
 
-        `settle_s` (default config/settings.py::Settings.RELAY_SETTLE_TIME_S)
-        is the delay after every relay open/close, before the DMM is read.
+        The delay after every relay open/close, before the DMM is read, is
+        NOT a parameter here -- it is Settings.RELAY_SETTLE_TIME_S, the one
+        global relay settling/dead-time constant, enforced unconditionally
+        by RelayBase.open()/close() (hardware/relay.py) itself. This
+        sequence never adds its own relay-settle sleep on top of that.
         `samples` (default Settings.MONITOR_SCAN_SAMPLES) is how many DMM
         readings are averaged (min/max also recorded) per relay state.
         `dwell_s` (default Settings.MONITOR_SCAN_DWELL_TIME_S) is how long
         the relay is held closed AFTER the initial settled CLOSED reading,
         to observe stability over time; `dwell_interval_s` (default
         Settings.MONITOR_SCAN_DWELL_SAMPLE_INTERVAL_S) is the DMM/DAQ
-        sample period during that dwell. All four are configurable per
+        sample period during that dwell. All three are configurable per
         call -- never hardcoded into the per-reading measurement logic
         below.
 
@@ -126,15 +129,14 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
         sleep()) and immediately runs the same safe-shutdown path as any
         other cancellation in this codebase.
         """
-        settle_s = self.s.RELAY_SETTLE_TIME_S if settle_s is None else settle_s
         samples = self.s.MONITOR_SCAN_SAMPLES if samples is None else samples
         dwell_s = self.s.MONITOR_SCAN_DWELL_TIME_S if dwell_s is None else dwell_s
         dwell_interval_s = self.s.MONITOR_SCAN_DWELL_SAMPLE_INTERVAL_S if dwell_interval_s is None else dwell_interval_s
 
         self.log.info(
             "Monitor Battery Scan starting. Battery: %s  Group: %s  Positions: %s  "
-            "Settle: %.3fs  Samples: %d  Dwell: %.1fs (every %.1fs)",
-            battery_type, group, positions_in_group, settle_s, samples, dwell_s, dwell_interval_s,
+            "Settle (global): %.3fs  Samples: %d  Dwell: %.1fs (every %.1fs)",
+            battery_type, group, positions_in_group, self.s.RELAY_SETTLE_TIME_S, samples, dwell_s, dwell_interval_s,
         )
         run_number = self._run_number()
         total = len(positions_in_group)
@@ -164,7 +166,7 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
                     battery_type=battery_type, group=group, position=position,
                     channel=channel, relay_address=relay_address,
                     run_number=run_number, scan_progress=scan_progress,
-                    settle_s=settle_s, samples=samples,
+                    samples=samples,
                     dwell_s=dwell_s, dwell_interval_s=dwell_interval_s, token=token,
                 )
 
@@ -182,19 +184,21 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
         )
 
     def _scan_one_position(self, battery_type, group, position, channel, relay_address,
-                            run_number, scan_progress, settle_s, samples,
+                            run_number, scan_progress, samples,
                             dwell_s, dwell_interval_s, token):
         """
         Measure Voltage_Open_Before / Voltage_Closed / Voltage_Open_After
         for one battery position, holding the relay closed for a
         monitoring dwell between the CLOSED reading and Voltage_Open_After.
-        Every relay transition goes through NumatoRelayMatrix.open()/
-        close() (Read State -> Verify -> Force All OFF -> Verify OFF ->
-        [action] -> Verify Action, unconditionally -- see hardware/
-        relay_eth.py), followed by a settling delay, before any voltage is
-        sampled. No pass/fail interpretation of any reading -- this
-        sequence characterizes hardware, it does not gate on it. Only a
-        genuine RelayError/SafetyViolationError (or an unexpected
+        Every relay transition goes through RelayBase.open()/close()
+        (hardware/relay.py), which for NumatoRelayMatrix runs Read State ->
+        Verify -> Force All OFF -> Verify OFF -> [action] -> Verify Action
+        (see hardware/relay_eth.py) and then unconditionally blocks for
+        Settings.RELAY_SETTLE_TIME_S before returning -- no separate
+        settling delay is added here; the relay call itself does not
+        return until settled. No pass/fail interpretation of any reading --
+        this sequence characterizes hardware, it does not gate on it. Only
+        a genuine RelayError/SafetyViolationError (or an unexpected
         exception) stops the scan; that propagates to run()'s run_guarded()
         handling unchanged.
 
@@ -213,7 +217,6 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
             level="INFO", source="monitor_battery_scan", channel=channel, relay=relay_address,
             message="All relays verified open",
         )
-        interruptible_sleep(settle_s, token=token)
 
         open_before = self._sample_dmm(samples)
         self.storage.log_event(
@@ -242,7 +245,6 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
             level="INFO", source="monitor_battery_scan", channel=channel, relay=relay_address,
             message=f"Position {position} relay closed",
         )
-        interruptible_sleep(settle_s, token=token)
 
         closed = self._sample_dmm(samples)
         self.storage.log_event(
@@ -298,7 +300,6 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
             level="INFO", source="monitor_battery_scan", channel=channel, relay=relay_address,
             message=f"Position {position} relay reopened",
         )
-        interruptible_sleep(settle_s, token=token)
 
         open_after = self._sample_dmm(samples)
         self.storage.log_event(

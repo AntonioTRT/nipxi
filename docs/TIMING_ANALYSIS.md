@@ -4,12 +4,17 @@
 > cancellation checkpoint inside `hold_s`/`STABILIZATION_S` dwells while
 > hardware remains energized) has been fixed -- see `docs/architecture.md`
 > Section 27 ("Interruptible Wait Mechanism") and `docs/MILESTONES.md` for
-> the implementation and verification record. The other findings in this
-> document (dead `sample_rate_hz` config, no DMM/DAQ timeout configuration,
-> no `SafetyMonitor.check()` debounce, no engineered relay contact
-> settling time, the first-`initiate()` measurement transient) remain open
-> -- see `docs/TODO.md`. This document is kept as the historical record of
-> the review, not rewritten in place.
+> the implementation and verification record. The "no engineered relay
+> contact settling time" finding (Section 4, and the Section 9/10
+> inconsistencies it caused) has also been fixed -- see
+> `docs/architecture.md` Section 43 ("Single Global Relay Settling/Dead-Time
+> Constant"): `Settings.RELAY_SETTLE_TIME_S` is now `2.0` s, enforced
+> unconditionally in `hardware/relay.py::RelayBase.open()`/`close()` for
+> every relay switch in the application, never `0`. The other findings in
+> this document (dead `sample_rate_hz` config, no DMM/DAQ timeout
+> configuration, no `SafetyMonitor.check()` debounce, the first-`initiate()`
+> measurement transient) remain open -- see `docs/TODO.md`. This document
+> is kept as the historical record of the review, not rewritten in place.
 
 Analysis-only document. No code was modified to produce this review. Every
 `time.sleep()`, `timeout`, retry loop, polling loop, verification cycle,

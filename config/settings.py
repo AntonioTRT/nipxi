@@ -99,7 +99,12 @@ class Settings:
     # -------------------------------------------------------------------------
     # Stabilization and sampling
     # -------------------------------------------------------------------------
-    STABILIZATION_S     = 5.0   # s  - wait after relay switch before measuring
+    # Wait after SMU output enable before measuring (electrical/output
+    # stabilization only). This is NOT relay-related -- the mandatory
+    # relay contact settling/dead-time delay is RELAY_SETTLE_TIME_S below,
+    # enforced centrally by RelayBase.open()/close() (hardware/relay.py),
+    # never here.
+    STABILIZATION_S     = 5.0   # s  - wait after SMU output enable before measuring
     SAMPLE_RATE_HZ      = 1.0   # Hz - DAQ acquisition rate during cycle
 
     # -------------------------------------------------------------------------
@@ -162,14 +167,19 @@ class Settings:
     PROTO_TEST_DWELL_S = 5   # s -- per-relay dwell time
 
     # -------------------------------------------------------------------------
-    # Monitor Battery Scan (test_control/monitor_battery_scan_sequence.py) --
-    # relay/DMM/DAQ path validation, no charging. Unconfirmed placeholders --
-    # real hardware behavior (relay settling time, DMM read jitter) is not
-    # yet characterized; this workflow exists to characterize it, not to
-    # enforce it. Configurable per docs/architecture.md, not hardcoded into
-    # the sequence's measurement logic.
+    # Relay settling / dead-time -- SINGLE GLOBAL CONSTANT for every relay
+    # switching operation in the entire application (Monitor Battery,
+    # Monitor Battery Scan, Proto Test, ChargeSequence, DischargeSequence,
+    # relay validation/hardware-validation workflows, and any future
+    # caller). Enforced centrally in RelayBase.open()/close()
+    # (hardware/relay.py) immediately after every relay action completes
+    # and is verified -- callers never need (and must never add) their own
+    # relay-settle sleep; do not hardcode a second timing value anywhere
+    # else for this purpose. Must never be 0 -- a 0 s value would allow a
+    # subsequent relay action before the previous one has mechanically
+    # settled, which this constant exists specifically to prevent.
     # -------------------------------------------------------------------------
-    RELAY_SETTLE_TIME_S    = 0.2  # s -- delay after every relay open/close before reading the DMM
+    RELAY_SETTLE_TIME_S    = 2.0  # s -- mandatory dead-time after every relay open()/close(), never 0
     MONITOR_SCAN_SAMPLES   = 3    # count -- DMM samples averaged per voltage reading
 
     # How long a position's relay is held closed AFTER the initial settled

@@ -125,12 +125,12 @@ class SimulatedRelay(RelayBase):
         self._active_channel = None
         self.connected = False
 
-    def open(self, channel: int):
+    def _open_impl(self, channel: int):
         self._validate_channel(channel)
         if self._active_channel == channel:
             self._active_channel = None
 
-    def close(self, channel: int):
+    def _close_impl(self, channel: int):
         self._validate_channel(channel)
         self._active_channel = channel
 

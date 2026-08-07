@@ -152,7 +152,10 @@ class DischargeSequence(BatteryOperationSequence):
             # Selection -> Battery Voltage Measurement (DMM) -> Sanity
             # Validation -> SMU Enable. See ChargeSequence.run()'s identical
             # rationale and BatteryOperationSequence._check_battery_polarity().
-            interruptible_sleep(self.s.STABILIZATION_S, token=token)
+            # No separate relay-settle sleep here -- self.relay.close() above
+            # already blocked for Settings.RELAY_SETTLE_TIME_S (the single
+            # global relay settling/dead-time constant, enforced in
+            # RelayBase.open()/close(), hardware/relay.py) before returning.
             pre_enable_v = self.dmm.measure_dc_voltage()
             self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
 

@@ -2454,3 +2454,82 @@ one relay-selected channel, the validation scope Milestone VIII already
 recommended and this session does not change.
 
 **Recommendations:** validate `ChargeSequence`/`DischargeSequence` against Group A + a real SB battery first (the only fully-validated software configuration today); do not attempt HUB until a group is reassigned to a higher-current SMU; do not start `CycleSequence` until at least one real charge and one real discharge have completed successfully on real hardware.
+
+## 43. Single Global Relay Settling/Dead-Time Constant
+
+**Driver for this change:** a pre-hardware-validation timing review (Sections
+1, 4, 8, 9 and `docs/TIMING_ANALYSIS.md`) found relay settling delay was
+inconsistent across workflows -- `MonitorBatteryScanSequence` used
+`Settings.RELAY_SETTLE_TIME_S` (`0.2s`), `MonitorBatterySequence` and the
+`test.py` relay validation/hardware-validation scans had **no delay at
+all** between a relay action and the next step, and `ChargeSequence`/
+`DischargeSequence` used the unrelated `Settings.STABILIZATION_S` (`5.0s`,
+also serving a second, different purpose: post-output-enable electrical
+settling). This meant relay dead-time was not a single, deliberately-chosen
+value -- it was zero in some paths and an inherited, undifferentiated
+constant in others.
+
+**Decision:** relay settling/dead-time must be `2.0` s, everywhere a relay
+is switched, with no exceptions and never `0`.
+
+**Implementation -- enforced structurally in `RelayBase`, not per-caller:**
+`hardware/relay.py::RelayBase.open()`/`close()` are now concrete (no longer
+abstract) and are the single point where every relay switch happens.
+Each calls the driver-specific `_open_impl()`/`_close_impl()` (the renamed
+abstract methods `NumatoRelayMatrix`/`SerialRelay`/`SimulatedRelay` must
+implement), then unconditionally blocks for `Settings.RELAY_SETTLE_TIME_S`
+via a new `_settle()` helper, which raises `ValidationError` if that
+constant is ever configured `<= 0`. Because every concrete relay driver
+subclasses `RelayBase` and no subclass overrides `open()`/`close()`
+themselves anymore, **every relay switch in the application -- in every
+workflow, every commissioning/validation test, and any future caller --
+automatically waits the same 2.0 s before returning control to the
+caller**, without that caller needing to add its own delay. This also
+means a subsequent relay action (open-then-close, close-then-open, or one
+channel to another) can never begin less than 2.0 s after the previous
+one completed, since the previous `open()`/`close()` call does not return
+until that wait has elapsed.
+
+**Call sites updated to remove now-duplicate, inconsistent delays:**
+- `config/settings.py::RELAY_SETTLE_TIME_S` changed from `0.2` to `2.0`,
+  and re-documented as the one global constant for this purpose (not a
+  `MonitorBatteryScanSequence`-specific value).
+- `MonitorBatteryScanSequence` no longer takes a `settle_s` parameter or
+  calls its own `interruptible_sleep(settle_s, ...)` after `relay.open()`/
+  `relay.close()` -- the wait already happened inside those calls.
+- `ChargeSequence`/`DischargeSequence` no longer sleep
+  `Settings.STABILIZATION_S` immediately after `relay.close()` (that
+  delay was relay-related and is now redundant); the second
+  `STABILIZATION_S` sleep, after `smu.output_enable()`, is unchanged --
+  it is genuine electrical/output stabilization, not relay settling, and
+  `STABILIZATION_S`'s docstring was updated to make that distinction
+  explicit so the two concerns are not re-merged later.
+- `MonitorBatterySequence` and every `test.py` relay validation/hardware-
+  validation scan (`_run_relay_matrix_scan`, `test_relay_safety_selftest`,
+  etc.) needed no code change -- they call `relay.open()`/`relay.close()`
+  directly, so they inherit the enforced delay automatically. This also
+  closes the "no delay found -- back-to-back" gap the timing review
+  identified in `MonitorBatterySequence` and in the 32-channel relay
+  matrix scan.
+
+**Non-goals / explicitly unchanged:** `Settings.STABILIZATION_S` (SMU
+output electrical settling) and `Settings.PROTO_TEST_DWELL_S` (per-relay
+measurement dwell) remain separate constants for separate physical
+concerns -- this change only consolidates the relay contact settling/
+dead-time value itself, per the explicit requirement that there be a
+single constant for relay switching, not that all hardware timing
+collapse into one number. `hardware/relay_matrix.py::RelayMatrix` (dead,
+unreferenced legacy code, not a `RelayBase` subclass, not reachable via
+`RelayFactory`) was left untouched, consistent with Section 24's
+precedent of not modifying unreachable scaffolding.
+
+**Verification:** all touched modules byte-compile cleanly
+(`hardware/relay.py`, `hardware/relay_eth.py`, `hardware/relay_serial.py`,
+`hardware/simulated.py`, `config/settings.py`,
+`test_control/monitor_battery_scan_sequence.py`,
+`test_control/charge_sequence.py`, `test_control/discharge_sequence.py`).
+Real-hardware confirmation that 2.0 s is sufficient for the Numato relay
+bank's actual mechanical settling time is still a first-hardware-
+validation task (see Section 42 and `docs/TIMING_ANALYSIS.md`'s
+Recommendations) -- this change fixes the software's *consistency* and
+*floor*, not a hardware-measured value.

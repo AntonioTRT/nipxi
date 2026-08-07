@@ -22,7 +22,10 @@ Relay convention (electrical):
   open(channel)  -- de-energizes the coil, breaks the contact, current cannot flow
 """
 
+import time
 from abc import abstractmethod
+
+from config.settings import Settings
 from hardware.base import HardwareBase
 from utils.errors import ValidationError
 
@@ -31,7 +34,18 @@ class RelayBase(HardwareBase):
     """
     Abstract base for all relay controllers.
 
-    Subclasses must implement: connect, disconnect, open, close, query.
+    Subclasses must implement: connect, disconnect, query, and the
+    driver-specific _open_impl/_close_impl. open()/close() themselves are
+    concrete here (NOT overridable) and are the single enforcement point
+    for Settings.RELAY_SETTLE_TIME_S -- the one global relay settling/
+    dead-time constant used everywhere in the application. Every relay
+    switch, in every workflow, always blocks for RELAY_SETTLE_TIME_S after
+    the driver reports the action complete and verified, before control
+    returns to the caller -- so no subsequent relay action (on this
+    channel or any other) can ever follow with less than a full settle
+    time in between, and no caller needs (or is permitted) to add its own
+    relay-settle delay. RELAY_SETTLE_TIME_S must never be 0.
+
     open_all / close_all have default implementations that loop over channels;
     override them if the hardware supports a faster bulk command.
     """
@@ -41,16 +55,40 @@ class RelayBase(HardwareBase):
         self.num_channels = num_channels
 
     # ------------------------------------------------------------------
+    # Public API -- concrete, not overridable. Both wrap the driver-
+    # specific implementation with the mandatory settle delay.
+    # ------------------------------------------------------------------
+
+    def open(self, channel: int):
+        """Open (de-energize) relay for the given channel, then settle."""
+        self._open_impl(channel)
+        self._settle()
+
+    def close(self, channel: int):
+        """Close (energize) relay for the given channel, then settle."""
+        self._close_impl(channel)
+        self._settle()
+
+    def _settle(self):
+        settle_s = Settings.RELAY_SETTLE_TIME_S
+        if settle_s <= 0:
+            raise ValidationError(
+                "Settings.RELAY_SETTLE_TIME_S must be > 0 -- a 0 s relay "
+                "settling/dead-time delay is never permitted"
+            )
+        time.sleep(settle_s)
+
+    # ------------------------------------------------------------------
     # Abstract interface -- every driver must implement these
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def open(self, channel: int):
-        """Open (de-energize) relay for the given channel."""
+    def _open_impl(self, channel: int):
+        """Drive the hardware to open (de-energize) the given channel."""
 
     @abstractmethod
-    def close(self, channel: int):
-        """Close (energize) relay for the given channel."""
+    def _close_impl(self, channel: int):
+        """Drive the hardware to close (energize) the given channel."""
 
     @abstractmethod
     def query(self, channel: int) -> bool:
