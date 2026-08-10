@@ -177,10 +177,13 @@ is out of scope except where explicitly noted.
 
 **Answer:** For `ChargeSequence`/`DischargeSequence`: every raised exception is caught by `run_guarded()`, which calls `safety.emergency_stop()`/`safe_cancel_shutdown()` — both call `relay_matrix.open_all()` unconditionally. So no known exception path in the current sequences leaves a relay closed without at least one force-open attempt. However, `relay.open(relay_address)` (the sequence's own normal-completion relay-open, at charge_sequence.py:207/discharge_sequence.py:214) is only reached on the success path (`break` on EOC/EOD) — every abnormal exit relies entirely on the SAFETY layer's `open_all()`, not the sequence's own code. If `open_all()` itself fails (communication breakdown), the relay CAN remain closed — this is explicitly logged as CRITICAL, not silently accepted.
 
+**Refinement (Monitor Battery review, Section 13 below):** "every exception branch calls `safety.emergency_stop()`/`safe_cancel_shutdown()`" is true only when that branch's own `storage.log_event()`/`record_execution_state()`/`finish_run_summary()` calls (which run *before* the safety call in each branch) succeed. If the database itself is the original failure, those calls raise again and `run_guarded()` exits *without* reaching `safety.emergency_stop()` at that layer — see Section 13's "What happens if the database becomes unavailable during a Monitor Battery run?" entry. This applies identically to ChargeSequence/DischargeSequence (they share the same `run_guarded()`), not just Monitor Battery. Hardware still ends up safe in this specific scenario via `test.py`'s outer `hw_mgr.disconnect_all()` backstop (not analyzed in this entry's original evidence below) — so the risk below is unchanged in severity, only the DB-failure case is now understood as a second, distinct way `emergency_stop()` can be skipped at the `run_guarded()` layer specifically (relay communication breakdown was the only one previously documented here).
+
 **Evidence:**
 - test_control/charge_sequence.py:191-212 — `finally` block disables SMU output; relay opened only after, only on success path
 - test_control/safety_monitor.py:114-146 — `emergency_stop()` always calls `relay_matrix.open_all()`, logs CRITICAL on failure but does not raise
-- test_control/battery_operation_sequence.py:105-159 — `run_guarded()`'s four exception branches all call `safety.emergency_stop()` or `safe_cancel_shutdown()`
+- test_control/battery_operation_sequence.py:105-159 — `run_guarded()`'s four exception branches all call `safety.emergency_stop()` or `safe_cancel_shutdown()`, but only after their own storage calls succeed (see Refinement above)
+- test_control/hardware_manager.py:375-383 — `disconnect_all()`'s independently-guarded relay `open_all()` backstop, called unconditionally from `test.py`'s outer `finally` regardless of what happened inside `run_guarded()`
 
 **Risks:** A total communication breakdown to the relay matrix during an emergency shutdown IS a path where the relay remains closed — this is a hardware-communication failure mode, not a software logic gap, and is honestly logged rather than hidden.
 
@@ -1428,3 +1431,156 @@ is out of scope except where explicitly noted.
 3. Audit every `test.py` hardware-commissioning workflow (SMU Functional Validation, Relay Ethernet Test, Proto Test Execution) for SafetyMonitor coverage parity with Charge/Discharge Battery.
 4. Design and gate a formal recovery-confirmation flow behind `config/system_mode.py::is_recovery_enabled()`, per docs/DATABASE_ROADMAP.md Section 4's own sketch, once real-world incomplete-run frequency data justifies the investment.
 5. Consider adding `FOREIGN KEY` constraints (with `PRAGMA foreign_keys = ON`) between `measurements`/`event_log`/`station_state` and `run_summary` for defense-in-depth referential integrity, if reporting tooling built on top of this database would benefit from database-enforced guarantees rather than code-convention-only guarantees.
+
+---
+
+## SECTION 13 — MONITOR BATTERY OPERATIONAL BEHAVIOR (Real Hardware Validation Readiness Review)
+
+*Findings below come from an implementation-level readiness review of `test_control/monitor_battery_sequence.py::MonitorBatterySequence`, performed against the actual code (not assumptions), ahead of Monitor Battery being the first workflow used for Real Hardware Validation. See docs/architecture.md Section 45 for the full technical writeup this section summarizes.*
+
+### Q: Is Monitor Battery intended to run forever until cancelled?
+
+**Status:** Implemented (by design)
+
+**Answer:** Yes. `_loop()`'s `while True:` has no `break`, no iteration cap, and no duration check anywhere in the file. There is no normal-completion path -- `BatteryOperationSequence.complete()` (the shared "finished successfully" bookkeeping other operations use) is never called by Monitor Battery. Cancellation (Ctrl+C) or a fault are the only two ways the loop ends. This is intentional, not an oversight -- the module's own docstring states monitoring continues "until the operator cancels ... or a real fault occurs."
+
+**Evidence:**
+- test_control/monitor_battery_sequence.py:149-186 -- `while True:` loop, no `break`
+- test_control/monitor_battery_sequence.py:121-123 -- module docstring stating the intended lifecycle
+- test_control/battery_operation_sequence.py:215-222 -- `complete()`'s docstring: "Monitor Battery has no normal completion path ... and never calls this"
+
+**Risks:** None -- this is the correct design for a continuous-monitoring workflow, not a defect.
+
+**Recommendation:** None.
+
+### Q: Is there an automatic timeout or automatic stop condition?
+
+**Status:** Not Implemented (by design)
+
+**Answer:** No. No `NIPXITimeoutError` is ever raised by this sequence's own code, and no maximum-duration setting is read anywhere in `monitor_battery_sequence.py`. The only stops are operator cancellation or an unhandled fault (DMM, relay, or database).
+
+**Evidence:**
+- test_control/monitor_battery_sequence.py -- no `NIPXITimeoutError`, no duration/timeout constant referenced
+- test_control/battery_operation_sequence.py:183-199 -- `run_guarded()`'s `NIPXITimeoutError` branch exists for other operations but nothing in Monitor Battery ever raises it
+
+**Risks:** None identified -- an unattended, indefinitely-running monitor is the intended use case for this workflow.
+
+**Recommendation:** None.
+
+### Q: Is measurement data buffered, or persisted immediately?
+
+**Status:** Implemented
+
+**Answer:** Persisted immediately, every iteration -- there is no buffering or batching anywhere in the write path. Each of `DataStorage.record_measurement()`/`record_execution_state()`/`log_event()` issues one `INSERT` and calls `commit()` before returning. Per loop iteration: one DMM read, one `record_measurement()` (one commit), one screen render.
+
+**Evidence:**
+- data/storage.py -- `record_measurement()`, `record_execution_state()`, `log_event()` each commit synchronously, no `executemany`/queue/batch logic anywhere in the file
+- test_control/monitor_battery_sequence.py:152-178 -- one DMM read + one `record_measurement()` + one `_render_frame()` per iteration
+
+**Risks:** DB write latency is on the critical path of every sample -- acceptable for this workflow's cadence (default 2s/sample), but worth keeping in mind if the sample rate is ever increased significantly.
+
+**Recommendation:** None at current sample rates.
+
+### Q: Is the relay switched repeatedly during monitoring, or held closed?
+
+**Status:** Implemented
+
+**Answer:** The relay closes exactly once, before the loop starts, and stays closed for the entire monitoring session -- there is no periodic re-close/re-verify inside the loop. It is opened only on exit (fault or cancellation), via the shared safety-shutdown path.
+
+**Evidence:**
+- test_control/monitor_battery_sequence.py:138 -- `self.relay.close(relay_address)`, called once, before `while True:`
+- test_control/battery_operation_sequence.py:141-213 -- every `run_guarded()` exception branch calls `safety.safe_cancel_shutdown()`/`safety.emergency_stop()`, both of which open the relay
+
+**Risks:** None -- this matches the intended electrical behavior (one continuous connection for the duration of monitoring).
+
+**Recommendation:** None.
+
+### Q: What is the expected Ctrl+C (cancellation) shutdown sequence?
+
+**Status:** Implemented
+
+**Answer:** `check_cancellation(token)` (checked at loop-top and inside `interruptible_sleep()`) raises `OperationCancelledError`, caught by `run_guarded()`'s dedicated branch:
+`OperationCancelledError` -> `log_event()` -> `record_execution_state(CANCELLED)` -> `finish_run_summary(stop_reason=CANCELLED, result="STOPPED_BY_OPERATOR")` -> `safety.safe_cancel_shutdown()` (SMU output-off + relay `open_all()`, both internally guarded, documented as "never raises") -> re-raise -> caught cleanly at `test.py` ("hardware is in a verified safe state") -> outer `finally` closes storage and calls `hw_mgr.disconnect_all()` (its own relay `open_all()` backstop).
+
+**Evidence:**
+- test_control/battery_operation_sequence.py:141-153 -- the `OperationCancelledError` branch
+- test.py:3849-3850, 3858-3868 -- the outer catch and `finally` cleanup
+
+**Risks:** None -- this is the intended, fully-verified normal termination path.
+
+**Recommendation:** None.
+
+### Q: What happens if the assigned DMM is missing or fails?
+
+**Status:** Implemented (mode-dependent)
+
+**Answer:** Depends on `HardwareManager`'s connect mode:
+- **PRODUCTION (strict):** DMM connect failure raises `HardwareInitError` from `connect_all()` -- caught at `test.py`, printed as `[FAIL] Hardware initialization failed`, and the workflow never starts. No storage is opened, no relay is touched.
+- **DEVELOPMENT/VALIDATION (lenient):** DMM connect failure is logged and recorded in `hardware_status["DMM"]` but does not block startup. The workflow proceeds: relay closes, monitoring starts, the first `dmm.measure_dc_voltage()` call raises `DMMError`, which is caught by `run_guarded()`'s generic exception branch, triggering the full emergency-shutdown sequence (relay opens) and ending the workflow.
+
+Once running, if the DMM is disconnected mid-loop, the same `DMMError` path applies -- there is no distinction in the code between "never connected" and "disconnected mid-run" once the sequence is executing.
+
+**Evidence:**
+- test_control/hardware_manager.py -- `_connect_all_strict()` (all-or-nothing) vs. `_connect_all_lenient()` (per-device, non-blocking)
+- hardware/dmm.py -- `measure_dc_voltage()` wraps any underlying failure in `DMMError`
+- test_control/battery_operation_sequence.py:201-213 -- the generic exception branch that catches `DMMError`
+
+**Risks:** In lenient/DEVELOPMENT mode specifically, the relay briefly activates before the DMM failure is discovered -- a real (if brief) relay activation with no working measurement path. Not a hardware-safety risk (the shutdown sequence still runs correctly), but worth operator awareness during commissioning.
+
+**Recommendation:** None required for Real Hardware Validation (production mode is the intended real-battery configuration and fails closed, before any hardware activation).
+
+### Q: Does Monitor Battery retry a failed measurement?
+
+**Status:** Not Implemented (by design)
+
+**Answer:** No. There is no retry/backoff logic anywhere in `hardware/dmm.py`'s `connect()`/`measure_dc_voltage()`, nor in `monitor_battery_sequence.py`'s loop, nor in `run_guarded()`. The first measurement failure ends the workflow via the standard fault-shutdown path.
+
+**Evidence:**
+- hardware/dmm.py -- `measure_dc_voltage()` raises immediately on first failure, no retry wrapper
+- test_control/monitor_battery_sequence.py -- no retry/backoff around the DMM call
+
+**Risks:** A single transient DMM read glitch (rather than a genuine disconnect) would end an otherwise-healthy multi-hour monitoring session. Acceptable given the project's stated safety-first philosophy (never mask a real fault by retrying blindly), but worth operator awareness for long unattended runs.
+
+**Recommendation:** None required to reach GO for Real Hardware Validation; consider only if real-hardware experience shows transient DMM read failures are common enough to matter.
+
+### Q: Is Monitor Battery safe to run continuously for many hours (e.g. an 8-hour unattended session)?
+
+**Status:** Implemented / Reviewed -- Supported
+
+**Answer:** Yes. The review found no memory-growth risk (only four floats are accumulated in `_VoltageStats` across the entire run; every measurement is persisted immediately, not held in memory) and no buffering issue (see the persistence entry above). Database write latency is on the critical path per sample but is not a correctness or stability risk at this workflow's sample rate.
+
+**Evidence:**
+- test_control/monitor_battery_sequence.py:70-107 -- `_VoltageStats`, bounded in-memory state
+- data/storage.py -- synchronous per-call commits, no accumulating buffer
+
+**Risks:** None identified for the 8-hour case specifically. General long-run software risks (a database or DMM fault at any point) are covered by the fault-handling entries above, not specific to duration.
+
+**Recommendation:** None.
+
+### Q: What happens if the database becomes unavailable during a Monitor Battery run?
+
+**Status:** Partially Implemented
+
+**Answer:** The run always stops, and the relay is always opened -- but not necessarily through the "clean" classified shutdown path. Each `run_guarded()` exception branch calls `storage.log_event()`/`record_execution_state()`/`finish_run_summary()` **before** calling `safety.emergency_stop()`/`safe_cancel_shutdown()`. If the database itself is the original failure, those storage calls raise a second exception (the DB is still broken), which propagates out of `run_guarded()` immediately -- skipping `safety.emergency_stop()` *at that layer*. The relay is still opened, but only via the outer backstop: `test.py::_run_monitor_battery()`'s `finally` block unconditionally calls `hw_mgr.disconnect_all()`, whose own relay `open_all()` step is independently guarded and cannot raise. Net effect: hardware ends up safe either way, but the failure's `run_summary`/`event_log` classification (stop reason, "why did this stop") may be missing or generic for this specific failure mode, rather than cleanly recorded as it would be for a DMM/relay fault.
+
+**Evidence:**
+- test_control/battery_operation_sequence.py:141-213 -- storage calls precede `safety.emergency_stop()`/`safe_cancel_shutdown()` in every branch
+- data/storage.py -- `record_measurement()`/`record_execution_state()`/`log_event()` do not catch their own `sqlite3.Error`
+- test_control/hardware_manager.py:375-383 -- `disconnect_all()`'s independently-guarded relay `open_all()` backstop
+- test.py:3858-3868 -- the outer `finally` that always calls `disconnect_all()`
+
+**Risks:** Diagnostic/traceability gap only -- hardware is not left energized in this scenario. This is the one documented caveat carried into the GO decision below.
+
+**Recommendation:** Optional hardening (not a blocker): wrap the storage calls inside `run_guarded()`'s except-branches so a DB failure while handling an unrelated fault does not itself prevent `safety.emergency_stop()` from running at that layer (it would still be redundant with the outer backstop, but would restore clean stop-reason classification for this specific failure mode).
+
+### Q: Is Monitor Battery ready for Real Hardware Validation?
+
+**Status:** Implemented / Reviewed -- **GO**
+
+**Answer:** Yes. The reviewed behavior matches the intended design in every respect: continuous operation until cancelled or faulted, immediate/synchronous persistence, relay held closed for the duration and opened on every exit path (directly or via the outer backstop), and a fully-verified Ctrl+C shutdown sequence. No software blocker was identified. The one caveat -- incomplete failure traceability specifically in the case of a mid-run database failure (see above) -- does not affect hardware safety and is documented, not hidden.
+
+**Evidence:** See all entries in this section, and docs/architecture.md Section 45.
+
+**Risks:** The database-failure traceability gap above; otherwise none identified.
+
+**Recommendation:** Proceed with Real Hardware Validation using Monitor Battery. Track the optional `run_guarded()` hardening above as a low-priority follow-up, not a gate.

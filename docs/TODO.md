@@ -259,6 +259,16 @@ the bottom, with a pointer to where the real documentation lives
   callers (`test.py:2623`, `test.py:2769`), which still do a bare
   `BATTERY_CONFIGS[cfg["battery_type"]]` lookup. Simulator/demo-only, no
   hardware activation -- deferred, not a blocker.
+- [ ] (Low priority, no hardware risk) `BatteryOperationSequence.run_guarded()`'s
+  exception branches call `storage.log_event()`/`record_execution_state()`/
+  `finish_run_summary()` before `safety.emergency_stop()`/
+  `safe_cancel_shutdown()` -- if the database itself is the original
+  failure, those storage calls raise again and skip the safety shutdown
+  *at that layer* (hardware is still safed via `test.py`'s outer
+  `hw_mgr.disconnect_all()` backstop, so this is a stop-reason/
+  traceability gap, not a hardware-safety gap). Found during the Monitor
+  Battery readiness review -- see docs/architecture.md Section 45,
+  docs/FAQ.md Section 13. Not a blocker for Real Hardware Validation.
 
 ### Configuration
 
@@ -365,6 +375,28 @@ Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
 
+- **Monitor Battery Operational Behavior Review -- GO for Real Hardware
+  Validation** -- implementation-level readiness review of
+  `MonitorBatterySequence` (not an architecture-assumption review):
+  confirmed it is intentionally a continuous, no-timeout, no-automatic-
+  stop workflow (runs until Ctrl+C or a real fault via its `while True:`
+  loop); confirmed every measurement/event is committed to the database
+  synchronously, with no buffering, so an 8-hour continuous session is
+  supported with no memory-growth or buffering risk; confirmed the relay
+  closes once at startup and opens on every exit path (directly via
+  `safety.emergency_stop()`/`safe_cancel_shutdown()`, or via
+  `HardwareManager.disconnect_all()`'s outer backstop); confirmed DMM
+  dependency behavior differs by system mode (PRODUCTION fails closed
+  before any hardware activation; DEVELOPMENT/VALIDATION briefly activates
+  the relay before the first failed measurement triggers shutdown); and
+  confirmed there is no retry/recovery on measurement failure (by design).
+  One documented, non-blocking caveat: a mid-run database failure can
+  cause `run_guarded()`'s own failure-classification storage calls to
+  themselves fail, skipping `safety.emergency_stop()` at that layer --
+  hardware is still safed via the outer cleanup path, but the recorded
+  stop-reason/traceability for that specific failure mode may be
+  incomplete. **Decision: GO.** No software blocker found. See
+  docs/architecture.md Section 45 and docs/FAQ.md Section 13.
 - **Matrix Scan 5s ON-State Dwell (for physical rack inspection)** -- added
   `Settings.RELAY_MATRIX_SCAN_DWELL_S` (`5.0` s), a new constant used only
   by `test.py::_run_relay_matrix_scan()` ("[2] Matrix Scan (ON -> READ ->

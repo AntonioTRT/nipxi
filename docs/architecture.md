@@ -2615,3 +2615,130 @@ read/write/verify correction was needed as part of this fix.
 byte-compile cleanly after the change. `RelayBase.settle()`'s `> 0` guard
 means `test_relay_ethernet_test()` cannot silently regress to a 0 s delay
 either, for the same reason `open()`/`close()` cannot.
+
+## 45. Monitor Battery Operational Behavior -- Real Hardware Validation Readiness Review
+
+**Purpose:** `MonitorBatterySequence` (`test_control/monitor_battery_sequence.py`)
+was reviewed at the implementation level -- against the actual code, not
+architectural assumptions -- as the first workflow scheduled for Real
+Hardware Validation. This section is the technical record of that review;
+docs/FAQ.md Section 13 carries the same findings in Q&A form, and
+docs/MILESTONES.md/docs/TODO.md record the GO decision. **Conclusion: GO.
+No software blocker identified.**
+
+### Startup sequence
+
+`test.py::_run_monitor_battery()`: select group -> select position ->
+`_confirm_operation()` gate -> `HardwareManager.connect_all()` ->
+`_open_storage_guarded()` (`DataStorage.open()`) ->
+`_start_run_summary_guarded()` (`DataStorage.start_run_summary()`) -> a
+fixed block of `log_event()` traceability calls (config snapshot,
+hardware identity) -- all strictly before the relay is ever touched. If
+`connect_all()`, `open()`, or `start_run_summary()` fails, the workflow
+aborts at that point with a clean `[FAIL]` message and no relay
+activation (test.py:3779-3830).
+
+### DMM dependency behavior
+
+Mode-dependent, via `HardwareManager.connect_all()`'s strict/lenient
+dispatch (`test_control/hardware_manager.py`):
+- **PRODUCTION (strict):** DMM connect failure raises `HardwareInitError`
+  from the all-or-nothing connect sequence -- the workflow never starts,
+  no storage is opened, no relay is touched.
+- **DEVELOPMENT/VALIDATION (lenient):** DMM connect failure only logs and
+  records `hardware_status["DMM"]`; `connect_all()` does not raise and
+  nothing downstream checks that status. The workflow proceeds: relay
+  closes, the first `dmm.measure_dc_voltage()` call raises `DMMError`,
+  caught by `run_guarded()`'s generic exception branch, triggering the
+  full emergency-shutdown sequence (relay opens) and ending the run.
+
+A DMM disconnected mid-run (rather than never connected) follows the
+identical `DMMError` path -- the code makes no distinction between the
+two cases once the sequence is executing.
+
+### Long-duration monitoring behavior
+
+`_loop()` is a bare `while True:` with no `break`, no iteration cap, and
+no duration/timeout check anywhere in the file -- this is intentional
+(module docstring: monitoring continues "until the operator cancels ...
+or a real fault occurs"). `BatteryOperationSequence.complete()` (the
+shared normal-completion bookkeeping other operations use) is never
+called by Monitor Battery -- there is no normal completion path, only
+cancellation or fault. Reviewed specifically for an example 8-hour
+continuous session: no memory-growth risk (`_VoltageStats` accumulates
+only four floats across the entire run) and no buffering risk (every
+measurement is committed to the database immediately, never queued) --
+**supported**.
+
+### Database persistence behavior
+
+Every write is synchronous and immediate: `DataStorage.record_measurement()`/
+`record_execution_state()`/`log_event()` each issue one `INSERT` and call
+`commit()` before returning -- no batching, no `executemany`, no
+in-memory queue anywhere in `data/storage.py`. Per loop iteration: one
+DMM read, one `record_measurement()` commit, one screen render (`_render_frame()`).
+
+### Relay behavior
+
+The relay closes exactly once, before the loop starts
+(`monitor_battery_sequence.py:138`), and remains closed for the entire
+session -- there is no periodic re-close/re-verify inside the loop. It is
+opened only on exit, via the shared safety-shutdown path
+(`safety.safe_cancel_shutdown()`/`safety.emergency_stop()`, both called
+from every `run_guarded()` exception branch) or, as a backstop, via
+`HardwareManager.disconnect_all()`'s own independently-guarded relay
+`open_all()` step in `test.py`'s outer `finally`.
+
+### Cancellation (shutdown) behavior
+
+The intended, fully-verified normal termination path:
+```
+check_cancellation(token) raises OperationCancelledError
+  -> log_event()
+  -> record_execution_state(CANCELLED)
+  -> finish_run_summary(stop_reason=CANCELLED, result="STOPPED_BY_OPERATOR")
+  -> safety.safe_cancel_shutdown()   (SMU output-off + relay open_all(), both "never raise")
+  -> re-raise
+  -> caught cleanly at test.py ("hardware is in a verified safe state")
+  -> outer finally: storage.close() + hw_mgr.disconnect_all()
+```
+(`test_control/battery_operation_sequence.py:141-153`, `test.py:3849-3850, 3858-3868`).
+
+### No retry/recovery
+
+There is no retry or backoff logic anywhere in `hardware/dmm.py`'s
+`connect()`/`measure_dc_voltage()`, nor in `monitor_battery_sequence.py`'s
+loop, nor in `run_guarded()`. The first measurement failure -- transient
+glitch or genuine fault, the code does not distinguish -- ends the
+workflow via the standard fault-shutdown path. Consistent with the
+project's stated safety-first philosophy (never mask a real fault by
+retrying blindly).
+
+### Known caveat: mid-run database failure
+
+The run always stops and the relay is always opened, but not necessarily
+through the "clean" classified shutdown path. Each `run_guarded()`
+exception branch calls `storage.log_event()`/`record_execution_state()`/
+`finish_run_summary()` **before** `safety.emergency_stop()`/
+`safe_cancel_shutdown()`. If the database itself is the original failure,
+those storage calls raise a second exception (the DB is still broken),
+which propagates out of `run_guarded()` immediately -- skipping
+`safety.emergency_stop()` *at that layer*. Hardware still ends up safe
+via the outer `test.py` `finally`'s `hw_mgr.disconnect_all()` backstop
+(its relay `open_all()` step is independently guarded and cannot raise),
+but the failure's `run_summary`/`event_log` classification (the recorded
+stop reason) may be missing or generic for this specific failure mode,
+rather than cleanly recorded as it would be for a DMM/relay fault. This
+is a diagnostic/traceability gap only, not a hardware-safety gap, and is
+the one documented caveat carried into the GO decision.
+
+### GO decision
+
+**GO for Real Hardware Validation using Monitor Battery.** No software
+blocker identified. The database-failure traceability caveat above is
+tracked as an optional, low-priority follow-up (wrap the storage calls
+inside `run_guarded()`'s except-branches so a DB failure while handling
+an unrelated fault does not itself skip `safety.emergency_stop()` at that
+layer -- redundant with the outer backstop for hardware safety, but would
+restore clean stop-reason classification for this one failure mode), not
+a gate on proceeding.

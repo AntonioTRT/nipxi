@@ -1421,6 +1421,79 @@ IX's recommended Real Hardware Validation scope (`ChargeSequence`/
 
 ---
 
+## Milestone XI: Monitor Battery Operational Behavior Review -- GO for Real Hardware Validation
+
+**Status:** ACHIEVED
+
+**Scope:** Monitor Battery (`test_control/monitor_battery_sequence.py::MonitorBatterySequence`)
+is the first workflow scheduled for Real Hardware Validation. This
+milestone is an implementation-level readiness review -- performed
+against the actual code, not architectural assumptions -- covering
+startup, DMM dependency behavior, long-duration operation, database
+persistence, relay behavior, cancellation/shutdown, retry behavior, and
+failure-mode traceability. Documentation-only session: no implementation
+code was changed to produce or act on this review.
+
+### Objectives achieved
+
+- **Confirmed intended lifecycle.** Monitor Battery's `while True:` loop
+  has no timeout, no automatic stop condition, and no normal-completion
+  path by design -- it runs until operator cancellation (Ctrl+C) or a
+  real fault, exactly as the module's own docstring states.
+- **Confirmed long-duration safety.** An example 8-hour continuous
+  session was analyzed specifically: no memory-growth risk (bounded
+  in-memory state, four floats), no buffering risk (every measurement
+  committed to the database synchronously, immediately, every iteration).
+  **Supported.**
+- **Confirmed relay behavior.** Closes once at startup, stays closed for
+  the full session, opens on every exit path -- either directly via
+  `safety.emergency_stop()`/`safe_cancel_shutdown()`, or via
+  `HardwareManager.disconnect_all()`'s outer backstop.
+- **Confirmed DMM dependency behavior is mode-dependent.** PRODUCTION
+  fails closed (`HardwareInitError`, no hardware activation).
+  DEVELOPMENT/VALIDATION briefly activates the relay before the first
+  failed measurement triggers the standard emergency-shutdown path.
+- **Confirmed no retry/recovery exists** -- by design, consistent with
+  the project's safety-first philosophy of never masking a real fault.
+- **Found and documented one non-blocking caveat:** a mid-run database
+  failure can cause `run_guarded()`'s own failure-classification storage
+  calls to themselves fail, skipping `safety.emergency_stop()` at that
+  layer specifically. Hardware is still safed via the outer `test.py`
+  cleanup path (`hw_mgr.disconnect_all()`'s independently-guarded relay
+  `open_all()`), so this is a traceability/stop-reason gap, not a
+  hardware-safety gap.
+
+### Architectural decisions made
+
+- No code changes were made as part of this review -- the caveat found
+  is tracked as an optional, low-priority follow-up (see docs/TODO.md),
+  not treated as a blocker, since hardware safety is preserved either way
+  via the existing outer-layer backstop.
+
+### Verification
+
+Every finding is cited against the actual source (`test_control/
+monitor_battery_sequence.py`, `test_control/battery_operation_sequence.py`,
+`test_control/hardware_manager.py`, `hardware/dmm.py`, `data/storage.py`,
+`test.py`, `utils/errors.py`, `utils/cancellation.py`) -- see
+docs/architecture.md Section 45 for full evidence and docs/FAQ.md Section
+13 for the Q&A-form record. No mocked or physical-hardware test was run
+as part of this documentation-only session; the review is a static
+implementation trace, not a dynamic test.
+
+### Milestone readiness decision
+
+**GO for Real Hardware Validation using Monitor Battery.** No software
+blocker identified.
+
+### Recommended next milestone
+
+Proceed with Real Hardware Validation using Monitor Battery per this
+GO decision. Track the `run_guarded()` storage-ordering hardening
+(docs/TODO.md) as an optional low-priority follow-up, not a gate.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the
