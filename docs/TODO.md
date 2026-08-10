@@ -365,6 +365,15 @@ Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
 
+- **Matrix Scan 5s ON-State Dwell (for physical rack inspection)** -- added
+  `Settings.RELAY_MATRIX_SCAN_DWELL_S` (`5.0` s), a new constant used only
+  by `test.py::_run_relay_matrix_scan()` ("[2] Matrix Scan (ON -> READ ->
+  OFF, scoped by group)"). Each relay now stays ON for 5s after
+  activation/read before being turned OFF, giving an operator time to
+  observe LEDs/routing/measurements/wiring during real-rack validation.
+  Deliberately independent of `Settings.RELAY_SETTLE_TIME_S` (unchanged,
+  `2.0` s, still enforced by every `relay.open()`/`close()` call) and does
+  not affect any other workflow. See docs/architecture.md Section 21.
 - **Single Global Relay Settle/Dead-Time Constant + RelayEthernetTest Fix**
   -- a pre-hardware-validation timing review found relay settle delay was
   inconsistent (0.2s/0s/borrowed-`STABILIZATION_S` across different

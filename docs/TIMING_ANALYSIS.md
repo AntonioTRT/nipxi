@@ -14,7 +14,14 @@
 > that fix -- `test.py::test_relay_ethernet_test()` bypasses `open()`/
 > `close()` by design (Section 24's documented exception) and so received
 > no settle delay -- was found from real-hardware behavior and fixed; see
-> `docs/architecture.md` Section 44. The other findings in
+> `docs/architecture.md` Section 44. Separately, Matrix Scan (Section 10's
+> `_run_relay_matrix_scan()` row below) now holds each relay ON for an
+> additional `5.0` s (`Settings.RELAY_MATRIX_SCAN_DWELL_S`) for physical
+> rack inspection, on top of the settle delay -- see `docs/architecture.md`
+> Section 21; Section 10's "no artificial delay between channels" finding
+> is still accurate (the new dwell is within a channel's own ON period,
+> not between channels) and total 32-channel sweep time is now
+> correspondingly longer. The other findings in
 > this document (dead `sample_rate_hz` config, no DMM/DAQ timeout
 > configuration, no `SafetyMonitor.check()` debounce, the first-`initiate()`
 > measurement transient) remain open -- see `docs/TODO.md`. This document

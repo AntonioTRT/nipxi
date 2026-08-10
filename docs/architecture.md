@@ -1486,6 +1486,24 @@ Standalone callers (`scope_label=None`, no scope selection happened) print no ba
 
 **Implementation:** `test_relay_matrix_scan()`/`_run_relay_matrix_scan()` retain the `channel_start`/`channel_end` parameters added for group-scoping (both 1-based, inclusive, clipped to the selected device's configured channel count), defaulting to the full range when omitted. `_select_relay_scope()` now returns `(label, channel_start, channel_end)` instead of just the bounds, so the caller can print the scope banner above.
 
+**ON-state dwell for physical inspection (added later):** per-channel
+sequence in `_run_relay_matrix_scan()` is now `relay.close(ch)` (ON) ->
+`relay.read(ch)` (READ) -> **5.0s dwell** (`Settings.
+RELAY_MATRIX_SCAN_DWELL_S`, `config/settings.py`) -> `relay.open(ch)`
+(OFF), instead of turning the relay back off immediately after the read.
+This is a Matrix-Scan-only constant, separate from and in addition to
+`Settings.RELAY_SETTLE_TIME_S` (still `2.0` s, still enforced
+unconditionally by `RelayBase.open()`/`close()` on every relay action --
+unchanged by this addition). The dwell gives an operator on the physical
+rack time to observe relay activation, verify LEDs, verify physical
+routing/measurements/wiring, and confirm correct relay selection before
+the relay is deactivated. `relay.log` (`nipxi.hw.<device>`, visible via
+this test's existing `_numato_relay_debug_logging()` wrapper) now logs
+"activated" / "dwell starting" / "dwell complete -- deactivating" /
+"deactivated" for each channel. No other relay workflow (Monitor Battery,
+Monitor Battery Scan, ChargeSequence, DischargeSequence,
+`RelayEthernetTest`) reads or is affected by this constant.
+
 ## 22. Hardware Identity Traceability (Milestone II)
 
 **Objective:** a historical run in `run_summary`/`event_log` should be able to answer "which physical instruments were used?", "which hardware configuration produced these measurements?", and "what test bench configuration existed when the run executed?" -- not just electrical values and battery configuration. Before this extension, device identity (SMU/DMM/DAQ/relay-matrix model, resource string, IP) was only ever printed to the console (`test.py`'s `"Selected Hardware"` block) and lost the moment the session ended; nothing in `measurements`, `run_summary`, `event_log`, or `station_state` recorded which instrument produced a given row.

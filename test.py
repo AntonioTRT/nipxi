@@ -1504,11 +1504,21 @@ def _run_relay_numato_matrix_test(cfg, name, host, port, driver, user, config_re
 def test_relay_matrix_scan(name=None, cfg=None, channel_start=None, channel_end=None, scope_label=None):
     """
     Commissioning test: exercises every configured channel of the Numato
-    Relay Matrix module -- ON, READ, OFF -- one connection for the whole scan.
-    This is Functional Validation (it energizes every relay channel in turn)
-    -- see _functional_relay_numato(), which routes here from the shared
-    hardware-category menu; called with no arguments it falls back to its
-    own device picker for standalone use.
+    Relay Matrix module -- ON, READ, DWELL, OFF -- one connection for the
+    whole scan. Each channel is held ON for
+    Settings.RELAY_MATRIX_SCAN_DWELL_S (5.0s) after activation/read/verify
+    and before being turned back OFF, specifically to give an operator on
+    the physical rack time to observe relay activation, verify LEDs,
+    verify physical routing/measurements/wiring, and confirm correct relay
+    selection -- this dwell is Matrix-Scan-specific and does not apply to
+    any other relay workflow. It is independent of, and in addition to,
+    the unconditional Settings.RELAY_SETTLE_TIME_S settle delay every
+    relay.open()/close() call already applies (see hardware/relay.py::
+    RelayBase) -- this test does not change that value or that behavior.
+    This is Functional Validation (it energizes every relay channel in
+    turn) -- see _functional_relay_numato(), which routes here from the
+    shared hardware-category menu; called with no arguments it falls back
+    to its own device picker for standalone use.
 
     `channel_start`/`channel_end` (both optional, 1-based, inclusive) scope
     the scan to a subset of channels -- e.g. one battery group's channel
@@ -1617,7 +1627,7 @@ def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_r
                        config_ref, f"Connected and authenticated to {driver} at "
                        f"{host}:{port} (user='{user}')"))
 
-    # Full channel scan -- ON, READ, OFF per channel ------------------------------
+    # Full channel scan -- ON, READ, DWELL (Settings.RELAY_MATRIX_SCAN_DWELL_S), OFF per channel --
     try:
         for ch in range(channel_start, channel_end + 1):
             # Checkpoint: before starting a new channel, never mid-channel
@@ -1634,15 +1644,32 @@ def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_r
                 break
 
             try:
-                relay.close(ch)              # ON
-                state = relay.read(ch)       # READ
-                relay.open(ch)                # OFF
+                dwell_s = Settings.RELAY_MATRIX_SCAN_DWELL_S
+
+                relay.close(ch)              # ON (READ -> VERIFY -> WRITE -> SETTLE -> READ -> VERIFY, see RelayBase.close())
+                state = relay.read(ch)       # READ (post-activation)
+                relay.log.info(
+                    "Relay Matrix Scan: relay %d activated (READ reported %s)",
+                    ch, "ON" if state else "OFF",
+                )
+                relay.log.info(
+                    "Relay Matrix Scan: relay %d dwell starting -- %.1fs "
+                    "(hold ON for visual/physical inspection)", ch, dwell_s,
+                )
+                time.sleep(dwell_s)          # DWELL -- Matrix Scan only, see Settings.RELAY_MATRIX_SCAN_DWELL_S
+                relay.log.info(
+                    "Relay Matrix Scan: relay %d dwell complete (%.1fs) -- deactivating", ch, dwell_s,
+                )
+                relay.open(ch)                # OFF (READ -> VERIFY -> WRITE -> SETTLE -> READ -> VERIFY, see RelayBase.open())
+                relay.log.info(
+                    "Relay Matrix Scan: relay %d deactivated", ch,
+                )
                 if state:
                     results.append(_ok("Relay Matrix Scan", f"Relay {ch}", config_ref,
-                                       "ON -> READ -> OFF  OK  (READ reported ON)"))
+                                       f"ON -> READ -> DWELL {dwell_s:.1f}s -> OFF  OK  (READ reported ON)"))
                 else:
                     results.append(_warn("Relay Matrix Scan", f"Relay {ch}", config_ref,
-                                         "ON -> READ -> OFF sent, but READ reported OFF "
+                                         f"ON -> READ -> DWELL {dwell_s:.1f}s -> OFF sent, but READ reported OFF "
                                          "-- verify wiring/relay bank"))
             except Exception as e:
                 results.append(_fail("Relay Matrix Scan", f"Relay {ch}", config_ref,

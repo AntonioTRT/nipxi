@@ -182,6 +182,21 @@ class Settings:
     RELAY_SETTLE_TIME_S    = 2.0  # s -- mandatory dead-time after every relay open()/close(), never 0
     MONITOR_SCAN_SAMPLES   = 3    # count -- DMM samples averaged per voltage reading
 
+    # -------------------------------------------------------------------------
+    # Relay Matrix Scan (test.py::_run_relay_matrix_scan(), "[2] Matrix Scan
+    # (ON -> READ -> OFF, scoped by group)") -- how long each relay is held
+    # ON, after it has been activated/read/verified and before it is turned
+    # back OFF. This is a Matrix-Scan-ONLY dwell for real-rack hardware
+    # inspection (observe activation, verify LEDs, verify physical routing/
+    # measurements/wiring, confirm relay selection) -- it is NOT a relay
+    # settling/dead-time value and is completely independent of
+    # RELAY_SETTLE_TIME_S above, which still applies unchanged on top of
+    # this dwell (via RelayBase.open()/close()). Do not reuse this constant
+    # for any other workflow, and do not let RELAY_SETTLE_TIME_S be reused
+    # for this purpose either -- the two concerns are deliberately separate.
+    # -------------------------------------------------------------------------
+    RELAY_MATRIX_SCAN_DWELL_S = 5.0  # s -- ON-state dwell, Matrix Scan only
+
     # How long a position's relay is held closed AFTER the initial settled
     # voltage/DAQ reading, to observe relay/measurement stability over time
     # before moving to the next position -- see the CLOSED-state monitoring
