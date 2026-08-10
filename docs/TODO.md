@@ -365,6 +365,19 @@ Full detail lives in `docs/architecture.md` and `docs/CONFIGURATION.md`, not
 here -- this is an index, not a changelog. See `docs/MILESTONES.md` for the
 first real-rack hardware bring-up milestone record.
 
+- **Single Global Relay Settle/Dead-Time Constant + RelayEthernetTest Fix**
+  -- a pre-hardware-validation timing review found relay settle delay was
+  inconsistent (0.2s/0s/borrowed-`STABILIZATION_S` across different
+  workflows). Fixed by making `Settings.RELAY_SETTLE_TIME_S` (`2.0` s) the
+  single relay-timing constant, enforced centrally in
+  `hardware/relay.py::RelayBase.open()`/`close()` (never overridable,
+  never `0`). A follow-up real-hardware observation then found
+  `test.py::test_relay_ethernet_test()` still transitioning immediately --
+  root cause: it deliberately bypasses `open()`/`close()` to exercise
+  native Numato primitives directly (a pre-existing, documented
+  exception), so it never received the new delay. Fixed by exposing
+  `RelayBase.settle()` publicly and calling it explicitly from that test
+  after each native write. See docs/architecture.md Sections 43-44.
 - **Pre-Hardware-Validation MUST-FIX Closure** -- closed the four
   highest-priority gaps a pre-hardware-validation architecture FAQ review
   (`docs/FAQ.md`) identified: reverse polarity protection (new

@@ -1690,9 +1690,18 @@ def test_relay_ethernet_test(name=None, cfg=None):
     itself sourced from Settings.RELAY_COUNT) -- never hardcoded here.
 
     Sequence per relay_index in range(RELAY_COUNT):
-        write_all(OFF) -> read_all() -> verify all OFF
-        write(relay_index, ON) -> read_all() -> verify relay_index ON, rest OFF
-        write_all(OFF) -> read_all() -> verify all OFF
+        write_all(OFF) -> read_all() -> verify all OFF -> settle
+        write(relay_index, ON) -> read_all() -> verify relay_index ON, rest OFF -> settle
+        write_all(OFF) -> read_all() -> verify all OFF -> settle
+
+    This test deliberately bypasses RelayBase.open()/close() (it validates
+    the native command layer independently -- see docs/architecture.md
+    Section 24), so it is the one relay path that calls
+    RelayBase.settle() explicitly after each state-changing native
+    operation, rather than getting it automatically from open()/close().
+    settle() blocks for Settings.RELAY_SETTLE_TIME_S -- the single global
+    relay settling/dead-time constant (hardware/relay.py) -- never a
+    separate/hardcoded delay.
 
     Fails immediately on any mismatch -- does not continue to the remaining
     relays once one has failed.
@@ -1755,6 +1764,7 @@ def test_relay_ethernet_test(name=None, cfg=None):
                     try:
                         relay.write_all(0)
                         relay.verify_all(0)
+                        relay.settle()
                     except Exception:
                         pass
                     cancelled = True
@@ -1773,17 +1783,20 @@ def test_relay_ethernet_test(name=None, cfg=None):
 
                     relay.write_all(0)
                     relay.verify_all(0)
+                    relay.settle()   # Settings.RELAY_SETTLE_TIME_S -- see hardware/relay.py::RelayBase.settle()
 
                     relay.write(relay_index, True)
                     relay.verify_all(1 << relay_index)
+                    relay.settle()
 
                     relay.write_all(0)
                     relay.verify_all(0)
+                    relay.settle()
 
                     results.append(_ok(
                         "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
-                        "read_all (pre-check) -> write_all(OFF) -> verify -> write(ON) -> "
-                        "verify -> write_all(OFF) -> verify  PASS"
+                        "read_all (pre-check) -> write_all(OFF) -> verify -> settle -> write(ON) -> "
+                        "verify -> settle -> write_all(OFF) -> verify -> settle  PASS"
                     ))
                 except Exception as e:
                     results.append(_fail(

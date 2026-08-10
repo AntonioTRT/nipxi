@@ -1330,6 +1330,97 @@ scaling to more channels, attempting HUB, or starting `CycleSequence`.
 
 ---
 
+## Milestone X: Relay Settle-Time Consolidation + Real-Hardware Timing Fix
+
+**Status:** ACHIEVED
+
+**Scope:** two related fixes ahead of/during Real Hardware Validation.
+First, a pre-hardware timing review found relay settling delay was
+inconsistent across workflows -- `0.2s` in `MonitorBatteryScanSequence`,
+`0s` in `MonitorBatterySequence` and the `test.py` relay validation/
+hardware-validation scans, and the unrelated `STABILIZATION_S` (`5.0s`,
+an SMU electrical-settling value, not a relay one) borrowed by
+`ChargeSequence`/`DischargeSequence`. Second, real-hardware use of `[3]
+RelayEthernetTest (native 0-based primitives)` on the physical 8-relay
+Numato board showed relay transitions occurring immediately, not
+respecting the expected ~2s gap -- a real behavioral defect, not a
+misconfiguration.
+
+### Objectives achieved
+
+- **Single global relay timing constant.** `Settings.RELAY_SETTLE_TIME_S`
+  (`config/settings.py`) is now `2.0` s and the only relay-settling/
+  dead-time constant in the codebase. Enforced structurally in
+  `hardware/relay.py::RelayBase.open()`/`close()`, which are now concrete
+  (no longer abstract/overridable) and call the renamed driver-specific
+  `_open_impl()`/`_close_impl()` then unconditionally block via the new
+  `RelayBase.settle()`, which raises `ValidationError` if the constant is
+  ever configured `<= 0`. `NumatoRelayMatrix`, `SerialRelay`, and
+  `SimulatedRelay` were all updated to the new `_open_impl`/`_close_impl`
+  naming. Duplicate/inconsistent per-call-site delays were removed
+  (`MonitorBatteryScanSequence`'s own `settle_s` parameter/sleeps;
+  `ChargeSequence`/`DischargeSequence`'s pre-enable `STABILIZATION_S`
+  sleep, which was actually serving the relay-settle role under a
+  different constant's name).
+- **RelayEthernetTest root cause found and fixed.** `test.py::
+  test_relay_ethernet_test()` deliberately bypasses `RelayBase.open()`/
+  `close()` (an intentional, pre-existing, documented exception -- see
+  `docs/architecture.md` Section 24 -- to validate the native Numato
+  command layer independently). Because Section 43's fix lived entirely
+  inside `open()`/`close()`, this test received no settle delay at all,
+  which is exactly the immediately-transitioning behavior observed on
+  real hardware. Fixed by making `RelayBase.settle()` public and calling
+  it explicitly after each of the test's three native write operations
+  per relay index (plus its cancellation-triggered force-off), reusing
+  the same constant and the same guard -- no second implementation.
+- **Full relay-path audit performed** (`docs/architecture.md` Section
+  44): every relay-state-changing call site in the repo was checked
+  against the global constant; `test_relay_ethernet_test()` was the only
+  bypass found. Read/write/verify sequencing (Section 24's pattern) was
+  independently re-confirmed intact everywhere, including on the fixed
+  path -- the defect was specifically the missing delay, not a missing
+  verification step.
+
+### Architectural decisions made
+
+- The settle delay is enforced structurally (inside `RelayBase`), not by
+  convention at each call site, specifically so that no future workflow
+  can reintroduce a `0s`/inconsistent relay transition by omission.
+- `RelayBase.settle()` is deliberately public (not `_settle()`) precisely
+  because at least one legitimate, documented code path
+  (`test_relay_ethernet_test()`) must operate below the `open()`/`close()`
+  wrapper by design -- the fix had to accommodate that exception rather
+  than force every relay interaction through the wrapper.
+- `Settings.STABILIZATION_S` (SMU output electrical settling) and
+  `Settings.PROTO_TEST_DWELL_S` (per-relay measurement dwell) remain
+  intentionally separate from `RELAY_SETTLE_TIME_S` -- the requirement
+  was one constant per concern (relay switching), not collapsing all
+  hardware timing into a single number.
+
+### Verification
+
+All touched modules byte-compile cleanly (`hardware/relay.py`,
+`hardware/relay_eth.py`, `hardware/relay_serial.py`,
+`hardware/simulated.py`, `config/settings.py`, `test.py`,
+`test_control/monitor_battery_scan_sequence.py`,
+`test_control/charge_sequence.py`, `test_control/discharge_sequence.py`).
+A live smoke test against `SimulatedRelay` confirmed `close()` now blocks
+for the full configured `2.0` s before returning. Confirming `2.0` s
+against the Numato board's actual mechanical settling time on the
+physical rack remains an open real-hardware task (see
+`docs/TIMING_ANALYSIS.md` Recommendations) -- this milestone fixes
+software consistency and the RelayEthernetTest defect, not the
+hardware-measured value itself.
+
+### Recommended next milestone
+
+Re-run `[3] RelayEthernetTest` on the physical rack to confirm the ~2s
+gap is now observed between relay operations, then continue Milestone
+IX's recommended Real Hardware Validation scope (`ChargeSequence`/
+`DischargeSequence` against Group A + a real SB battery).
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

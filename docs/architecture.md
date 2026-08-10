@@ -2533,3 +2533,67 @@ bank's actual mechanical settling time is still a first-hardware-
 validation task (see Section 42 and `docs/TIMING_ANALYSIS.md`'s
 Recommendations) -- this change fixes the software's *consistency* and
 *floor*, not a hardware-measured value.
+
+## 44. RelayEthernetTest Bypassed the Global Relay Settle Constant -- Root Cause and Fix
+
+**Observed issue:** running `[3] RelayEthernetTest (native 0-based
+primitives)` against the 8-relay Numato board showed relay transitions
+happening immediately, with none of the expected ~2.0 s
+(`Settings.RELAY_SETTLE_TIME_S`) gap between them.
+
+**Root cause:** Section 43's fix enforces the settle delay inside
+`RelayBase.open()`/`close()` -- but `test.py::test_relay_ethernet_test()`
+was never calling those methods. As documented in Section 24 ("The one
+deliberate exception"), this test intentionally exercises
+`NumatoRelayMatrix`'s native primitives (`write()`, `write_all()`,
+`verify_all()`) directly, bypassing the `open()`/`close()` wrapper, to
+validate that command layer independently. Section 43 did not account for
+this pre-existing, already-documented bypass path: since the settle delay
+lived entirely inside `open()`/`close()`, any code that legitimately
+calls the native primitives directly received no settle delay at all --
+exactly the immediate-transition behavior observed on the physical rack.
+This was a real gap in the Section 43 implementation, not a hardware
+issue and not a misconfiguration.
+
+**Fix:** `hardware/relay.py::RelayBase._settle()` was renamed to a public
+`settle()` -- the single implementation of the settle delay, still called
+automatically by `open()`/`close()`, but now also callable directly by any
+path that deliberately operates below that wrapper. `test.py::
+test_relay_ethernet_test()` now calls `relay.settle()` after each of its
+three state-changing native operations per relay index (`write_all(0)`
+force-off, `write(relay_index, True)` energize, `write_all(0)`
+de-energize), and once more on the operator-cancellation force-off path.
+This reuses `Settings.RELAY_SETTLE_TIME_S` and `RelayBase.settle()`'s
+existing `> 0` guard -- no second constant, no duplicated sleep logic.
+
+**Audit performed (per this review's Phase 3/4 scope) -- every relay-state-changing call site in the repo:**
+
+| Call site | Reaches settle? | How |
+|---|---|---|
+| `NumatoRelayMatrix`/`SerialRelay`/`SimulatedRelay` via `RelayBase.open()`/`close()` | Yes | Automatic |
+| `MonitorBatterySequence.run()` | Yes | `relay.close()`/`open_all()` |
+| `MonitorBatteryScanSequence._scan_one_position()` | Yes | `relay.open()`/`close()` |
+| `ChargeSequence`/`DischargeSequence` | Yes | `relay.close()`/`open()` |
+| `ProtoTestSequence.run()` | Yes | `relay.close()`/`open()` |
+| `HardwareManager` startup/shutdown/`atexit` | Yes | `relay.open_all()` |
+| `SafetyMonitor.emergency_stop()`/`safe_cancel_shutdown()` | Yes | `relay_matrix.open_all()` |
+| `test.py` "Relay 1 quick check" / Matrix Scan / Safety Self-Test | Yes | `relay.close(ch)`/`relay.open(ch)` |
+| `test.py::test_relay_ethernet_test()` (`RelayEthernetTest`) | **No, until this fix** | Native `write()`/`write_all()` bypassing the wrapper -- now calls `relay.settle()` explicitly |
+
+No other bypass path was found (confirmed by a repo-wide search for direct
+`.write(`/`.write_all(` calls on a relay object outside
+`hardware/relay_eth.py` itself -- `test_relay_ethernet_test()` was the
+only caller).
+
+**Read/write verification audit (Phase 4):** every relay-state-changing
+call site above -- including `test_relay_ethernet_test()` -- already
+followed Read Current State -> Verify -> Write -> Read -> Verify before
+this fix (Section 24's pattern); that part of the architecture was not
+violated. The gap was specifically the missing settle delay on the one
+documented native-primitive path, not a missing read/verify step. No
+read/write/verify correction was needed as part of this fix.
+
+**Verification performed:** `hardware/relay.py` and `test.py`
+byte-compile cleanly after the change. `RelayBase.settle()`'s `> 0` guard
+means `test_relay_ethernet_test()` cannot silently regress to a 0 s delay
+either, for the same reason `open()`/`close()` cannot.

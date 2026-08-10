@@ -10,7 +10,11 @@
 > `docs/architecture.md` Section 43 ("Single Global Relay Settling/Dead-Time
 > Constant"): `Settings.RELAY_SETTLE_TIME_S` is now `2.0` s, enforced
 > unconditionally in `hardware/relay.py::RelayBase.open()`/`close()` for
-> every relay switch in the application, never `0`. The other findings in
+> every relay switch in the application, never `0`. A follow-up gap in
+> that fix -- `test.py::test_relay_ethernet_test()` bypasses `open()`/
+> `close()` by design (Section 24's documented exception) and so received
+> no settle delay -- was found from real-hardware behavior and fixed; see
+> `docs/architecture.md` Section 44. The other findings in
 > this document (dead `sample_rate_hz` config, no DMM/DAQ timeout
 > configuration, no `SafetyMonitor.check()` debounce, the first-`initiate()`
 > measurement transient) remain open -- see `docs/TODO.md`. This document

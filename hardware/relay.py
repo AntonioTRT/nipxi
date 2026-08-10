@@ -62,14 +62,28 @@ class RelayBase(HardwareBase):
     def open(self, channel: int):
         """Open (de-energize) relay for the given channel, then settle."""
         self._open_impl(channel)
-        self._settle()
+        self.settle()
 
     def close(self, channel: int):
         """Close (energize) relay for the given channel, then settle."""
         self._close_impl(channel)
-        self._settle()
+        self.settle()
 
-    def _settle(self):
+    def settle(self):
+        """
+        Block for Settings.RELAY_SETTLE_TIME_S -- the single global relay
+        settling/dead-time delay. Called automatically by open()/close()
+        above; ALSO the one method any code path that deliberately
+        operates on native/raw relay primitives below the open()/close()
+        wrapper (e.g. test.py::test_relay_ethernet_test(), which exercises
+        NumatoRelayMatrix's native write()/write_all() directly, by design,
+        to validate that layer independently -- see docs/architecture.md
+        Section 24) MUST call after every state-changing native operation.
+        This is the ONLY place the delay value/sleep is implemented -- no
+        other relay code path may hardcode or duplicate this logic; every
+        path either goes through open()/close() (automatic) or calls this
+        method explicitly (native-primitive paths).
+        """
         settle_s = Settings.RELAY_SETTLE_TIME_S
         if settle_s <= 0:
             raise ValidationError(

@@ -130,30 +130,32 @@ is out of scope except where explicitly noted.
 
 ### Q: Is there a mandatory delay between relay state transitions?
 
-**Status:** Not Implemented
+**Status:** Implemented
 
-**Answer:** No fixed settling delay exists in the relay driver itself between force-off and activate — the sequence is COMMAND→READBACK→VERIFY at protocol speed (bounded by the ~5s Telnet `timeout` config, not an intentional settle time). The only delay in the system near a relay-close event is `ChargeSequence`/`DischargeSequence`'s `STABILIZATION_S` interruptible sleep, which happens AFTER relay close and SMU `output_enable()` — it is an electrical-stabilization wait for the PSU/battery interface, not a relay mechanical-settling delay.
+**Answer:** Yes. `hardware/relay.py::RelayBase.open()`/`close()` are concrete (not overridable) and unconditionally block for `Settings.RELAY_SETTLE_TIME_S` (`2.0` s) via `RelayBase.settle()` immediately after the driver-specific `_open_impl()`/`_close_impl()` returns and is verified — before control returns to the caller. Because every production/validation relay path calls `open()`/`close()` (or, for the one documented native-primitive exception, calls `settle()` explicitly — see next entry's evidence and `docs/architecture.md` Section 24/44), no subsequent relay action can begin less than 2.0 s after the previous one completed. This was previously true only for `ChargeSequence`/`DischargeSequence`'s unrelated `STABILIZATION_S` electrical-settling wait; Monitor Battery, the relay validation/hardware-validation scans, and `RelayEthernetTest`'s native-primitive loop had **no delay at all** until this fix (see `docs/architecture.md` Sections 43-44 for the audit that found and corrected this).
 
 **Evidence:**
-- hardware/relay_eth.py:640-653 — `_force_all_off_and_verify()` (no explicit `time.sleep`)
-- test_control/charge_sequence.py:140 — `interruptible_sleep(self.s.STABILIZATION_S, token=token)` (after relay close + output_enable)
+- hardware/relay.py — `RelayBase.open()`/`close()`/`settle()`
+- hardware/relay_eth.py — `NumatoRelayMatrix._open_impl()`/`_close_impl()` (renamed from `open()`/`close()`)
+- test.py::test_relay_ethernet_test() — calls `relay.settle()` explicitly after each native `write()`/`write_all()`, since this test bypasses `open()`/`close()` by design
 
-**Risks:** Electromechanical relay contact bounce/settling is not explicitly modeled; the readback verification implicitly waits for the round-trip Telnet response, which may or may not be long enough for real contact settling — unconfirmed against real hardware.
+**Risks:** `2.0` s is a chosen safety-floor value, not yet confirmed against the Numato relay bank's real mechanical settling time on hardware — see `docs/TIMING_ANALYSIS.md` Recommendations.
 
-**Recommendation:** Confirm with real hardware whether the Telnet round-trip latency is sufficient settling time before the SMU is commanded; if not, add an explicit configurable settle delay.
+**Recommendation:** Confirm on first real hardware validation whether `2.0` s is sufficient (or excessive) for the physical relay's actual contact settling time; adjust the single `Settings.RELAY_SETTLE_TIME_S` constant if so — never add a second, path-specific value.
 
 ### Q: Is relay settling time configurable?
 
-**Status:** Not Implemented
+**Status:** Implemented
 
-**Answer:** No dedicated relay-settling-time setting exists in `config/settings.py` (only `STABILIZATION_S`, which is an SMU/battery-interface stabilization wait, not a relay-specific one — see previous entry).
+**Answer:** Yes. `Settings.RELAY_SETTLE_TIME_S` (`config/settings.py`) is the single global relay settling/dead-time constant, currently `2.0` s. It is the only relay-timing setting in the codebase and is enforced centrally in `RelayBase.open()`/`close()` — there is no per-workflow override and no second relay-timing constant anywhere. `RelayBase.settle()` raises `ValidationError` if it is ever configured `<= 0`, so a 0 s value can never silently take effect.
 
 **Evidence:**
-- Grep of `config/settings.py`/`hardware/relay_eth.py` found no relay-specific settle constant (only `Settings.STABILIZATION_S`, consumed in charge_sequence.py:140/discharge_sequence.py:151).
+- config/settings.py — `RELAY_SETTLE_TIME_S = 2.0`
+- hardware/relay.py::RelayBase.settle() — reads the constant, enforces `> 0`
 
-**Risks:** None beyond the previous entry's.
+**Risks:** None beyond the previous entry's (real-hardware confirmation of the value itself).
 
-**Recommendation:** If real-hardware testing shows contact bounce matters, add an explicit `RELAY_SETTLE_S` setting.
+**Recommendation:** None; already implemented as the single source of truth.
 
 ### Q: What happens if cancellation occurs during relay switching?
 
@@ -1374,6 +1376,8 @@ is out of scope except where explicitly noted.
 ## SECTION 12 — PRE-HARDWARE VALIDATION CONCLUSION
 
 *Updated this session to reflect the closure of four MUST-FIX items: reverse polarity protection, battery-type validation, timeout traceability, and database startup hardening. See docs/architecture.md "Pre-Hardware-Validation MUST-FIX Closure" for the consolidated writeup. Sections 1-4, 6, 8, 9, 11 below Section 12 headers are unaffected by this session's changes; only the tallies and lists below have been re-derived from the entries actually changed above.*
+
+*Addendum (later session): Section 1's "Is there a mandatory delay between relay state transitions?" and "Is relay settling time configurable?" both moved from Not Implemented to Implemented -- `Settings.RELAY_SETTLE_TIME_S` (`2.0` s) is now the single global relay settling/dead-time constant, enforced in `RelayBase.open()`/`close()`, with the one documented native-primitive exception (`test.py::test_relay_ethernet_test()`) calling `RelayBase.settle()` explicitly. See `docs/architecture.md` Sections 43-44. GREEN count: 44 (+2). The two former Not-Implemented entries are removed from any RED/YELLOW tracking below; no other item in this list was affected.*
 
 ### Classification Summary
 
