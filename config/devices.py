@@ -773,6 +773,20 @@ ETHERNET_DEVICES = {
         "num_channels":  Settings.RELAY_COUNT,
         "channel_count": Settings.RELAY_COUNT,
     },
+        # Numato Relay Matrix at 169.254.1.202
+    "MATRIX_NUMATO_203": {
+        "type":          "ethernet",
+        "driver":        "RELAY32ETHRL00",
+        "name":          "MATRIX_NUMATO_203",
+        "ip":            "169.254.1.203",
+        "port":          23,
+        "username":      "admin",
+        "user":          "admin",
+        "password":      "admin",
+        "timeout":       5.0,
+        "num_channels":  Settings.RELAY_COUNT,
+        "channel_count": Settings.RELAY_COUNT,
+    },
 }
 
 # Legacy compatibility -- old role-based names, kept only in case other code
