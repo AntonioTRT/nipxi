@@ -3580,6 +3580,88 @@ def _select_battery_position(group: str):
     return pos
 
 
+def _resolve_group_hardware(group: str, required_roles=("relay_matrix", "smu", "dmm", "daq")):
+    """
+    Resolve hardware assignment and battery type for `group`, entirely
+    from config/devices.py::BATTERY_GROUPS via hardware_for_group()/
+    group_test_config() -- never operator input, never a second hardware
+    map. Shared by every hardware-activating workflow (Monitor Battery,
+    Monitor Battery Scan, Charge/Discharge Battery, future Cycle Battery)
+    so each does not duplicate the same resolution/validation block.
+
+    Returns (hw, battery_type, battery_cfg) on success, or None on
+    failure (missing hardware role for `required_roles`, or unset/unknown
+    battery_type) -- an operator-facing [FAIL] message has already been
+    printed in that case and the caller must abort, no hardware activated.
+    """
+    hw = dev_cfg.hardware_for_group(group)
+    missing = _missing_hardware_roles(hw, required_roles=required_roles)
+    if missing:
+        print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
+        return None
+
+    battery_type = dev_cfg.group_test_config(group)["battery_type"]
+    if battery_type is None:
+        print(f"\n[FAIL] Group {group} has no battery_type configured -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
+        return None
+    if battery_type not in dev_cfg.BATTERY_CONFIGS:
+        print(f"\n[FAIL] Group {group} references unknown battery_type {battery_type!r} -- "
+              f"see config/devices.py::BATTERY_GROUPS[{group!r}] and BATTERY_CONFIGS. "
+              f"Aborting, no hardware activated.")
+        return None
+    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
+    return hw, battery_type, battery_cfg
+
+
+def _select_group_with_hardware_summary(required_roles=("relay_matrix", "smu", "dmm", "daq")):
+    """
+    Standard first step for every hardware-activating workflow: select
+    Battery Group, then immediately display the hardware that group
+    resolves to (config/devices.py::BATTERY_GROUPS[group]) -- Relay
+    Matrix, DMM, SMU, DAQ, Battery Type, Global Position Range -- before
+    the operator picks a position. Display/confirmation only: the
+    operator never chooses relay matrix/DMM/SMU/DAQ/battery_type
+    directly, only whether to proceed with the selected group's
+    engineering configuration.
+
+    If the operator answers N, re-prompts Group selection rather than
+    aborting the workflow -- picking the wrong group costs one extra
+    loop, not a restart back at the main menu.
+
+    Returns (group, hw, battery_type, battery_cfg) once confirmed, or
+    None if the operator cancels at the Group prompt itself (invalid
+    input / no groups enabled).
+    """
+    while True:
+        group = _select_battery_group()
+        if group is None:
+            return None
+
+        resolved = _resolve_group_hardware(group, required_roles=required_roles)
+        if resolved is None:
+            return None
+        hw, battery_type, battery_cfg = resolved
+
+        grp_cfg = dev_cfg.BATTERY_GROUPS[group]
+        print("\n" + "-" * 60)
+        print("Hardware Summary")
+        print("-" * 60)
+        print(f"\nGroup:\n{group}")
+        print(f"\nBattery Type:\n{battery_type}")
+        print(f"\nRelay Matrix:\n{hw['relay_matrix_name'] or '(none assigned)'}")
+        print(f"\nDMM:\n{hw['dmm_name'] or '(none assigned)'}")
+        print(f"\nSMU:\n{hw['smu_name'] or '(none assigned)'}")
+        print(f"\nDAQ:\n{hw['daq_name'] or '(none assigned)'}")
+        print(f"\nGlobal Position Range:\n{grp_cfg['position_start']}-{grp_cfg['position_end']}")
+        print("\n" + "-" * 60)
+        answer = input("Continue? (Y/N): ").strip().upper()
+        if answer == "Y":
+            return group, hw, battery_type, battery_cfg
+        print("\nReturning to Group selection.")
+
+
 def _open_storage_guarded(hw_mgr=None):
     """
     Open DataStorage with clean, operator-facing [FAIL] messaging instead
@@ -3648,6 +3730,7 @@ def _missing_hardware_roles(hw: dict, required_roles=("relay_matrix", "smu", "dm
 
 def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
                         group: str, positions_label: str, hw: dict,
+                        channel: int = None, relay_address: int = None,
                         extra_lines=None):
     """
     Single operator confirmation screen shared by every hardware-activating
@@ -3665,6 +3748,12 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
     run, but the only decision being confirmed here is "proceed with this
     group's configuration," not "which battery."
 
+    `channel`/`relay_address` are the config/devices.py::
+    resolve_group_position() / BATTERY_CHANNELS[channel]["relay_address"]
+    result for the operator's selected position -- omitted (None) by
+    workflows like Monitor Battery Scan that operate over a position range
+    rather than a single resolved channel.
+
     Returns True if the operator pressed ENTER (continue), False if the
     operator pressed C (cancel). Cancelling here happens before any relay/
     PSU/measurement action -- callers must not touch hardware until this
@@ -3677,7 +3766,9 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
     print(f"\nBattery Type (engineering-configured for this group):\n"
           f"{battery_type}  ({battery_cfg['capacity_ah'] * 1000:.0f} mAh)")
     print(f"\nGroup:\n{group}")
-    print(f"\nPositions:\n{positions_label}")
+    print(f"\nSelected Position:\n{positions_label}")
+    if channel is not None:
+        print(f"\nResolved Relay Channel:\n{channel}  (Relay {relay_address})")
     print(f"\nRelay Matrix:\n{hw['relay_matrix_name'] or '(none assigned)'}")
     print(f"\nSMU:\n{hw['smu_name'] or '(none assigned)'}")
     print(f"\nDMM:\n{hw['dmm_name'] or '(none assigned)'}")
@@ -3692,8 +3783,9 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
 def _run_monitor_battery():
     """
     Monitor Battery -- read-only battery monitoring, no charging, no
-    discharging. Workflow: Select Battery Group -> Select Battery Position
-    -> Confirmation Screen -> Configuration Snapshot Logged -> Relay Close
+    discharging. Workflow: Select Battery Group + Hardware Summary (see
+    _select_group_with_hardware_summary()) -> Select Battery Position ->
+    Confirmation Screen -> Configuration Snapshot Logged -> Relay Close
     -> Start Monitoring. Battery type is engineering-configured per group
     (config/devices.py::BATTERY_GROUPS[group]["battery_type"]), never an
     operator choice -- see docs/architecture.md "Battery Group Test
@@ -3712,39 +3804,14 @@ def _run_monitor_battery():
     from utils.cancellation import CancellationToken
     from utils.errors import HardwareInitError, OperationCancelledError
 
-    group = _select_battery_group()
-    if group is None:
+    selection = _select_group_with_hardware_summary()
+    if selection is None:
         return
+    group, hw, battery_type, battery_cfg = selection
 
     position = _select_battery_position(group)
     if position is None:
         return
-
-    # Hardware assignment resolved from config/devices.py::BATTERY_GROUPS via
-    # the single centralized resolver -- no positional SMU_ASSIGNMENTS/
-    # DAQ_CONFIG/DMM_CONFIG lookup here (see docs/architecture.md "Hardware
-    # Resolution Model").
-    hw = dev_cfg.hardware_for_group(group)
-    missing = _missing_hardware_roles(hw)
-    if missing:
-        print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
-        return
-
-    # Battery type is engineering-configured per group, never an operator
-    # choice -- see config/devices.py::group_test_config() / docs/
-    # architecture.md "Battery Group Test Configuration Architecture".
-    battery_type = dev_cfg.group_test_config(group)["battery_type"]
-    if battery_type is None:
-        print(f"\n[FAIL] Group {group} has no battery_type configured -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
-        return
-    if battery_type not in dev_cfg.BATTERY_CONFIGS:
-        print(f"\n[FAIL] Group {group} references unknown battery_type {battery_type!r} -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}] and BATTERY_CONFIGS. "
-              f"Aborting, no hardware activated.")
-        return
-    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
     channel = dev_cfg.resolve_group_position(group, position)
     ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
@@ -3762,7 +3829,8 @@ def _run_monitor_battery():
         f"\nMax Temperature:\n{battery_cfg['max_temp_c']:.1f} C",
     ]
     if not _confirm_operation("Monitor Battery", battery_type, battery_cfg, group,
-                               positions_label, hw, extra_lines=extra_lines):
+                               positions_label, hw, channel=channel, relay_address=relay_address,
+                               extra_lines=extra_lines):
         print("\nCancelled -- no relay activated.")
         return
 
@@ -3882,9 +3950,11 @@ def _run_monitor_battery_scan():
     has an SMU to confirm OFF, exactly as Monitor Battery already does.
 
     Workflow: Select Battery Group (= Scan Scope, since only "Single
-    Group" is supported today) -> Select Position Range -> Confirmation ->
-    Configuration Snapshot -> Hardware Traceability Snapshot -> Sequential
-    Relay Scan -> Safe Shutdown. Battery type is engineering-configured
+    Group" is supported today) + Hardware Summary (see
+    _select_group_with_hardware_summary()) -> Select Position Range ->
+    Confirmation -> Configuration Snapshot -> Hardware Traceability
+    Snapshot -> Sequential Relay Scan -> Safe Shutdown. Battery type is
+    engineering-configured
     per group, never an operator choice -- see docs/architecture.md
     "Battery Group Test Configuration Architecture". Reuses the exact same
     Milestone II infrastructure as _run_monitor_battery() (DataStorage,
@@ -3900,38 +3970,15 @@ def _run_monitor_battery_scan():
     from utils.cancellation import CancellationToken
     from utils.errors import HardwareInitError, OperationCancelledError
 
-    group = _select_battery_group()
-    if group is None:
+    selection = _select_group_with_hardware_summary()
+    if selection is None:
         return
+    group, hw, battery_type, battery_cfg = selection
 
     grp_cfg = dev_cfg.BATTERY_GROUPS[group]
     size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
     positions_in_group = list(range(1, size + 1))
     print(f"\nScan Scope: Single Group -- Group {group}, all positions 1-{size}")
-
-    # Hardware assignment resolved from config/devices.py::BATTERY_GROUPS via
-    # the single centralized resolver -- see docs/architecture.md "Hardware
-    # Resolution Model".
-    hw = dev_cfg.hardware_for_group(group)
-    missing = _missing_hardware_roles(hw)
-    if missing:
-        print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
-        return
-
-    # Battery type is engineering-configured per group, never an operator
-    # choice -- see config/devices.py::group_test_config().
-    battery_type = dev_cfg.group_test_config(group)["battery_type"]
-    if battery_type is None:
-        print(f"\n[FAIL] Group {group} has no battery_type configured -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
-        return
-    if battery_type not in dev_cfg.BATTERY_CONFIGS:
-        print(f"\n[FAIL] Group {group} references unknown battery_type {battery_type!r} -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}] and BATTERY_CONFIGS. "
-              f"Aborting, no hardware activated.")
-        return
-    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
 
     positions_label = f"1-{size}"
     extra_lines = ["\nCharging:\nNONE -- PSU/SMU output is never enabled"]
@@ -4040,11 +4087,11 @@ def _run_monitor_battery_scan():
 def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_line_fn):
     """
     Shared workflow for Charge Battery / Discharge Battery -- both are the
-    same skeleton as _run_monitor_battery() (select group -> select
-    position -> resolve hardware via hardware_for_group() -> validate
-    group test configuration (derives battery type from the group -- see
-    docs/architecture.md "Battery Group Test Configuration Architecture")
-    -> confirmation screen -> traceability -> ChargeSequence/
+    same skeleton as _run_monitor_battery() (select group + hardware
+    summary via _select_group_with_hardware_summary() -> select position
+    -> validate group test configuration (derives battery type from the
+    group -- see docs/architecture.md "Battery Group Test Configuration
+    Architecture") -> confirmation screen -> traceability -> ChargeSequence/
     DischargeSequence.run()) with only the sequence class, event-log
     source name, and confirmation-screen setpoint line differing --
     factored here once rather than duplicating the whole workflow twice.
@@ -4076,35 +4123,30 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     )
     from utils.validators import validate_group_test_config
 
-    group = _select_battery_group()
-    if group is None:
+    selection = _select_group_with_hardware_summary(required_roles=("relay_matrix", "smu", "dmm"))
+    if selection is None:
         return
+    group, hw, battery_type, battery_cfg = selection
 
     position = _select_battery_position(group)
     if position is None:
         return
 
-    hw = dev_cfg.hardware_for_group(group)
-    missing = _missing_hardware_roles(hw, required_roles=("relay_matrix", "smu", "dmm"))
-    if missing:
-        print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
-        return
-
     # Battery Group Test Configuration Architecture validation pipeline --
     # Group Configuration -> Battery Limits -> Hardware Capability -- runs
     # BEFORE anything below touches hardware (no HardwareManager
-    # constructed yet). Battery type is derived here from the group's own
-    # engineering configuration, never from operator input -- see
-    # docs/architecture.md "Battery Group Test Configuration Architecture"
-    # / utils/validators.py.
+    # constructed yet). battery_type/battery_cfg above already come from
+    # this same group's engineering configuration (via
+    # _select_group_with_hardware_summary() -> _resolve_group_hardware());
+    # this call additionally validates test_setpoints against battery
+    # limits and SMU capability, which the group-summary step does not --
+    # see docs/architecture.md "Battery Group Test Configuration
+    # Architecture" / utils/validators.py.
     try:
         validated = validate_group_test_config(group)
     except (GroupConfigurationError, ConfigurationError, HardwareConfigurationError) as e:
         print(f"\n[FAIL] {type(e).__name__}: {e}\nAborting, no hardware activated.")
         return
-    battery_type = validated["battery_type"]
-    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
     test_setpoints = validated["test_setpoints"]
 
     channel = dev_cfg.resolve_group_position(group, position)
@@ -4122,7 +4164,8 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         f"\nMax Temperature:\n{battery_cfg['max_temp_c']:.1f} C",
     ]
     if not _confirm_operation(operation, battery_type, battery_cfg, group,
-                               positions_label, hw, extra_lines=extra_lines):
+                               positions_label, hw, channel=channel, relay_address=relay_address,
+                               extra_lines=extra_lines):
         print("\nCancelled -- no relay activated.")
         return
 
