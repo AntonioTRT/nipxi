@@ -558,7 +558,7 @@ BATTERY_CHANNELS = {
 #     already used for "relay_matrix"/"smu"/"dmm"/"daq" above.
 BATTERY_GROUPS = {
     "A": {
-        "relay_matrix":   "MATRIX_NUMATO_201",
+        "relay_matrix":   "MATRIX_NUMATO_202",
         "position_start": 1,
         "position_end":   8,
         "enabled":        True,
