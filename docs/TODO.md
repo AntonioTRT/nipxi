@@ -372,33 +372,50 @@ the bottom, with a pointer to where the real documentation lives
   Group A as wired to `MATRIX_NUMATO_201` -- the live dict entry and real
   hardware validation confirm Group A is actually on `MATRIX_NUMATO_202`.
 
-### Architecture Standardization (see docs/architecture.md Sections 47-48, Milestones XIII-XIV)
+### Architecture Standardization (see docs/architecture.md Sections 47-49, Milestones XIII-XV)
 
-- [x] Group-naming semantics -- **RESOLVED (Milestone XIV):**
-  `<matrix letter><partition number>` (`B1..B4` on `MATRIX_NUMATO_202`,
-  `C1..C4` on `MATRIX_NUMATO_203`, etc.) -- groups are hardware ownership
-  sets, not workflow/battery-type families. Not a rename of today's
-  A/B/C/D; a new topology (today's Group A becomes B1).
+- [x] Group-naming semantics + final topology -- **RESOLVED (Milestone XV):**
+  `MATRIX_NUMATO_201 -> A1-A4`, `MATRIX_NUMATO_202 -> B1-B4`,
+  `MATRIX_NUMATO_203 -> C1-C4` -- groups are hardware ownership sets, not
+  workflow/battery-type families. Not a rename of today's A/B/C/D; a new
+  topology (today's Group A becomes B1). Active groups: B1 (existing rack
+  DMM/SMU/DAQ), C1 (NI USB-6211, NTC-only). A1 disabled (zero hardware
+  roles assigned -- see Milestone XV for the full alternatives review);
+  A2-A4/B2-B4/C2-C4 disabled placeholders.
 - [ ] **[MUST before Group C1's hardware is exercised for real]** Redesign
   position/channel ownership: move `BATTERY_CHANNELS` into each
   `BATTERY_GROUPS[group]["positions"]` sub-dict, scoped to that group's
-  own `relay_matrix` -- fixes a real, confirmed bug in
-  `utils/device_validator.py::_check_duplicate_relay_identifiers()`/
-  `_check_relay_count_consistency()`/`_check_battery_groups()` (checks
-  `relay_address` uniqueness/range globally, with no per-matrix
-  association -- will falsely flag B1 and C1 both using `relay_address=1`
-  on their own separate physical matrices as a duplicate-relay collision).
-  See docs/architecture.md Section 48 for the exact files/functions
-  affected (`config/devices.py`, `test.py`'s group/position selection
-  functions, `test_control/monitor_battery_scan_sequence.py`'s
+  own `relay_matrix`. **Corrected structure (Milestone XV):**
+  `relay_address` must stay unique across every group sharing one
+  `relay_matrix` (B1 owns 1-8, B2 owns 9-16, B3 owns 17-24, B4 owns 25-32
+  on `MATRIX_NUMATO_202` -- NOT reset to 1-8 per group), and is only free
+  to repeat across *different* matrices (B1 and C1 can both use 1-8).
+  Fixes a real, confirmed bug in `utils/device_validator.py`:
+  `_check_duplicate_relay_identifiers()` -- rekey by `(relay_matrix,
+  relay_address)`, not `relay_address` alone; `_check_battery_groups()` --
+  retire entirely (its invariant becomes structurally impossible once
+  positions live inside their owning group); `_check_relay_count_consistency()`
+  -- loop per group instead of a full matrix x `BATTERY_CHANNELS`
+  cross-product. Validate disabled groups too (don't skip), to catch a
+  `relay_address` collision between a real group and a disabled sibling
+  at config-load time. See docs/architecture.md Section 49 for the exact
+  files/functions affected (`config/devices.py`, `test.py`'s group/
+  position selection functions, `test_control/monitor_battery_scan_sequence.py`'s
   `DAQ_CHANNEL_0` constant).
+- [ ] A1: assign at least one real hardware role (`smu`/`dmm`/`daq`/
+  `ntc_daq`) and flip `enabled=True` once that hardware exists -- disabled
+  until then, per Milestone XV's decision.
+- [ ] `USB_DAQ_DEVICES` needs a second entry, `NTC_DAQ_USB6211` (for C1),
+  distinct from the existing `NTC_DAQ_USB6210` (for B1) -- neither
+  replaces the other.
 - [ ] Add `group_name`/`position_in_group` as additive `run_summary`
   columns (same migration pattern as `battery_type`) -- implement together
-  with the position-ownership redesign above, using final `B1`/`C1`-style
-  names directly. Prerequisite for Group History / Last Test From Group /
-  Group Statistics in Database Tools. Populate at `start_run_summary()`
-  time; reuse `list_run_summaries()`/`get_last_run_summary()`/
-  `run_summary_report.py::render_run_summary()` for the three new views.
+  with the position-ownership redesign above, using final `A1`/`B1`/`C1`-
+  style names directly. Prerequisite for Group History / Last Test From
+  Group / Group Statistics in Database Tools. Populate at
+  `start_run_summary()` time; reuse `list_run_summaries()`/
+  `get_last_run_summary()`/`run_summary_report.py::render_run_summary()`
+  for the three new views.
 - [ ] Add a group-centric path to Test SMU/DMM/DAQ/Relay Matrix (Select
   Group -> Resolve Group Hardware -> Run) **alongside**, not replacing,
   the existing per-device picker -- a pure replacement would remove the

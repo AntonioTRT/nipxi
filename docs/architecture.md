@@ -3458,3 +3458,175 @@ physical relay matrix (Group C1) is populated. Recommend implementing the
 position-ownership redesign and the Section 47 `group_name`/
 `position_in_group` migration together, using `B1`/`C1`-style names
 directly, before Group C1's hardware is exercised for real.
+
+---
+
+## 49. Final Group Topology, Position Ownership Structure, and Validator Redesign Plan
+
+**Purpose:** Section 48 left the naming scheme confirmed but the exact
+topology and A1's enabled state open. This section locks the final,
+production group topology, the recommended `BATTERY_GROUPS[group]
+["positions"]` structure (with a correction to Section 48's own sketch),
+the exact validator redesign, and A1's resolved enabled/hardware state.
+**Documentation-only session -- no implementation code was changed.**
+docs/FAQ.md Section 17 carries the same findings in Q&A form.
+
+### Final topology (locked)
+
+```
+MATRIX_NUMATO_201 -> A1, A2, A3, A4   (channels 1-8, 9-16, 17-24, 25-32)
+MATRIX_NUMATO_202 -> B1, B2, B3, B4   (channels 1-8, 9-16, 17-24, 25-32)
+MATRIX_NUMATO_203 -> C1, C2, C3, C4   (channels 1-8, 9-16, 17-24, 25-32)
+```
+
+**Active groups:** `B1` (existing rack DMM/SMU/DAQ), `C1` (NI USB-6211,
+NTC-only). **A1 is disabled** -- see the resolved decision below. All
+other groups (`A2-A4`, `B2-B4`, `C2-C4`) exist as disabled placeholders
+with position/`relay_address` assignments already reserved on their
+owning matrix, so activating one later never requires reassigning
+`relay_address` ranges already claimed by a sibling group on the same
+matrix.
+
+**Note:** `MATRIX_NUMATO_201` is the source of the existing
+`NUMATO_RELAY_MATRIX_CONFIG` backward-compat alias -- the exact default
+`main.py`'s still-live legacy path (Section 46) already targets. A1 and
+`main.py`'s legacy default share the same physical instrument; retiring
+`main.py` and standing up A1 are related future work on the same matrix.
+Separately, the long-standing stale comment at `config/devices.py:514-516`
+(tracked in `docs/TODO.md`, previously "Group A ... MATRIX_NUMATO_201"
+when the code actually pointed at 202) resolves itself under this
+topology -- A1 really does own 201 now.
+
+### A1 resolution: disabled, zero hardware roles assigned
+
+Three alternatives were reviewed:
+
+1. **Enabled, full hardware assignment** -- rejected. Would require either
+   a second physical DMM/SMU/PSU stack (not confirmed to exist) or sharing
+   B1's "existing rack" instruments across two physically separate
+   matrices, which would silently couple A1 and B1 into one hardware set
+   for concurrency purposes despite being on different matrices --
+   undermining the "one matrix = one independent hardware set" model this
+   topology is built on.
+2. **Disabled until hardware is assigned** -- **adopted.**
+3. **Enabled, relay-only** -- rejected. Does not achieve "relay-only" given
+   current code: Monitor Battery, Monitor Battery Scan, Charge Battery,
+   and Discharge Battery all call `_select_group_with_hardware_summary()`
+   with the default `required_roles=("relay_matrix","smu","dmm","daq")` --
+   all four, not a subset. A1 with zero of `smu`/`dmm`/`daq` assigned
+   would fail every one of those four workflows immediately with
+   `[FAIL] Group A1 has no smu, dmm, daq assigned`. Only NTC Group Scan
+   (`required_roles=("ntc_daq",)`) could ever succeed on a
+   hardware-incomplete group, and A1 has no `ntc_daq` either.
+
+**Principle applied, and why C1 is not the same situation despite also
+lacking `smu`/`dmm`/`daq`:** enable a group once it has at least one
+assigned hardware role giving it at least one genuinely working workflow.
+C1 clears this bar (`ntc_daq` assigned, NTC Group Scan succeeds today);
+A1, as specified, has zero roles assigned and would fail every workflow
+with no exception.
+
+**Cost of disabling A1: none for relay hardware bring-up.**
+`test.py::_select_relay_scope()` (Relay Functional Validation / Matrix
+Scan) already deliberately bypasses `BATTERY_GROUPS[group]["enabled"]` --
+documented as a previously-fixed bug (see Section 47/48) -- so
+`MATRIX_NUMATO_201`'s physical relay hardware remains fully testable
+regardless of A1's `enabled` state.
+
+### Recommended `positions` structure -- corrected from Section 48's sketch
+
+Section 48's own example reset `relay_address` to 1-8 per group. That is
+wrong for groups sharing one physical matrix: B1-B4 all live on the same
+32-channel `MATRIX_NUMATO_202`, so the physical channel count does not
+shrink just because it is partitioned across four group entries --
+`relay_address` must stay unique across every group sharing a
+`relay_matrix` (B1 owns 1-8, B2 owns 9-16, B3 owns 17-24, B4 owns 25-32),
+and is only free to repeat across *different* matrices (B1's channel 1
+and C1's channel 1 legitimately coexist). This is the precise meaning of
+"(matrix, relay)-aware."
+
+```python
+BATTERY_GROUPS = {
+    "A1": {
+        "relay_matrix": "MATRIX_NUMATO_201",
+        "smu": None, "dmm": None, "daq": None, "ntc_daq": None,
+        "battery_type": None, "test_setpoints": None,
+        "enabled": False,
+        "positions": {
+            1: {"relay_address": 1, "daq_voltage_ch": None, "daq_current_ch": None,
+                "daq_ntc_ch": None, "fuse_rating_a": 2.0, "enabled": True},
+            # ... 2..8, relay_address 2..8
+        },
+    },
+    "A2": {  # disabled placeholder, SAME matrix as A1
+        "relay_matrix": "MATRIX_NUMATO_201", "enabled": False,
+        "positions": {1: {"relay_address": 9, ...}, ...},   # continues 201's numbering
+    },
+    # A3 -> relay_address 17-24, A4 -> 25-32, same matrix
+    "B1": {
+        "relay_matrix": "MATRIX_NUMATO_202",
+        "smu": "PRIMARY_SMU", "dmm": "MAIN_DMM", "daq": "MAIN_DAQ", "ntc_daq": None,
+        "battery_type": "SB", "test_setpoints": {...}, "enabled": True,
+        "positions": {1: {"relay_address": 1, ...}, ..., 8: {"relay_address": 8, ...}},
+    },
+    # B2/B3/B4 -> relay_address 9-16 / 17-24 / 25-32, same matrix, disabled placeholders
+    "C1": {
+        "relay_matrix": "MATRIX_NUMATO_203",
+        "smu": None, "dmm": None, "daq": None, "ntc_daq": "NTC_DAQ_USB6211",
+        "battery_type": None, "test_setpoints": None, "enabled": True,
+        "positions": {1: {"relay_address": 1, ...}, ..., 8: {"relay_address": 8, ...}},
+    },
+    # C2/C3/C4 -> relay_address 9-16 / 17-24 / 25-32, disabled placeholders
+}
+```
+
+Per-position `"enabled"` carries over unchanged from today's
+`BATTERY_CHANNELS[i]["enabled"]` -- lets one position inside an active
+group be individually disabled (e.g. known-bad wiring) without disabling
+the whole group. **`NTC_DAQ_USB6211` is a distinct device from
+`NTC_DAQ_USB6210`** (introduced for what is now B1) -- both belong in
+`USB_DAQ_DEVICES` side by side, one per group needing temporary NTC-only
+acquisition; neither replaces the other.
+
+### Validator redesign -- exact function-level plan
+
+| Function | Change |
+|---|---|
+| `_check_duplicate_relay_identifiers()` | Key the "seen" map by `(relay_matrix, relay_address)`, resolved per group, instead of `relay_address` alone. |
+| `_check_battery_groups()` | **Retire entirely** -- once positions live inside their owning group, there is no external global table a position could ever fall outside of; the invariant it protects becomes structurally impossible to violate. |
+| `_check_relay_count_consistency()` | Loop *per group*: resolve that group's own `relay_matrix`'s channel count, validate only that group's own `positions` against it -- replaces today's full matrix x `BATTERY_CHANNELS` cross-product with a simpler per-group loop. |
+
+**Disabled groups should still be validated for internal consistency**
+(not skipped) -- catching a `relay_address` collision between, say, B1's
+real positions and B2's placeholder positions at config-load time is
+exactly the hygiene this validator exists for, before it could resurface
+as a real hardware conflict the moment `enabled` is later flipped to
+`True`.
+
+### Menu impact -- confirmed, no change required
+
+`test.py::_select_battery_group()` already lists every `BATTERY_GROUPS`
+entry (disabled ones shown with a caveat, rejected on selection) --
+already exercised and correct for today's disabled placeholders. Twelve
+groups (three active, nine disabled) exhibit identical behavior to
+today's four, through the same unchanged function. The one cosmetic-only
+observation: the listing will show 12 lines instead of 4 -- optional
+future polish (filter to enabled-only, or group the display by matrix),
+not required now.
+
+### Database planning -- confirmed simpler, unchanged from Section 48
+
+`position_in_group` becomes the literal `positions` dict key at every
+call site once this redesign lands -- no `resolve_group_position()`
+arithmetic needed. The existing `channel` INTEGER column (today: "global
+position," a concept this redesign retires) can be repurposed directly as
+`position_in_group`'s value going forward.
+
+### GO / NO-GO
+
+**GO for this final topology and structure.** A1: disabled, zero hardware
+roles, `MATRIX_NUMATO_201`, ready to enable the moment any real hardware
+role is assigned. B1/C1: enabled, as already designed in Section 48.
+Position ownership, validator redesign, and the database migration
+(Section 47) should be implemented together, in that order, using these
+final names.

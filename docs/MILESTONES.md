@@ -1735,6 +1735,79 @@ validation and the Milestone XII `main.py` retirement work.
 
 ---
 
+## Milestone XV: Final Group Topology, Position Ownership Structure, and Validator Redesign Plan
+
+**Status:** ACHIEVED (design/documentation review only -- no implementation performed)
+
+**Scope:** Locked the final, production group topology begun in Milestone
+XIV: `MATRIX_NUMATO_201 -> A1-A4`, `MATRIX_NUMATO_202 -> B1-B4`,
+`MATRIX_NUMATO_203 -> C1-C4`. Resolved A1's open enabled/hardware-assignment
+question. Corrected the `positions` structure sketched in Milestone XIV
+(relay_address must stay unique per matrix, not reset per group). Produced
+the exact `utils/device_validator.py` redesign plan. Documentation-only
+session: no implementation code was changed.
+
+### Objectives achieved
+
+- **Locked the final topology and active groups:** B1 (existing rack
+  DMM/SMU/DAQ) and C1 (NI USB-6211, NTC-only) enabled; A1 and all other
+  eight groups (A2-A4/B2-B4/C2-C4) disabled placeholders with reserved,
+  non-overlapping position/`relay_address` ranges on their owning matrix.
+- **Resolved A1's enabled state:** disabled, zero hardware roles assigned.
+  Reviewed and rejected two alternatives (full hardware assignment --
+  requires unconfirmed second-instrument hardware or an undesirable
+  cross-matrix resource coupling with B1; "relay-only" enabled -- doesn't
+  actually work given current code, since every real battery workflow
+  except NTC Group Scan requires the full `smu`+`dmm`+`daq` role set by
+  default). Confirmed disabling A1 costs nothing for relay hardware
+  bring-up (`_select_relay_scope()` already bypasses `enabled`).
+- **Corrected a real error in the Milestone XIV `positions` sketch:**
+  `relay_address` must remain unique across every group sharing one
+  physical `relay_matrix` (B1 owns 1-8, B2 owns 9-16, etc. on the same
+  32-channel matrix), not reset to 1-8 per group -- caught and fixed
+  before any implementation.
+- **Produced the exact validator redesign:** `_check_duplicate_relay_identifiers()`
+  keyed by `(relay_matrix, relay_address)`; `_check_battery_groups()`
+  retired entirely (its invariant becomes structurally impossible under
+  the new model); `_check_relay_count_consistency()` restructured to loop
+  per group instead of a full cross-product.
+- **Confirmed menu behavior requires no change** -- `_select_battery_group()`
+  already handles disabled placeholders correctly, exercised and confirmed
+  for today's B/C/D; twelve groups behave identically to today's four.
+
+### Architectural decisions made
+
+- No code changes were made as part of this review. The `positions`
+  restructure, the three validator changes, and the Milestone XIII
+  database migration are recommended to be implemented together, in that
+  order, using these final names.
+
+### Verification
+
+Every finding is cited against the actual source (`config/devices.py`,
+`test.py`, `utils/device_validator.py`) -- see docs/architecture.md
+Section 49 for full evidence and docs/FAQ.md Section 17 for the Q&A-form
+record. No mocked or physical-hardware test was run; this is a static
+implementation trace.
+
+### Milestone readiness decision
+
+**GO for this final topology and structure.** A1 resolved (disabled until
+hardware is assigned); B1/C1 confirmed as designed. No finding blocks
+proceeding to implementation.
+
+### Recommended next milestone
+
+Implement, together and in this order: (1) the `positions` restructure
+(`BATTERY_GROUPS[group]["positions"]`, final topology, A1 disabled), (2)
+the three `utils/device_validator.py` changes, (3) the Milestone XIII
+`group_name`/`position_in_group` database migration -- using `A1`/`B1`/
+`C1`-style names directly throughout. In parallel with the still-pending
+ChargeSequence/DischargeSequence real-hardware validation and the
+Milestone XII `main.py` retirement work.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

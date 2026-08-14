@@ -1764,3 +1764,55 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 **Risks:** None new -- this confirms and sharpens an existing design, not a new concern.
 
 **Recommendation:** Runtime schedules groups; concurrency is derived from shared `relay_matrix`/`smu`/`dmm`/`daq` names, unchanged from Section 46.
+
+## SECTION 17 — FINAL GROUP TOPOLOGY, POSITION OWNERSHIP, VALIDATOR REDESIGN
+
+*Findings below lock the final production group topology and resolve A1's enabled state. See docs/architecture.md Section 49 for the full technical writeup.*
+
+### Q: What is the final, locked group topology?
+
+**Status:** Final
+
+**Answer:** `MATRIX_NUMATO_201 -> A1-A4`, `MATRIX_NUMATO_202 -> B1-B4`, `MATRIX_NUMATO_203 -> C1-C4`, each matrix's 32 channels partitioned into four 8-position groups. Active: B1 (existing rack DMM/SMU/DAQ), C1 (NI USB-6211, NTC-only). A1 disabled (see below). All other groups exist as disabled placeholders with reserved position/`relay_address` ranges on their owning matrix.
+
+**Evidence:** docs/architecture.md Section 49.
+
+**Risks:** None -- this is a naming/topology finalization, not a behavior change.
+
+**Recommendation:** Proceed with implementation using these final names directly.
+
+### Q: Should A1 be enabled, disabled, or "relay-only"?
+
+**Status:** Resolved -- disabled
+
+**Answer:** Disabled, with zero hardware roles assigned (`relay_matrix="MATRIX_NUMATO_201"` only). "Enabled with full hardware" would require unconfirmed second-instrument hardware or an undesirable cross-matrix resource coupling with B1. "Enabled, relay-only" doesn't actually work given current code -- Monitor Battery/Monitor Battery Scan/Charge/Discharge Battery all require `smu`+`dmm`+`daq` by default (`required_roles=("relay_matrix","smu","dmm","daq")`), so a hardware-incomplete A1 would fail every one of them immediately. C1 is not the same situation despite also lacking `smu`/`dmm`/`daq` -- it has `ntc_daq` assigned, giving it one genuinely working workflow (NTC Group Scan) today; A1 has none.
+
+**Evidence:** `test.py::_select_group_with_hardware_summary()` default `required_roles`; `test.py::_select_relay_scope()`'s documented `enabled`-bypass (confirms disabling A1 costs nothing for relay hardware bring-up).
+
+**Risks:** None -- A1 can be flipped to `enabled=True` the moment any real hardware role is assigned.
+
+**Recommendation:** A1 disabled until it has at least one assigned hardware role.
+
+### Q: Does `relay_address` reset to 1-8 for every group, or stay unique per matrix?
+
+**Status:** Corrected from an earlier sketch -- unique per matrix
+
+**Answer:** `relay_address` must stay unique across every group sharing one `relay_matrix` -- B1-B4 all live on the same 32-channel `MATRIX_NUMATO_202`, so B1 owns channels 1-8, B2 owns 9-16, B3 owns 17-24, B4 owns 25-32. It is only free to repeat across *different* matrices (B1's channel 1 and C1's channel 1 legitimately coexist). This is the precise meaning of "(matrix, relay)-aware" validation.
+
+**Evidence:** docs/architecture.md Section 49's `positions` structure example.
+
+**Risks:** An earlier review sketch (Section 48) incorrectly reset `relay_address` to 1-8 per group regardless of shared matrix -- corrected here before any implementation.
+
+**Recommendation:** Reserve non-overlapping `relay_address` ranges for every group on a shared matrix, including disabled placeholders, from the start.
+
+### Q: Which `utils/device_validator.py` checks need to change, and how?
+
+**Status:** Three functions reviewed, one retired entirely
+
+**Answer:** `_check_duplicate_relay_identifiers()` -- key by `(relay_matrix, relay_address)` instead of `relay_address` alone. `_check_battery_groups()` -- retire entirely; the invariant it protects (a global position falling outside every group's range) becomes structurally impossible once positions live inside their owning group. `_check_relay_count_consistency()` -- loop per group instead of a full matrix x `BATTERY_CHANNELS` cross-product.
+
+**Evidence:** `utils/device_validator.py` lines 142-224.
+
+**Risks:** Disabled groups should still be validated for internal consistency (not skipped) -- catches a `relay_address` collision between a real group and a disabled sibling on the same matrix before it can resurface as a real hardware conflict later.
+
+**Recommendation:** Implement all three changes together with the `positions` restructure.
