@@ -3044,7 +3044,12 @@ def _open_real_storage_readonly():
 def _db_view_latest_run():
     """View the most recent run_summary row -- battery config snapshot,
     hardware identity snapshot, voltage summary, everything Milestone II
-    traceability records for one run."""
+    traceability records for one run. Uses the same generic renderer as
+    the end-of-run summary and the "Last Test Summary" menu entry (see
+    test_control/run_summary_report.py::render_run_summary()) instead of
+    dumping raw columns, so every summary view in the app looks identical."""
+    from test_control.run_summary_report import render_run_summary
+
     config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
     storage = _open_real_storage_readonly()
     if storage is None:
@@ -3055,9 +3060,8 @@ def _db_view_latest_run():
         if run is None:
             return [_warn("Database Tools", "Latest Run", config_ref,
                           "run_summary is empty -- no runs recorded")]
-        print(f"\nLatest Run (run_summary)\n{'-' * 60}")
-        for k, v in run.items():
-            print(f"  {k:34s}: {v}")
+        print()
+        render_run_summary(run, storage=storage)
         return [_ok("Database Tools", "Latest Run", config_ref,
                     f"Run #{run.get('id')}  run_id={run.get('run_id')}  "
                     f"test_type={run.get('test_type')}  result={run.get('result')}")]
@@ -3173,6 +3177,35 @@ def _db_view_statistics():
         return results
     finally:
         conn.close()
+
+
+def _show_last_test_summary():
+    """
+    Last Test Summary -- top-level menu shortcut that immediately displays
+    the most recent run's summary, without navigating into Database Tools.
+    Uses the exact same renderer as Database Tools' "View Latest Run" and
+    every workflow's end-of-run display (test_control/run_summary_report.py
+    ::render_run_summary()) -- one summary format everywhere in the app.
+    """
+    from test_control.run_summary_report import render_run_summary
+
+    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    storage = _open_real_storage_readonly()
+    if storage is None:
+        return [_warn("Last Test Summary", "Last Test Summary", config_ref,
+                      "No database file yet -- no runs recorded")]
+    try:
+        run = storage.get_last_run_summary()
+        if run is None:
+            return [_warn("Last Test Summary", "Last Test Summary", config_ref,
+                          "run_summary is empty -- no runs recorded")]
+        print()
+        render_run_summary(run, storage=storage)
+        return [_ok("Last Test Summary", "Last Test Summary", config_ref,
+                    f"Run #{run.get('id')}  test_type={run.get('test_type')}  "
+                    f"result={run.get('result')}")]
+    finally:
+        storage.close()
 
 
 def test_database_tools():
@@ -3780,6 +3813,27 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
     return answer != "C"
 
 
+def _print_post_run_summary(storage):
+    """
+    Print the generic Run Summary for the run `storage` just finished --
+    the SAME renderer (test_control/run_summary_report.py::
+    render_run_summary()) used by the "Last Test Summary" menu entry and
+    Database Tools' "View Latest Run" screen. Called after the safe-
+    shutdown sequence completes, while `storage` is still open, so the
+    per-relay Monitor Battery Scan breakdown (queried from `measurements`)
+    and the Group lookup (queried from `event_log`) are available. No-op
+    (prints nothing) if no run_summary row exists for this run_id, which
+    should not happen in practice -- start_run_summary() is always called
+    before any of these sequences run.
+    """
+    from test_control.run_summary_report import render_run_summary
+    run = storage.get_run_summary(storage.run_id)
+    if run is None:
+        return
+    print()
+    render_run_summary(run, storage=storage)
+
+
 def _run_monitor_battery():
     """
     Monitor Battery -- read-only battery monitoring, no charging, no
@@ -3922,6 +3976,12 @@ def _run_monitor_battery():
                 print(f"\n[FAIL] Monitor Battery aborted: {e}")
         finally:
             signal.signal(signal.SIGINT, previous_sigint_handler)
+
+        # Post-run summary -- printed after the safe-shutdown sequence above
+        # completes, from run_summary/measurements the sequence already
+        # wrote (storage is still open here) -- see test_control/
+        # run_summary_report.py. No hardware read, no new data source.
+        _print_post_run_summary(storage)
 
     finally:
         try:
@@ -4070,6 +4130,8 @@ def _run_monitor_battery_scan():
                 print(f"\n[FAIL] Monitor Battery Scan aborted: {e}")
         finally:
             signal.signal(signal.SIGINT, previous_sigint_handler)
+
+        _print_post_run_summary(storage)
 
     finally:
         try:
@@ -4256,6 +4318,8 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
                 print(f"\n[FAIL] {operation} aborted: {e}")
         finally:
             signal.signal(signal.SIGINT, previous_sigint_handler)
+
+        _print_post_run_summary(storage)
 
     finally:
         try:
@@ -4489,6 +4553,7 @@ MENU = [
     ("Test Sensors (NTC)",            test_sensors),
     ("Test Safety Monitor (workflow simulator)", test_safety_monitor),
     ("Database Tools",                test_database_tools),
+    ("Last Test Summary",             _show_last_test_summary),
     ("UI Test (demo screens -- no hardware, no database)", test_ui_preview),
 ]
 
