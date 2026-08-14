@@ -1494,6 +1494,85 @@ GO decision. Track the `run_guarded()` storage-ordering hardening
 
 ---
 
+## Milestone XII: Production Runtime Architecture Review -- Reuse, Concurrency, and Failure-Policy Assessment
+
+**Status:** ACHIEVED (design review only -- no implementation performed)
+
+**Scope:** With Monitor Battery and Monitor Battery Scan validated on real
+hardware and ChargeSequence/DischargeSequence real-hardware validation
+still the next milestone, this review assessed whether a future
+production runtime (start every enabled `BATTERY_GROUPS` group, run
+indefinitely, one worker per hardware set) can be built entirely on the
+existing architecture. Documentation-only session: no implementation code
+was changed to produce or act on this review.
+
+### Objectives achieved
+
+- **Confirmed shared architecture** across `MonitorBatterySequence`/
+  `MonitorBatteryScanSequence`/`ChargeSequence`/`DischargeSequence` --
+  one base class (`BatteryOperationSequence`), one shutdown path, one
+  safety class, one database path, one traceability path, one
+  cancellation path.
+- **Found a real reuse gap:** `main.py` (the actual production entry
+  point) still runs a second, live charge/discharge implementation
+  (`TestExecutor`/`BatteryTestSequence`/`ChargeCycle`/`DischargeCycle`)
+  with no reverse-polarity protection and no Milestone II traceability.
+  A Runtime built on `ChargeSequence`/`DischargeSequence` alone would
+  become a third implementation unless this path is retired/replaced as
+  part of the same effort.
+- **Confirmed `BATTERY_GROUPS` already models hardware ownership**
+  sufficiently to derive a hardware-set partition (`hardware_for_group()`,
+  shared-resource-name grouping) -- no topology file or duplicate
+  ownership model is needed.
+- **Found a real hardware-inventory constraint:** only one `MAIN_DMM`/
+  `MAIN_DAQ` exists today, shared by every configured group, capping true
+  N-way concurrency below the 3-hardware-set example until additional
+  instruments are assigned or a resource-checkout layer serializes shared
+  access -- consistent with an existing, already-documented `docs/TODO.md`
+  note about Group B sharing `MAIN_DAQ`.
+- **Recommended a failure policy:** isolate the affected hardware set by
+  default; escalate only to hardware sets that depend on a resource that
+  is itself the failure (shared DMM/DAQ, or the shared SQLite file) --
+  derived from the same ownership model used for scheduling.
+- **Reaffirmed the Section 45 database-failure caveat** in this new
+  context: the Runtime's Cycle Controller must reproduce `test.py`'s
+  outer `finally: hw_mgr.disconnect_all()` backstop per worker, or that
+  mitigation is silently lost.
+
+### Architectural decisions made
+
+- No code changes were made as part of this review. Retiring/replacing
+  `main.py`'s legacy path, building the resource-checkout layer, and
+  designing `CycleSequence` (composition over the existing Charge/
+  Discharge sequences, not a new implementation) are named as required
+  parts of the Runtime design effort, not deferred silently.
+
+### Verification
+
+Every finding is cited against the actual source (`main.py`,
+`test_control/test_executor.py`, `test_control/battery_test.py`,
+`test_control/charge_cycle.py`, `test_control/battery_operation_sequence.py`,
+`config/devices.py`, `test_control/hardware_manager.py`, `data/storage.py`,
+`docs/TODO.md`) -- see docs/architecture.md Section 46 for full evidence
+and docs/FAQ.md Section 14 for the Q&A-form record. No mocked or
+physical-hardware test was run; this is a static implementation trace.
+
+### Milestone readiness decision
+
+**GO for starting Production Runtime Architecture design**, conditional on
+the design explicitly addressing: `main.py` retirement/replacement, the
+resource-checkout/hardware-set-partition layer, `CycleSequence`'s design,
+and treating concurrency validation as gated on a second real hardware set
+existing. No finding blocks starting the design itself.
+
+### Recommended next milestone
+
+Begin Production Runtime Architecture design under the conditions above,
+in parallel with (not instead of) the still-pending ChargeSequence/
+DischargeSequence real-hardware validation milestone.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

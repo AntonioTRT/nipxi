@@ -1584,3 +1584,67 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 **Risks:** The database-failure traceability gap above; otherwise none identified.
 
 **Recommendation:** Proceed with Real Hardware Validation using Monitor Battery. Track the optional `run_guarded()` hardening above as a low-priority follow-up, not a gate.
+
+## SECTION 14 — PRODUCTION RUNTIME ARCHITECTURE REVIEW (Reuse, Concurrency, Failure Policy)
+
+*Findings below summarize the pre-implementation architecture review performed ahead of designing a production runtime that starts every enabled `BATTERY_GROUPS` group and runs indefinitely. See docs/architecture.md Section 46 for the full technical writeup this section summarizes.*
+
+### Q: Do MonitorBatterySequence, MonitorBatteryScanSequence, ChargeSequence, and DischargeSequence all share one architecture?
+
+**Status:** Implemented
+
+**Answer:** Yes, for the code path `test.py` drives. All four subclass `BatteryOperationSequence` and share its `run_guarded()` (shutdown), `SafetyMonitor` usage, `DataStorage` read/write methods, hardware-identity traceability helpers, and `CancellationToken`-based cancellation -- no per-sequence reimplementation of any of these.
+
+**Evidence:** `test_control/battery_operation_sequence.py`; `test_control/monitor_battery_sequence.py`, `monitor_battery_scan_sequence.py`, `charge_sequence.py`, `discharge_sequence.py`; `test.py::_run_monitor_battery()`/`_run_monitor_battery_scan()`/`_run_charge_or_discharge()`.
+
+**Risks:** None within this code path. See the next question for where this breaks down elsewhere in the repo.
+
+**Recommendation:** None for this path.
+
+### Q: Is ChargeSequence/DischargeSequence really the only implementation of charging/discharging in this codebase today?
+
+**Status:** Not yet -- a real gap
+
+**Answer:** No. `main.py` (the actual `python main.py` entry point) builds and runs a separate, live implementation: `TestExecutor` -> `BatteryTestSequence` -> `ChargeCycle`/`DischargeCycle`. It shares `SafetyMonitor` but not `BatteryOperationSequence`, has no reverse-polarity check, and writes through the legacy `DataStorage.record()` path -- no `event_log`/`run_summary`/hardware-identity traceability for any run it drives.
+
+**Evidence:** `main.py:40,113`; `test_control/test_executor.py:37-40,136-137`; `test_control/battery_test.py`; `test_control/charge_cycle.py` (no polarity/`ReversePolarityError` reference anywhere in the file).
+
+**Risks:** A production Runtime built on `ChargeSequence`/`DischargeSequence` becomes a *third* implementation unless `main.py`'s path is explicitly retired or rewritten onto the same architecture as part of this effort.
+
+**Recommendation:** Make retiring/replacing `main.py`'s `TestExecutor` path an explicit deliverable of the Runtime effort, not an afterthought.
+
+### Q: Does `BATTERY_GROUPS` already contain enough information to derive hardware ownership / concurrency?
+
+**Status:** Data model: yes. Real hardware inventory: not yet for 3-way concurrency.
+
+**Answer:** `hardware_for_group()` already resolves relay_matrix/smu/dmm/daq names per group -- a "hardware set" is a pure derivation (group by shared resource name), no new topology file needed. But `PXI_SLOTS` has only one enabled DMM (`MAIN_DMM`) and one enabled DAQ (`MAIN_DAQ`) in the whole rack, and every configured group references them -- so true independent 3-hardware-set concurrency isn't supported by current hardware inventory yet, only by the data model.
+
+**Evidence:** `config/devices.py::hardware_for_group()` (647-674), `BATTERY_GROUPS`/`PXI_SLOTS`/`ETHERNET_DEVICES`; `docs/TODO.md`'s existing Group B/`MAIN_DAQ` sharing note.
+
+**Risks:** Two "concurrent" hardware sets sharing the one real DMM/DAQ would contend for telemetry; `HardwareManager` also has no built-in concept of a second concurrent owner of the same physical instrument.
+
+**Recommendation:** Add a resource-checkout/scheduling layer in the Cycle Controller (not a new hardware/safety implementation) so a group only starts once every resource name it needs is free.
+
+### Q: If a fault occurs in one active cycle, should the Runtime stop only that hardware set, or everything?
+
+**Status:** Design recommendation (not yet implemented)
+
+**Answer:** Isolate the affected hardware set by default (Option A) -- `SafetyMonitor`'s shutdown methods already operate per-`(smu, relay_matrix)`, and an unrelated hardware set has no causal exposure to another set's fault. Escalate to stopping every hardware set that depends on a resource that is *itself* the failure (today: `MAIN_DMM`/`MAIN_DAQ`, or the shared SQLite file) -- derived from the same ownership tuple used for scheduling, not a blanket global stop.
+
+**Evidence:** `test_control/safety_monitor.py::emergency_stop()`/`safe_cancel_shutdown()` (per-instrument arguments, no global registry); docs/architecture.md Section 45's `run_guarded()` DB-failure-ordering caveat.
+
+**Risks:** A Runtime that only reuses `test.py`'s per-worker outer `finally: disconnect_all()` backstop implicitly, without deliberately reproducing it per worker, would silently lose the mitigation Section 45 already relies on.
+
+**Recommendation:** Isolate by default; escalate only along actual shared-resource dependency; the Cycle Controller must wrap every worker's cycle in the same unconditional `disconnect_all()` `finally` `test.py` already uses.
+
+### Q: Is Runtime Architecture design cleared to start?
+
+**Status:** GO, with conditions carried into the design
+
+**Answer:** Yes. No finding in this review blocks starting the design itself. The design must explicitly address: (1) retiring/replacing `main.py`'s legacy path, (2) a resource-checkout layer given the shared-DMM/DAQ constraint, (3) `CycleSequence` (not yet implemented -- must be built as composition over the existing Charge/Discharge sequences), and (4) that concurrency behavior can be designed now but needs a second real hardware set to be hardware-validated.
+
+**Evidence:** docs/architecture.md Section 46 (full writeup).
+
+**Risks:** See Section 46's Risks list -- none are gates on starting design.
+
+**Recommendation:** Proceed with Production Runtime Architecture design under the conditions above.

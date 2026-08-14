@@ -2742,3 +2742,342 @@ an unrelated fault does not itself skip `safety.emergency_stop()` at that
 layer -- redundant with the outer backstop for hardware safety, but would
 restore clean stop-reason classification for this one failure mode), not
 a gate on proceeding.
+
+---
+
+## 46. Production Runtime Architecture Review -- Reuse, Concurrency, and Failure-Policy Assessment
+
+**Purpose:** Monitor Battery and Monitor Battery Scan are validated on real
+hardware (Section 45; ChargeSequence/DischargeSequence real-hardware
+validation is the next milestone, still pending). Before designing a
+production runtime that starts every enabled `BATTERY_GROUPS` group and
+runs indefinitely, this section reviews whether the existing architecture
+can be reused unchanged, whether `BATTERY_GROUPS` already models hardware
+ownership well enough to derive concurrency, and what a safe failure
+policy looks like. **Documentation-only session -- no implementation code
+was changed.** docs/FAQ.md Section 14 carries the same findings in Q&A
+form; docs/MILESTONES.md records the GO/NO-GO decision.
+
+### Architecture assessment -- do the four sequences share one framework?
+
+Yes, for everything built on `test.py`'s Milestone II path. `MonitorBatterySequence`,
+`MonitorBatteryScanSequence`, `ChargeSequence`, and `DischargeSequence` all
+subclass `test_control/battery_operation_sequence.py::BatteryOperationSequence`
+and call its shared methods directly -- no per-sequence reimplementation of
+any of the following:
+
+- **Shared shutdown path:** `run_guarded()`'s five exception branches
+  (`OperationCancelledError`/`SafetyViolationError`/`RelayError`/
+  `NIPXITimeoutError`/generic `Exception`) all end by calling
+  `safety.safe_cancel_shutdown()` or `safety.emergency_stop()` -- the
+  identical two-instrument sequence (PMU output off + verified, then all
+  relays forced open + verified) in every case, differing only in
+  `stop_reason`/log severity. Backed up by `HardwareManager.disconnect_all()`
+  in `test.py`'s outer `finally` (all four `_run_*()` entry points), and
+  again by `HardwareManager`'s `atexit`-registered handlers.
+- **Shared safety path:** one `SafetyMonitor` instance per run, constructed
+  identically in all four `test.py` entry points. `ChargeSequence`/
+  `DischargeSequence` call `set_battery_limits()` + `check(mode="charge"/"discharge")`
+  every sample; Monitor/Scan never source current so never call `check()`,
+  but route through the identical shutdown methods on every exit.
+  `_check_battery_polarity()` (defined once, on the base class) gives
+  Charge/Discharge identical reverse-polarity coverage.
+- **Shared database path:** one `DataStorage` instance per run
+  (`data/storage.py`), one `run_id` for every table write. All four
+  sequences write through the same `record_measurement()`/`log_event()`/
+  `record_execution_state()`/`start_run_summary()`/`finish_run_summary()`
+  methods -- no sequence writes SQL directly.
+- **Shared traceability path:** `test.py::_hardware_snapshot_fields()` +
+  `config/devices.py::hardware_traceability_messages()` produce the
+  identical hardware-identity `event_log` narrative for all four
+  entry points, built from the same `hardware_for_group()`-resolved
+  cfg dicts `HardwareManager` was actually constructed with.
+- **Shared cancellation path:** `CancellationToken` + `check_cancellation()`/
+  `interruptible_sleep()` (`utils/cancellation.py`), with the identical
+  SIGINT-handler swap/restore bracketing the sequence call in all four
+  `test.py::_run_*()` functions.
+
+**This satisfies the stated goal for the code paths test.py drives today.**
+See the next subsection for where this breaks down elsewhere in the repo.
+
+### Reuse assessment -- is ChargeSequence/DischargeSequence really the *only* implementation?
+
+**No -- not yet, and this is the most important finding in this review.**
+`main.py` (the actual `python main.py` production entry point, not
+`test.py`'s interactive menu) builds and runs a **second, live, independent
+charge/discharge implementation** today:
+
+```
+main.py -> TestExecutor (test_control/test_executor.py)
+        -> BatteryTestSequence (test_control/battery_test.py)
+        -> ChargeCycle / DischargeCycle (test_control/charge_cycle.py / discharge_cycle.py)
+```
+
+This is not dead code -- `main.py:113` constructs `TestExecutor`, which
+constructs `ChargeCycle`/`DischargeCycle` (`test_executor.py:136-137`) and
+runs them via `BatteryTestSequence.run()` on every real `python main.py`
+invocation. It shares `SafetyMonitor` with the new path (same class,
+constructed fresh per run) but **does not** share `BatteryOperationSequence`,
+does not call `_check_battery_polarity()` (confirmed: no reference to
+polarity/`ReversePolarityError` anywhere in `charge_cycle.py`), and writes
+measurements through the legacy `DataStorage.record()` (`_COLUMNS` only) --
+not `record_measurement()` -- so it produces **no `event_log`, no
+`run_summary`, no hardware-identity traceability** for any run it drives.
+`ChargeSequence`/`DischargeSequence` were explicitly "harvested from"
+`ChargeCycle`/`DischargeCycle` (see Section 33) -- the two pairs are
+related by ancestry, not by being the same code.
+
+**Consequence:** today, which charge/discharge implementation actually
+runs depends entirely on which file the operator launches (`test.py` vs.
+`main.py`) -- an accidental, entry-point-selected fork, not a designed one.
+A production runtime built on `ChargeSequence`/`DischargeSequence`
+(correctly, per this review) would become a **third** implementation
+sitting alongside two pre-existing ones unless `main.py`'s path is
+explicitly retired as part of this work. This must be a named deliverable
+of the runtime effort, not an afterthought: either `main.py` is rewritten
+to build on `HardwareManager` + `BatteryOperationSequence` subclasses the
+same way `test.py` does (and `test_executor.py`/`battery_test.py`/
+`charge_cycle.py`/`discharge_cycle.py` are retired), or the new Runtime
+replaces `main.py` as the production entry point outright and the legacy
+files are deleted once nothing imports them. Leaving both live after the
+Runtime ships would permanently violate goal 2/3 as stated.
+
+### Concurrency assessment -- does `BATTERY_GROUPS` already model hardware ownership?
+
+**Yes, the data model is already sufficient** -- `hardware_for_group(group)`
+(`config/devices.py:647-674`) resolves `relay_matrix_name`/`smu_name`/
+`dmm_name`/`daq_name` for any group from `BATTERY_GROUPS[group]` alone; no
+topology file or runtime map is needed to know which physical instruments a
+group depends on. Deriving a "hardware set" partition is a pure function
+of this existing data: two groups belong to the same hardware set if the
+tuples of (`relay_matrix`, `smu`, `dmm`, `daq`) they resolve to share *any*
+name in common -- not just the relay matrix. Today: Group A and Group B
+both resolve to `relay_matrix="MATRIX_NUMATO_202"`, `dmm="MAIN_DMM"`,
+`daq="MAIN_DAQ"` (Group B additionally has `smu=None`, i.e. unassigned) --
+so A and B are already, correctly, one hardware set by this definition
+(matching the example in the request). Groups C/D are unconfigured
+placeholders (`relay_matrix: None`) and are not real hardware sets yet.
+
+**However, real hardware inventory today cannot support three
+independent, contention-free hardware sets as drawn in the request.**
+`PXI_SLOTS` has exactly one enabled DMM (`MAIN_DMM`, slot 3) and one
+enabled DAQ (`MAIN_DAQ`, slot 2) in the entire rack. Every group defined
+in `BATTERY_GROUPS` today references these same two names -- there is no
+second physical DMM or DAQ to assign to a second hardware set. This exact
+risk is already flagged in `docs/TODO.md` ("Multi-SMU/multi-DAQ channel
+assignment... `BATTERY_GROUPS["B"]["daq"]` is currently `"MAIN_DAQ"`, not a
+dedicated device") for Group B specifically -- this review generalizes it:
+**any** future hardware set sharing `dmm`/`daq` with an already-running
+one cannot safely run at the same time under the current instrument count,
+regardless of how many additional relay matrices/SMUs exist (three Numato
+units are already configured in `ETHERNET_DEVICES` -- `MATRIX_NUMATO_201`
+is defined but not referenced by any group today, `_203` likewise -- so
+relay-matrix-level parallelism is closer to real than DMM/DAQ-level
+parallelism is).
+
+Two additional structural points a Runtime must account for, both derived
+from the same ownership model rather than new mechanism:
+
+- **`HardwareManager` builds its own driver instances per construction**
+  (`hardware_manager.py:111-114`) -- it has no concept of a second,
+  concurrent owner of the same physical relay matrix/SMU/DMM. A Runtime
+  must guarantee at most one live `HardwareManager` (one live connection)
+  per physical resource at any moment; two workers independently
+  constructing a `HardwareManager` against the same `relay_cfg` (e.g. both
+  pointed at `MATRIX_NUMATO_202`) would open two uncoordinated Telnet
+  sessions against one physical relay matrix -- a real hardware risk, not
+  a modeling detail.
+- **A resource-checkout layer, not a new hardware/safety implementation,
+  is the correct fix.** A Cycle Controller can resolve each enabled
+  group's required resource names via the existing `hardware_for_group()`,
+  and only start a worker for a group once every one of its resource names
+  is free (held by no other running worker); the worker releases them when
+  its `HardwareManager`/`DataStorage` close. Two groups whose resource
+  tuples are disjoint run concurrently for free; two groups sharing any
+  resource serialize automatically, because the second one's checkout
+  blocks. This is scheduling logic sitting in front of the existing
+  architecture, not a parallel implementation of anything named in goal 3.
+
+### Failure policy -- isolate the affected hardware set, or stop everything?
+
+**Recommendation: (A) isolate the affected hardware set by default, with
+one named escalation rule for resources that are, today, actually shared.**
+
+Reasoning:
+- `SafetyMonitor.emergency_stop()`/`safe_cancel_shutdown()` already operate
+  on the specific `(smu, relay_matrix)` handles passed to them -- they are
+  inherently per-hardware-set, not global, today. There is no existing
+  registry of "every active `SafetyMonitor`" to fan a stop out to; building
+  one would be new orchestration code (acceptable, since it only calls the
+  existing method once per affected worker -- see below), not a new safety
+  implementation.
+- A safety violation, relay fault, SMU fault, or timeout on one hardware
+  set's electrically-independent instrument stack has no causal
+  relationship to a different hardware set's electrical state, *given*
+  the hardware sets are genuinely disjoint (own relay matrix, own SMU).
+  Stopping unaffected hardware sets on every fault would halt otherwise-healthy,
+  unrelated cycles with no safety benefit -- unacceptable for a "runs
+  forever" runtime whose whole premise is unattended operation.
+- **Escalation rule:** any fault on a resource actually shared across
+  hardware sets today -- `MAIN_DMM`/`MAIN_DAQ` failing, or the single
+  SQLite database file becoming unwritable -- must stop every hardware set
+  that currently depends on that specific resource (derived from the same
+  ownership tuple used for scheduling above), not just the worker that
+  first observed the fault. A dead shared DMM leaves every dependent
+  hardware set with no telemetry to safety-check against, which is
+  equivalent to that DMM failing individually for each of them. This is
+  "stop workers whose dependency set intersects the failed resource," not
+  a blanket stop of everything regardless of dependency -- Option A and
+  Option B are not mutually exclusive; B only applies within A's own
+  dependency-scoped definition of "affected."
+- A database failure specifically also revives the caveat already
+  documented in Section 45: every `run_guarded()` exception branch writes
+  to storage *before* calling the safety-shutdown method, so if storage
+  itself is the fault, that write raises a second exception and skips
+  `safety.emergency_stop()`/`safe_cancel_shutdown()` **at that layer**.
+  Section 45 found this is backstopped today by `test.py`'s outer
+  `finally: hw_mgr.disconnect_all()`, which cannot be skipped (plain
+  `finally`, and its own steps are independently guarded so they cannot
+  raise). **A Runtime's Cycle Controller must replicate this exact outer
+  backstop per worker** (call `disconnect_all()` in a `finally` around
+  every cycle, unconditionally) -- this redundant safety net exists today
+  because of how `test.py` happens to call these sequences, not because
+  `BatteryOperationSequence` guarantees it itself; losing it in the
+  Runtime would reopen a gap Section 45 already closed once.
+
+### Database -- what's already there, and is it restart-durable?
+
+- **Already written:** `measurements` (per-sample), `run_summary` (one row
+  per run -- battery config + hardware-identity snapshot + stop_reason/
+  result + duration), `event_log` (fine-grained narrative), `station_state`
+  (last-known relay/state, across all run_ids).
+- **Errors already persisted:** every `run_guarded()` exception branch logs
+  an `event_log` row (`level="ERROR"`), a `station_state` row (the matching
+  `StopReason`), and finishes `run_summary` with a classified `stop_reason`/
+  `result` -- for `SafetyViolationError`/`RelayError`/`NIPXITimeoutError`/
+  generic `Exception` alike (`battery_operation_sequence.py:141-213`).
+- **Execution states persisted:** `ACTIVE` (loop start), `CANCELLED`/
+  `SAFETY_VIOLATION`/`FAILED`/`TIMEOUT`/`COMPLETED` (`utils/stop_reason.py`'s
+  vocabulary, one row per transition, via `record_execution_state()`).
+- **Traceable after restart:** yes, for every case except the one narrow
+  DB-failure-during-exception-handling edge case above -- SQLite is a real
+  file on disk, and `get_last_run_summary()`/`get_recent_events(run_id)`/
+  `get_measurements(run_id)`/`get_last_execution_state()` all already work
+  identically whether called moments after a run or after a full process
+  restart (this is exactly the pattern `test.py`'s Database Tools/"Last
+  Test Summary" menu entries and the recovery display already use). Even
+  in the narrow edge case, the plain Python logger (`self.log.error(...)`)
+  always executes *before* any storage write in every branch, so the
+  fault is still visible in application logs independent of SQLite.
+- Neither `record_measurement()`/`log_event()`/`finish_run_summary()`/
+  `record_execution_state()` catch `sqlite3.Error` internally (unlike the
+  legacy `record()`/`query()` pair) -- a genuine mid-write DB fault
+  surfaces as an ordinary Python exception, caught by whichever
+  `run_guarded()` branch is active (usually the generic `Exception`
+  branch), which is what produces the Section 45 caveat above.
+
+### Runtime design recommendation
+
+```
+Runtime
+  -> Cycle Controller  (new -- resource checkout + scheduling only)
+       -> resolves hardware_for_group() per enabled BATTERY_GROUPS entry
+       -> starts one worker per free hardware-set resource tuple
+       -> each worker: HardwareManager + SafetyMonitor + DataStorage,
+          constructed/torn down exactly as test.py's _run_*() functions
+          do today, wrapping disconnect_all() in an unconditional finally
+       -> each worker drives the existing MonitorBatterySequence /
+          ChargeSequence / DischargeSequence -- no new charge/discharge/
+          safety/shutdown logic anywhere in this layer
+```
+
+No conflict was found between this shape and the existing architecture
+*for the sequences themselves* -- the Cycle Controller is additive
+scheduling logic sitting where `test.py`'s interactive prompts sit today,
+calling the same constructors with the same arguments. The one required,
+non-additive change is retiring or replacing `main.py`'s `TestExecutor`
+path (see Reuse assessment above) -- without that, the Runtime becomes a
+third implementation rather than the second's replacement.
+
+`CycleSequence` (charge -> rest -> discharge, "runs forever") does not
+exist yet. It must be built the same way the other four were -- subclass
+`BatteryOperationSequence`, compose the *existing* `ChargeSequence.run()`/
+`DischargeSequence.run()` calls (not new charge/discharge logic) with a
+rest/dwell phase between them -- before "Runtime runs forever" is literally
+possible. This is new code, but it is composition of existing sequences,
+not a parallel implementation of what they already do.
+
+### Config ownership
+
+**Confirmed: `config/devices.py` can remain the sole source of truth.**
+Hardware ownership (`relay_matrix`/`smu`/`dmm`/`daq` per group), battery
+ownership (`battery_type` per group), group ownership (`position_start`/
+`position_end`/`enabled`), and position ownership (`BATTERY_CHANNELS`) are
+all already there, and `hardware_for_group()`/`group_test_config()`/
+`resolve_group_position()`/`group_for_position()` already derive everything
+a Runtime needs from them. The only new function this review identifies as
+needed is a pure derivation -- something like `hardware_sets() ->
+list[frozenset[group]]`, grouping `BATTERY_GROUPS` keys by shared resource
+names -- which reads `BATTERY_GROUPS` and returns a partition; it does not
+introduce a second ownership model, any more than `resolve_group_position()`
+introduces a second position registry today. No topology file, runtime
+map, or duplicate hardware map is required.
+
+### Risks
+
+1. **`main.py`'s legacy `TestExecutor`/`ChargeCycle`/`DischargeCycle` path
+   is a currently-live second implementation** with weaker safety coverage
+   (no reverse-polarity check) and no Milestone II traceability at all.
+   Highest-priority item -- see Reuse assessment.
+2. **Shared `MAIN_DMM`/`MAIN_DAQ` across every currently-configured group**
+   caps real concurrency below what the 3-hardware-set example assumes,
+   until either additional DMM/DAQ hardware is assigned per set or a
+   resource-checkout layer serializes access to the shared instruments
+   specifically (already partially documented in `docs/TODO.md`).
+3. **`run_guarded()`'s traceability-before-shutdown ordering** (Section 45)
+   is backstopped today only by `test.py`'s calling convention; the
+   Runtime must reproduce that same outer `finally` per worker or the
+   backstop is silently lost for a code path nobody is watching
+   interactively.
+4. **`CycleSequence` does not exist** -- the "runs forever" runtime concept
+   cannot be literally realized until it is built (as a composition of the
+   existing Charge/Discharge sequences, per Runtime design above).
+5. **Only one real hardware set exists today** (Group A; Group B is
+   disabled, C/D are unconfigured placeholders) -- the concurrency design
+   above can be authored and reasoned about now, but cannot be
+   hardware-validated for actual N-way concurrency until at least a second
+   fully wired hardware set (its own relay matrix + SMU, at minimum)
+   exists. Design now, validate concurrency later.
+6. **Minor doc hygiene:** the `BATTERY_GROUPS` comment block
+   (`config/devices.py` lines ~507-509) still describes Group A as wired
+   to `MATRIX_NUMATO_201`; the live dict entry (and real-hardware
+   validation results reported for this milestone) confirm Group A is
+   actually on `MATRIX_NUMATO_202`. Stale comment, not a code defect --
+   worth a one-line fix so a future reader doesn't derive hardware-set
+   membership from the comment instead of the dict.
+7. **ChargeSequence/DischargeSequence real-hardware validation is still
+   pending** (per this session's status) -- the Runtime design can
+   proceed in parallel, but the Runtime should not be the first thing to
+   exercise Charge/Discharge against real batteries; that validation
+   (Milestone-equivalent to Section 45's Monitor Battery review) remains
+   the immediate next step independent of this architecture work.
+
+### GO / NO-GO decision
+
+**GO for starting Production Runtime Architecture design**, on the
+following conditions carried into that design rather than treated as
+blockers:
+
+- The design must include an explicit plan for `main.py`'s legacy path
+  (retire-and-replace, or rewrite onto `HardwareManager`/
+  `BatteryOperationSequence`) -- not merely build the Runtime alongside it.
+- The design must include the resource-checkout/hardware-set-partition
+  layer described above before any concurrency claim is made, given the
+  shared-DMM/DAQ constraint.
+- `CycleSequence` must be designed (composition over `ChargeSequence`/
+  `DischargeSequence`) as part of this same effort, not deferred silently.
+- Concurrency behavior can be designed and code-reviewed now but is
+  gated on a second real hardware set existing before it can be
+  hardware-validated.
+
+No finding in this review blocks starting the design work itself.

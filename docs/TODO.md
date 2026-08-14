@@ -352,6 +352,26 @@ the bottom, with a pointer to where the real documentation lives
 - [ ] Set up a remote Git repository and update `README.md` with the URL.
 - [ ] CI: add basic linting (ruff or flake8) as a pre-commit hook.
 
+### Production Runtime Architecture (see docs/architecture.md Section 46, Milestone XII)
+
+- [ ] **[MUST before Runtime ships]** Retire or rewrite `main.py`'s legacy
+  `TestExecutor`/`BatteryTestSequence`/`ChargeCycle`/`DischargeCycle` path
+  -- it is a currently-live second charge/discharge implementation with no
+  reverse-polarity check and no Milestone II traceability (`event_log`/
+  `run_summary`). A Runtime built on `ChargeSequence`/`DischargeSequence`
+  alone becomes a third implementation unless this is resolved.
+- [ ] Design and build a resource-checkout/hardware-set-partition layer in
+  the future Cycle Controller, derived from `hardware_for_group()` (group
+  by shared `relay_matrix`/`smu`/`dmm`/`daq` name) -- required before any
+  concurrency claim, given only one `MAIN_DMM`/`MAIN_DAQ` exists today.
+- [ ] Design `CycleSequence` (charge -> rest -> discharge) as a composition
+  over the existing `ChargeSequence.run()`/`DischargeSequence.run()` calls,
+  subclassing `BatteryOperationSequence` like the other four -- not a new
+  charge/discharge implementation.
+- [ ] Fix stale comment in `config/devices.py` (~line 507-509) describing
+  Group A as wired to `MATRIX_NUMATO_201` -- the live dict entry and real
+  hardware validation confirm Group A is actually on `MATRIX_NUMATO_202`.
+
 ---
 
 ## Optional / Future
