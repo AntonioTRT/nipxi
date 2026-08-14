@@ -1648,3 +1648,67 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 **Risks:** See Section 46's Risks list -- none are gates on starting design.
 
 **Recommendation:** Proceed with Production Runtime Architecture design under the conditions above.
+
+## SECTION 15 — ARCHITECTURE STANDARDIZATION REVIEW (Group Naming, Enabled Groups, Group-Centric Workflows, Database, Runtime Prep)
+
+*Findings below summarize the pre-Runtime standardization review of the operator workflow around `BATTERY_GROUPS`. See docs/architecture.md Section 47 for the full technical writeup.*
+
+### Q: Does renaming battery groups (e.g. "A" -> "A1") require code changes?
+
+**Status:** No code changes required -- one open naming-semantics decision remains
+
+**Answer:** `group` is used everywhere as an opaque dict-key string (confirmed by direct search of `test.py`/`config/devices.py`/`utils/validators.py`) -- no code assumes a single uppercase letter. The rename is data-only in `BATTERY_GROUPS`. What remains open is whether today's four groups get a 1:1 rename (A->A1, B->B1, ...) or are reorganized into sub-groups of one family (A1="old A", A2="old B", ...) -- that's a physical-topology decision only the operator can make, not derivable from the code.
+
+**Evidence:** `config/devices.py::BATTERY_GROUPS`, `test.py::_select_battery_group()`, `utils/validators.py::validate_group_test_config()`.
+
+**Risks:** None to the codebase; the open naming-semantics decision must be resolved before the rename itself is executed.
+
+**Recommendation:** Recommend the 1:1 rename reading as lower-risk; confirm with the operator before implementing.
+
+### Q: Is the `enabled` flag on `BATTERY_GROUPS` a new feature?
+
+**Status:** Already implemented
+
+**Answer:** No -- every `BATTERY_GROUPS` entry already has `"enabled": True/False`, already enforced at `_select_battery_group()`, already the sole ownership model (no parallel `ENABLED_GROUPS` list). One nuance must be preserved: `_select_relay_scope()` (Relay Functional Validation) deliberately does NOT gate on `enabled` -- a previously-fixed bug, documented in its own docstring -- since `enabled=False` means "no battery relay matrix wired for battery testing," not "these channels can't be tested."
+
+**Evidence:** `config/devices.py::BATTERY_GROUPS`, `test.py::_select_battery_group()` (test.py:3597-3611), `test.py::_select_relay_scope()` (test.py:1990-2009).
+
+**Risks:** Applying "hide disabled groups" too broadly (to raw hardware-validation scope selectors, not just battery workflows) would regress an already-fixed bug.
+
+**Recommendation:** No change needed; preserve the existing distinction.
+
+### Q: Should hardware tests (Test SMU/DMM/DAQ/Relay Matrix) be switched to Select Group -> Resolve -> Run?
+
+**Status:** Recommend additive, not a replacement
+
+**Answer:** Not as a replacement. `HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` are physically present but not assigned to any group today -- a pure group-resolved test could never reach them, removing the ability to validate hardware before deciding which group to assign it to.
+
+**Evidence:** `test.py::_run_hardware_category()` (test.py:136), `test.py::test_smu()` (test.py:781), `config/devices.py::PXI_SLOTS` (HIGH_POWER_SMU/AUX_SMU_1/AUX_SMU_2 comments: "not yet assigned to any battery channel").
+
+**Risks:** Replacing the direct device picker would be a real capability loss for pre-commissioning hardware validation.
+
+**Recommendation:** Add group-centric resolution as an additional path alongside the existing device picker.
+
+### Q: What's missing from the database for group-centric reporting (Group History / Last Test From Group / Group Statistics)?
+
+**Status:** One blocking schema gap identified
+
+**Answer:** `run_summary` has no `group` column -- `group`/`position_in_group` exist only as free text inside `event_log.message`. Recommend adding `group_name` (and optionally `position_in_group`) as additive `run_summary` columns, the same migration pattern already used for `battery_type`/hardware-identity columns. Once added, all three requested features are thin queries/aggregations over existing, already-generic code (`list_run_summaries()`, `get_last_run_summary()`, `render_run_summary()`).
+
+**Evidence:** `data/storage.py::CREATE_RUN_SUMMARY_SQL`/`_RUN_SUMMARY_MIGRATION_COLUMNS`, `test_control/run_summary_report.py::_lookup_group()` (the existing event_log-parsing workaround this would replace).
+
+**Risks:** None -- purely additive schema change, no existing data affected.
+
+**Recommendation:** Add `group_name`/`position_in_group` as the prerequisite for Group History/Last Test From Group/Group Statistics.
+
+### Q: Does this standardization move the project closer to the intended Runtime shape, without violating single-source-of-truth or duplicating charge/discharge logic?
+
+**Status:** Yes, consistent -- one prerequisite from Section 46 remains open
+
+**Answer:** Yes. `enabled` already lives inside `BATTERY_GROUPS` (no parallel list); the naming change is a rename within the same structure; `group_name` is additive to the existing schema; the hardware-test recommendation is explicitly additive. `main.py`'s legacy `TestExecutor`/`ChargeCycle`/`DischargeCycle` path (Section 46) is unaffected by this batch and still needs retiring before Runtime ships.
+
+**Evidence:** docs/architecture.md Section 47 (full writeup), Section 46 (main.py finding).
+
+**Risks:** None new; the standing `main.py` retirement prerequisite from Section 46 is restated, not resolved, by this review.
+
+**Recommendation:** Proceed with this standardization work; keep `main.py` retirement tracked as the standing Runtime prerequisite.

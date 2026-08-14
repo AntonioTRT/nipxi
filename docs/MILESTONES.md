@@ -1573,6 +1573,87 @@ DischargeSequence real-hardware validation milestone.
 
 ---
 
+## Milestone XIII: Architecture Standardization Review -- Group Naming, Enabled Groups, Group-Centric Workflows, Database, Runtime Prep
+
+**Status:** ACHIEVED (design/documentation review only -- no implementation performed)
+
+**Scope:** With ChargeSequence/DischargeSequence implemented, Generic Run
+Summary/Last Test Summary/NTC Group Scan/NTC Presence Detection
+implemented, and CycleSequence/Runtime Architecture designed (Milestone
+XII), this review standardized the operator workflow around
+`BATTERY_GROUPS` ahead of Runtime implementation. Documentation-only
+session: no implementation code was changed to produce or act on this
+review.
+
+### Objectives achieved
+
+- **Confirmed the group naming migration (A -> A1/A2/A3/A4) is
+  code-neutral** -- `group` is used everywhere as an opaque string key, no
+  code assumes single-letter format. Identified one open, operator-only
+  decision on naming semantics (1:1 rename vs. family reorganization) that
+  must be resolved before the rename is executed.
+- **Confirmed `enabled`/disabled groups are already fully implemented** --
+  not a new field, already the sole ownership model, already enforced at
+  the one shared battery-workflow gate. Flagged one nuance that must be
+  preserved: `_select_relay_scope()`'s deliberate, previously-fixed
+  bypass of `enabled` for raw hardware-validation scoping.
+- **Confirmed operator workflow standardization already matches the
+  proposed shape** across all six battery workflows -- no conflicts found.
+- **Found a real risk in the hardware-test standardization proposal:**
+  switching Test SMU/DMM/DAQ/Relay Matrix to pure group-resolution would
+  remove the ability to validate hardware not yet assigned to any group
+  (`HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` today). Recommended an
+  additive group-centric path instead of a replacement.
+- **Documented the exact group/hardware ownership resolution chain**
+  (Group -> battery type -> relay matrix/SMU/DMM/DAQ/NTC DAQ -> position
+  mapping), with exact files/functions.
+- **Identified the blocking schema gap for group-centric database
+  reporting:** `run_summary` has no `group` column today (only free-text
+  `event_log` narration). Recommended an additive `group_name`/
+  `position_in_group` migration -- the same pattern already used for
+  `battery_type`/hardware-identity columns -- as the prerequisite for
+  Group History/Last Test From Group/Group Statistics.
+- **Reaffirmed the Milestone XII `main.py` retirement prerequisite** --
+  unaffected by, and not resolved by, this standardization batch.
+
+### Architectural decisions made
+
+- No code changes were made as part of this review. The naming-semantics
+  decision, the `group_name`/`position_in_group` schema addition, and the
+  additive group-centric hardware-test path are named as concrete
+  follow-up implementation items, not deferred silently.
+
+### Verification
+
+Every finding is cited against the actual source (`config/devices.py`,
+`test.py`, `utils/validators.py`, `data/storage.py`,
+`test_control/run_summary_report.py`) -- see docs/architecture.md Section
+47 for full evidence and docs/FAQ.md Section 15 for the Q&A-form record.
+No mocked or physical-hardware test was run; this is a static
+implementation trace.
+
+### Milestone readiness decision
+
+**GO for this standardization work.** The naming migration's open
+1:1-vs-family decision requires operator confirmation before that rename
+is executed; the `group_name`/`position_in_group` schema addition and the
+additive hardware-test path are the concrete follow-up implementation
+items. No finding blocks proceeding toward Runtime implementation --
+`main.py` retirement (Milestone XII) remains the standing prerequisite,
+unchanged by this review.
+
+### Recommended next milestone
+
+Resolve the group-naming semantics decision with the operator, then
+implement (in any order): the naming migration itself, the
+`group_name`/`position_in_group` schema addition and its three
+group-centric reporting features, and the additive group-centric
+hardware-test path -- in parallel with the still-pending
+ChargeSequence/DischargeSequence real-hardware validation and the
+Milestone XII `main.py` retirement work.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

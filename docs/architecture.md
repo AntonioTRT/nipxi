@@ -3081,3 +3081,200 @@ blockers:
   hardware-validated.
 
 No finding in this review blocks starting the design work itself.
+
+---
+
+## 47. Architecture Standardization Review -- Group Naming, Enabled Groups, Group-Centric Workflows, Database, and Runtime Prep
+
+**Purpose:** with ChargeSequence/DischargeSequence implemented, Generic Run
+Summary/Last Test Summary/NTC Group Scan/NTC Presence Detection implemented,
+and CycleSequence/Runtime Architecture designed (Section 46), this review
+standardizes the operator workflow around `BATTERY_GROUPS` before Runtime
+implementation begins. **Documentation-only session -- no implementation
+code was changed.** docs/FAQ.md Section 15 carries the same findings in
+Q&A form; docs/MILESTONES.md records the review; docs/TODO.md tracks the
+resulting follow-up items.
+
+### 1. Battery group naming standard (A -> A1/A2/A3/A4)
+
+Confirmed by direct search of `test.py`, `config/devices.py`, and
+`utils/validators.py`: `group` is used everywhere as an opaque dict-key
+string (`BATTERY_GROUPS.keys()`, `if group not in dev_cfg.BATTERY_GROUPS`,
+`.strip().upper()`) -- no code assumes a single uppercase letter (no
+length check, no alphabet/`ord()` math, no regex). A rename of
+`BATTERY_GROUPS`' keys is mechanically a data-only change with **zero
+required code changes** anywhere in `test.py`/`config/devices.py`/
+`utils/validators.py`/`test_control/*`.
+
+**Database impact:** none structurally -- `group` is not a `run_summary`/
+`measurements` column today (see item 6 below), only free text inside
+`event_log.message` (`"Group selected: A"`). Renaming changes what future
+rows say; historical rows keep the old name, same consideration as any
+text-valued rename.
+
+**Runtime impact:** none -- Runtime doesn't exist yet; it will read
+`BATTERY_GROUPS.keys()` directly, whatever they are named.
+
+**Open decision, not resolvable from the code -- needs an operator
+decision before the rename itself is executed:** the example
+(`A1..A4, B1..B4, ...`) is ambiguous between (a) a 1:1 rename of today's
+four groups (`A->A1, B->B1, C->C1, D->D1`, each keeping its exact
+`position_start`/`position_end`/hardware assignment, with `A2/A3/A4`
+reserved for additional hardware added later under the same letter), or
+(b) a reorganization where today's four groups become sub-groups of one
+family (`A1="old A", A2="old B", ...`), freeing other letters for a
+different equipment class entirely. (a) is a pure rename; (b) requires
+re-deciding what a "family" conceptually groups. Recommended: (a), as the
+lower-risk, more literal reading -- but this is the operator's call.
+
+### 2. Enabled/disabled groups
+
+**Already implemented, not a new field.** Every `BATTERY_GROUPS` entry
+already carries `"enabled": True/False` (Group A `True`; B/C/D `False`),
+enforced at `test.py::_select_battery_group()` (the one shared gate every
+real battery workflow -- Monitor Battery, Monitor Battery Scan, Charge/
+Discharge Battery, NTC Group Scan -- routes through via
+`_select_group_with_hardware_summary()`). No parallel `ENABLED_GROUPS`
+list exists or is needed; `BATTERY_GROUPS` remains the sole ownership
+model, satisfying the stated requirement as-is.
+
+**One nuance that must NOT be regressed:** `test.py::_select_relay_scope()`
+(Relay Functional Validation's channel-range scoping) deliberately does
+*not* gate on `enabled` -- its own docstring documents this as a
+previously-fixed bug: `enabled=False` means "no battery relay matrix
+wired for battery testing," not "these physical relay channels don't
+exist or can't be tested." Gating that selector on `enabled` previously
+collapsed every Group B/C/D scope choice back to scanning all 32
+channels. "Disabled groups must not appear in operator menus" must be
+scoped to *battery* workflows, not raw hardware-validation scope
+selectors -- the codebase currently gets this distinction right and any
+future change must preserve it.
+
+**Runtime/Cycle impact:** trivially satisfied once Runtime exists --
+it reads the same `BATTERY_GROUPS[g]["enabled"]` field directly.
+
+### 3. Operator workflow standardization
+
+No conflicts. Every implemented workflow already matches the proposed
+"Select Group -> Select Position (when applicable) -> Execute" shape:
+Monitor Battery/Charge Battery/Discharge Battery select both group and
+position; Monitor Battery Scan/NTC Group Scan select only a group (and
+operate over every position in it). All six (including the not-yet-built
+Cycle Battery, which will inherit this shape once composed from
+Charge/DischargeSequence) route through the same two shared functions
+(`_select_group_with_hardware_summary()` + `_select_battery_position()`
+where applicable) -- this standardization already exists structurally.
+
+### 4. Hardware test standardization -- a real risk, not just a design preference
+
+Current: `test_smu()`/`test_dmm()`/`test_daq()`/`test_relay_numato()` all
+route through the shared `_run_hardware_category()` (`test.py:136`),
+which lists **every individually configured device in that category**,
+not group-scoped -- e.g. `test_smu()` can directly select `PRIMARY_SMU`,
+`HIGH_POWER_SMU`, `AUX_SMU_1`, or `AUX_SMU_2`.
+
+**Risk of replacing this with a pure group-resolved test:**
+`HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` are physically present
+(`PXI_SLOTS`) but not assigned to any group today. A group-only resolver
+(Select Group -> Resolve Group SMU -> Run) can only ever reach whatever
+`BATTERY_GROUPS[group]["smu"]` currently points at -- today, exclusively
+`PRIMARY_SMU`. Replacing the direct picker would make it impossible to
+validate not-yet-assigned hardware before deciding which group to assign
+it to -- exactly the pre-commissioning use case these tests exist for.
+
+**Recommendation:** add group-centric resolution as an *additional* path
+(e.g. a "Select by Group" option alongside the existing device list, or a
+separate "Test Group Hardware" entry that resolves and runs all four
+roles for a group at once) -- do not replace the existing device picker.
+
+### 5. Group ownership review -- the resolution chain
+
+```
+Group (operator selects)
+  -> config/devices.py::group_test_config(group)        battery_type, test_setpoints
+  -> config/devices.py::hardware_for_group(group)        relay_matrix_name/_cfg (-> ETHERNET_DEVICES)
+                                                          smu_name/_cfg         (-> SMU_ASSIGNMENTS)
+                                                          dmm_name/_cfg         (-> DMM_CONFIGS)
+                                                          daq_name/_cfg         (-> DAQ_CONFIGS)
+                                                          ntc_daq_name/_cfg     (-> _ALL_DAQ_CONFIGS,
+                                                                                    falls back to "daq")
+  -> config/devices.py::resolve_group_position(group, position_in_group)   global channel number
+  -> config/devices.py::BATTERY_CHANNELS[channel]        relay_address, daq_voltage_ch/
+                                                          daq_current_ch/daq_ntc_ch
+```
+Every real workflow calls this exact chain via the shared
+`_select_group_with_hardware_summary()`/`_resolve_group_hardware()`
+helpers -- no workflow re-derives hardware assignment independently.
+
+### 6. Database improvements -- the blocking gap
+
+`run_summary` has no `group` column. `group`/`position_in_group` exist
+only as free text inside `event_log.message` (`"Group selected: A"`,
+`"Position selected: 3 (Group A Position 3)"`) -- `run_summary_report.py::
+_lookup_group()` already had to work around this by parsing event_log
+text. Every group-centric reporting feature requested (Group History,
+Last Test From Group, Group Statistics) needs to filter/aggregate by
+group, which is exactly what a free-text field cannot do efficiently or
+reliably.
+
+**Recommendation:** add `group_name` (and optionally `position_in_group`)
+as real, additive `run_summary` columns -- the same migration pattern
+already used repeatedly in this schema (see the existing
+`_RUN_SUMMARY_MIGRATION_COLUMNS` mechanism `battery_type`/hardware-identity
+columns were added through). Populate at `start_run_summary()` time,
+exactly like `battery_type` already is.
+
+**Existing reusable code, once `group_name` exists:**
+- `DataStorage.list_run_summaries()` -- **Group History** = filter by `group_name`.
+- `DataStorage.get_last_run_summary()`/`get_run_summary()` -- **Last Test
+  From Group** = the same query with `WHERE group_name=? ORDER BY id DESC
+  LIMIT 1`, handed to the already-generic `run_summary_report.py::
+  render_run_summary()` -- zero new rendering code, the same function
+  end-of-run/Last Test Summary/Database Tools already share.
+- **Group Statistics** -- pure SQL aggregation over `run_summary`
+  (`SELECT test_type, result, COUNT(*) ... WHERE group_name=? GROUP BY
+  test_type, result`) -- no new architecture, 1-2 new `DataStorage`
+  query methods following existing method shapes.
+
+**Missing fields:** `group_name` (blocking), `position_in_group`
+(nice-to-have). Everything else the statistics view needs
+(`test_type`/`result`/`stop_reason`/timestamps) already exists.
+
+### 7. Traceability requirements
+
+Group and position-within-group are the only two traceability dimensions
+still free-text-only (`event_log`) rather than structured columns --
+directly addressed by item 6's proposed schema addition. Battery Type/
+Relay Matrix/SMU/DMM/DAQ are all already structured `run_summary` columns
+for every workflow that uses them. Minor, non-blocking inconsistency: NTC
+Group Scan doesn't echo `"Battery selected: {type}"` into `event_log` the
+way Monitor/Charge/Discharge do (the value is still captured structurally
+in `run_summary.battery_type` -- this is a narration-style gap, not a
+data gap).
+
+### 8. Runtime preparation -- consistency check
+
+This standardization batch is consistent with, and strengthens,
+`Runtime -> Enabled Groups -> NTC Presence Check -> CycleSequence ->
+ChargeSequence -> DischargeSequence`:
+- **Single source of truth preserved:** `enabled` already lives inside
+  `BATTERY_GROUPS`; the naming change is a rename within the same
+  structure; `group_name` is additive to the existing schema.
+- **No duplicate ownership models:** the hardware-test recommendation
+  (item 4) is explicitly additive, to avoid creating a second, narrower
+  hardware-selection path that can't reach unassigned devices.
+- **No duplicate charge/discharge implementations:** unaffected by this
+  batch, and **still an open item from Section 46** -- `main.py`'s legacy
+  `TestExecutor`/`ChargeCycle`/`DischargeCycle` path is still live and
+  still needs retiring before Runtime ships. Restated here so it isn't
+  lost among this round's changes.
+
+### GO / NO-GO
+
+**GO for this standardization work**, with the naming migration's open
+(a)/(b) decision (item 1) requiring operator confirmation before that
+specific rename is executed, and the `group_name`/`position_in_group`
+schema addition (item 6) and additive hardware-test path (item 4) as the
+concrete follow-up implementation items. No finding here blocks proceeding
+toward Runtime implementation; `main.py` retirement (Section 46) remains
+the standing prerequisite, unchanged by this review.

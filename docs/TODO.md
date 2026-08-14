@@ -372,6 +372,29 @@ the bottom, with a pointer to where the real documentation lives
   Group A as wired to `MATRIX_NUMATO_201` -- the live dict entry and real
   hardware validation confirm Group A is actually on `MATRIX_NUMATO_202`.
 
+### Architecture Standardization (see docs/architecture.md Section 47, Milestone XIII)
+
+- [ ] **[Needs operator decision first]** Confirm group-naming migration
+  semantics before implementing `A -> A1/A2/A3/A4`-style names: 1:1 rename
+  of today's four groups (recommended) vs. reorganizing them as
+  sub-groups of one family. Code changes are otherwise minimal --
+  `group` is used everywhere as an opaque string key.
+- [ ] Add `group_name` (and optionally `position_in_group`) as additive
+  `run_summary` columns (same migration pattern as `battery_type`) --
+  the prerequisite for Group History / Last Test From Group / Group
+  Statistics in Database Tools. Populate at `start_run_summary()` time;
+  reuse `list_run_summaries()`/`get_last_run_summary()`/
+  `run_summary_report.py::render_run_summary()` for the three new views.
+- [ ] Add a group-centric path to Test SMU/DMM/DAQ/Relay Matrix (Select
+  Group -> Resolve Group Hardware -> Run) **alongside**, not replacing,
+  the existing per-device picker -- a pure replacement would remove the
+  ability to validate hardware not yet assigned to any group
+  (`HIGH_POWER_SMU`/`AUX_SMU_1`/`AUX_SMU_2` today).
+- [ ] Minor: have NTC Group Scan echo `"Battery selected: {type}"` into
+  `event_log`, matching Monitor/Charge/Discharge's narration style (the
+  value is already captured structurally in `run_summary.battery_type`;
+  this is cosmetic, not a data gap).
+
 ---
 
 ## Optional / Future
