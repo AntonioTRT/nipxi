@@ -2131,20 +2131,24 @@ def test_sensors():
     rather than raising, so this menu item still completes cleanly on a
     laptop with no rack attached (Part 1 always runs regardless).
     """
-    config_ref = "hardware/temperature.py  Beta=3950 K  R25=10 kOhm  Vcc=3.3 V"
+    config_ref = "hardware/temperature.py  Beta=3950 K  R25=10 kOhm  V_exc=5.0 V"
     results    = []
 
     # -- Module import + function test ----------------------------------------
     try:
         from hardware.temperature import (
             ntc_voltage_to_celsius, TemperatureSensor,
-            NTC_BETA, NTC_R25_OHM, NTC_VCC
+            NTC_BETA, NTC_R25_OHM, NTC_EXCITATION_V
         )
     except ImportError as e:
         return [_fail("Sensors", "NTC", config_ref, f"Import error: {e}")]
 
-    # Test 1: Reference point 25 degC at 1.65 V
-    v_ref = NTC_VCC / 2.0   # 1.65 V for 3.3 V supply with matched divider
+    # Test 1: Reference point 25 degC at the matched-divider midpoint (2.5 V
+    # for a 5 V excitation rail) -- R_ntc == R_pulldown at balance, so this
+    # midpoint stays ~25 degC regardless of which side of the divider the
+    # NTC is on (see hardware/temperature.py's module docstring for the
+    # confirmed real topology: NTC on the excitation side).
+    v_ref = NTC_EXCITATION_V / 2.0   # 2.5 V for a 5 V supply with matched divider
     t = ntc_voltage_to_celsius(v_ref)
     if t is None:
         results.append(_fail("Sensors", "NTC", config_ref,
@@ -2166,22 +2170,24 @@ def test_sensors():
         results.append(_warn("Sensors", "NTC guard (V=0)", config_ref,
                              f"V=0 V returned {t_oob} instead of None"))
 
-    # Test 3: Out-of-range guard (V=Vcc)
-    t_oob2 = ntc_voltage_to_celsius(NTC_VCC)
+    # Test 3: Out-of-range guard (V=V_exc)
+    t_oob2 = ntc_voltage_to_celsius(NTC_EXCITATION_V)
     if t_oob2 is None:
-        results.append(_ok("Sensors", f"NTC guard (V=Vcc)", config_ref,
-                           f"V={NTC_VCC} V correctly returns None"))
+        results.append(_ok("Sensors", f"NTC guard (V=V_exc)", config_ref,
+                           f"V={NTC_EXCITATION_V} V correctly returns None"))
     else:
-        results.append(_warn("Sensors", f"NTC guard (V=Vcc)", config_ref,
-                             f"V={NTC_VCC} V returned {t_oob2} instead of None"))
+        results.append(_warn("Sensors", f"NTC guard (V=V_exc)", config_ref,
+                             f"V={NTC_EXCITATION_V} V returned {t_oob2} instead of None"))
 
     # Test 4: Monotonicity
-    # Divider: higher V -> larger R_NTC -> lower T
-    t_lo_v = ntc_voltage_to_celsius(1.0)   # low V -> small R_NTC -> hot (~45 degC)
-    t_hi_v = ntc_voltage_to_celsius(2.5)   # high V -> large R_NTC -> cold (~1 degC)
-    if t_lo_v is not None and t_hi_v is not None and t_lo_v > t_hi_v:
+    # Divider (NTC on the excitation side, see module docstring): higher
+    # v_ntc -> SMALLER R_NTC -> HOTTER -- the opposite direction from a
+    # reciprocal ("NTC to GND") divider.
+    t_lo_v = ntc_voltage_to_celsius(1.0)   # low V, near GND -> large R_NTC -> cold
+    t_hi_v = ntc_voltage_to_celsius(4.0)   # high V, near rail -> small R_NTC -> hot
+    if t_lo_v is not None and t_hi_v is not None and t_hi_v > t_lo_v:
         results.append(_ok("Sensors", "NTC monotonicity", config_ref,
-                           f"V=1.0V -> {t_lo_v:.1f} degC,  V=2.5V -> {t_hi_v:.1f} degC  OK"))
+                           f"V=1.0V -> {t_lo_v:.1f} degC,  V=4.0V -> {t_hi_v:.1f} degC  OK"))
     else:
         results.append(_warn("Sensors", "NTC monotonicity", config_ref,
                              "Monotonicity check failed -- review divider topology"))
@@ -2202,16 +2208,25 @@ def test_sensors():
     # Test 6: DAQ-based NTC channel scan -- the future battery-temperature
     # acquisition architecture. Iterates every ENABLED BATTERY_CHANNELS
     # entry's daq_ntc_ch -- config-driven, never a hardcoded channel list.
+    # Connects via Group A's resolved "ntc_daq" (see config/devices.py::
+    # hardware_for_group()) -- BATTERY_CHANNELS 1-8 are Group A's positions,
+    # and daq_ntc_ch currently points at the NI USB-6210 development DAQ
+    # (config/devices.py::USB_DAQ_DEVICES), not the DAQ_CONFIG default
+    # (MAIN_DAQ) used elsewhere in this file -- see docs/architecture.md.
     enabled_channels = {i: ch for i, ch in dev_cfg.BATTERY_CHANNELS.items() if ch.get("enabled")}
     if not enabled_channels:
         results.append(_warn("Sensors", "NTC DAQ scan", config_ref,
                              "No enabled BATTERY_CHANNELS entries -- nothing to scan"))
         return results
 
-    daq_cfg = dev_cfg.DAQ_CONFIG
-    daq_ref = f"{daq_cfg.get('resource', '')} / {daq_cfg.get('model', 'NI-6363')}"
+    ntc_daq_cfg = dev_cfg.hardware_for_group("A")["ntc_daq_cfg"]
+    if ntc_daq_cfg is None:
+        results.append(_warn("Sensors", "NTC DAQ scan", config_ref,
+                             "Group A has no ntc_daq/daq assigned -- nothing to scan"))
+        return results
+    daq_ref = f"{ntc_daq_cfg.get('resource', '')} / {ntc_daq_cfg.get('model', '')}"
     from hardware.daq import DAQ
-    daq = DAQ(daq_cfg)
+    daq = DAQ(ntc_daq_cfg)
     try:
         daq.connect()
     except Exception as e:
@@ -2229,7 +2244,7 @@ def test_sensors():
                 if t_c is None:
                     results.append(_warn("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
                                          f"Channel {ntc_ch}: {v:.4f} V -- out of NTC divider range "
-                                         f"(0 < V < {NTC_VCC} V), no valid temperature"))
+                                         f"(0 < V < {NTC_EXCITATION_V} V), no valid temperature"))
                 else:
                     results.append(_ok("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
                                        f"Channel {ntc_ch}: {v:.4f} V -> {t_c:.2f} degC"))
@@ -4363,14 +4378,136 @@ def _run_discharge_battery():
     )
 
 
+def _run_ntc_group_scan():
+    """
+    NTC Group Scan -- read temperature + battery-presence for every position
+    in a group via the group's resolved "ntc_daq" (config/devices.py::
+    hardware_for_group(), falling back to the group's normal "daq" if no
+    temporary override is set -- see USB_DAQ_DEVICES/BATTERY_GROUPS[...]
+    ["ntc_daq"]). NTC channels are independent per-position DAQ analog
+    inputs (BATTERY_CHANNELS[...]["daq_ntc_ch"]), not routed through the
+    relay matrix -- this workflow never touches a relay or the SMU/PMU, so
+    it deliberately does NOT build on BatteryOperationSequence/
+    HardwareManager (there is nothing for run_guarded()'s safety-shutdown
+    machinery to shut down here) -- it constructs a bare DAQ directly, the
+    same precedent test_sensors()'s Test 6 already established for a
+    DAQ-only operation.
+
+    Persists one measurements row per position (test_type="ntc_scan",
+    phase_detail=<presence>, voltage_v=<raw divider volts>, temp_c=<computed
+    or None>) -- the SAME test_type literal in both run_summary and
+    measurements (unlike Charge/Discharge's split "charge_battery"/"charge"
+    vocabulary -- see docs/architecture.md Section 46), so this data is
+    query-able later (by a future Runtime/CycleSequence) via the existing
+    DataStorage.get_measurements(run_id=..., channel=...) path -- no new
+    query helper needed for this foundation work.
+    """
+    print("NTC GROUP SCAN -- temperature/presence check via DAQ (no relay, no PSU)")
+
+    from hardware.daq import DAQ
+    from hardware.temperature import ntc_voltage_to_celsius, classify_ntc_presence, NTCPresence
+    from utils.errors import DAQError
+
+    selection = _select_group_with_hardware_summary(required_roles=("ntc_daq",))
+    if selection is None:
+        return
+    group, hw, battery_type, battery_cfg = selection
+
+    grp_cfg = dev_cfg.BATTERY_GROUPS[group]
+    size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
+    positions_in_group = list(range(1, size + 1))
+
+    ntc_daq_cfg = hw["ntc_daq_cfg"]
+    print(f"\nNTC DAQ:\n  {dev_cfg.device_display_name(ntc_daq_cfg)}\n  {ntc_daq_cfg.get('resource', '')}\n")
+
+    daq = DAQ(ntc_daq_cfg)
+    try:
+        daq.connect()
+    except Exception as e:
+        print(f"[FAIL] DAQ connection failed: {e}")
+        return
+
+    storage = _open_storage_guarded()
+    if storage is None:
+        daq.disconnect()
+        return
+
+    rows = []
+    try:
+        if not _start_run_summary_guarded(
+            storage, test_type="ntc_scan",
+            battery_type=battery_type,
+            ntc_daq_name=hw["ntc_daq_name"],
+            ntc_daq_resource=ntc_daq_cfg.get("resource"),
+            ntc_daq_model=ntc_daq_cfg.get("model"),
+        ):
+            return
+        storage.log_event(level="INFO", source="ntc_scan", message="Run started")
+        storage.log_event(level="INFO", source="ntc_scan", message=f"Group selected: {group}")
+        storage.log_event(level="INFO", source="ntc_scan",
+                           message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
+
+        for position in positions_in_group:
+            channel = dev_cfg.resolve_group_position(group, position)
+            ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
+            ntc_ch = ch_cfg["daq_ntc_ch"] if ch_cfg else None
+
+            voltage_v = None
+            temp_c = None
+            if ntc_ch is None:
+                presence = NTCPresence.FAULT
+                storage.log_event(level="WARNING", source="ntc_scan", channel=channel,
+                                   message=f"Position {position}: no daq_ntc_ch configured")
+            else:
+                try:
+                    voltage_v = daq.read_channel(ntc_ch)
+                    presence = classify_ntc_presence(voltage_v)
+                    if presence == NTCPresence.PRESENT:
+                        temp_c = ntc_voltage_to_celsius(voltage_v)
+                except DAQError as e:
+                    presence = NTCPresence.FAULT
+                    storage.log_event(level="WARNING", source="ntc_scan", channel=channel,
+                                       message=f"Position {position}: DAQ read failed -- {e}")
+
+            storage.record_measurement(
+                test_type="ntc_scan", channel=channel, phase_detail=presence,
+                voltage_v=voltage_v, temp_c=temp_c,
+            )
+            rows.append((position, presence, temp_c))
+
+        storage.log_event(level="INFO", source="ntc_scan", message="Scan complete")
+        storage.finish_run_summary(stop_reason="COMPLETED", result="PASS")
+
+        print()
+        print("=" * 60)
+        print(f"NTC Group Scan -- Group {group}")
+        print("=" * 60)
+        print(f"{'Position':<10}{'Present':<10}{'Temperature'}")
+        print("-" * 40)
+        for position, presence, temp_c in rows:
+            if presence == NTCPresence.PRESENT:
+                present_label = "YES"
+            elif presence == NTCPresence.ABSENT:
+                present_label = "NO"
+            else:
+                present_label = "FAULT"
+            temp_label = f"{temp_c:.1f} C" if temp_c is not None else "N/A"
+            print(f"{position:<10}{present_label:<10}{temp_label}")
+        print("=" * 60)
+
+    finally:
+        storage.close()
+        daq.disconnect()
+
+
 def run_main_test():
     """
     Run Main Test -- battery-centric operator workflow entry point
     (Milestone II Monitor Battery blueprint). Submenu: Monitor Battery,
-    Charge Battery, Discharge Battery, and Monitor Battery Scan are
-    implemented; Cycle Battery (charge -> rest -> discharge composition)
-    remains a placeholder for future work -- see docs/architecture.md
-    Section 35 "Revised Roadmap".
+    Charge Battery, Discharge Battery, Monitor Battery Scan, and NTC Group
+    Scan are implemented; Cycle Battery (charge -> rest -> discharge
+    composition) remains a placeholder for future work -- see
+    docs/architecture.md Section 35 "Revised Roadmap".
     """
     print("RUN MAIN TEST")
     print("\n1. Monitor Battery")
@@ -4378,6 +4515,7 @@ def run_main_test():
     print("3. Discharge Battery")
     print("4. Cycle Battery")
     print("5. Monitor Battery Scan (relay/DMM/DAQ path validation, no charging)")
+    print("6. NTC Group Scan (temperature/presence check via DAQ, no relay/PSU)")
     choice = input("\nSelect mode: ").strip()
 
     if choice == "1":
@@ -4390,6 +4528,8 @@ def run_main_test():
         print("\nCycle Battery -- not yet implemented.")
     elif choice == "5":
         _run_monitor_battery_scan()
+    elif choice == "6":
+        _run_ntc_group_scan()
     else:
         print("\nInvalid selection.")
 

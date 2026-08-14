@@ -491,7 +491,14 @@ BATTERY_CHANNELS = {
         "relay_address": i,          # relay matrix channel number
         "daq_voltage_ch": f"Dev1/ai{i - 1}",
         "daq_current_ch": f"Dev1/ai{i + 7}",
-        "daq_ntc_ch":     f"Dev1/ai{i + 15}",
+        # TEMPORARY -- NTC channels point at the NI USB-6210 development DAQ
+        # (see USB_DAQ_DEVICES/BATTERY_GROUPS[...]["ntc_daq"] below), NOT
+        # "Dev1" (MAIN_DAQ) like daq_voltage_ch/daq_current_ch above. "Dev2"
+        # is the placeholder NI-MAX alias -- confirm/update against NI-MAX
+        # once the USB-6210 is physically attached. Migration to the future
+        # rack DAQ: point this back at that device's own per-position
+        # channels (e.g. "Dev1/ai{i+15}") once available -- config-only.
+        "daq_ntc_ch":     f"Dev2/ai{i - 1}",
         "fuse_rating_a":  2.0,
         "enabled":        True,
     }
@@ -573,6 +580,16 @@ BATTERY_GROUPS = {
         # group's "smu" to HIGH_POWER_SMU or AUX_SMU_1/2 first (a hardware/
         # wiring decision -- not done here, see docs/TODO.md).
         "battery_type":   "SB",
+        # TEMPORARY -- the rack DAQ this group's NTC channels will eventually
+        # use (see "daq" above, MAIN_DAQ) is not yet available; this overrides
+        # NTC acquisition specifically to the NI USB-6210 development DAQ
+        # (see USB_DAQ_DEVICES above) without touching "daq" itself, which
+        # MonitorBatteryScanSequence's already real-hardware-validated
+        # DAQ_CHANNEL_0 read still depends on. Migration to the rack DAQ:
+        # delete this line (or point it at the rack DAQ's own name) once
+        # available -- hardware_for_group() then falls back to "daq"
+        # automatically. Configuration-only; see docs/architecture.md.
+        "ntc_daq":        "NTC_DAQ_USB6210",
         "test_setpoints": {
             "charge_current_a":    0.05,   # <= SB max_charge_current_a (0.08) and
                                             #    <= PRIMARY_SMU max_current_a (0.1)
@@ -647,21 +664,32 @@ def group_for_position(global_position: int):
 def hardware_for_group(group: str) -> dict:
     """
     Centralized hardware-resolution model: Group -> Relay Matrix -> SMU ->
-    DMM -> DAQ. The single place every workflow (Monitor Battery, Monitor
-    Battery Scan, Charge/Discharge/Cycle Battery, the future Workflow
-    Simulator) resolves which physical devices a group uses -- no workflow
-    should look up SMU_ASSIGNMENTS/DMM_CONFIGS/DAQ_CONFIGS/ETHERNET_DEVICES
-    directly or pick a device positionally (e.g. next(iter(...))).
+    DMM -> DAQ (-> NTC DAQ). The single place every workflow (Monitor
+    Battery, Monitor Battery Scan, Charge/Discharge/Cycle Battery, NTC
+    Group Scan, the future Workflow Simulator) resolves which physical
+    devices a group uses -- no workflow should look up SMU_ASSIGNMENTS/
+    DMM_CONFIGS/DAQ_CONFIGS/ETHERNET_DEVICES/USB_DAQ_DEVICES directly or
+    pick a device positionally (e.g. next(iter(...))).
 
     Returns a dict with one "<role>_name"/"<role>_cfg" pair per role
-    (relay_matrix/smu/dmm/daq). A role's cfg is None if BATTERY_GROUPS[group]
-    has no device assigned for it (e.g. Group C/D today) -- this is never
-    silently substituted with another device; callers must check for None
-    and refuse to activate hardware for that role.
+    (relay_matrix/smu/dmm/daq/ntc_daq). A role's cfg is None if
+    BATTERY_GROUPS[group] has no device assigned for it (e.g. Group C/D
+    today) -- this is never silently substituted with another device;
+    callers must check for None and refuse to activate hardware for that
+    role.
+
+    "ntc_daq" is resolved from BATTERY_GROUPS[group]["ntc_daq"] if set,
+    else falls back to the group's own "daq" -- so a group with no
+    temporary override simply uses its normal DAQ for NTC too (the eventual
+    production shape, once a single rack DAQ serves every role). This
+    fallback is what makes migrating off a temporary NTC DAQ override
+    (e.g. the NI USB-6210) purely a config change: delete/repoint
+    "ntc_daq" and resolution falls back to "daq" automatically.
 
     Raises KeyError if `group` is not a key in BATTERY_GROUPS.
     """
     grp = BATTERY_GROUPS[group]
+    ntc_daq_key = grp.get("ntc_daq") or grp["daq"]
     return {
         "relay_matrix_name": grp["relay_matrix"],
         "relay_matrix_cfg":  ETHERNET_DEVICES.get(grp["relay_matrix"]),
@@ -671,6 +699,8 @@ def hardware_for_group(group: str) -> dict:
         "dmm_cfg":  DMM_CONFIGS.get(grp["dmm"]),
         "daq_name": grp["daq"],
         "daq_cfg":  DAQ_CONFIGS.get(grp["daq"]),
+        "ntc_daq_name": ntc_daq_key,
+        "ntc_daq_cfg":  _ALL_DAQ_CONFIGS.get(ntc_daq_key),
     }
 
 
@@ -788,6 +818,46 @@ ETHERNET_DEVICES = {
         "channel_count": Settings.RELAY_COUNT,
     },
 }
+
+# =============================================================================
+# USB-attached DAQ devices -- NOT PXI-slot devices (no slot number, so these
+# cannot live in PXI_SLOTS/be derived into DAQ_CONFIGS), same reasoning as
+# ETHERNET_DEVICES/GPIB_INSTRUMENTS above having their own dict. Currently
+# holds only the NI USB-6210: a TEMPORARY development stand-in for the
+# future rack DAQ, used exclusively for NTC/temperature acquisition (see
+# BATTERY_GROUPS[...]["ntc_daq"] and hardware_for_group() below) while the
+# rack DAQ is not yet available. hardware/daq.py::DAQ needs no changes to
+# support this -- it talks to any device purely through nidaqmx, with no
+# PXI-specific assumptions, so a USB-6210 enumerates and reads exactly like
+# a PXI DAQ card.
+# =============================================================================
+
+USB_DAQ_DEVICES = {
+    "NTC_DAQ_USB6210": {
+        "type":            "usb",
+        "resource":        "Dev2",   # NI-MAX alias placeholder -- confirm/update
+                                      # once the USB-6210 is physically attached
+        "model":           "USB-6210",
+        "nickname":        "NTC_DAQ_USB6210",
+        # Must cover the full 0-5V divider swing (see hardware/temperature.py's
+        # NTC_EXCITATION_V) with margin -- the USB-6210 supports a +/-10V
+        # per-channel range.
+        "voltage_range_v": 10.0,
+        "role":            "TEMPORARY development NTC/temperature acquisition -- "
+                            "stand-in for the future rack DAQ. Scoped to NTC "
+                            "channels only (see BATTERY_CHANNELS[...]['daq_ntc_ch']), "
+                            "not also voltage/current -- those remain on MAIN_DMM/"
+                            "PRIMARY_SMU respectively, unaffected by this device.",
+        "enabled":         True,
+    },
+}
+
+# Every DAQ-shaped device this project can resolve a group's DAQ role to,
+# regardless of connection type -- PXI-slot-derived (DAQ_CONFIGS) plus
+# hand-authored USB devices (USB_DAQ_DEVICES above). Used only by
+# hardware_for_group()'s "ntc_daq" resolution; DAQ_CONFIGS itself stays
+# purely PXI-slot-derived, unchanged, for every other purpose.
+_ALL_DAQ_CONFIGS = {**DAQ_CONFIGS, **USB_DAQ_DEVICES}
 
 # Legacy compatibility -- old role-based names, kept only in case other code
 # or external scripts still import these directly.
