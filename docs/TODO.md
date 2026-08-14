@@ -372,18 +372,32 @@ the bottom, with a pointer to where the real documentation lives
   Group A as wired to `MATRIX_NUMATO_201` -- the live dict entry and real
   hardware validation confirm Group A is actually on `MATRIX_NUMATO_202`.
 
-### Architecture Standardization (see docs/architecture.md Section 47, Milestone XIII)
+### Architecture Standardization (see docs/architecture.md Sections 47-48, Milestones XIII-XIV)
 
-- [ ] **[Needs operator decision first]** Confirm group-naming migration
-  semantics before implementing `A -> A1/A2/A3/A4`-style names: 1:1 rename
-  of today's four groups (recommended) vs. reorganizing them as
-  sub-groups of one family. Code changes are otherwise minimal --
-  `group` is used everywhere as an opaque string key.
-- [ ] Add `group_name` (and optionally `position_in_group`) as additive
-  `run_summary` columns (same migration pattern as `battery_type`) --
-  the prerequisite for Group History / Last Test From Group / Group
-  Statistics in Database Tools. Populate at `start_run_summary()` time;
-  reuse `list_run_summaries()`/`get_last_run_summary()`/
+- [x] Group-naming semantics -- **RESOLVED (Milestone XIV):**
+  `<matrix letter><partition number>` (`B1..B4` on `MATRIX_NUMATO_202`,
+  `C1..C4` on `MATRIX_NUMATO_203`, etc.) -- groups are hardware ownership
+  sets, not workflow/battery-type families. Not a rename of today's
+  A/B/C/D; a new topology (today's Group A becomes B1).
+- [ ] **[MUST before Group C1's hardware is exercised for real]** Redesign
+  position/channel ownership: move `BATTERY_CHANNELS` into each
+  `BATTERY_GROUPS[group]["positions"]` sub-dict, scoped to that group's
+  own `relay_matrix` -- fixes a real, confirmed bug in
+  `utils/device_validator.py::_check_duplicate_relay_identifiers()`/
+  `_check_relay_count_consistency()`/`_check_battery_groups()` (checks
+  `relay_address` uniqueness/range globally, with no per-matrix
+  association -- will falsely flag B1 and C1 both using `relay_address=1`
+  on their own separate physical matrices as a duplicate-relay collision).
+  See docs/architecture.md Section 48 for the exact files/functions
+  affected (`config/devices.py`, `test.py`'s group/position selection
+  functions, `test_control/monitor_battery_scan_sequence.py`'s
+  `DAQ_CHANNEL_0` constant).
+- [ ] Add `group_name`/`position_in_group` as additive `run_summary`
+  columns (same migration pattern as `battery_type`) -- implement together
+  with the position-ownership redesign above, using final `B1`/`C1`-style
+  names directly. Prerequisite for Group History / Last Test From Group /
+  Group Statistics in Database Tools. Populate at `start_run_summary()`
+  time; reuse `list_run_summaries()`/`get_last_run_summary()`/
   `run_summary_report.py::render_run_summary()` for the three new views.
 - [ ] Add a group-centric path to Test SMU/DMM/DAQ/Relay Matrix (Select
   Group -> Resolve Group Hardware -> Run) **alongside**, not replacing,
@@ -394,6 +408,10 @@ the bottom, with a pointer to where the real documentation lives
   `event_log`, matching Monitor/Charge/Discharge's narration style (the
   value is already captured structurally in `run_summary.battery_type`;
   this is cosmetic, not a data gap).
+- [ ] Minor: `run_summary_report.py::render_run_summary()` has no display
+  section for `test_type == "ntc_scan"` -- falls through to "(no summary
+  section defined...)". Add an NTC section (reuse the Position/Present/
+  Temperature shape `_run_ntc_group_scan()` already prints).
 
 ---
 

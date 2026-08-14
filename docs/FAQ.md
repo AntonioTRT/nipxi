@@ -1712,3 +1712,55 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 **Risks:** None new; the standing `main.py` retirement prerequisite from Section 46 is restated, not resolved, by this review.
 
 **Recommendation:** Proceed with this standardization work; keep `main.py` retirement tracked as the standing Runtime prerequisite.
+
+## SECTION 16 — GROUP HARDWARE OWNERSHIP MODEL (Multi-Matrix Topology, Position/Channel Storage Fix)
+
+*Findings below resolve Section 15's open group-naming question and review the multi-matrix B1-B4/C1-C4 topology. See docs/architecture.md Section 48 for the full technical writeup.*
+
+### Q: Does the B1/B2/B3/B4, C1/C2/C3/C4 naming scheme fit the current design?
+
+**Status:** Naming: yes, unchanged. Storage model: no -- a real fix is required.
+
+**Answer:** `group` is used everywhere as an opaque string key -- `B1`/`C1` are exactly as valid as `A` was, zero code impact for the naming itself. But `BATTERY_CHANNELS` is a flat, global position/relay-address table with `relay_address` derived from a global sequence number, not scoped per relay matrix. This has been silently correct only because exactly one physical matrix has ever been populated. It breaks the moment a second one (Group C1, `MATRIX_NUMATO_203`) is populated.
+
+**Evidence:** `config/devices.py::BATTERY_CHANNELS`/`resolve_group_position()`; `utils/device_validator.py::_check_duplicate_relay_identifiers()` (lines 142-162), `_check_relay_count_consistency()` (193-224), `_check_battery_groups()` (165-190).
+
+**Risks:** `_check_duplicate_relay_identifiers()` would report a false duplicate-relay collision the moment B1 and C1 both have `relay_address=1` on their own, separate, legitimate physical matrices -- confirmed by direct code inspection, not speculative.
+
+**Recommendation:** Move position/channel ownership into each `BATTERY_GROUPS` entry (a `"positions"` sub-dict, keyed 1-8, holding `relay_address`/DAQ channels local to that group's own matrix) -- eliminating the shared global namespace that causes the bug.
+
+### Q: Should positions stay numbered 1-8 within each group?
+
+**Status:** Yes, unchanged -- only the storage location changes
+
+**Answer:** Operator-facing behavior already matches this (`_select_battery_position()`'s prompt is already "Position within Group {group} (1-{size})" -- global position numbers have always been internal-only). What changes is where that range lives: a group's own `positions` dict key, not an indirection into a separate global table via `position_start`/`position_end` arithmetic.
+
+**Evidence:** `test.py::_select_battery_position()`.
+
+**Risks:** None -- this is a storage-location change, not a behavior change.
+
+**Recommendation:** Keep 1-8 within each group; move ownership into `BATTERY_GROUPS[group]["positions"]`.
+
+### Q: Should group naming be finalized before the database migration?
+
+**Status:** Finalized by this review
+
+**Answer:** Yes -- `<matrix letter><partition number>` (e.g. `B1`/`C1`), confirmed as a new topology (not a rename of today's A/B/C/D): today's Group A becomes B1; C1/C2/etc. are genuinely new, on a second physical matrix. Recommend proceeding with the Section 47 `group_name`/`position_in_group` migration using these final names directly.
+
+**Evidence:** docs/architecture.md Section 48.
+
+**Risks:** None -- this closes the open question Section 47 left unresolved.
+
+**Recommendation:** Implement the position-ownership redesign and the `group_name`/`position_in_group` migration together, using `B1`/`C1`-style names directly.
+
+### Q: Does this topology improve Runtime scalability, and should Runtime operate on groups or relay matrices?
+
+**Status:** Groups -- confirmed, and it strengthens the existing Section 46 concurrency model
+
+**Answer:** A relay matrix is a shared physical resource, not a unit of work. Under this topology, B1-B4 sharing `MATRIX_NUMATO_202` (and the same rack DMM/SMU/DAQ) are exactly one hardware set per Section 46's resource-partition model -- they cannot run concurrently with each other, only with C1-C4 (a different matrix). Runtime should schedule groups; the underlying hardware-set concurrency constraint is derived from shared resource names exactly as Section 46 already designed.
+
+**Evidence:** docs/architecture.md Section 46 (resource-partition model), Section 48 (this topology's concrete instance of it).
+
+**Risks:** None new -- this confirms and sharpens an existing design, not a new concern.
+
+**Recommendation:** Runtime schedules groups; concurrency is derived from shared `relay_matrix`/`smu`/`dmm`/`daq` names, unchanged from Section 46.

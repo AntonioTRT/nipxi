@@ -1660,3 +1660,84 @@ implementation, Milestone II's Monitor Battery implementation, and the
 Menu Restructuring Review above. See `docs/TODO.md` for the live
 remaining-work checklist and `docs/architecture.md`/`docs/CONFIGURATION.md`
 for full technical detail on every item referenced above.*
+
+---
+
+## Milestone XIV: Group Hardware Ownership Model -- Multi-Matrix Topology (B1-B4/C1-C4) and Position/Channel Storage Fix
+
+**Status:** ACHIEVED (design/documentation review only -- no implementation performed)
+
+**Scope:** Resolved Milestone XIII's open group-naming question with a
+concrete real-hardware topology: groups are hardware ownership sets
+(`<matrix letter><partition number>`, e.g. `B1..B4` on `MATRIX_NUMATO_202`,
+`C1..C4` on `MATRIX_NUMATO_203`), never workflow/battery-type/test-type
+families. Documentation-only session: no implementation code was changed.
+
+### Objectives achieved
+
+- **Confirmed the naming scheme itself requires no code change** -- `group`
+  is used everywhere as an opaque string key, unchanged from Milestone
+  XIII's finding.
+- **Found a real, latent bug the naming question was masking:**
+  `BATTERY_CHANNELS`'s flat, global position/relay-address model, and
+  `utils/device_validator.py`'s startup checks built on top of it, assume
+  exactly one physical relay matrix. Confirmed by direct code inspection
+  that `_check_duplicate_relay_identifiers()` would report a false
+  duplicate-relay collision the moment a second matrix (Group C1) is
+  populated with its own, legitimately separate `relay_address` values.
+- **Recommended the fix:** move position/channel ownership into each
+  `BATTERY_GROUPS` entry (a `"positions"` sub-dict scoped to that group's
+  own `relay_matrix`), eliminating the shared global namespace entirely.
+- **Confirmed operator-facing behavior (positions 1-8 within a group) is
+  already correct and unaffected** -- only the internal storage location
+  changes.
+- **Confirmed convergence with Milestone XIII's pending database
+  migration:** `channel` and the planned `position_in_group` column are
+  the same underlying fix, best implemented together, using the final
+  `B1`/`C1`-style names directly.
+- **Confirmed Runtime should schedule groups, not relay matrices** --
+  strengthening, not changing, Milestone XII's shared-resource
+  concurrency model (B1-B4 share one hardware set; C1-C4 share a
+  different one).
+
+### Architectural decisions made
+
+- No code changes were made as part of this review. The position-ownership
+  redesign, the matrix-scoping fix to `utils/device_validator.py`, and the
+  Milestone XIII database migration are recommended to be implemented
+  together, using the final group names directly.
+
+### Verification
+
+Every finding is cited against the actual source (`config/devices.py`,
+`test.py`, `test_control/monitor_battery_scan_sequence.py`,
+`utils/device_validator.py`) -- see docs/architecture.md Section 48 for
+full evidence and docs/FAQ.md Section 16 for the Q&A-form record. No
+mocked or physical-hardware test was run; this is a static implementation
+trace.
+
+### Milestone readiness decision
+
+**GO for adopting this group-ownership model and naming scheme.** The
+naming was never the blocker; the position/channel storage redesign is
+required regardless of naming, because the current model has a latent
+validator bug that triggers the moment Group C1's hardware is populated.
+
+### Recommended next milestone
+
+Implement, together: the position-ownership redesign
+(`BATTERY_GROUPS[group]["positions"]`), the matrix-scoping fix to
+`utils/device_validator.py`, and the Milestone XIII `group_name`/
+`position_in_group` database migration -- using `B1`/`C1`-style names
+directly -- before Group C1's hardware is exercised for real. In parallel
+with the still-pending ChargeSequence/DischargeSequence real-hardware
+validation and the Milestone XII `main.py` retirement work.
+
+---
+
+*Record created after Hardware Bring-Up Milestone 1 was confirmed on the
+physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
+implementation, Milestone II's Monitor Battery implementation, and the
+Menu Restructuring Review above. See `docs/TODO.md` for the live
+remaining-work checklist and `docs/architecture.md`/`docs/CONFIGURATION.md`
+for full technical detail on every item referenced above.*

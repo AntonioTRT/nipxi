@@ -3278,3 +3278,183 @@ schema addition (item 6) and additive hardware-test path (item 4) as the
 concrete follow-up implementation items. No finding here blocks proceeding
 toward Runtime implementation; `main.py` retirement (Section 46) remains
 the standing prerequisite, unchanged by this review.
+
+---
+
+## 48. Group Hardware Ownership Model -- Multi-Matrix Topology (B1-B4/C1-C4) and the Position/Channel Storage Fix
+
+**Purpose:** Section 47 left the group-naming semantics open (1:1 rename vs.
+family reorganization). This section resolves that: groups are **hardware
+ownership sets**, not workflow/battery-type/test-type families. Naming is
+`<matrix letter><partition number>` -- e.g. `B1..B4` partition
+`MATRIX_NUMATO_202`'s 32 channels into four independent 8-position groups;
+`C1..C4` do the same for `MATRIX_NUMATO_203`. Any group can run any
+supported workflow (Monitor Battery, Monitor Battery Scan, NTC Group Scan,
+Charge/Discharge Battery, future Cycle Battery) -- nothing about a group's
+name implies which workflows it supports; that's determined entirely by
+which hardware roles are actually assigned to it (`smu`/`dmm`/`daq`/
+`ntc_daq` each independently `None`-or-assigned, exactly as today).
+**Documentation-only session -- no implementation code was changed.**
+docs/FAQ.md Section 16 carries the same findings in Q&A form;
+docs/MILESTONES.md records the review.
+
+### The naming scheme itself fits the current design (confirmed, unchanged from Section 47)
+
+`group` is used everywhere as an opaque string dict-key (`BATTERY_GROUPS.keys()`,
+`if group not in dev_cfg.BATTERY_GROUPS`, `.strip().upper()`) -- no code
+assumes single-letter format. `B1`/`C1` are exactly as valid a key as `A`
+was. This part requires zero code change.
+
+### The real blocker: `BATTERY_CHANNELS` is a flat, global position/relay-address space -- and a validator bug proves it
+
+`BATTERY_CHANNELS` (`config/devices.py`) is one dict keyed by an
+ever-increasing "global position" number, with `relay_address` derived
+directly from that global index (`resolve_group_position()` computes
+`global = position_start + position_in_group - 1`; `relay_address` for
+Group A's positions is literally that same global number). This has been
+silently correct only because exactly one physical relay matrix has ever
+been populated (Group A on `MATRIX_NUMATO_202`) -- one matrix, one flat
+namespace, nothing to collide.
+
+**It breaks the moment a second physically distinct matrix is populated**
+-- which is exactly what Group C1 (`MATRIX_NUMATO_203`) does. Confirmed by
+direct inspection of `utils/device_validator.py`:
+
+- `_check_duplicate_relay_identifiers()` (lines 142-162) flags any
+  `relay_address` value that repeats *anywhere* in `BATTERY_CHANNELS`, with
+  **no association between a channel and which relay matrix it's actually
+  wired to**. B1's position 1 (`relay_address=1` on `MATRIX_NUMATO_202`)
+  and C1's position 1 (`relay_address=1` on `MATRIX_NUMATO_203`) are two
+  legitimately different physical relays that happen to share a channel
+  *number* -- this validator would report them as a duplicate-relay
+  collision, a false positive, the moment both are populated.
+- `_check_relay_count_consistency()` (lines 193-224) loops every configured
+  relay matrix and checks *every* `BATTERY_CHANNELS` entry's
+  `relay_address` against *that* matrix's channel count -- again with no
+  per-entry matrix association.
+- `_check_battery_groups()` (lines 165-190) assumes every `BATTERY_CHANNELS`
+  position falls inside exactly one contiguous `BATTERY_GROUPS`
+  `position_start..position_end` range -- a model that only makes sense
+  for one continuous global sequence, not per-matrix-partitioned groups.
+
+**Root cause, stated plainly:** positions are *indexed into* a shared
+global table via `position_start`/`position_end` arithmetic, not *owned
+by* the group. This is precisely the "groups are hardware ownership sets"
+philosophy this review is asked to confirm -- the current storage model
+contradicts it structurally, independent of naming.
+
+### Recommended model: positions live inside each group
+
+```python
+BATTERY_GROUPS = {
+    "B1": {
+        "relay_matrix": "MATRIX_NUMATO_202",
+        "smu": "PRIMARY_SMU", "dmm": "MAIN_DMM", "daq": "MAIN_DAQ",
+        "ntc_daq": None,   # falls back to "daq" once the rack DAQ serves NTC too
+        "battery_type": "SB", "test_setpoints": {...}, "enabled": True,
+        "positions": {
+            1: {"relay_address": 1, "daq_voltage_ch": "Dev1/ai0",
+                "daq_current_ch": "Dev1/ai8", "daq_ntc_ch": "Dev1/ai16",
+                "fuse_rating_a": 2.0, "enabled": True},
+            # ... 2..8
+        },
+    },
+    "C1": {
+        "relay_matrix": "MATRIX_NUMATO_203",
+        "smu": None, "dmm": None, "daq": None,   # not yet wired for charge/discharge
+        "ntc_daq": "NTC_DAQ_USB6211",
+        "battery_type": None, "test_setpoints": None, "enabled": True,
+        "positions": {1: {"relay_address": 1, "daq_ntc_ch": "Dev2/ai0", ...}, ...},
+    },
+}
+```
+
+`relay_address` is now scoped to its own group's `relay_matrix` --
+`B1[1]["relay_address"]=1` and `C1[1]["relay_address"]=1` coexist without
+contradiction, because they're keyed under groups pointing at different
+physical matrices. No shared global namespace remains to collide in.
+`hardware_for_group(group)` is extended to also return `positions`; no new
+resolution mechanism, the same function every workflow already calls.
+
+**Operator-facing behavior is unchanged.** `_select_battery_position()`'s
+prompt already reads `"Position within Group {group} (1-{size})"` --
+global position numbers have always been an internal-only detail, never
+shown to the operator. Positions 1..8 *within a group* remains exactly
+right; what changes is that this range is now the group's own dict, not
+an indirection into a separate global table.
+
+### Convergence with the Section 47 `group_name`/`position_in_group` migration
+
+`measurements`/`run_summary`/`event_log`'s `channel` column (today: "the
+global position") and the pending `position_in_group` column are not two
+separate concerns -- once `group_name` disambiguates a run, `channel` no
+longer needs global uniqueness and can simply become `position_in_group`
+directly. Recommend sequencing the position-ownership redesign and the
+Section 47 database migration together, using the final names (`B1`,
+`C1`, ...) directly -- no reason to migrate through an intermediate
+naming scheme.
+
+### Files affected
+
+**Pure naming (opaque key rename):** `config/devices.py::BATTERY_GROUPS`
+keys and comments only -- unchanged from Section 47's finding.
+
+**Structural (position/channel ownership redesign) -- confirmed by exact
+search of every `BATTERY_CHANNELS`/`resolve_group_position`/
+`group_for_position`/`position_start`/`position_end` reference:**
+- `config/devices.py` -- `BATTERY_CHANNELS` absorbed into each group's
+  `positions`; `resolve_group_position()`/`group_for_position()` rewritten
+  or removed (no more global-position arithmetic); `position_start`/
+  `position_end` fields retired.
+- `test.py` -- every caller: `_select_battery_group()` (:3602),
+  `_select_battery_position()` (:3618), `_select_relay_scope()` (:2032),
+  `_select_group_with_hardware_summary()` (:3705), `_run_monitor_battery()`
+  (:3885-3888), `_run_monitor_battery_scan()` (:4054),
+  `_run_charge_or_discharge()` (:4229-4232), `_run_ntc_group_scan()`
+  (:4417, 4451-4452), `test_sensors()`'s Test 6 (:2216), the startup
+  config self-test (:293-310).
+- `test_control/monitor_battery_scan_sequence.py` -- `DAQ_CHANNEL_0 =
+  BATTERY_CHANNELS[1]["daq_voltage_ch"]` (line 85) must become
+  group-relative, not a hardcoded reference to global position 1.
+- `utils/device_validator.py` -- `_check_duplicate_relay_identifiers()`/
+  `_check_relay_count_consistency()`/`_check_battery_groups()` (lines
+  142-224) must become matrix-scoped (validate uniqueness/range *within*
+  each group's own `relay_matrix`) -- this is the actual fix for the bug
+  described above, not a byproduct of the rename.
+- `config/settings.py::GROUP_SIZE` -- comment references only; not
+  consumed by live logic today, no functional change needed.
+
+### Database impact
+
+Confirmed: store `group_name`/`position_in_group` using the final names
+(`"B1"`, `"C1"`, ...) directly, per Section 47's already-designed
+additive migration -- this topology clarification doesn't change that
+migration's shape, only confirms the values it will store. The
+position-ownership redesign makes `position_in_group` a directly
+available value at every call site (a group's own `positions` dict key),
+removing the `resolve_group_position()` indirection that currently
+produces it.
+
+### Runtime impact
+
+Runtime should schedule **groups**, not relay matrices -- a matrix is a
+shared physical resource, not a unit of work. Under this topology, B1-B4
+sharing `MATRIX_NUMATO_202` (and, per the described real hardware, the
+same rack DMM/SMU/DAQ) are exactly one hardware set in Section 46's
+resource-partition model: **B1-B4 cannot run concurrently with each
+other, only with C1-C4** (a different matrix). This is a concrete,
+useful instance of Section 46's shared-resource concurrency constraint,
+not a new concern -- the four sub-groups per matrix are four
+independently addressable battery positions sharing one exclusive
+hardware stack, not four independent execution slots.
+
+### GO / NO-GO
+
+**GO for adopting this group-ownership model and naming scheme.** The
+naming itself was never the blocker; the position/channel storage
+redesign is required regardless of naming, because the current model
+already has a latent validator bug that triggers the moment a second
+physical relay matrix (Group C1) is populated. Recommend implementing the
+position-ownership redesign and the Section 47 `group_name`/
+`position_in_group` migration together, using `B1`/`C1`-style names
+directly, before Group C1's hardware is exercised for real.
