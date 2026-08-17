@@ -36,12 +36,12 @@ class Settings:
     # Battery positions -- the system is organized around battery positions
     # grouped into blocks of GROUP_SIZE (see config/devices.py::BATTERY_GROUPS
     # -- each group of GROUP_SIZE positions corresponds to a distinct relay
-    # matrix; Group A/positions 1-8 is the only group with real hardware
+    # matrix; Group B1/positions 1-8 is the only group with real hardware
     # today). Renamed from NUM_CHANNELS -- "channel" reads as a generic DAQ/
     # electrical term; this constant has always meant "how many battery
-    # positions exist", confirmed by its only two real call sites
-    # (test.py's BATTERY_CHANNELS count-check, utils/validators.py's range
-    # validation) -- neither is DAQ-channel-related.
+    # positions exist". This is the legacy Proto Test Execution numbering
+    # (utils/validators.py's range validation) -- separate from, and not
+    # touched by, config/devices.py::BATTERY_GROUPS' per-group "positions".
     # -------------------------------------------------------------------------
     GROUP_SIZE = 8
     BATTERY_POSITIONS = 8

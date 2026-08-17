@@ -1781,6 +1781,8 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 
 **Recommendation:** Proceed with implementation using these final names directly.
 
+**Status update (Group Ownership Migration, docs/architecture.md Section 53):** Implemented in code. Every A/C-family group carries its family's `relay_matrix` (`A1-A4 -> MATRIX_NUMATO_201`, `C1-C4 -> MATRIX_NUMATO_203`) with `smu`/`dmm`/`daq`/`ntc_daq` unassigned and `enabled=False`. C1's `NTC_DAQ_USB6211` assignment remains a separate, not-yet-done item (see docs/TODO.md).
+
 ### Q: Should A1 be enabled, disabled, or "relay-only"?
 
 **Status:** Resolved -- disabled
@@ -1816,6 +1818,8 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 **Risks:** Disabled groups should still be validated for internal consistency (not skipped) -- catches a `relay_address` collision between a real group and a disabled sibling on the same matrix before it can resurface as a real hardware conflict later.
 
 **Recommendation:** Implement all three changes together with the `positions` restructure.
+
+**Status update (Group Ownership Migration, docs/architecture.md Section 53):** Implemented exactly as recommended above. `_check_duplicate_relay_identifiers()` -> `_check_relay_identifiers()`, keyed by `(relay_matrix, relay_address)`; `_check_battery_groups()` deleted; `_check_relay_count_consistency()` loops per group. Disabled groups (empty `positions` dicts) are included in the loop, not skipped -- a future `relay_address` collision between a real and disabled group on the same matrix is still caught. Regression-verified: same-matrix duplicate flagged, cross-matrix reuse allowed.
 
 ## SECTION 18 — TEMPERATURE MONITORING (Dual DAQ Ownership, NTC Acquisition Pipeline)
 
@@ -1903,7 +1907,7 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 
 **Answer:** Yes -- NTC channels are independent per-position DAQ analog inputs, never routed through the relay matrix (the same structural fact that already made NTC Group Scan possible with zero relay/SMU involvement). Reading the whole group's NTC channels requires no relay switching and no SMU/PMU interaction, so it can run entirely before the target position's relay is ever engaged.
 
-**Evidence:** `hardware/daq.py::DAQ.read_channel()`; `config/devices.py::BATTERY_CHANNELS[...]["daq_ntc_ch"]` (fixed per-position DAQ channel, independent of `relay_address`).
+**Evidence:** `hardware/daq.py::DAQ.read_channel()`; `config/devices.py::BATTERY_GROUPS[group]["positions"][...]["daq_ntc_ch"]` (fixed per-position DAQ channel, independent of `relay_address`).
 
 **Risks:** None found beyond the DAQError-gating issue below, which was caught and fixed during this same implementation.
 

@@ -79,26 +79,28 @@ from utils.errors import DAQError
 
 # Fixed physical DAQ channel used for every position's CLOSED-state read,
 # regardless of which battery position is under test -- see the module
-# docstring. Reuses BATTERY_CHANNELS[1]'s voltage channel string as "Channel
-# 0" (e.g. "Dev1/ai0") rather than inventing a second constant that could
-# drift from config/devices.py.
-DAQ_CHANNEL_0 = dev_cfg.BATTERY_CHANNELS[1]["daq_voltage_ch"]
+# docstring. Reuses Group B1's position 1 voltage channel string as
+# "Channel 0" (e.g. "Dev1/ai0") rather than inventing a second constant
+# that could drift from config/devices.py.
+DAQ_CHANNEL_0 = dev_cfg.BATTERY_GROUPS["B1"]["positions"][1]["daq_voltage_ch"]
 
 
 class MonitorBatteryScanSequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, daq, relay, safety: SafetyMonitor, storage, settings: Settings):
+    def __init__(self, smu, dmm, daq, relay, safety: SafetyMonitor, storage, settings: Settings, group_name=None):
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
-                          source="monitor_battery_scan", dmm=dmm, daq=daq)
+                          source="monitor_battery_scan", dmm=dmm, daq=daq, group_name=group_name)
 
     def run(self, battery_type: str, group: str, positions_in_group: list, token=None,
             samples: int = None,
             dwell_s: float = None, dwell_interval_s: float = None):
         """
         Scan every position in `positions_in_group` (in-group, 1-based --
-        e.g. Group A positions 1-8) belonging to `group`, resolving each to
-        its global channel/relay address via config/devices.py::
-        resolve_group_position()/BATTERY_CHANNELS -- the same resolution
+        e.g. Group B1 positions 1-8) belonging to `group`, resolving each
+        one's relay address via config/devices.py::
+        BATTERY_GROUPS[group]["positions"] -- the same resolution
         test.py's battery-selection flow already uses for Monitor Battery.
+        `channel` is just `position` itself (position_in_group) -- there is
+        no separate global position number.
 
         The delay after every relay open/close, before the DMM is read, is
         NOT a parameter here -- it is Settings.RELAY_SETTLE_TIME_S, the one
@@ -148,8 +150,8 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
         total_samples = 0
 
         for idx, position in enumerate(positions_in_group, start=1):
-            channel = dev_cfg.resolve_group_position(group, position)
-            ch_cfg = dev_cfg.BATTERY_CHANNELS[channel]
+            ch_cfg = dev_cfg.BATTERY_GROUPS[group]["positions"][position]
+            channel = position
             relay_address = ch_cfg["relay_address"]
             last_channel, last_relay = channel, relay_address
             scan_progress = f"{idx}/{total}"
@@ -224,7 +226,8 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
             message=f"Position {position}: voltage measured (open, before) -- "
                     f"avg {open_before['avg']:.6f} V (min {open_before['min']:.6f} / max {open_before['max']:.6f})",
         )
-        self.storage.record_measurement(
+        self._record_measurement(
+            position_in_group=position,
             test_type="monitor_scan", channel=channel, relay=relay_address,
             phase_detail="OPEN_BEFORE",
             voltage_v=open_before["avg"], voltage_min_v=open_before["min"], voltage_max_v=open_before["max"],
@@ -267,7 +270,8 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
                 message=f"DAQ channel 0 read failed -- {e}",
             )
 
-        self.storage.record_measurement(
+        self._record_measurement(
+            position_in_group=position,
             test_type="monitor_scan", channel=channel, relay=relay_address,
             phase_detail="CLOSED",
             voltage_v=closed["avg"], voltage_min_v=closed["min"], voltage_max_v=closed["max"],
@@ -307,7 +311,8 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
             message=f"Position {position}: voltage measured (open, after) -- "
                     f"avg {open_after['avg']:.6f} V (min {open_after['min']:.6f} / max {open_after['max']:.6f})",
         )
-        self.storage.record_measurement(
+        self._record_measurement(
+            position_in_group=position,
             test_type="monitor_scan", channel=channel, relay=relay_address,
             phase_detail="OPEN_AFTER",
             voltage_v=open_after["avg"], voltage_min_v=open_after["min"], voltage_max_v=open_after["max"],
@@ -373,7 +378,8 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
 
                 remaining_s = max(0.0, dwell_s - elapsed)
                 dwell_progress = f"{min(elapsed, dwell_s):.1f}/{dwell_s:.1f} s"
-                self.storage.record_measurement(
+                self._record_measurement(
+                    position_in_group=position,
                     test_type="monitor_scan", channel=channel, relay=relay_address,
                     phase_detail="MONITORING", voltage_v=voltage, daq_channel_0_raw=daq_raw,
                 )

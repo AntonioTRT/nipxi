@@ -397,15 +397,15 @@ DMM_CONFIG = DMM_CONFIGS["MAIN_DMM"]
 
 # =============================================================================
 # Battery type/model catalog -- physical battery specs (chemistry, capacity,
-# voltage/current/temperature limits), independent of which channel a
-# battery currently occupies (see BATTERY_CHANNELS below for wiring). This
-# is the foundation for the future data/battery_repository.py (see
-# docs/DATABASE_ROADMAP.md Section 2) -- NOT wired into safety_monitor.py or
-# charge_cycle.py/discharge_cycle.py yet, which still read the single
-# global BAT_VOLTAGE_MAX/MIN/BAT_CURRENT_MAX/BAT_TEMP_MAX_C from
-# config/settings.py for every channel regardless of what's actually
-# installed there. Update BATTERY_CHANNELS[i]["battery_type"] below to
-# record which of these is physically installed in each channel.
+# voltage/current/temperature limits), independent of which position a
+# battery currently occupies (see BATTERY_GROUPS[group]["positions"] below
+# for wiring). This is the foundation for the future
+# data/battery_repository.py (see docs/DATABASE_ROADMAP.md Section 2) -- NOT
+# wired into safety_monitor.py or charge_cycle.py/discharge_cycle.py yet,
+# which still read the single global BAT_VOLTAGE_MAX/MIN/BAT_CURRENT_MAX/
+# BAT_TEMP_MAX_C from config/settings.py for every channel regardless of
+# what's actually installed there. "battery_type" is instead recorded once
+# per GROUP (BATTERY_GROUPS[group]["battery_type"] below), never per position.
 #
 # IMPORTANT -- these are battery CAPABILITIES and RECOMMENDED operating
 # ranges, NOT the operational authority. This dict describes what the
@@ -424,8 +424,9 @@ DMM_CONFIG = DMM_CONFIGS["MAIN_DMM"]
 # =============================================================================
 # Operator-selectable battery types: HUB and SB. Battery selection is
 # explicit and operator-controlled (see test.py's battery-type selection
-# prompt, Monitor Battery workflow) -- BATTERY_CHANNELS below deliberately
-# does NOT reference a battery type; it is physical wiring information only.
+# prompt, Monitor Battery workflow) -- BATTERY_GROUPS[group]["positions"]
+# below deliberately does NOT reference a battery type; it is physical
+# wiring information only.
 #
 # CONFIRMED vs ASSUMED -- read before relying on these for safety enforcement:
 #   CONFIRMED (from the source spec):
@@ -471,70 +472,37 @@ BATTERY_CONFIGS = {
     },
 }
 
-# Battery channel definitions -- PHYSICAL WIRING ONLY.
-# Key: global battery position (1-based, see BATTERY_GROUPS below for how
-# a position maps to a group + relay matrix). Deliberately does NOT
-# reference a battery type -- which battery is being tested is an explicit
-# operator choice at run start (test.py's battery-type selection prompt),
-# never inferred from which position/relay was picked. See docs/
-# architecture.md "Battery Group / Position Architecture".
-#
-# daq_voltage_ch/daq_current_ch/daq_ntc_ch use "Dev1" as the NI-MAX device
-# alias placeholder for MAIN_DAQ (PXI_SLOTS[2], resource "PXI1Slot2") --
-# "Dev1" is whatever alias NI-MAX actually assigns that resource on this
-# machine, not necessarily literally "Dev1". Confirm and update these
-# strings against NI-MAX during hardware validation; PXI_SLOTS[2]["resource"]
-# is the authoritative resource string for MAIN_DAQ itself.
-BATTERY_CHANNELS = {
-    i: {
-        "id": f"BAT_{i}",
-        "relay_address": i,          # relay matrix channel number
-        "daq_voltage_ch": f"Dev1/ai{i - 1}",
-        "daq_current_ch": f"Dev1/ai{i + 7}",
-        # TEMPORARY -- NTC channels point at the NI USB-6210 development DAQ
-        # (see USB_DAQ_DEVICES/BATTERY_GROUPS[...]["ntc_daq"] below), NOT
-        # "Dev1" (MAIN_DAQ) like daq_voltage_ch/daq_current_ch above. "Dev2"
-        # is the placeholder NI-MAX alias -- confirm/update against NI-MAX
-        # once the USB-6210 is physically attached. Migration to the future
-        # rack DAQ: point this back at that device's own per-position
-        # channels (e.g. "Dev1/ai{i+15}") once available -- config-only.
-        "daq_ntc_ch":     f"Dev2/ai{i - 1}",
-        "fuse_rating_a":  2.0,
-        "enabled":        True,
-    }
-    for i in range(1, 9)
-}
-
 # =============================================================================
-# Battery groups -- relay routing architecture.
+# Battery groups -- relay routing architecture + position ownership.
 #
-# Battery groups are NOT a purely logical grouping: each group of
-# Settings.GROUP_SIZE (8) battery positions corresponds to a distinct relay
-# routing section, physically one Ethernet relay matrix per group. Group A
-# (positions 1-8) is the only group with real hardware today -- MATRIX_NUMATO_201
-# (see ETHERNET_DEVICES above). Group B is pre-wired to MATRIX_NUMATO_202
-# (already configured, Milestone 1) but not yet enabled for battery routing.
-# Groups C/D are placeholders for future relay matrices that don't exist yet
-# (`relay_matrix: None`) -- present so the operator workflow and Relay
-# Functional Validation's group-scope menu are future-proof without a later
-# redesign; selecting a disabled/unconfigured group reports "no relays
-# configured for this group" (same graceful pattern as the hardware-cleanup
-# disabled-device entries above), never a crash.
+# Battery groups are NOT a purely logical grouping: each group corresponds to
+# a distinct relay routing section, physically one Ethernet relay matrix per
+# matrix "family" (e.g. every B-family group below shares MATRIX_NUMATO_202).
+# Locked naming: A1-A4, B1-B4, C1-C4. Each group owns its OWN "positions"
+# dict -- there is no global battery-position numbering anymore (previously
+# BATTERY_CHANNELS + position_start/position_end). B1 (real hardware today)
+# owns positions 1-8, keyed by position-within-group (1-based, exactly what
+# the operator selects as "Position N"); a disabled/placeholder group owns
+# an empty "positions": {} until it is wired.
 #
-# position_start/position_end are GLOBAL battery position numbers (matching
-# BATTERY_CHANNELS' keys); relay_offset is subtracted from a global position
-# to get the 1-based position *within* the group (e.g. global position 11
-# in Group B -> position_start=9 -> in-group position 11-9+1 = 3).
+# "positions": {position_in_group: {relay_address, daq_voltage_ch,
+# daq_current_ch, daq_ntc_ch, fuse_rating_a, enabled}, ...} -- relay_address
+# must be unique only WITHIN this group's own relay_matrix (see
+# utils/device_validator.py), never globally: two different physical
+# matrices may both legitimately use relay_address=1. config/devices.py::
+# group_size(group) returns len(positions) -- the one place "how many
+# positions does this group have" is computed, never a separately-tracked
+# count that could drift from the dict itself.
 # =============================================================================
 # "smu"/"dmm"/"daq" are name-keys into SMU_ASSIGNMENTS/DMM_CONFIGS/DAQ_CONFIGS
 # below -- same reference-by-name pattern "relay_matrix" already uses against
 # ETHERNET_DEVICES, not a second copy of any hardware config. None means "no
-# device of this role assigned to this group yet" (same meaning as
-# "relay_matrix": None for groups C/D): hardware_for_group() below returns
-# None for that role rather than guessing a default, and callers must refuse
-# to activate hardware for a role that resolves to None. Only MAIN_DMM/
-# MAIN_DAQ physically exist today, so every group currently shares them --
-# multiple DMMs/DAQs is a future scaling step, same as multiple SMUs.
+# device of this role assigned to this group yet": hardware_for_group() below
+# returns None for that role rather than guessing a default, and callers must
+# refuse to activate hardware for a role that resolves to None. Only MAIN_DMM/
+# MAIN_DAQ physically exist today, so every group with a DMM/DAQ role
+# currently shares them -- multiple DMMs/DAQs is a future scaling step, same
+# as multiple SMUs.
 #
 # "battery_type"/"test_setpoints" (added for the Battery Group Test
 # Configuration Architecture -- see docs/architecture.md) make each group a
@@ -555,19 +523,44 @@ BATTERY_CHANNELS = {
 #     and are never duplicated here). A setpoint may legitimately be well
 #     below the battery's own max_charge_current_a/max_discharge_current_a
 #     (e.g. a conservative/slow-rate test recipe) -- see the values chosen
-#     for Group A below, deliberately kept within PRIMARY_SMU's own
+#     for Group B1 below, deliberately kept within PRIMARY_SMU's own
 #     max_current_a (0.1 A) rather than at SB's actual 0.08/0.16 A limits.
 #     validate_group_test_config() enforces setpoint <= BATTERY_CONFIGS
 #     limit AND setpoint <= assigned SMU's max_current_a, in that order,
 #     before any hardware is touched.
-#   - None (both fields, for groups B/C/D below) means "not yet configured
-#     for any battery/test" -- the same "None = unassigned" convention
-#     already used for "relay_matrix"/"smu"/"dmm"/"daq" above.
+#   - None (both fields, for every placeholder group below) means "not yet
+#     configured for any battery/test" -- the same "None = unassigned"
+#     convention already used for "relay_matrix"/"smu"/"dmm"/"daq" above.
+
+
+def _placeholder_group() -> dict:
+    """A group with no hardware/battery/position assignment yet -- same
+    shape as a real group, every role None, empty positions. Used for every
+    group that doesn't have real hardware wired to it today."""
+    return {
+        "relay_matrix": None, "smu": None, "dmm": None, "daq": None, "ntc_daq": None,
+        "enabled": False, "battery_type": None, "test_setpoints": None,
+        "positions": {},
+    }
+
+
 BATTERY_GROUPS = {
-    "A": {
+    # A-family -- MATRIX_NUMATO_201. Disabled (see docs/architecture.md
+    # Section 49 / docs/FAQ.md Section 17): A1's "enabled, relay-only"
+    # alternative doesn't actually work given every real workflow's default
+    # required_roles=("relay_matrix","smu","dmm","daq"), and "enabled with
+    # full hardware" would need unconfirmed second-instrument hardware --
+    # so relay_matrix identifies the family, but smu/dmm/daq/ntc_daq stay
+    # unassigned and enabled stays False until real hardware exists.
+    "A1": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_201"},
+    "A2": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_201"},
+    "A3": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_201"},
+    "A4": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_201"},
+
+    # B-family -- MATRIX_NUMATO_202, the one relay matrix in service today.
+    # B1 is the only group with real hardware/positions.
+    "B1": {
         "relay_matrix":   "MATRIX_NUMATO_202",
-        "position_start": 1,
-        "position_end":   8,
         "enabled":        True,
         "smu":            "PRIMARY_SMU",
         "dmm":            "MAIN_DMM",
@@ -599,66 +592,47 @@ BATTERY_GROUPS = {
             "discharge_cutoff_v":  3.0,    # == SB voltage_min_v (the safety floor --
                                             #    see "Discharge Cutoff Policy")
         },
+        "positions": {
+            # daq_ntc_ch is TEMPORARY -- "Dev2" is the NI USB-6210 dev DAQ
+            # (see "ntc_daq" above); migration to the rack DAQ repoints this
+            # at that device's own per-position channels, config-only.
+            i: {
+                "relay_address":  i,
+                "daq_voltage_ch": f"Dev1/ai{i - 1}",
+                "daq_current_ch": f"Dev1/ai{i + 7}",
+                "daq_ntc_ch":     f"Dev2/ai{i - 1}",
+                "fuse_rating_a":  2.0,
+                "enabled":        True,
+            }
+            for i in range(1, 9)
+        },
     },
-    "B": {
-        "relay_matrix":   "MATRIX_NUMATO_202",
-        "position_start": 9,
-        "position_end":   16,
-        "enabled":        False,   # matrix exists in config, not yet wired for battery routing
-        "smu":            None,    # no SMU assigned to this group yet
-        "dmm":            "MAIN_DMM",
-        "daq":            "MAIN_DAQ",
-        "battery_type":   None,    # not yet configured for any battery/test
-        "test_setpoints": None,
-    },
-    "C": {
-        "relay_matrix":   None,    # no relay matrix assigned yet
-        "position_start": 17,
-        "position_end":   24,
-        "enabled":        False,
-        "smu":            None,
-        "dmm":            None,
-        "daq":            None,
-        "battery_type":   None,
-        "test_setpoints": None,
-    },
-    "D": {
-        "relay_matrix":   None,    # no relay matrix assigned yet
-        "position_start": 25,
-        "position_end":   32,
-        "enabled":        False,
-        "smu":            None,
-        "dmm":            None,
-        "daq":            None,
-        "battery_type":   None,
-        "test_setpoints": None,
-    },
+    # B2-B4: same matrix family as B1, not yet wired for battery routing --
+    # DMM/DAQ are shared (physically exist), no SMU/positions assigned yet.
+    "B2": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_202", "dmm": "MAIN_DMM", "daq": "MAIN_DAQ"},
+    "B3": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_202"},
+    "B4": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_202"},
+
+    # C-family -- MATRIX_NUMATO_203. C1 is intended to be NTC-only (a
+    # second development USB DAQ, NTC_DAQ_USB6211 -- not yet added to
+    # USB_DAQ_DEVICES, see docs/TODO.md) with no relay/SMU/DMM battery
+    # routing; relay_matrix identifies the family now, ntc_daq assignment
+    # is separate, still-pending work.
+    "C1": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_203"},
+    "C2": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_203"},
+    "C3": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_203"},
+    "C4": {**_placeholder_group(), "relay_matrix": "MATRIX_NUMATO_203"},
 }
 
 
-def resolve_group_position(group: str, position_in_group: int) -> int:
+def group_size(group: str) -> int:
     """
-    Convert (group, position-within-group) -- what the operator selects,
-    e.g. "Group A, Position 3" -- to the global battery position number
-    BATTERY_CHANNELS is keyed by. Raises KeyError for an unknown group,
-    ValueError if position_in_group is out of range for that group.
+    Number of positions this group owns -- len(BATTERY_GROUPS[group]
+    ["positions"]), never a separately-tracked count that could drift from
+    the dict itself. 0 for a disabled/placeholder group (empty positions).
+    Raises KeyError if `group` is not a key in BATTERY_GROUPS.
     """
-    grp = BATTERY_GROUPS[group]
-    size = grp["position_end"] - grp["position_start"] + 1
-    if not (1 <= position_in_group <= size):
-        raise ValueError(
-            f"Position {position_in_group} out of range for group {group!r} "
-            f"(1..{size})"
-        )
-    return grp["position_start"] + position_in_group - 1
-
-
-def group_for_position(global_position: int):
-    """Return the group name a global battery position belongs to, or None."""
-    for name, grp in BATTERY_GROUPS.items():
-        if grp["position_start"] <= global_position <= grp["position_end"]:
-            return name
-    return None
+    return len(BATTERY_GROUPS[group].get("positions", {}))
 
 
 def hardware_for_group(group: str) -> dict:
@@ -845,9 +819,10 @@ USB_DAQ_DEVICES = {
         "voltage_range_v": 10.0,
         "role":            "TEMPORARY development NTC/temperature acquisition -- "
                             "stand-in for the future rack DAQ. Scoped to NTC "
-                            "channels only (see BATTERY_CHANNELS[...]['daq_ntc_ch']), "
-                            "not also voltage/current -- those remain on MAIN_DMM/"
-                            "PRIMARY_SMU respectively, unaffected by this device.",
+                            "channels only (see BATTERY_GROUPS[...]['positions']"
+                            "[...]['daq_ntc_ch']), not also voltage/current -- those "
+                            "remain on MAIN_DMM/PRIMARY_SMU respectively, unaffected "
+                            "by this device.",
         "enabled":         True,
     },
 }

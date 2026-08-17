@@ -4031,3 +4031,106 @@ position before an operation started) -- not built in this pass.
 stopping -- the one real issue surfaced (DAQError over-aborting) was
 caught by dry-run testing during this same implementation pass, not left
 for later discovery, and fixed before considering the work done.
+
+## 53. Group Ownership Migration -- Position Ownership, Per-Matrix Validator, Database Traceability
+
+Follow-up to Section 49's plan: the complete migration to the final
+group-centric ownership model, covering three coupled changes implemented
+together (Runtime/CycleSequence remain untouched, out of scope).
+
+**Group rename executed.** `BATTERY_GROUPS`' old `"A"`/`"B"`/`"C"`/`"D"` keys
+are retired. Locked naming `A1-A4, B1-B4, C1-C4` (Section 49) is now the
+actual code, not just the plan: old `"A"` (real hardware --
+`MATRIX_NUMATO_202`, `PRIMARY_SMU`, `MAIN_DMM`, `MAIN_DAQ`,
+`NTC_DAQ_USB6210`, battery `SB`) became `B1`, unchanged in every
+hardware/setpoint value. Old `"B"` (same matrix, `MAIN_DMM`/`MAIN_DAQ`
+assigned, disabled) became `B2`. `B3`/`B4` are new disabled placeholders
+continuing `MATRIX_NUMATO_202`'s address space. Per Section 49/FAQ Section
+17's already-locked topology, every A/C-family group carries its family's
+`relay_matrix` (`A1-A4 -> MATRIX_NUMATO_201`, `C1-C4 -> MATRIX_NUMATO_203`)
+but no `smu`/`dmm`/`daq`/`ntc_daq` and `enabled=False` -- old `"C"`/`"D"`
+carried no real hardware and did not map cleanly onto a 4-group family, so
+they were not reused verbatim. `C1`'s intended `ntc_daq="NTC_DAQ_USB6211"`
+(NTC-only) is a separate, still-pending item (see `docs/TODO.md` -- the
+`USB_DAQ_DEVICES` entry doesn't exist yet).
+
+**Task 1 -- position ownership.** `BATTERY_CHANNELS` (the flat, global,
+8-position dict) is retired. Every group now owns its own
+`BATTERY_GROUPS[group]["positions"]` dict, keyed by position-in-group
+(1-based -- exactly what the operator selects as "Position N"). `B1`'s
+positions carry the identical `relay_address`/`daq_voltage_ch`/
+`daq_current_ch`/`daq_ntc_ch`/`fuse_rating_a` values `BATTERY_CHANNELS` used
+to hold -- no data changed, only where it lives. `resolve_group_position()`/
+`group_for_position()` (global-position arithmetic) are deleted entirely --
+there is no global position number anymore; a new `config/devices.py::
+group_size(group)` returns `len(positions)`. Every consumer (`test.py`'s
+config self-test, `_functional_daq()`, `_select_relay_scope()`,
+`test_sensors()` Test 6, group/position selection helpers,
+`_run_monitor_battery()`/`_run_monitor_battery_scan()`/
+`_run_charge_or_discharge()`/`_ntc_group_snapshot()`/`_run_ntc_group_scan()`,
+and `test_control/monitor_battery_scan_sequence.py`'s `DAQ_CHANNEL_0`/`run()`)
+was migrated to read positions off the owning group instead of the global
+dict. `channel` (the int column `measurements`/`event_log`/
+`record_execution_state()` have always used) is now simply
+`position_in_group`'s value -- numerically unchanged for `B1` (whose
+positions already started at 1), by construction for every future group.
+
+**Task 2 -- validator redesign.** `utils/device_validator.py`'s
+`_check_duplicate_relay_identifiers()` assumed `relay_address` was unique
+across the whole rig -- false the moment a second physical matrix exists
+(`MATRIX_NUMATO_202` relay 1 and a future `MATRIX_NUMATO_203` relay 1 are
+distinct, valid channels). Replaced with `_check_relay_identifiers()`,
+keyed by `(relay_matrix, relay_address)` -- uniqueness is now scoped per
+matrix. `_check_battery_groups()` (every `BATTERY_CHANNELS` position covered
+by exactly one `BATTERY_GROUPS` range) is deleted outright: that invariant
+is now structurally impossible to violate, since a position only exists
+inside its owning group's own dict -- there is no coverage left to check.
+`_check_relay_count_consistency()` was restructured to loop the new
+per-group positions instead of the flat dict, preserving the exact same
+`num_channels == channel_count == Settings.RELAY_COUNT` + range checks.
+Regression-verified: a duplicate `relay_address` on the SAME matrix is
+still flagged; the same `relay_address` reused across two DIFFERENT
+matrices is correctly allowed.
+
+**Task 3 -- database traceability.** Additive `group_name TEXT`/
+`position_in_group INTEGER` columns added to both `run_summary` and
+`measurements` (`data/storage.py`'s `CREATE_RUN_SUMMARY_SQL`/
+`_RUN_SUMMARY_COLUMNS`/`_RUN_SUMMARY_MIGRATION_COLUMNS` and
+`CREATE_TABLE_SQL`/`_MEASUREMENT_EXTRA_COLUMNS`/
+`_MEASUREMENT_MIGRATION_COLUMNS`) -- same `_migrate_add_missing_columns()`
+pattern as every prior schema addition; a pre-existing database gets these
+columns via `ALTER TABLE` on next `open()`, existing rows read back
+`NULL`. No signature changes to `record_measurement()`/`start_run_summary()`
+-- both already accept `**fields`. `BatteryOperationSequence` gained an
+optional `group_name` constructor parameter (stored once per sequence
+instance) and a `_record_measurement(position_in_group=..., **fields)`
+wrapper that fills in `group_name` automatically; every sequence class
+(`MonitorBatterySequence`, `ChargeSequence`, `DischargeSequence`,
+`MonitorBatteryScanSequence`) now calls this wrapper instead of
+`self.storage.record_measurement()` directly, passing their own `channel`
+(== `position_in_group`) per call. `test.py` passes `group_name=group`
+(and `position_in_group=position` where a single position is selected) at
+every `_start_run_summary_guarded()` call and sequence construction, and at
+`_ntc_group_snapshot()`'s direct `record_measurement()` call.
+`run_summary_report.py::render_run_summary()` now reads `run_summary.group_name`
+directly, falling back to the pre-existing `event_log` text-parsing
+(`_lookup_group()`) only for rows written before this migration.
+
+**Verified:** every `resolve_group_position`/`BATTERY_CHANNELS`/
+`position_start`/`position_end` reference removed from all `.py` sources
+(one intentional historical-context comment excepted in
+`config/devices.py`). `validate_devices_or_raise()` passes cleanly.
+Dry-ran Monitor Battery, Monitor Battery Scan, Charge Battery, Discharge
+Battery, and NTC Group Scan against `B1` with no real hardware attached --
+all fail cleanly at hardware connect (never a traceback), and the printed
+Run Summary correctly shows `Group: B1` read from the new column. Confirmed
+`C1` (a disabled placeholder) is correctly unselectable. Confirmed the
+additive migration on both a fresh database and a simulated pre-migration
+`run_summary` table (old row reads back with `group_name IS NULL`, a new
+row populates both columns).
+
+**Not touched (explicitly out of scope):** Runtime, CycleSequence,
+`main.py`'s legacy path, and `utils/validators.py::validate_channel()`/
+`Settings.BATTERY_POSITIONS`/`GROUP_SIZE` (a separate, still-functional
+legacy Proto Test Execution numbering system with zero references to any
+of the retired names).

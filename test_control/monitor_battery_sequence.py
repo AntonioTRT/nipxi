@@ -25,14 +25,16 @@ TEMPORARY IMPLEMENTATION -- voltage source is the DMM, not the DAQ:
     Battery itself, once channel mapping and hardware integration are
     completed -- must migrate battery telemetry acquisition to the final
     DAQ-based architecture (per-position voltage/current/NTC channels via
-    BATTERY_CHANNELS' daq_voltage_ch/daq_current_ch/daq_ntc_ch), not stay on
-    a single shared DMM. See docs/architecture.md Section 20 ("Temporary
+    BATTERY_GROUPS[group]["positions"]' daq_voltage_ch/daq_current_ch/
+    daq_ntc_ch), not stay on a single shared DMM. See docs/architecture.md
+    Section 20 ("Temporary
     DMM-based monitoring" / "Future DAQ-based battery telemetry").
 
 Temperature (NTC), unlike voltage/current, IS wired in for real: `daq`
 (optional -- HardwareManager's "ntc_daq" role, see docs/architecture.md
 "Dual DAQ Ownership Model") and `ntc_channel` (this position's own
-BATTERY_CHANNELS[...]["daq_ntc_ch"], resolved by the caller) are read once
+BATTERY_GROUPS[group]["positions"][...]["daq_ntc_ch"], resolved by the
+caller) are read once
 per loop iteration, exactly like the DMM voltage read above -- the same
 per-position, read-only-what's-active model, not a continuous full-group
 NTC scan (that remains NTC Group Scan's job). A reading classified PRESENT
@@ -125,7 +127,7 @@ class _VoltageStats:
 
 
 class MonitorBatterySequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None):
+    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None, group_name=None):
         # `daq` (optional, default None) -- HardwareManager's "ntc_daq" role
         # for this group (see docs/architecture.md "Dual DAQ Ownership
         # Model"), NOT the group's general "daq" role -- Monitor Battery's
@@ -133,7 +135,7 @@ class MonitorBatterySequence(BatteryOperationSequence):
         # this group has no NTC acquisition capability yet; temperature
         # stays "N/A" exactly as before, no behavior change.
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
-                          source="monitor_battery", dmm=dmm, daq=daq)
+                          source="monitor_battery", dmm=dmm, daq=daq, group_name=group_name)
 
     def run(self, channel: int, relay_address: int, sample_interval_s: float = 2.0,
             ntc_channel: str = None, battery_cfg: dict = None, token=None):
@@ -146,8 +148,8 @@ class MonitorBatterySequence(BatteryOperationSequence):
         session ends -- there is no natural "success" exit the way a
         bounded Proto Test relay cycle has one.
 
-        `ntc_channel` (this position's BATTERY_CHANNELS[...]["daq_ntc_ch"],
-        resolved by the caller) and `battery_cfg` (for
+        `ntc_channel` (this position's BATTERY_GROUPS[group]["positions"]
+        [...]["daq_ntc_ch"], resolved by the caller) and `battery_cfg` (for
         SafetyMonitor.set_battery_limits() -- so an overtemperature
         threshold uses this battery's own max_temp_c, not just the global
         Settings fallback) are both optional; omitting either preserves
@@ -214,7 +216,8 @@ class MonitorBatterySequence(BatteryOperationSequence):
 
                 stats.add(voltage_v)
 
-                self.storage.record_measurement(
+                self._record_measurement(
+                    position_in_group=channel,
                     test_type="monitor", channel=channel, relay=relay_address,
                     phase_detail="MONITORING",
                     voltage_v=voltage_v, current_a=current_a, temp_c=temp_c,

@@ -1982,6 +1982,43 @@ operation, and a genuine absent-but-readable signal on another position
 in the group correctly does not). In parallel with the still-pending
 items tracked under Milestones XII/XIII/XV/XVI.
 
+## Milestone XVIII: Group Ownership Migration -- Position Ownership, Per-Matrix Validator, Database Traceability
+
+Completed Milestone XV's plan: the full migration to the final
+group-centric ownership model, implemented as one coherent change (see
+`docs/architecture.md` Section 53 for the complete technical detail).
+
+- `BATTERY_GROUPS` renamed to the locked `A1-A4, B1-B4, C1-C4` scheme (old
+  `"A"` -> `B1`, unchanged hardware; old `"B"` -> `B2`; `B3`/`B4`/`A1-A4`/
+  `C1-C4` are disabled placeholders).
+- Positions now live inside their owning group
+  (`BATTERY_GROUPS[group]["positions"]`) instead of the flat, global
+  `BATTERY_CHANNELS` dict, which is retired, along with
+  `resolve_group_position()`/`group_for_position()`.
+- `utils/device_validator.py`'s relay-uniqueness check is now scoped per
+  `(relay_matrix, relay_address)` instead of globally -- two different
+  matrices may legitimately reuse the same `relay_address`.
+- `run_summary`/`measurements` gained additive `group_name`/
+  `position_in_group` columns, populated by every implemented workflow;
+  `run_summary_report.py` now reads Group directly off the new column.
+
+### Milestone readiness decision
+
+**Implemented and verified.** Every retired-name reference removed from
+source; validator regression-checked (same-matrix duplicate still flagged,
+cross-matrix reuse now correctly allowed); all five implemented workflows
+(Monitor Battery, Monitor Battery Scan, Charge Battery, Discharge Battery,
+NTC Group Scan) dry-run cleanly against `B1` with no hardware attached;
+additive DB migration verified against both a fresh database and a
+simulated pre-migration table. Runtime/CycleSequence/main.py's legacy path
+deliberately untouched, per the milestone's own scope.
+
+### Recommended next milestone
+
+Real-hardware validation of Charge/Discharge Battery on Group B1 (still
+the highest-priority open item), then main.py legacy path retirement
+(Section 50's findings), then CycleSequence, then Runtime/Cycle Controller.
+
 ---
 
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the

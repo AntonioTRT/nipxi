@@ -19,7 +19,8 @@ the bottom, with a pointer to where the real documentation lives
   `_identify_temperature()` still exist and are still covered by Hardware
   Discovery). Battery temperature monitoring is expected to come entirely
   through the DAQ NTC path (`test_sensors()`'s Test 6,
-  `BATTERY_CHANNELS[i]["daq_ntc_ch"]`) instead -- if a real TC/RTD-specific
+  `BATTERY_GROUPS["B1"]["positions"][i]["daq_ntc_ch"]`) instead -- if a
+  real TC/RTD-specific
   need for this module is ever identified, revisit whether it's still
   worth a driver at all before building one.
 - [ ] Confirm the instrument connected at GPIB0 (`config/devices.py::GPIB_INSTRUMENTS`)
@@ -43,16 +44,16 @@ the bottom, with a pointer to where the real documentation lives
   individually testable but not yet assigned to any battery channel --
   `HardwareManager` still drives only `PRIMARY_SMU`/`MAIN_DAQ`. **Sharpened
   by the Battery Group Assignment review (docs/architecture.md Section 38):**
-  `BATTERY_CHANNELS` only covers global positions 1-8 today (hardcoded
-  `range(1, 9)`); naively extending its per-position DAQ-channel formula to
-  Group B (positions 9-16) would collide with Group A's channels on the
-  same shared `MAIN_DAQ` (`BATTERY_GROUPS["B"]["daq"]` is currently
-  `"MAIN_DAQ"`, not a dedicated device). When Group B is wired for real:
-  enable `EXPANSION_DAQ` (`PXI_SLOTS` slot 17, currently commented out),
-  point `BATTERY_GROUPS["B"]["daq"]` at it instead of `MAIN_DAQ`, and
-  extend `BATTERY_CHANNELS` for positions 9-16 using per-group-relative
-  channel numbering (mirroring Group A's `ai0-7`/`ai8-15`/`ai16-23` shape
-  on `EXPANSION_DAQ`, not continuing global numbering onto a shared device).
+  only `B1` owns real positions today (`BATTERY_GROUPS["B1"]["positions"]`,
+  1-8); naively copying its per-position DAQ-channel formula onto `B2`
+  would collide with `B1`'s channels on the same shared `MAIN_DAQ`
+  (`BATTERY_GROUPS["B2"]["daq"]` is currently `"MAIN_DAQ"`, not a
+  dedicated device). When B2 is wired for real: enable `EXPANSION_DAQ`
+  (`PXI_SLOTS` slot 17, currently commented out), point
+  `BATTERY_GROUPS["B2"]["daq"]` at it instead of `MAIN_DAQ`, and give it
+  its own `positions` dict for 9-16 using per-group-relative channel
+  numbering (mirroring `B1`'s `ai0-7`/`ai8-15`/`ai16-23` shape on
+  `EXPANSION_DAQ`, not continuing global numbering onto a shared device).
 - [x] `SMU.set_charge_mode()`/`set_discharge_mode()`/`output_enable()`/
   `output_disable()`/`measure()` -- **DONE.** All five are now real
   (`output_disable()` was already real). `set_discharge_mode()` is
@@ -197,7 +198,7 @@ the bottom, with a pointer to where the real documentation lives
   discharge limit specifically. See docs/architecture.md Section 39.
 - [MUST] Migrate `MonitorBatterySequence` from its temporary DMM voltage
   source back to the final per-position DAQ architecture
-  (`BATTERY_CHANNELS[i]["daq_voltage_ch"]`/`daq_current_ch"]`) once the
+  (`BATTERY_GROUPS["B1"]["positions"][i]["daq_voltage_ch"]`/`daq_current_ch"]`) once the
   channel/device configuration issue that blocked the original DAQ path is
   resolved and confirmed against real NI-MAX aliases/wiring -- see
   `docs/architecture.md` Section 20a. Until then, Monitor Battery reads one
@@ -273,7 +274,7 @@ the bottom, with a pointer to where the real documentation lives
 ### Configuration
 
 - [MUST] Confirm relay channel numbers match physical wiring on the BLOSS
-  Hub PCB, and DAQ channel names (`BATTERY_CHANNELS[i]["daq_voltage_ch"]`
+  Hub PCB, and DAQ channel names (`BATTERY_GROUPS["B1"]["positions"][i]["daq_voltage_ch"]`
   etc.) match the PCB-to-connector layout -- these still assume a "Dev1"
   NI-MAX alias for `MAIN_DAQ` (`PXI_SLOTS[2]`) that has not been confirmed
   against NI-MAX on the real machine.
@@ -396,48 +397,46 @@ the bottom, with a pointer to where the real documentation lives
 
 ### Architecture Standardization (see docs/architecture.md Sections 47-49, Milestones XIII-XV)
 
-- [x] Group-naming semantics + final topology -- **RESOLVED (Milestone XV):**
+- [x] Group-naming semantics + final topology -- **RESOLVED (Milestone XV)
+  and now IMPLEMENTED IN CODE (Milestone XVIII):**
   `MATRIX_NUMATO_201 -> A1-A4`, `MATRIX_NUMATO_202 -> B1-B4`,
   `MATRIX_NUMATO_203 -> C1-C4` -- groups are hardware ownership sets, not
-  workflow/battery-type families. Not a rename of today's A/B/C/D; a new
-  topology (today's Group A becomes B1). Active groups: B1 (existing rack
-  DMM/SMU/DAQ), C1 (NI USB-6211, NTC-only). A1 disabled (zero hardware
-  roles assigned -- see Milestone XV for the full alternatives review);
-  A2-A4/B2-B4/C2-C4 disabled placeholders.
-- [ ] **[MUST before Group C1's hardware is exercised for real]** Redesign
-  position/channel ownership: move `BATTERY_CHANNELS` into each
-  `BATTERY_GROUPS[group]["positions"]` sub-dict, scoped to that group's
-  own `relay_matrix`. **Corrected structure (Milestone XV):**
-  `relay_address` must stay unique across every group sharing one
-  `relay_matrix` (B1 owns 1-8, B2 owns 9-16, B3 owns 17-24, B4 owns 25-32
-  on `MATRIX_NUMATO_202` -- NOT reset to 1-8 per group), and is only free
-  to repeat across *different* matrices (B1 and C1 can both use 1-8).
-  Fixes a real, confirmed bug in `utils/device_validator.py`:
-  `_check_duplicate_relay_identifiers()` -- rekey by `(relay_matrix,
-  relay_address)`, not `relay_address` alone; `_check_battery_groups()` --
-  retire entirely (its invariant becomes structurally impossible once
-  positions live inside their owning group); `_check_relay_count_consistency()`
-  -- loop per group instead of a full matrix x `BATTERY_CHANNELS`
-  cross-product. Validate disabled groups too (don't skip), to catch a
-  `relay_address` collision between a real group and a disabled sibling
-  at config-load time. See docs/architecture.md Section 49 for the exact
-  files/functions affected (`config/devices.py`, `test.py`'s group/
-  position selection functions, `test_control/monitor_battery_scan_sequence.py`'s
-  `DAQ_CHANNEL_0` constant).
+  workflow/battery-type families. `config/devices.py::BATTERY_GROUPS` now
+  actually uses these keys (old Group A's hardware moved to `B1` verbatim).
+  A1 disabled (zero hardware roles assigned -- see Milestone XV for the
+  full alternatives review); A2-A4/B2-B4/C1-C4 disabled placeholders --
+  C1's intended NTC-only hardware (`NTC_DAQ_USB6211`) is NOT yet assigned,
+  tracked separately below.
+- [x] **DONE (Milestone XVIII):** Redesigned position/channel ownership --
+  `BATTERY_CHANNELS` moved into each `BATTERY_GROUPS[group]["positions"]`
+  sub-dict, scoped to that group's own `relay_matrix`; `resolve_group_position()`/
+  `group_for_position()` retired in favor of `group_size(group)`.
+  **Structure preserved (Milestone XV's correction):** `relay_address` is
+  scoped per relay_matrix, not reset to 1-8 per group -- when B2/B3/B4 get
+  real positions, they must use relay_address 9-16/17-24/25-32 on
+  `MATRIX_NUMATO_202`, matching B1's 1-8, not restart at 1. Fixed the
+  confirmed validator bug: `utils/device_validator.py`'s relay-uniqueness
+  check is now keyed by `(relay_matrix, relay_address)`, not
+  `relay_address` alone (regression-verified: same-matrix duplicate still
+  flagged, cross-matrix reuse now correctly allowed); `_check_battery_groups()`
+  retired entirely; `_check_relay_count_consistency()` loops per group. See
+  docs/architecture.md Section 53 for the full file/function list.
 - [ ] A1: assign at least one real hardware role (`smu`/`dmm`/`daq`/
   `ntc_daq`) and flip `enabled=True` once that hardware exists -- disabled
   until then, per Milestone XV's decision.
-- [ ] `USB_DAQ_DEVICES` needs a second entry, `NTC_DAQ_USB6211` (for C1),
-  distinct from the existing `NTC_DAQ_USB6210` (for B1) -- neither
-  replaces the other.
-- [ ] Add `group_name`/`position_in_group` as additive `run_summary`
-  columns (same migration pattern as `battery_type`) -- implement together
-  with the position-ownership redesign above, using final `A1`/`B1`/`C1`-
-  style names directly. Prerequisite for Group History / Last Test From
-  Group / Group Statistics in Database Tools. Populate at
-  `start_run_summary()` time; reuse `list_run_summaries()`/
-  `get_last_run_summary()`/`run_summary_report.py::render_run_summary()`
-  for the three new views.
+- [ ] `USB_DAQ_DEVICES` needs a second entry, `NTC_DAQ_USB6211`, and `C1`
+  needs its `ntc_daq` assigned to it (C1 is otherwise still a disabled,
+  hardware-less placeholder after Milestone XVIII) -- distinct from the
+  existing `NTC_DAQ_USB6210` (B1), neither replaces the other.
+- [x] **DONE (Milestone XVIII):** Added `group_name`/`position_in_group` as
+  additive `run_summary`/`measurements` columns (same migration pattern as
+  `battery_type`), using final `A1`/`B1`/`C1`-style names directly.
+  Populated at `start_run_summary()`/`record_measurement()` time by every
+  implemented workflow; `run_summary_report.py::render_run_summary()` now
+  reads `group_name` directly (falls back to the old `event_log`-parsing
+  `_lookup_group()` only for pre-migration rows). Prerequisite for Group
+  History / Last Test From Group / Group Statistics in Database Tools --
+  those views themselves are not yet built.
 - [ ] Add a group-centric path to Test SMU/DMM/DAQ/Relay Matrix (Select
   Group -> Resolve Group Hardware -> Run) **alongside**, not replacing,
   the existing per-device picker -- a pure replacement would remove the
@@ -486,10 +485,10 @@ the bottom, with a pointer to where the real documentation lives
   is available -- confirm a genuine open/shorted target position
   correctly aborts, and a genuine (but readable) absent signal on a
   *different* position in the group correctly does not.
-- [ ] Once `group_name`/`position_in_group` lands (Milestone XIII), add a
-  "pre-check catch rate" bucket to Group Statistics (how often a group's
-  pre-check found a non-PRESENT target position before an operation
-  started) -- not built in this pass.
+- [ ] Now that `group_name`/`position_in_group` has landed (Milestone
+  XVIII), add a "pre-check catch rate" bucket to Group Statistics (how
+  often a group's pre-check found a non-PRESENT target position before an
+  operation started) -- not built in this pass.
 
 ---
 

@@ -90,7 +90,9 @@ CREATE TABLE IF NOT EXISTS measurements (
     in_compliance                 INTEGER,
     daq_channel_0_raw             REAL,
     voltage_min_v                 REAL,
-    voltage_max_v                 REAL
+    voltage_max_v                 REAL,
+    group_name                    TEXT,
+    position_in_group             INTEGER
 );
 """
 
@@ -128,6 +130,12 @@ _MEASUREMENT_EXTRA_COLUMNS = [
     # characterization analysis. NULL for every other test_type (and NULL
     # here too if only a single sample was taken).
     "voltage_min_v", "voltage_max_v",
+    # Group ownership traceability (Group Ownership Migration) -- which
+    # BATTERY_GROUPS group/position this row belongs to. `channel` above
+    # remains position_in_group's numeric value (no separate global
+    # position number exists) -- group_name is what disambiguates rows
+    # from two different groups that happen to share a channel number.
+    "group_name", "position_in_group",
 ]
 
 _MEASUREMENT_ALL_COLUMNS = _COLUMNS + _MEASUREMENT_EXTRA_COLUMNS
@@ -210,7 +218,9 @@ CREATE TABLE IF NOT EXISTS run_summary (
     daq_model                          TEXT,
     relay_matrix_name                  TEXT,
     relay_matrix_resource              TEXT,
-    relay_matrix_model                 TEXT
+    relay_matrix_model                 TEXT,
+    group_name                         TEXT,
+    position_in_group                  INTEGER
 );
 """
 
@@ -239,6 +249,12 @@ _RUN_SUMMARY_COLUMNS = [
     "dmm_name", "dmm_resource", "dmm_model",
     "daq_name", "daq_resource", "daq_model",
     "relay_matrix_name", "relay_matrix_resource", "relay_matrix_model",
+    # Group ownership traceability (Group Ownership Migration) -- which
+    # BATTERY_GROUPS group/position this run targeted. Populated once, at
+    # start_run_summary() time, same as the hardware snapshot above.
+    # position_in_group is NULL for a whole-group operation (Monitor
+    # Battery Scan, NTC Group Scan) that has no single selected position.
+    "group_name", "position_in_group",
 ]
 
 # Runtime event history -- Milestone II. Fine-grained, timestamped narrative
@@ -285,6 +301,8 @@ _MEASUREMENT_MIGRATION_COLUMNS = [
     ("daq_channel_0_raw", "REAL"),
     ("voltage_min_v", "REAL"),
     ("voltage_max_v", "REAL"),
+    ("group_name", "TEXT"),
+    ("position_in_group", "INTEGER"),
 ]
 
 _STATION_STATE_MIGRATION_COLUMNS = [
@@ -315,6 +333,8 @@ _RUN_SUMMARY_MIGRATION_COLUMNS = [
     ("relay_matrix_name", "TEXT"),
     ("relay_matrix_resource", "TEXT"),
     ("relay_matrix_model", "TEXT"),
+    ("group_name", "TEXT"),
+    ("position_in_group", "INTEGER"),
 ]
 
 

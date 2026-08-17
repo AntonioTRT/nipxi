@@ -139,61 +139,44 @@ def _check_duplicate_com_ports(registry: list, errors: list):
             seen[port] = name
 
 
-def _check_duplicate_relay_identifiers(dev_cfg, errors: list) -> dict:
+def _check_relay_identifiers(dev_cfg, errors: list) -> dict:
     """
-    BATTERY_CHANNELS 'relay_address' must be unique -- two logical battery
-    channels must never be wired to the same physical relay. Returns the
-    seen-address map so relay-count consistency can reuse it.
-    """
-    battery_channels = getattr(dev_cfg, "BATTERY_CHANNELS", {})
-    seen = {}
-    for ch_id, ch in battery_channels.items():
-        addr = ch.get("relay_address")
-        if addr is None:
-            errors.append(f"BATTERY_CHANNELS[{ch_id}]: missing 'relay_address'")
-            continue
-        if addr in seen:
-            errors.append(
-                f"Duplicate relay_address {addr!r}: used by both "
-                f"BATTERY_CHANNELS[{seen[addr]}] and BATTERY_CHANNELS[{ch_id}]"
-            )
-        else:
-            seen[addr] = ch_id
-    return battery_channels
-
-
-def _check_battery_groups(dev_cfg, battery_channels: dict, errors: list):
-    """
-    Every BATTERY_CHANNELS global position must fall inside exactly one
-    BATTERY_GROUPS range -- catches a position added to BATTERY_CHANNELS
-    without a corresponding group entry (or a group range that overlaps
-    another) at startup, before it surfaces as a confusing None from
-    config/devices.py::group_for_position() later.
-
-    Note: BATTERY_CHANNELS deliberately no longer references a battery
-    type (see its module comment) -- battery selection is an explicit,
-    operator-controlled choice at run start (test.py's battery-type
-    selection prompt), not statically wired to a position/relay. There is
-    therefore no "battery_type must reference BATTERY_CONFIGS" check here
-    any more; BATTERY_CONFIGS is validated only by virtue of being a plain
-    dict the operator's selection prompt reads from directly.
+    Every (relay_matrix, relay_address) pair must be unique -- two logical
+    battery positions on the SAME physical matrix must never be wired to
+    the same relay. Two different matrices may legitimately reuse the same
+    relay_address (e.g. MATRIX_NUMATO_202 relay 1 and MATRIX_NUMATO_203
+    relay 1 are distinct, valid channels) -- uniqueness is scoped per
+    matrix, never global. Returns {(group, position): (relay_matrix, addr)}
+    so relay-count consistency can reuse it without re-walking BATTERY_GROUPS.
     """
     groups = getattr(dev_cfg, "BATTERY_GROUPS", {})
-    for ch_id in battery_channels:
-        matches = [
-            name for name, grp in groups.items()
-            if grp["position_start"] <= ch_id <= grp["position_end"]
-        ]
-        if not matches:
-            errors.append(f"BATTERY_CHANNELS[{ch_id}]: not covered by any BATTERY_GROUPS range")
-        elif len(matches) > 1:
-            errors.append(f"BATTERY_CHANNELS[{ch_id}]: covered by overlapping groups {matches}")
+    seen = {}
+    positions = {}
+    for group, grp in groups.items():
+        relay_matrix = grp.get("relay_matrix")
+        for pos, ch in grp.get("positions", {}).items():
+            addr = ch.get("relay_address")
+            if addr is None:
+                errors.append(f"BATTERY_GROUPS[{group!r}]['positions'][{pos}]: missing 'relay_address'")
+                continue
+            key = (relay_matrix, addr)
+            positions[(group, pos)] = key
+            if key in seen:
+                errors.append(
+                    f"Duplicate relay_address {addr!r} on relay_matrix {relay_matrix!r}: "
+                    f"used by both group {seen[key][0]!r} position {seen[key][1]} and "
+                    f"group {group!r} position {pos}"
+                )
+            else:
+                seen[key] = (group, pos)
+    return positions
 
 
-def _check_relay_count_consistency(dev_cfg, battery_channels: dict, errors: list):
+def _check_relay_count_consistency(dev_cfg, positions: dict, errors: list):
     """
     num_channels / channel_count / Settings.RELAY_COUNT must all agree, and
-    every BATTERY_CHANNELS relay_address must fall within that count.
+    every position's relay_address must fall within that count on its own
+    relay_matrix.
     """
     from config.settings import Settings
 
@@ -215,12 +198,11 @@ def _check_relay_count_consistency(dev_cfg, battery_channels: dict, errors: list
         limit = channel_count or num_channels or Settings.RELAY_COUNT
         if not limit:
             continue
-        for ch_id, ch in battery_channels.items():
-            addr = ch.get("relay_address")
-            if addr is not None and not (1 <= addr <= limit):
+        for (group, pos), (relay_matrix, addr) in positions.items():
+            if relay_matrix == name and not (1 <= addr <= limit):
                 errors.append(
-                    f"BATTERY_CHANNELS[{ch_id}]: relay_address {addr} is "
-                    f"out of range for relay '{name}' (1..{limit})"
+                    f"BATTERY_GROUPS[{group!r}]['positions'][{pos}]: relay_address {addr} "
+                    f"is out of range for relay '{name}' (1..{limit})"
                 )
 
 
@@ -239,12 +221,13 @@ def validate_devices(dev_cfg) -> list:
         - no duplicate VISA resources (SMU/DMM/DAQ)
         - no duplicate IP addresses (Numato Relay Matrix devices)
         - no duplicate COM ports (serial relays)
-        - no duplicate relay identifiers (BATTERY_CHANNELS relay_address)
+        - no duplicate relay identifiers -- (relay_matrix, relay_address)
+          must be unique; the SAME relay_address on two DIFFERENT matrices
+          is valid and not flagged
         - relay count consistency (num_channels == channel_count ==
-          Settings.RELAY_COUNT, and every relay_address in range)
+          Settings.RELAY_COUNT, and every relay_address in range on its
+          own relay_matrix)
         - every relay 'type' is registered in RelayFactory
-        - every BATTERY_CHANNELS position is covered by exactly one
-          BATTERY_GROUPS range
     """
     errors = []
     registry = _build_registry(dev_cfg)
@@ -258,9 +241,8 @@ def validate_devices(dev_cfg) -> list:
     _check_duplicate_resources(registry, errors)
     _check_duplicate_ips(registry, errors)
     _check_duplicate_com_ports(registry, errors)
-    battery_channels = _check_duplicate_relay_identifiers(dev_cfg, errors)
-    _check_relay_count_consistency(dev_cfg, battery_channels, errors)
-    _check_battery_groups(dev_cfg, battery_channels, errors)
+    positions = _check_relay_identifiers(dev_cfg, errors)
+    _check_relay_count_consistency(dev_cfg, positions, errors)
 
     return errors
 

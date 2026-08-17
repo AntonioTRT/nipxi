@@ -57,8 +57,9 @@ battery's limit or the assigned SMU's capability. This class trusts that
 validation already happened; it does not re-validate `test_setpoints`
 itself.
 
-Temperature: `ntc_channel` (this position's own BATTERY_CHANNELS[...]
-["daq_ntc_ch"], resolved by the caller), read via `self.daq` --
+Temperature: `ntc_channel` (this position's own BATTERY_GROUPS[group]
+["positions"][...]["daq_ntc_ch"], resolved by the caller), read via
+`self.daq` --
 HardwareManager's "ntc_daq" role (see docs/architecture.md "Dual DAQ
 Ownership Model"), NOT the general DAQ telemetry this class still doesn't
 use for voltage/current. A reading classified PRESENT
@@ -95,7 +96,7 @@ from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, Reve
 
 
 class ChargeSequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None):
+    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None, group_name=None):
         # `daq` (optional, default None) -- accepted and stored now so a
         # future DAQ integration (Section 31 "Telemetry Source Strategy",
         # deliberately deferred) only needs to change the two telemetry
@@ -103,7 +104,7 @@ class ChargeSequence(BatteryOperationSequence):
         # caller that doesn't pass one. Not read anywhere in this class
         # today -- DMM + SMU.measure() remain the active telemetry source.
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
-                          source="charge_battery", dmm=dmm, daq=daq)
+                          source="charge_battery", dmm=dmm, daq=daq, group_name=group_name)
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
             test_setpoints: dict, ntc_channel: str = None, token=None) -> bool:
@@ -118,8 +119,8 @@ class ChargeSequence(BatteryOperationSequence):
         validated by the caller via utils/validators.py::
         validate_group_test_config()) supplies the actual commanded
         current/CV voltage. `ntc_channel` (optional -- this position's
-        BATTERY_CHANNELS[...]["daq_ntc_ch"]) enables real temperature
-        acquisition into the existing safety check; omitted, temperature
+        BATTERY_GROUPS[group]["positions"][...]["daq_ntc_ch"]) enables real
+        temperature acquisition into the existing safety check; omitted, temperature
         stays "N/A" exactly as before.
 
         Returns True once EOC is reached. Raises SafetyViolationError,
@@ -221,7 +222,8 @@ class ChargeSequence(BatteryOperationSequence):
                     if not status.safe:
                         raise SafetyViolationError(f"Channel {channel}: {status.reason}")
 
-                    self.storage.record_measurement(
+                    self._record_measurement(
+                        position_in_group=channel,
                         test_type="charge", channel=channel, relay=relay_address,
                         phase_detail="CC_CV", voltage_v=v, current_a=i, temp_c=t_c,
                         smu_measured_v=smu_reading["voltage_v"], smu_measured_i=i,

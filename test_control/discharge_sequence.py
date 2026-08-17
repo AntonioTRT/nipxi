@@ -51,8 +51,9 @@ discharge current and target cutoff -- already validated by the caller
 (utils/validators.py::validate_group_test_config()) before this class is
 constructed. This class trusts that validation; it does not repeat it.
 
-Temperature: `ntc_channel` (this position's own BATTERY_CHANNELS[...]
-["daq_ntc_ch"], resolved by the caller), read via `self.daq` --
+Temperature: `ntc_channel` (this position's own BATTERY_GROUPS[group]
+["positions"][...]["daq_ntc_ch"], resolved by the caller), read via
+`self.daq` --
 HardwareManager's "ntc_daq" role (see docs/architecture.md "Dual DAQ
 Ownership Model") and charge_sequence.py's identical rationale. Fed into
 the same safety.check() call below that already enforces voltage/current
@@ -80,12 +81,12 @@ from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, Reve
 
 
 class DischargeSequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None):
+    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None, group_name=None):
         # `daq` (optional, default None) -- see charge_sequence.py::
         # ChargeSequence.__init__()'s identical comment. Not read anywhere
         # in this class today.
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
-                          source="discharge_battery", dmm=dmm, daq=daq)
+                          source="discharge_battery", dmm=dmm, daq=daq, group_name=group_name)
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
             test_setpoints: dict, ntc_channel: str = None, token=None) -> bool:
@@ -99,8 +100,9 @@ class DischargeSequence(BatteryOperationSequence):
         REQUIRED, already validated by the caller via utils/validators.py::
         validate_group_test_config()) supplies the actual commanded
         discharge current and target cutoff. `ntc_channel` (optional --
-        this position's BATTERY_CHANNELS[...]["daq_ntc_ch"]) enables real
-        temperature acquisition into the existing safety check; omitted,
+        this position's BATTERY_GROUPS[group]["positions"][...]
+        ["daq_ntc_ch"]) enables real temperature acquisition into the
+        existing safety check; omitted,
         temperature stays "N/A" exactly as before.
 
         Returns True once EOD is reached. Raises SafetyViolationError,
@@ -221,7 +223,8 @@ class DischargeSequence(BatteryOperationSequence):
                     if not status.safe:
                         raise SafetyViolationError(f"Channel {channel}: {status.reason}")
 
-                    self.storage.record_measurement(
+                    self._record_measurement(
+                        position_in_group=channel,
                         test_type="discharge", channel=channel, relay=relay_address,
                         phase_detail="CC_DISCHARGE", voltage_v=v, current_a=i, temp_c=t_c,
                         smu_measured_v=smu_reading["voltage_v"], smu_measured_i=i,

@@ -289,26 +289,23 @@ def test_configuration():
     else:
         results.append(_ok("Configuration", "RELAY_COM_PORT", ref, Settings.RELAY_COM_PORT))
 
-    # -- Battery channel map --------------------------------------------------
-    ref = "config/devices.py -> BATTERY_CHANNELS"
-    expected = list(range(1, Settings.BATTERY_POSITIONS + 1))
-    actual   = sorted(dev_cfg.BATTERY_CHANNELS.keys())
-    if actual != expected:
-        results.append(_fail("Configuration", "BATTERY_CHANNELS", ref,
-                             f"Expected {expected}, got {actual}"))
-    else:
-        required = ["relay_address", "daq_voltage_ch", "daq_current_ch",
-                    "daq_ntc_ch", "fuse_rating_a"]
-        broken = False
-        for ch_id, ch in dev_cfg.BATTERY_CHANNELS.items():
+    # -- Battery position ownership --------------------------------------------
+    ref = "config/devices.py -> BATTERY_GROUPS[...]['positions']"
+    required = ["relay_address", "daq_voltage_ch", "daq_current_ch",
+                "daq_ntc_ch", "fuse_rating_a"]
+    broken = False
+    total = 0
+    for group, grp in dev_cfg.BATTERY_GROUPS.items():
+        for pos, ch in grp.get("positions", {}).items():
+            total += 1
             missing = [k for k in required if k not in ch]
             if missing:
-                results.append(_fail("Configuration", f"BAT_{ch_id}", ref,
+                results.append(_fail("Configuration", f"{group}_POS{pos}", ref,
                                      f"Missing keys: {missing}"))
                 broken = True
-        if not broken:
-            results.append(_ok("Configuration", "BATTERY_CHANNELS", ref,
-                               f"{len(actual)} channels defined (1-{actual[-1]})"))
+    if not broken:
+        results.append(_ok("Configuration", "BATTERY_GROUPS positions", ref,
+                           f"{total} position(s) defined across {len(dev_cfg.BATTERY_GROUPS)} groups"))
 
     # -- SMU / DAQ / DMM configs (config/devices.py is the single source of
     #    truth for these VISA resource strings -- config/settings.py does
@@ -1077,16 +1074,17 @@ def _functional_daq(name: str, cfg: dict):
     interface/identity checks -- those are Identity Validation's job
     (_identify_daq), run separately.
 
-    Assumes the wiring documented in BATTERY_CHANNELS (MAIN_DAQ) -- if
-    EXPANSION_DAQ/PRECISION_DAQ is selected instead, the channel string may
-    not correspond to a real battery signal on that card; this is a
-    pre-existing assumption, not something this refactor introduces.
+    Assumes the wiring documented in BATTERY_GROUPS["B1"]["positions"]
+    (MAIN_DAQ) -- if EXPANSION_DAQ/PRECISION_DAQ is selected instead, the
+    channel string may not correspond to a real battery signal on that
+    card; this is a pre-existing assumption, not something this refactor
+    introduces.
     """
     resource   = cfg.get("resource", "")
     model      = cfg.get("model", "NI-6363")
     range_v    = cfg.get("voltage_range_v", 5.0)
     config_ref = f"{resource} / {model}"
-    test_ch    = dev_cfg.BATTERY_CHANNELS[1]["daq_voltage_ch"]
+    test_ch    = dev_cfg.BATTERY_GROUPS["B1"]["positions"][1]["daq_voltage_ch"]
     results    = []
 
     from hardware.daq import DAQ
@@ -1131,8 +1129,9 @@ def test_temperature_module():
     RETIRED as a standalone top-level MENU entry (see docs/architecture.md
     "NTC Sensor Acquisition -- DAQ Architecture" / docs/MILESTONES.md):
     battery temperature monitoring is expected to come entirely through the
-    per-position DAQ NTC channel path (BATTERY_CHANNELS[i]["daq_ntc_ch"],
-    see test_sensors()'s Test 6), never through this separate PXIe-4353
+    per-position DAQ NTC channel path (BATTERY_GROUPS[group]["positions"]
+    [...]["daq_ntc_ch"], see test_sensors()'s Test 6), never through this
+    separate PXIe-4353
     module -- no thermocouple/RTD channel driver has ever existed for it
     (see PXI_SLOTS[15]'s validation_notes), and none is planned now that the
     DAQ path covers the same need. The function/identify check are kept
@@ -1990,10 +1989,12 @@ def test_relay_numato():
 def _select_relay_scope():
     """
     Scope-selection menu for Relay Functional Validation -- lets a scan be
-    restricted to one group's channel range on the CURRENTLY SELECTED relay
-    matrix device: Group A = channels 1-8, Group B = 9-16, Group C = 17-24,
-    Group D = 25-32 (see config/devices.py::BATTERY_GROUPS' position_start/
-    position_end).
+    restricted to one group's relay_address range on the CURRENTLY SELECTED
+    relay matrix device. Only groups with at least one position defined
+    (config/devices.py::BATTERY_GROUPS[group]["positions"]) are offered --
+    a placeholder group with no positions has no relay_address range to
+    scope to. Config-driven: as more groups get real positions, they appear
+    here automatically, with no code change.
 
     Deliberately NOT gated on BATTERY_GROUPS[group]["enabled"]. That flag
     means "no battery relay matrix has been deployed/wired for this group
@@ -2001,35 +2002,34 @@ def _select_relay_scope():
     only to _select_battery_group()/Monitor Battery. Relay Functional
     Validation tests raw relay hardware on whichever device is already
     selected, completely independent of whether a battery is wired to those
-    channels -- channels 9-32 are just as real and safely testable on a
-    32-channel Numato matrix as channels 1-8, even before any battery relay
-    matrix exists for Group B/C/D. Gating this scope selector on `enabled`
-    was a bug: it silently collapsed every Group B/C/D selection back to
-    "All Groups" (scanning all 32 channels instead of the requested 8),
-    since every group but A currently has `enabled=False`.
+    channels. Gating this scope selector on `enabled` was a bug: it
+    silently collapsed a group selection back to "All Groups" instead of
+    scoping to that group's actual channels.
 
     Returns (label, channel_start, channel_end) -- label is "All Groups" or
     "Group <X>" (for the "Relay validation scope: ..." banner the caller
-    prints); channel_start/channel_end are 1-based, inclusive, or
-    (None, None) for "All Groups" (the full configured population,
-    resolved against the actual device's channel count by the caller).
+    prints); channel_start/channel_end are 1-based, inclusive relay_address
+    values, or (None, None) for "All Groups" (the full configured
+    population, resolved against the actual device's channel count by the
+    caller).
     """
+    offerable = [g for g, grp in dev_cfg.BATTERY_GROUPS.items() if grp.get("positions")]
     print("\nRelay Validation Scope")
     print("1. All Groups")
-    print("2. Group A")
-    print("3. Group B")
-    print("4. Group C")
-    print("5. Group D")
+    for i, group in enumerate(offerable, start=2):
+        print(f"{i}. Group {group}")
     choice = input("\nScope: ").strip()
-    group_by_choice = {"2": "A", "3": "B", "4": "C", "5": "D"}
+    group_by_choice = {str(i): group for i, group in enumerate(offerable, start=2)}
     if choice in ("", "1"):
         return "All Groups", None, None
     group = group_by_choice.get(choice)
     grp = dev_cfg.BATTERY_GROUPS.get(group) if group else None
-    if grp is None:
+    positions = grp.get("positions") if grp else None
+    if not positions:
         print("Invalid selection -- defaulting to All Groups.")
         return "All Groups", None, None
-    return f"Group {group}", grp["position_start"], grp["position_end"]
+    addresses = [ch["relay_address"] for ch in positions.values()]
+    return f"Group {group}", min(addresses), max(addresses)
 
 
 def _test_relay_matrix_scan_scoped(name=None, cfg=None):
@@ -2119,12 +2119,12 @@ def test_sensors():
 
     Which NTC channels are "enabled" is config-driven, reusing the SAME
     per-position `enabled` flag and `daq_ntc_ch` field config/devices.py::
-    BATTERY_CHANNELS already carries (no new/duplicate configuration
-    variable introduced) -- this test iterates
-    `{i: ch for i, ch in BATTERY_CHANNELS.items() if ch["enabled"]}` rather
-    than any hardcoded channel list or count. Disabling a position in
-    BATTERY_CHANNELS (e.g. while its wiring is unconfirmed) automatically
-    removes it from this scan with no code change here.
+    BATTERY_GROUPS["B1"]["positions"] already carries (no new/duplicate
+    configuration variable introduced) -- this test iterates
+    `{pos: ch for pos, ch in BATTERY_GROUPS["B1"]["positions"].items() if ch["enabled"]}`
+    rather than any hardcoded channel list or count. Disabling a position
+    (e.g. while its wiring is unconfirmed) automatically removes it from
+    this scan with no code change here.
 
     Test 6 requires a real DAQ and is reported per-channel (PASS/FAIL) --
     a missing/unreachable DAQ fails every channel with a clear reason
@@ -2206,23 +2206,23 @@ def test_sensors():
         results.append(_fail("Sensors", "TemperatureSensor class", config_ref, str(e)))
 
     # Test 6: DAQ-based NTC channel scan -- the future battery-temperature
-    # acquisition architecture. Iterates every ENABLED BATTERY_CHANNELS
-    # entry's daq_ntc_ch -- config-driven, never a hardcoded channel list.
-    # Connects via Group A's resolved "ntc_daq" (see config/devices.py::
-    # hardware_for_group()) -- BATTERY_CHANNELS 1-8 are Group A's positions,
-    # and daq_ntc_ch currently points at the NI USB-6210 development DAQ
-    # (config/devices.py::USB_DAQ_DEVICES), not the DAQ_CONFIG default
+    # acquisition architecture. Iterates every ENABLED position in Group
+    # B1's positions' daq_ntc_ch -- config-driven, never a hardcoded channel
+    # list. Connects via Group B1's resolved "ntc_daq" (see config/devices.py
+    # ::hardware_for_group()) -- B1 is the only group with real positions
+    # today, and daq_ntc_ch currently points at the NI USB-6210 development
+    # DAQ (config/devices.py::USB_DAQ_DEVICES), not the DAQ_CONFIG default
     # (MAIN_DAQ) used elsewhere in this file -- see docs/architecture.md.
-    enabled_channels = {i: ch for i, ch in dev_cfg.BATTERY_CHANNELS.items() if ch.get("enabled")}
+    enabled_channels = {pos: ch for pos, ch in dev_cfg.BATTERY_GROUPS["B1"]["positions"].items() if ch.get("enabled")}
     if not enabled_channels:
         results.append(_warn("Sensors", "NTC DAQ scan", config_ref,
-                             "No enabled BATTERY_CHANNELS entries -- nothing to scan"))
+                             "No enabled positions in Group B1 -- nothing to scan"))
         return results
 
-    ntc_daq_cfg = dev_cfg.hardware_for_group("A")["ntc_daq_cfg"]
+    ntc_daq_cfg = dev_cfg.hardware_for_group("B1")["ntc_daq_cfg"]
     if ntc_daq_cfg is None:
         results.append(_warn("Sensors", "NTC DAQ scan", config_ref,
-                             "Group A has no ntc_daq/daq assigned -- nothing to scan"))
+                             "Group B1 has no ntc_daq/daq assigned -- nothing to scan"))
         return results
     daq_ref = f"{ntc_daq_cfg.get('resource', '')} / {ntc_daq_cfg.get('model', '')}"
     from hardware.daq import DAQ
@@ -3598,15 +3598,17 @@ def _select_battery_group():
     print("\nSelect Battery Group")
     for name in names:
         grp = dev_cfg.BATTERY_GROUPS[name]
-        status = "" if grp["enabled"] else "  (no relay matrix installed yet)"
-        print(f"  {name}. Positions {grp['position_start']}-{grp['position_end']}{status}")
+        status = "" if grp["enabled"] else "  (not yet wired for battery routing)"
+        size = dev_cfg.group_size(name)
+        positions_label = f"Positions 1-{size}" if size else "(no positions configured)"
+        print(f"  {name}. {positions_label}{status}")
     choice = input("\nGroup: ").strip().upper()
     grp = dev_cfg.BATTERY_GROUPS.get(choice)
     if grp is None:
         print("Invalid selection.")
         return None
     if not grp["enabled"]:
-        print(f"Group {choice} has no relay matrix installed yet -- cannot select.")
+        print(f"Group {choice} is not yet wired for battery routing -- cannot select.")
         return None
     return choice
 
@@ -3614,8 +3616,7 @@ def _select_battery_group():
 def _select_battery_position(group: str):
     """Position selection is always relative to the selected group (e.g.
     "Group A Position 3"), never a raw global position number."""
-    grp = dev_cfg.BATTERY_GROUPS[group]
-    size = grp["position_end"] - grp["position_start"] + 1
+    size = dev_cfg.group_size(group)
     choice = input(f"\nPosition within Group {group} (1-{size}): ").strip()
     try:
         pos = int(choice)
@@ -3692,7 +3693,6 @@ def _select_group_with_hardware_summary(required_roles=("relay_matrix", "smu", "
             return None
         hw, battery_type, battery_cfg = resolved
 
-        grp_cfg = dev_cfg.BATTERY_GROUPS[group]
         print("\n" + "-" * 60)
         print("Hardware Summary")
         print("-" * 60)
@@ -3702,7 +3702,7 @@ def _select_group_with_hardware_summary(required_roles=("relay_matrix", "smu", "
         print(f"\nDMM:\n{hw['dmm_name'] or '(none assigned)'}")
         print(f"\nSMU:\n{hw['smu_name'] or '(none assigned)'}")
         print(f"\nDAQ:\n{hw['daq_name'] or '(none assigned)'}")
-        print(f"\nGlobal Position Range:\n{grp_cfg['position_start']}-{grp_cfg['position_end']}")
+        print(f"\nPositions:\n1-{dev_cfg.group_size(group)}")
         print("\n" + "-" * 60)
         answer = input("Continue? (Y/N): ").strip().upper()
         if answer == "Y":
@@ -3797,10 +3797,10 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
     group's configuration," not "which battery."
 
     `channel`/`relay_address` are the config/devices.py::
-    resolve_group_position() / BATTERY_CHANNELS[channel]["relay_address"]
-    result for the operator's selected position -- omitted (None) by
-    workflows like Monitor Battery Scan that operate over a position range
-    rather than a single resolved channel.
+    BATTERY_GROUPS[group]["positions"][position]["relay_address"] result
+    for the operator's selected position (channel == position_in_group) --
+    omitted (None) by workflows like Monitor Battery Scan that operate over
+    a position range rather than a single resolved channel.
 
     Returns True if the operator pressed ENTER (continue), False if the
     operator pressed C (cancel). Cancelling here happens before any relay/
@@ -3883,12 +3883,12 @@ def _run_monitor_battery():
     if position is None:
         return
 
-    channel = dev_cfg.resolve_group_position(group, position)
-    ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
+    ch_cfg = dev_cfg.BATTERY_GROUPS[group]["positions"].get(position)
     if ch_cfg is None:
-        print(f"\n[FAIL] No BATTERY_CHANNELS entry for resolved position {channel} -- check config/devices.py.")
+        print(f"\n[FAIL] No position {position} configured for Group {group} -- check config/devices.py.")
         return
     relay_address = ch_cfg["relay_address"]
+    channel = position
 
     positions_label = f"{position} (Group {group} Position {position})"
     extra_lines = [
@@ -3942,6 +3942,7 @@ def _run_monitor_battery():
             battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
             battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
             capacity_ah=battery_cfg["capacity_ah"],
+            group_name=group, position_in_group=position,
             **hardware_snapshot,
         ):
             return
@@ -3983,8 +3984,7 @@ def _run_monitor_battery():
         # identical DAQError. An absent/faulted NTC on some OTHER position
         # in the group is recorded but never blocks this run either, since
         # it isn't part of what's being monitored.
-        grp_cfg = dev_cfg.BATTERY_GROUPS[group]
-        size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
+        size = dev_cfg.group_size(group)
         ntc_snapshot = _ntc_group_snapshot(
             storage, hw_mgr.ntc_daq, group, size, source="monitor",
             phase_detail="NTC_PRECHECK", log_summary=True,
@@ -4011,7 +4011,7 @@ def _run_monitor_battery():
             safety = SafetyMonitor(Settings)
             sequence = MonitorBatterySequence(
                 smu=hw_mgr.smu, dmm=hw_mgr.dmm, relay=hw_mgr.relay, safety=safety,
-                storage=storage, settings=Settings, daq=hw_mgr.ntc_daq,
+                storage=storage, settings=Settings, daq=hw_mgr.ntc_daq, group_name=group,
             )
             try:
                 sequence.run(
@@ -4086,8 +4086,7 @@ def _run_monitor_battery_scan():
         return
     group, hw, battery_type, battery_cfg = selection
 
-    grp_cfg = dev_cfg.BATTERY_GROUPS[group]
-    size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
+    size = dev_cfg.group_size(group)
     positions_in_group = list(range(1, size + 1))
     print(f"\nScan Scope: Single Group -- Group {group}, all positions 1-{size}")
 
@@ -4133,6 +4132,7 @@ def _run_monitor_battery_scan():
             battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
             battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
             capacity_ah=battery_cfg["capacity_ah"],
+            group_name=group,
             **hardware_snapshot,
         ):
             return
@@ -4165,7 +4165,7 @@ def _run_monitor_battery_scan():
             safety = SafetyMonitor(Settings)
             sequence = MonitorBatteryScanSequence(
                 smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.daq, relay=hw_mgr.relay, safety=safety,
-                storage=storage, settings=Settings,
+                storage=storage, settings=Settings, group_name=group,
             )
             try:
                 sequence.run(
@@ -4263,12 +4263,12 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         return
     test_setpoints = validated["test_setpoints"]
 
-    channel = dev_cfg.resolve_group_position(group, position)
-    ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
+    ch_cfg = dev_cfg.BATTERY_GROUPS[group]["positions"].get(position)
     if ch_cfg is None:
-        print(f"\n[FAIL] No BATTERY_CHANNELS entry for resolved position {channel} -- check config/devices.py.")
+        print(f"\n[FAIL] No position {position} configured for Group {group} -- check config/devices.py.")
         return
     relay_address = ch_cfg["relay_address"]
+    channel = position
 
     positions_label = f"{position} (Group {group} Position {position})"
     extra_lines = [
@@ -4319,6 +4319,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
             battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
             capacity_ah=battery_cfg["capacity_ah"],
+            group_name=group, position_in_group=position,
             **hardware_snapshot,
         ):
             return
@@ -4354,8 +4355,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         # stay internally consistent -- see docs/architecture.md Section 46
         # for the pre-existing run_summary-vs-measurements vocabulary split
         # this deliberately does not add a third variant to.
-        grp_cfg = dev_cfg.BATTERY_GROUPS[group]
-        size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
+        size = dev_cfg.group_size(group)
         measurement_test_type = {"charge_battery": "charge", "discharge_battery": "discharge"}.get(source, source)
         ntc_snapshot = _ntc_group_snapshot(
             storage, hw_mgr.ntc_daq, group, size, source=measurement_test_type,
@@ -4387,7 +4387,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             # still use the DMM/SMU for voltage/current telemetry.
             sequence = sequence_cls(
                 smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.ntc_daq, relay=hw_mgr.relay,
-                safety=safety, storage=storage, settings=Settings,
+                safety=safety, storage=storage, settings=Settings, group_name=group,
             )
             try:
                 sequence.run(
@@ -4456,9 +4456,9 @@ def _ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
     (an already-connected DAQ -- the group's resolved "ntc_daq", or its
     "daq" fallback -- see config/devices.py::hardware_for_group()). NTC
     channels are independent per-position DAQ analog inputs
-    (BATTERY_CHANNELS[...]["daq_ntc_ch"]), not routed through the relay
-    matrix -- this never touches a relay, the SMU, or the PMU, so it's
-    safe to call before any of those are ever engaged.
+    (BATTERY_GROUPS[group]["positions"][...]["daq_ntc_ch"]), not routed
+    through the relay matrix -- this never touches a relay, the SMU, or the
+    PMU, so it's safe to call before any of those are ever engaged.
 
     Records one measurements row per position (test_type=`source`,
     phase_detail=`phase_detail` if given, else the presence value itself --
@@ -4499,9 +4499,9 @@ def _ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
 
     results = []
     for position in range(1, size + 1):
-        channel = dev_cfg.resolve_group_position(group, position)
-        ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
+        ch_cfg = dev_cfg.BATTERY_GROUPS[group]["positions"].get(position)
         ntc_ch = ch_cfg["daq_ntc_ch"] if ch_cfg else None
+        channel = position
 
         voltage_v = None
         temp_c = None
@@ -4527,6 +4527,7 @@ def _ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
             test_type=source, channel=channel,
             phase_detail=phase_detail if phase_detail is not None else presence,
             voltage_v=voltage_v, temp_c=temp_c,
+            group_name=group, position_in_group=position,
         )
         if log_summary:
             temp_label = f" -- {temp_c:.1f} C" if temp_c is not None else ""
@@ -4575,8 +4576,7 @@ def _run_ntc_group_scan():
         return
     group, hw, battery_type, battery_cfg = selection
 
-    grp_cfg = dev_cfg.BATTERY_GROUPS[group]
-    size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
+    size = dev_cfg.group_size(group)
 
     ntc_daq_cfg = hw["ntc_daq_cfg"]
     print(f"\nNTC DAQ:\n  {dev_cfg.device_display_name(ntc_daq_cfg)}\n  {ntc_daq_cfg.get('resource', '')}\n")
@@ -4600,6 +4600,7 @@ def _run_ntc_group_scan():
             ntc_daq_name=hw["ntc_daq_name"],
             ntc_daq_resource=ntc_daq_cfg.get("resource"),
             ntc_daq_model=ntc_daq_cfg.get("model"),
+            group_name=group,
         ):
             return
         storage.log_event(level="INFO", source="ntc_scan", message="Run started")

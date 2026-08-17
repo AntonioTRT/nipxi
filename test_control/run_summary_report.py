@@ -9,16 +9,15 @@ sequence already populates via BatteryOperationSequence.run_guarded()/
 complete() (test_control/battery_operation_sequence.py). No new in-memory
 buffer, no new table: the only additional query this module performs is
 Monitor Battery Scan's per-relay breakdown, read from `measurements` (which
-has no per-relay columns on run_summary itself), and Group, which is not a
-run_summary column either and is instead recovered from this run's own
-event_log "Group selected: <group>" entry (still SQLite, still this run's
-own data -- not a new source of truth).
+has no per-relay columns on run_summary itself).
 
-Why Group isn't just read off run_summary: BATTERY_GROUPS entries can share
-a relay matrix (see config/devices.py), so relay_matrix_name alone cannot be
-reversed back into a group letter. The event_log message is the one place
-"which group was selected for this run" is already recorded, by every
-implemented workflow, before any hardware is touched.
+Group is read from run_summary.group_name (Group Ownership Migration --
+populated at start_run_summary() time by every implemented workflow), with
+a fallback to parsing this run's own event_log "Group selected: <group>"
+entry for any row written before that column existed (group_name is NULL
+on those). relay_matrix_name alone cannot substitute for either: BATTERY_GROUPS
+entries can share a relay matrix (see config/devices.py), so it cannot be
+reversed back into a group name.
 """
 
 from test_control.execution_screen import _fmt, _fmt_volts
@@ -195,7 +194,7 @@ def render_run_summary(run: dict, storage=None) -> None:
     Summary" menu entry, and from Database Tools' "View Latest Run" screen.
     """
     test_type = run.get("test_type")
-    group = _lookup_group(storage, run["run_id"]) if storage is not None else None
+    group = run.get("group_name") or (_lookup_group(storage, run["run_id"]) if storage is not None else None)
 
     print("=" * 60)
     print("Run Summary")

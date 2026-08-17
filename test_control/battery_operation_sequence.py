@@ -42,7 +42,7 @@ class BatteryOperationSequence:
     """
 
     def __init__(self, smu, relay, safety: SafetyMonitor, storage, settings,
-                 source: str, dmm=None, daq=None):
+                 source: str, dmm=None, daq=None, group_name=None):
         self.smu = smu
         self.dmm = dmm
         self.daq = daq
@@ -51,11 +51,28 @@ class BatteryOperationSequence:
         self.storage = storage
         self.s = settings
         self.source = source
+        self.group_name = group_name
         self.log = logging.getLogger(f"nipxi.{source}")
 
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
+
+    def _record_measurement(self, *, position_in_group=None, **fields):
+        """
+        storage.record_measurement() wrapper that fills in this sequence's
+        own group_name (set at construction, constant for the sequence's
+        lifetime) alongside the per-call position_in_group -- so every
+        subclass's measurement-recording call site doesn't have to repeat
+        `group_name=self.group_name` itself. `position_in_group` is passed
+        per-call (not stored on self) since MonitorBatteryScanSequence
+        scans many positions per instance; Monitor/Charge/Discharge pass
+        their one fixed `channel` (== position_in_group under the Group
+        Ownership Migration -- see config/devices.py::BATTERY_GROUPS).
+        """
+        return self.storage.record_measurement(
+            group_name=self.group_name, position_in_group=position_in_group, **fields,
+        )
 
     def _run_number(self):
         """The current run_summary row's integer id, or None if not found --

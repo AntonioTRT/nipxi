@@ -26,8 +26,8 @@ Two API layers are exposed:
      verify_all(expected_mask), reset(). These are thin wrappers around the
      literal command strings above and do no channel remapping.
 
-  2. Public RelayBase API (1-based, matches BATTERY_CHANNELS / ACTIVE_CHANNELS
-     elsewhere in this app) -- connect(), disconnect(), open(channel),
+  2. Public RelayBase API (1-based, matches BATTERY_GROUPS[group]["positions"]
+     / ACTIVE_CHANNELS elsewhere in this app) -- connect(), disconnect(), open(channel),
      close(channel), query(channel)/read(channel), open_all(), close_all().
      open()/close() are implemented ON TOP of the native primitives and are
      the only methods that ever change relay state; both always run the
