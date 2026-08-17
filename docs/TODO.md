@@ -475,6 +475,21 @@ the bottom, with a pointer to where the real documentation lives
   structurally blocked by `main.py`'s total lack of group awareness
   (Section 50); revisit only as part of `main.py`'s eventual retirement/
   rewrite (Milestone XII).
+- [x] **DONE (Milestone XVII):** Group NTC pre-check -- one-time full-group
+  NTC snapshot before Monitor Battery/Charge Battery/Discharge Battery,
+  gated only on the selected position's own result, sharing
+  `_ntc_group_snapshot()` with NTC Group Scan.
+
+### Group NTC Pre-Check follow-ups (see docs/architecture.md Section 52, Milestone XVII)
+
+- [ ] Real-hardware validation of the pre-check itself once NTC hardware
+  is available -- confirm a genuine open/shorted target position
+  correctly aborts, and a genuine (but readable) absent signal on a
+  *different* position in the group correctly does not.
+- [ ] Once `group_name`/`position_in_group` lands (Milestone XIII), add a
+  "pre-check catch rate" bucket to Group Statistics (how often a group's
+  pre-check found a non-PRESENT target position before an operation
+  started) -- not built in this pass.
 
 ---
 

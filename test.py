@@ -3867,6 +3867,7 @@ def _run_monitor_battery():
     print("MONITOR BATTERY")
 
     import signal
+    from hardware.temperature import NTCPresence
     from test_control.hardware_manager import HardwareManager
     from test_control.monitor_battery_sequence import MonitorBatterySequence
     from test_control.safety_monitor import SafetyMonitor
@@ -3969,6 +3970,36 @@ def _run_monitor_battery():
         # docs/architecture.md "Hardware Identity Traceability").
         for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
             storage.log_event(level="INFO", source="monitor_battery", message=message)
+
+        # Group NTC pre-check -- one-time snapshot of every position's NTC
+        # in this group, BEFORE the target relay ever closes (NTC channels
+        # are independent DAQ analog inputs, never routed through the
+        # relay matrix -- see _ntc_group_snapshot()). No-op if this group
+        # has no ntc_daq/daq assigned. Aborts (no relay activation) only if
+        # the SELECTED position was actually READ (see "readable" in
+        # _ntc_group_snapshot()'s docstring) and came back not PRESENT --
+        # a DAQ comms failure on the read itself does NOT abort, matching
+        # the active-monitoring loop's own graceful degradation on the
+        # identical DAQError. An absent/faulted NTC on some OTHER position
+        # in the group is recorded but never blocks this run either, since
+        # it isn't part of what's being monitored.
+        grp_cfg = dev_cfg.BATTERY_GROUPS[group]
+        size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
+        ntc_snapshot = _ntc_group_snapshot(
+            storage, hw_mgr.ntc_daq, group, size, source="monitor",
+            phase_detail="NTC_PRECHECK", log_summary=True,
+        )
+        target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
+        if target_ntc is not None and target_ntc["readable"] and target_ntc["presence"] != NTCPresence.PRESENT:
+            storage.log_event(
+                level="ERROR", source="monitor_battery", channel=channel, relay=relay_address,
+                message=f"NTC pre-check failed for selected position -- {target_ntc['presence']}",
+            )
+            storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
+            storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
+            print(f"\n[FAIL] NTC pre-check failed for the selected position "
+                  f"({target_ntc['presence']}) -- aborting, no relay activated.")
+            return
 
         token = CancellationToken(owner="test.py:_run_monitor_battery")
         previous_sigint_handler = signal.signal(
@@ -4196,6 +4227,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     print(operation.upper())
 
     import signal
+    from hardware.temperature import NTCPresence
     from test_control.hardware_manager import HardwareManager
     from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken
@@ -4312,6 +4344,35 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
             storage.log_event(level="INFO", source=source, message=message)
 
+        # Group NTC pre-check -- one-time snapshot of every position's NTC
+        # in this group, BEFORE the target relay ever closes -- see
+        # _ntc_group_snapshot()'s docstring (test.py) for why this is safe
+        # to do before any relay/SMU activity. Measurement rows use the
+        # SAME short test_type ChargeSequence/DischargeSequence's own
+        # sampling-loop rows already use ("charge"/"discharge", not
+        # "charge_battery"/"discharge_battery") so this run's measurements
+        # stay internally consistent -- see docs/architecture.md Section 46
+        # for the pre-existing run_summary-vs-measurements vocabulary split
+        # this deliberately does not add a third variant to.
+        grp_cfg = dev_cfg.BATTERY_GROUPS[group]
+        size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
+        measurement_test_type = {"charge_battery": "charge", "discharge_battery": "discharge"}.get(source, source)
+        ntc_snapshot = _ntc_group_snapshot(
+            storage, hw_mgr.ntc_daq, group, size, source=measurement_test_type,
+            phase_detail="NTC_PRECHECK", log_summary=True,
+        )
+        target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
+        if target_ntc is not None and target_ntc["readable"] and target_ntc["presence"] != NTCPresence.PRESENT:
+            storage.log_event(
+                level="ERROR", source=source, channel=channel, relay=relay_address,
+                message=f"NTC pre-check failed for selected position -- {target_ntc['presence']}",
+            )
+            storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
+            storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
+            print(f"\n[FAIL] NTC pre-check failed for the selected position "
+                  f"({target_ntc['presence']}) -- aborting, no relay activated.")
+            return
+
         token = CancellationToken(owner=f"test.py:_run_charge_or_discharge:{source}")
         previous_sigint_handler = signal.signal(
             signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
@@ -4388,35 +4449,126 @@ def _run_discharge_battery():
     )
 
 
+def _ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
+                         phase_detail: str = None, log_summary: bool = False) -> list:
+    """
+    One-time NTC read across every position 1..size in `group`, via `daq`
+    (an already-connected DAQ -- the group's resolved "ntc_daq", or its
+    "daq" fallback -- see config/devices.py::hardware_for_group()). NTC
+    channels are independent per-position DAQ analog inputs
+    (BATTERY_CHANNELS[...]["daq_ntc_ch"]), not routed through the relay
+    matrix -- this never touches a relay, the SMU, or the PMU, so it's
+    safe to call before any of those are ever engaged.
+
+    Records one measurements row per position (test_type=`source`,
+    phase_detail=`phase_detail` if given, else the presence value itself --
+    NTC Group Scan's original, unchanged behavior) and, if `log_summary`
+    is True, one event_log line per position summarizing presence/
+    temperature (NTC Group Scan itself does not log a summary line for a
+    normal PRESENT/ABSENT reading, only for the two failure cases below --
+    unchanged; callers that need per-position traceability, e.g. a
+    pre-operation group NTC pre-check, opt in explicitly).
+
+    Returns a list of {"position", "channel", "presence", "temp_c",
+    "readable"} dicts in position order. `readable` is True only when a
+    real ADC value was obtained and classified -- False for both "no
+    daq_ntc_ch configured" (a config gap) and a DAQError on the read
+    itself (a DAQ connectivity problem). Both still record `presence` as
+    FAULT (informative -- "no reliable reading available") but callers
+    that gate an operation on presence must check `readable` too: a DAQ
+    comms hiccup is an infrastructure problem, not a signal that the
+    battery/sensor at that position is actually faulted, and must not be
+    treated the same as a real, successfully-read ABSENT/FAULT signal --
+    the active-monitoring loops (Monitor Battery/Charge/Discharge's own
+    sampling loops) already degrade gracefully on the identical DAQError,
+    never aborting the run over it; this pre-check must not be stricter
+    than the loop it precedes.
+
+    No-op (returns []) if `daq` is None -- a group with no NTC hardware
+    assigned behaves exactly as if this were never called.
+
+    Shared by NTC Group Scan and the pre-operation group NTC pre-check
+    (Charge/Discharge/Monitor Battery) so there is exactly one place this
+    scan loop is implemented -- not two independent copies of the same logic.
+    """
+    from hardware.temperature import ntc_voltage_to_celsius, classify_ntc_presence, NTCPresence
+    from utils.errors import DAQError
+
+    if daq is None:
+        return []
+
+    results = []
+    for position in range(1, size + 1):
+        channel = dev_cfg.resolve_group_position(group, position)
+        ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
+        ntc_ch = ch_cfg["daq_ntc_ch"] if ch_cfg else None
+
+        voltage_v = None
+        temp_c = None
+        readable = True
+        if ntc_ch is None:
+            presence = NTCPresence.FAULT
+            readable = False
+            storage.log_event(level="WARNING", source=source, channel=channel,
+                               message=f"Position {position}: no daq_ntc_ch configured")
+        else:
+            try:
+                voltage_v = daq.read_channel(ntc_ch)
+                presence = classify_ntc_presence(voltage_v)
+                if presence == NTCPresence.PRESENT:
+                    temp_c = ntc_voltage_to_celsius(voltage_v)
+            except DAQError as e:
+                presence = NTCPresence.FAULT
+                readable = False
+                storage.log_event(level="WARNING", source=source, channel=channel,
+                                   message=f"Position {position}: DAQ read failed -- {e}")
+
+        storage.record_measurement(
+            test_type=source, channel=channel,
+            phase_detail=phase_detail if phase_detail is not None else presence,
+            voltage_v=voltage_v, temp_c=temp_c,
+        )
+        if log_summary:
+            temp_label = f" -- {temp_c:.1f} C" if temp_c is not None else ""
+            storage.log_event(
+                level="INFO" if presence == NTCPresence.PRESENT else "WARNING",
+                source=source, channel=channel,
+                message=f"NTC snapshot -- Position {position} (channel {channel}): {presence}{temp_label}",
+            )
+        results.append({
+            "position": position, "channel": channel, "presence": presence,
+            "temp_c": temp_c, "readable": readable,
+        })
+    return results
+
+
 def _run_ntc_group_scan():
     """
     NTC Group Scan -- read temperature + battery-presence for every position
     in a group via the group's resolved "ntc_daq" (config/devices.py::
     hardware_for_group(), falling back to the group's normal "daq" if no
     temporary override is set -- see USB_DAQ_DEVICES/BATTERY_GROUPS[...]
-    ["ntc_daq"]). NTC channels are independent per-position DAQ analog
-    inputs (BATTERY_CHANNELS[...]["daq_ntc_ch"]), not routed through the
-    relay matrix -- this workflow never touches a relay or the SMU/PMU, so
+    ["ntc_daq"]). This workflow never touches a relay or the SMU/PMU, so
     it deliberately does NOT build on BatteryOperationSequence/
     HardwareManager (there is nothing for run_guarded()'s safety-shutdown
     machinery to shut down here) -- it constructs a bare DAQ directly, the
     same precedent test_sensors()'s Test 6 already established for a
-    DAQ-only operation.
+    DAQ-only operation. The per-position scan loop itself is
+    _ntc_group_snapshot() (above), shared with the pre-operation group NTC
+    pre-check now used by Monitor Battery/Charge Battery/Discharge Battery.
 
     Persists one measurements row per position (test_type="ntc_scan",
     phase_detail=<presence>, voltage_v=<raw divider volts>, temp_c=<computed
     or None>) -- the SAME test_type literal in both run_summary and
     measurements (unlike Charge/Discharge's split "charge_battery"/"charge"
     vocabulary -- see docs/architecture.md Section 46), so this data is
-    query-able later (by a future Runtime/CycleSequence) via the existing
-    DataStorage.get_measurements(run_id=..., channel=...) path -- no new
-    query helper needed for this foundation work.
+    query-able later via the existing DataStorage.get_measurements(run_id=...,
+    channel=...) path -- no new query helper needed.
     """
     print("NTC GROUP SCAN -- temperature/presence check via DAQ (no relay, no PSU)")
 
     from hardware.daq import DAQ
-    from hardware.temperature import ntc_voltage_to_celsius, classify_ntc_presence, NTCPresence
-    from utils.errors import DAQError
+    from hardware.temperature import NTCPresence
 
     selection = _select_group_with_hardware_summary(required_roles=("ntc_daq",))
     if selection is None:
@@ -4425,7 +4577,6 @@ def _run_ntc_group_scan():
 
     grp_cfg = dev_cfg.BATTERY_GROUPS[group]
     size = grp_cfg["position_end"] - grp_cfg["position_start"] + 1
-    positions_in_group = list(range(1, size + 1))
 
     ntc_daq_cfg = hw["ntc_daq_cfg"]
     print(f"\nNTC DAQ:\n  {dev_cfg.device_display_name(ntc_daq_cfg)}\n  {ntc_daq_cfg.get('resource', '')}\n")
@@ -4442,7 +4593,6 @@ def _run_ntc_group_scan():
         daq.disconnect()
         return
 
-    rows = []
     try:
         if not _start_run_summary_guarded(
             storage, test_type="ntc_scan",
@@ -4457,33 +4607,7 @@ def _run_ntc_group_scan():
         storage.log_event(level="INFO", source="ntc_scan",
                            message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
 
-        for position in positions_in_group:
-            channel = dev_cfg.resolve_group_position(group, position)
-            ch_cfg = dev_cfg.BATTERY_CHANNELS.get(channel)
-            ntc_ch = ch_cfg["daq_ntc_ch"] if ch_cfg else None
-
-            voltage_v = None
-            temp_c = None
-            if ntc_ch is None:
-                presence = NTCPresence.FAULT
-                storage.log_event(level="WARNING", source="ntc_scan", channel=channel,
-                                   message=f"Position {position}: no daq_ntc_ch configured")
-            else:
-                try:
-                    voltage_v = daq.read_channel(ntc_ch)
-                    presence = classify_ntc_presence(voltage_v)
-                    if presence == NTCPresence.PRESENT:
-                        temp_c = ntc_voltage_to_celsius(voltage_v)
-                except DAQError as e:
-                    presence = NTCPresence.FAULT
-                    storage.log_event(level="WARNING", source="ntc_scan", channel=channel,
-                                       message=f"Position {position}: DAQ read failed -- {e}")
-
-            storage.record_measurement(
-                test_type="ntc_scan", channel=channel, phase_detail=presence,
-                voltage_v=voltage_v, temp_c=temp_c,
-            )
-            rows.append((position, presence, temp_c))
+        rows = _ntc_group_snapshot(storage, daq, group, size, source="ntc_scan")
 
         storage.log_event(level="INFO", source="ntc_scan", message="Scan complete")
         storage.finish_run_summary(stop_reason="COMPLETED", result="PASS")
@@ -4494,15 +4618,16 @@ def _run_ntc_group_scan():
         print("=" * 60)
         print(f"{'Position':<10}{'Present':<10}{'Temperature'}")
         print("-" * 40)
-        for position, presence, temp_c in rows:
-            if presence == NTCPresence.PRESENT:
+        for row in rows:
+            if row["presence"] == NTCPresence.PRESENT:
                 present_label = "YES"
-            elif presence == NTCPresence.ABSENT:
+            elif row["presence"] == NTCPresence.ABSENT:
                 present_label = "NO"
             else:
                 present_label = "FAULT"
+            temp_c = row["temp_c"]
             temp_label = f"{temp_c:.1f} C" if temp_c is not None else "N/A"
-            print(f"{position:<10}{present_label:<10}{temp_label}")
+            print(f"{row['position']:<10}{present_label:<10}{temp_label}")
         print("=" * 60)
 
     finally:

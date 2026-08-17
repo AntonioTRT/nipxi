@@ -1905,6 +1905,85 @@ validation work (Milestone XII).
 
 ---
 
+## Milestone XVII: Group NTC Pre-Check -- One-Time Full-Group Snapshot Before Charge/Discharge/Monitor Battery
+
+**Status:** ACHIEVED (implemented and verified this session)
+
+**Scope:** Implemented a one-time NTC scan of every position in the
+selected group, run before the target position's relay ever closes, for
+Monitor Battery, Charge Battery, and Discharge Battery -- catching an
+open/shorted NTC or unexpected battery absence before the operation
+starts, while active-position-only monitoring continues unchanged during
+execution.
+
+### Objectives achieved
+
+- **Confirmed low-risk and structurally aligned** -- NTC channels are
+  independent per-position DAQ analog inputs, never routed through the
+  relay matrix, so a full-group scan requires zero relay/SMU interaction.
+- **Reused NTC Group Scan's scan loop rather than duplicating it** -- new
+  `test.py::_ntc_group_snapshot()` extracted from `_run_ntc_group_scan()`'s
+  own loop; `_run_ntc_group_scan()` refactored to call it, verified
+  byte-for-byte unchanged output.
+- **No changes to `ChargeSequence`/`DischargeSequence`/
+  `MonitorBatterySequence`** -- the pre-check is pure orchestration in
+  `test.py`, placed exactly where the existing pre-relay traceability
+  block already lives.
+- **Found and fixed a real gating bug during dry-run testing, before
+  considering this done:** the first version treated a DAQ connectivity
+  failure (`DAQError`) identically to a genuine `ABSENT`/`FAULT` signal --
+  both hard-aborted the operation, which was *stricter* than the
+  already-implemented active-monitoring loop's own graceful degradation on
+  the identical error. Fixed with a new `"readable"` field distinguishing
+  "couldn't read" from "read, and it's genuinely not present/faulted" --
+  only the latter gates the operation.
+- **Confirmed the gate only blocks on the target position** -- a fault on
+  any other position in the group is recorded/logged but never blocks the
+  run.
+
+### Architectural decisions made
+
+- Pre-check data shares the *same* `run_id` as the operation it precedes
+  (no separate run/`run_summary` row) -- it's part of that run's own
+  story, not an independent scan.
+- Measurement rows use the same short `test_type` form
+  (`"monitor"`/`"charge"`/`"discharge"`) the operation's own sampling loop
+  already uses, deliberately not introducing a third variant of the
+  already-flagged Section 46 `run_summary`-vs-`measurements` vocabulary
+  split.
+- No new `run_summary` columns -- consistent with Section 51's deferral of
+  run-level temperature aggregation.
+
+### Verification
+
+`_ntc_group_snapshot()` unit-tested directly against three fake DAQ
+behaviors (`DAQError`, open-circuit-range voltage, balanced-divider
+voltage) -- confirmed `readable`/`presence`/`temp_c` correct in all three
+cases. `_run_ntc_group_scan()` dry-run confirmed unchanged after the
+refactor. `_run_monitor_battery()`/`_run_charge_battery()` dry-run end to
+end with no real hardware attached, both before and after the
+`readable`-field fix -- before the fix, both hard-aborted at the
+pre-check; after, both proceed past it (8 `measurements` rows recorded)
+and fail cleanly at the same real-network boundary as every prior
+session's dry runs, confirming the fix restored backward compatibility.
+
+### Milestone readiness decision
+
+**Implemented and verified.** No architectural concern warranted
+stopping; the one real issue found (`DAQError` over-aborting) was caught
+by this session's own dry-run testing and fixed before completion, not
+left as a known gap.
+
+### Recommended next milestone
+
+Validate the pre-check against real NTC hardware once available
+(confirm a genuine open/shorted channel correctly aborts the target
+operation, and a genuine absent-but-readable signal on another position
+in the group correctly does not). In parallel with the still-pending
+items tracked under Milestones XII/XIII/XV/XVI.
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

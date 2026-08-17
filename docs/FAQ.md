@@ -1892,3 +1892,67 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 **Risks:** None.
 
 **Recommendation:** None -- confirmed as designed.
+
+## SECTION 19 — GROUP NTC PRE-CHECK (One-Time Full-Group Snapshot Before Charge/Discharge/Monitor Battery)
+
+*Findings below cover the implemented group NTC pre-check feature. See docs/architecture.md Section 52 for the full technical writeup.*
+
+### Q: Is a full-group NTC scan before Charge/Discharge/Monitor Battery low-risk, given it means reading positions other than the one being operated on?
+
+**Status:** Confirmed low-risk, implemented
+
+**Answer:** Yes -- NTC channels are independent per-position DAQ analog inputs, never routed through the relay matrix (the same structural fact that already made NTC Group Scan possible with zero relay/SMU involvement). Reading the whole group's NTC channels requires no relay switching and no SMU/PMU interaction, so it can run entirely before the target position's relay is ever engaged.
+
+**Evidence:** `hardware/daq.py::DAQ.read_channel()`; `config/devices.py::BATTERY_CHANNELS[...]["daq_ntc_ch"]` (fixed per-position DAQ channel, independent of `relay_address`).
+
+**Risks:** None found beyond the DAQError-gating issue below, which was caught and fixed during this same implementation.
+
+**Recommendation:** None -- implemented as designed.
+
+### Q: Does the pre-check duplicate NTC Group Scan's scanning logic?
+
+**Status:** No -- refactored to share it
+
+**Answer:** `test.py::_ntc_group_snapshot()` is a new function extracted from `_run_ntc_group_scan()`'s own per-position loop. `_run_ntc_group_scan()` was refactored to call it (verified: byte-for-byte identical output after the refactor). The pre-check is the shared function's second caller.
+
+**Evidence:** `test.py::_ntc_group_snapshot()`, `_run_ntc_group_scan()`.
+
+**Risks:** None -- dry-run verified unchanged NTC Group Scan output.
+
+**Recommendation:** None -- implemented as designed.
+
+### Q: Does a fault on a position other than the one being charged/discharged/monitored block the operation?
+
+**Status:** No, by design
+
+**Answer:** The pre-check only gates on the *selected* position's own result. A fault on some other position in the group is recorded (`measurements`/`event_log`) but never blocks the run -- it isn't part of what's being operated on.
+
+**Evidence:** `test.py`'s gate check filters `ntc_snapshot` to the matching `position` before evaluating.
+
+**Risks:** None.
+
+**Recommendation:** None -- implemented as designed.
+
+### Q: What happened when this was dry-run tested without real NTC hardware attached?
+
+**Status:** A real issue found and fixed before considering this done
+
+**Answer:** The first version hard-aborted Charge/Discharge/Monitor Battery every time, because a `DAQError` (the temporary NTC DAQ isn't reachable on this dev machine) was treated identically to a genuine `ABSENT`/`FAULT` signal. This was stricter than the *active-monitoring loop* (Section 51), which already degrades gracefully on the same `DAQError` and never aborts. Fixed by adding a `"readable"` field -- `False` for a config gap or `DAQError`, `True` only for a real, classified ADC reading -- and gating only on `readable and presence != PRESENT`.
+
+**Evidence:** `test.py::_ntc_group_snapshot()`'s `"readable"` field; both call sites' gate checks.
+
+**Risks:** None remaining -- re-verified after the fix: the same dry run now proceeds past the pre-check and fails at the expected real-hardware boundary, matching pre-existing behavior.
+
+**Recommendation:** None further -- implemented and fixed within this same session.
+
+### Q: How is the pre-check snapshot stored, and does it create a separate run?
+
+**Status:** Implemented -- same run, no new run_summary row
+
+**Answer:** No separate run -- the pre-check's `measurements`/`event_log` rows share the *same* `run_id` as the Charge/Discharge/Monitor Battery operation it precedes, tagged `phase_detail="NTC_PRECHECK"`. No new `run_summary` columns. On a target-position abort, the run's own `run_summary` row is finished with `stop_reason="SAFETY_VIOLATION"`/`result="FAIL"` via existing columns.
+
+**Evidence:** docs/architecture.md Section 52 "Database behavior".
+
+**Risks:** None.
+
+**Recommendation:** Group Statistics could add a "pre-check catch rate" bucket once the `group_name` migration lands -- not built in this pass.

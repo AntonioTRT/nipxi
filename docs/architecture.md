@@ -3898,3 +3898,136 @@ NTC divider voltage
 ### USB -> PXI migration -- confirmed unchanged
 
 `HardwareManager` receives `ntc_daq_cfg` as a plain config dict; `hardware/daq.py::DAQ` remains device-form-factor-agnostic (pure `nidaqmx`, no PXI-vs-USB-specific code, confirmed in an earlier review). Migrating from the temporary USB NI DAQ to the future PXI DAQ requires exactly: repoint or remove `BATTERY_GROUPS[group]["ntc_daq"]` (falls back to `"daq"` automatically) and update `BATTERY_CHANNELS[...]["daq_ntc_ch"]` channel strings to the PXI DAQ's real per-position wiring. Zero changes to `HardwareManager`, `MonitorBatterySequence`/`ChargeSequence`/`DischargeSequence`, `SafetyMonitor`, or any database/UI code -- confirmed, not just asserted, by the fact that every new code path added this session reads `ntc_channel`/`daq` purely through parameters and config, never a hardcoded device identity.
+
+---
+
+## 52. Group NTC Pre-Check -- One-Time Full-Group Snapshot Before Charge/Discharge/Monitor Battery
+
+**Purpose:** implements a one-time NTC scan of every position in the
+selected group, before the target position's relay ever closes, for
+Monitor Battery, Charge Battery, and Discharge Battery -- catching an
+open/shorted NTC or unexpected battery absence before the operation
+starts, while active-position-only monitoring continues unchanged during
+execution. **Implemented this session.**
+
+### Review findings
+
+Confirmed low-risk, backward-compatible, and aligned with the existing
+architecture, for one structural reason: **NTC channels are independent
+per-position DAQ analog inputs, never routed through the relay matrix**
+(established in the Section 51/earlier NTC work). A full-group NTC read
+therefore requires zero relay switching and zero SMU/PMU interaction --
+it can run entirely before the target position's relay is ever engaged,
+using only the already-connected `ntc_daq`. This is the same structural
+fact that already made NTC Group Scan possible with no relay/SMU
+involvement at all.
+
+### Design: reuse, not duplicate, NTC Group Scan's scan loop
+
+`test.py::_ntc_group_snapshot(storage, daq, group, size, source,
+phase_detail=None, log_summary=False)` is a new, shared function
+extracted from `_run_ntc_group_scan()`'s own per-position loop --
+**`_run_ntc_group_scan()` itself was refactored to call it**, producing
+byte-for-byte identical output to before (verified by dry run). The new
+pre-check is the second caller, passing `phase_detail="NTC_PRECHECK"` and
+`log_summary=True` to get its own distinct measurement tag and
+traceability without changing NTC Group Scan's own, more minimal logging
+(it only logged on the two failure cases before; that stays true when
+called through the shared function too, since `log_summary` defaults to
+`False`).
+
+### Where the pre-check runs
+
+Inside `test.py::_run_monitor_battery()`/`_run_charge_or_discharge()`,
+immediately after the existing pre-relay traceability `event_log` block
+and before `CancellationToken`/relay activation -- the same "caller
+already has this information, owns pre-relay bookkeeping" placement
+`MonitorBatterySequence`'s own docstring already establishes for
+`start_run_summary()`/config-snapshot logging. **No changes to
+`ChargeSequence`/`DischargeSequence`/`MonitorBatterySequence` themselves**
+-- the pre-check is pure orchestration in `test.py`, exactly where every
+other pre-relay step already lives.
+
+### Gating logic -- and a real refinement found during testing
+
+The pre-check aborts the operation (no relay activation, `run_summary`
+finished with `stop_reason="SAFETY_VIOLATION"`, `result="FAIL"`) **only
+if the SELECTED position itself** comes back not `PRESENT`. A fault on
+some *other* position in the group is recorded and logged but never
+blocks this run -- it isn't part of what's being operated on.
+
+**Found and fixed during dry-run verification, before considering this
+done:** the first implementation treated a `DAQError` on the read itself
+(a DAQ connectivity failure) identically to a successfully-read
+`ABSENT`/`FAULT` signal -- both hard-aborted the operation. Dry-running
+against this development machine (no real NTC hardware attached)
+surfaced the problem immediately: every Charge/Discharge/Monitor Battery
+run would abort purely because the *temporary* NTC DAQ isn't reachable
+today, even though the exact same `DAQError` inside the *active*
+monitoring loop (already implemented in Section 51) degrades gracefully
+and never aborts. **This pre-check must not be stricter than the loop it
+precedes.**
+
+Fixed by adding a `"readable"` field to `_ntc_group_snapshot()`'s
+returned dicts -- `True` only when a real ADC value was obtained and
+classified; `False` for both "no `daq_ntc_ch` configured" (a config gap)
+and a `DAQError` on the read (an infrastructure problem). The gate now
+checks `target["readable"] and target["presence"] != PRESENT` -- a DAQ
+comms hiccup no longer blocks the run; only a genuine, successfully-read
+`ABSENT`/`FAULT` signal does. Re-verified after the fix: the same dry run
+that previously hard-aborted now proceeds past the pre-check and fails
+later at the real hardware boundary, exactly matching pre-pre-check
+behavior.
+
+### Verification
+
+`_ntc_group_snapshot()` unit-tested directly (a fake `DAQError`-raising
+DAQ, a fake DAQ returning an open-circuit-range voltage, and a fake DAQ
+returning a balanced-divider voltage) -- confirmed `readable=False`/
+`presence="fault"` for the first, `readable=True`/`presence="absent"` for
+the second, `readable=True`/`presence="present"`/`temp_c=25.0` for the
+third. `_run_ntc_group_scan()` dry-run confirmed unchanged output after
+the refactor. `_run_monitor_battery()`/`_run_charge_battery()` dry-run
+end to end with no real hardware attached -- both now proceed past the
+pre-check (8 `measurements` rows recorded for the group snapshot) and
+fail cleanly at the same real-network boundary as before this session's
+change, confirming the fix restored backward compatibility.
+
+### Database behavior
+
+**What is stored:** one `measurements` row per group position
+(`phase_detail="NTC_PRECHECK"`, `test_type` = the same short form the
+operation's own sampling-loop rows already use -- `"monitor"`/`"charge"`/
+`"discharge"`, not `"monitor_battery"`/`"charge_battery"`/
+`"discharge_battery"`, to avoid introducing a third variant of the
+already-flagged Section 46 vocabulary split within one run's own
+`measurements`). One `event_log` line per position (`INFO` for `PRESENT`,
+`WARNING` otherwise), all under the **same `run_id`** as the operation
+itself -- the pre-check is part of that run's own story, not an
+independent scan with its own `run_summary` row. On a target-position
+abort: one additional `ERROR` `event_log` line, and the run's own
+`run_summary` row is finished with `stop_reason="SAFETY_VIOLATION"`/
+`result="FAIL"` via the existing columns -- no new schema.
+
+**No new `run_summary` columns** -- consistent with Section 51's
+deferral of run-level temperature aggregation.
+
+**Querying later:** no new query helper -- `DataStorage.get_measurements(run_id=...,
+channel=...)` already returns `phase_detail`, e.g. `SELECT channel, temp_c
+FROM measurements WHERE run_id=? AND phase_detail='NTC_PRECHECK' ORDER BY
+channel` reconstructs the full group snapshot for that run.
+
+**Group History/Group Statistics reuse:** the same answer as Section 51
+-- possible once the already-pending `group_name`/`position_in_group`
+migration (Section 47) lands; nothing about this pre-check needs its own
+additional migration. One natural future extension worth naming now: once
+that migration exists, Group Statistics could add a "pre-check catch
+rate" bucket (how often a group's pre-check found a non-`PRESENT` target
+position before an operation started) -- not built in this pass.
+
+### GO / NO-GO
+
+**Implemented.** No architectural concern was found that warranted
+stopping -- the one real issue surfaced (DAQError over-aborting) was
+caught by dry-run testing during this same implementation pass, not left
+for later discovery, and fixed before considering the work done.
