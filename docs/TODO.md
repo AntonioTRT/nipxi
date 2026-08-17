@@ -359,7 +359,25 @@ the bottom, with a pointer to where the real documentation lives
   -- it is a currently-live second charge/discharge implementation with no
   reverse-polarity check and no Milestone II traceability (`event_log`/
   `run_summary`). A Runtime built on `ChargeSequence`/`DischargeSequence`
-  alone becomes a third implementation unless this is resolved.
+  alone becomes a third implementation unless this is resolved. **Sharpened
+  by the Section 50 pre-implementation review:** `main.py`'s hardcoded
+  relay target (`NUMATO_RELAY_MATRIX_CONFIG` -> `MATRIX_NUMATO_201`) is
+  now, under the approved topology, an explicitly disabled group (A1) with
+  zero hardware assigned -- it targets exactly the one matrix everyone has
+  agreed isn't ready, and `BATTERY_GROUPS[...]["enabled"]` provides zero
+  protection against `main.py` running there, since it never reads
+  `BATTERY_GROUPS` at all.
+- [ ] **[Safety gap, independent of Runtime]** `hardware/daq.py::DAQ.read_all_batteries()`
+  is a hardcoded stub (always returns `voltage_v=0.0`/`current_a=0.0` for
+  every channel) -- `main.py`'s legacy `ChargeCycle`/`DischargeCycle` path
+  is the only real caller, meaning `SafetyMonitor.check()` is evaluated
+  against fake zero readings for the entire duration of any charge/
+  discharge run through that path, and EOC/EOD by voltage is never
+  reachable (a charge cycle runs the full 2-hour `CHARGE_TIMEOUT_S` before
+  timing out). Not introduced by the topology work; surfaced by the
+  Section 50 "what would happen if executed today" review. Resolved
+  automatically once `main.py`'s legacy path is retired (item above) --
+  tracked here so it isn't lost as a standalone risk in the meantime.
 - [ ] Design and build a resource-checkout/hardware-set-partition layer in
   the future Cycle Controller, derived from `hardware_for_group()` (group
   by shared `relay_matrix`/`smu`/`dmm`/`daq` name) -- required before any
@@ -368,9 +386,13 @@ the bottom, with a pointer to where the real documentation lives
   over the existing `ChargeSequence.run()`/`DischargeSequence.run()` calls,
   subclassing `BatteryOperationSequence` like the other four -- not a new
   charge/discharge implementation.
-- [ ] Fix stale comment in `config/devices.py` (~line 507-509) describing
-  Group A as wired to `MATRIX_NUMATO_201` -- the live dict entry and real
-  hardware validation confirm Group A is actually on `MATRIX_NUMATO_202`.
+- [x] ~~Fix stale comment in `config/devices.py` (~line 507-509) describing
+  Group A as wired to `MATRIX_NUMATO_201`~~ -- **SUPERSEDED (Milestone XV):**
+  "Group A" no longer exists under the approved topology; the comment will
+  be rewritten as part of the topology implementation itself, not as a
+  standalone fix. Coincidentally, A1 (the new name for that same matrix)
+  really is on `MATRIX_NUMATO_201`, so this old comment's original claim
+  becomes true again for a differently-named group.
 
 ### Architecture Standardization (see docs/architecture.md Sections 47-49, Milestones XIII-XV)
 
@@ -429,6 +451,30 @@ the bottom, with a pointer to where the real documentation lives
   section for `test_type == "ntc_scan"` -- falls through to "(no summary
   section defined...)". Add an NTC section (reuse the Position/Present/
   Temperature shape `_run_ntc_group_scan()` already prints).
+
+### Temperature Monitoring (see docs/architecture.md Section 51, Milestone XVI)
+
+- [ ] Real-hardware validation of the NTC acquisition path in a live
+  Monitor Battery/Charge/Discharge run (not just the standalone NTC Group
+  Scan path) once a USB DAQ is physically attached -- confirm
+  `classify_ntc_presence()`/`ntc_voltage_to_celsius()` against a real
+  divider signal, confirm the overtemperature `SafetyViolationError` path
+  actually trips on a real out-of-range reading.
+- [ ] Add a separate, non-fatal *warning* temperature threshold (below the
+  existing critical `max_temp_c` SafetyMonitor already enforces) --
+  needs a design decision on where the threshold value lives
+  (`BATTERY_CONFIGS` field vs. global `Settings` constant) and which
+  event_log entry announces it. Deliberately not built in this pass.
+  See docs/architecture.md Section 51.
+- [ ] Add `run_summary`-level temperature aggregation (min/max/avg per
+  run), mirroring the still-deferred Charge/Discharge voltage-stat
+  enrichment -- a `_TempStats`-style accumulator, same pattern as Monitor
+  Battery's existing `_VoltageStats`. Deliberately not built in this pass
+  to keep the temperature-acquisition change additive and scoped.
+- [ ] Legacy `main.py` temperature integration remains out of scope --
+  structurally blocked by `main.py`'s total lack of group awareness
+  (Section 50); revisit only as part of `main.py`'s eventual retirement/
+  rewrite (Milestone XII).
 
 ---
 

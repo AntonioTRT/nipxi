@@ -1808,6 +1808,103 @@ Milestone XII `main.py` retirement work.
 
 ---
 
+## Milestone XVI: Temperature Monitoring as a First-Class Feature -- Dual DAQ Ownership (Option A) Implemented
+
+**Status:** ACHIEVED (implemented and verified this session -- not design-review-only)
+
+**Scope:** Implemented real NTC temperature acquisition for Monitor
+Battery, Charge Battery, and Discharge Battery, resolving the dual-DAQ
+ownership question (a group's general `"daq"` role vs. its `"ntc_daq"`
+role, possibly a different physical instrument) raised in the prior
+review. Decision: Option A -- `HardwareManager` owns a fifth device role.
+
+### Objectives achieved
+
+- **`HardwareManager` extended with an `ntc_daq` slot** -- backward
+  compatible (`main.py`'s call site unaffected), with identity-based
+  dedup so a group whose `"ntc_daq"` falls back to `"daq"` never opens a
+  second connection to the same physical instrument. Verified
+  programmatically for both the shared-instance and distinct-instance
+  cases.
+- **New `SafetyMonitor.check_temperature()`** -- a small, additive
+  temperature-only check for Monitor Battery specifically, since it has
+  no real `current_a` to pass into the existing `check()` and must not
+  silently start enforcing voltage/current limits it never enforced
+  before. `check()` itself is unchanged.
+- **`ChargeSequence`/`DischargeSequence`** now feed a real, classified
+  temperature reading into the *existing* `check()` call -- `temp_c` was
+  always a checked parameter, just always `None` until now. No change to
+  `check()`'s own logic.
+- **`MonitorBatterySequence`** gained a `daq` constructor parameter and
+  `ntc_channel`/`battery_cfg` run() parameters -- an overtemperature
+  reading now raises `SafetyViolationError`, routed through the existing
+  `run_guarded()` safety-shutdown path, for the first time in this
+  sequence's history.
+- **Per-position acquisition model confirmed correct and implemented as
+  designed** -- reads only the active position's NTC channel, once per
+  sampling-loop iteration; does not continuously scan the whole group
+  (that remains NTC Group Scan's distinct job).
+- **Fault/absent NTC readings are throttled to one `event_log` entry per
+  state transition**, not per sample -- avoids event_log spam over a
+  multi-hour charge/discharge run.
+- **Confirmed the USB-to-PXI DAQ migration remains configuration-only**
+  after this change -- no code added anywhere reads a hardcoded device
+  identity; `ntc_daq_cfg`/`ntc_channel` flow purely through parameters and
+  config.
+
+### Architectural decisions made
+
+- Option A (HardwareManager ownership) adopted over the alternative
+  (per-sequence bolt-on DAQ connections) reviewed previously -- single
+  connection lifecycle, single shutdown lifecycle, single error-handling
+  path, as required.
+- `run_summary`-level temperature aggregation (min/max/avg per run) and a
+  separate, non-fatal warning threshold (below the existing critical
+  `max_temp_c`) are explicitly deferred, tracked in `docs/TODO.md` --
+  keeps this implementation additive and scoped, mirroring the
+  already-standing deferral of Charge/Discharge's own voltage-stat
+  enrichment.
+- Legacy `main.py` integration remains explicitly out of scope --
+  structurally blocked by its lack of group awareness (Section 50), not
+  attempted here.
+
+### Verification
+
+Full `py_compile` check across all six modified files
+(`test_control/hardware_manager.py`, `safety_monitor.py`,
+`monitor_battery_sequence.py`, `charge_sequence.py`,
+`discharge_sequence.py`, `test.py`). `HardwareManager`'s dual-DAQ
+construction verified programmatically for both the shared-instance
+(`ntc_daq is daq == True`) and distinct-instance
+(`ntc_daq is daq == False`) cases. `SafetyMonitor.check_temperature()`
+unit-verified (`None`/safe/unsafe, with and without `battery_cfg`).
+`_run_monitor_battery()` and `_run_charge_battery()` dry-run end to end
+with no real hardware attached -- both fail cleanly at the expected
+real-network boundary (Numato relay matrix unreachable from this dev
+machine), with no exception from any new code path. No physical hardware
+was available for this session; real-hardware validation of the NTC
+acquisition path itself remains a follow-up once a USB DAQ is attached.
+
+### Milestone readiness decision
+
+**Implemented and verified to the extent possible without physical NTC
+hardware attached.** No blocker found during the pre-implementation
+review; the one architectural decision it surfaced (dual-DAQ ownership)
+was resolved by the operator as Option A and implemented accordingly.
+
+### Recommended next milestone
+
+Validate the NTC acquisition path against real USB DAQ hardware once
+available (confirm `classify_ntc_presence()`/`ntc_voltage_to_celsius()`
+against a real divider signal in a live Monitor Battery/Charge/Discharge
+run, not just the standalone NTC Group Scan path). In parallel: the
+`group_name`/`position_in_group` database migration (Milestone XIII), the
+position-ownership/validator redesign (Milestone XV), and the standing
+`main.py` retirement and ChargeSequence/DischargeSequence real-hardware
+validation work (Milestone XII).
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
 implementation, Milestone II's Monitor Battery implementation, and the

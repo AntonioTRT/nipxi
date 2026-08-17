@@ -3913,7 +3913,8 @@ def _run_monitor_battery():
     print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
     print(f"DMM (temporary voltage source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
 
-    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
+    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
+                             dmm_cfg=dmm_cfg, ntc_daq_cfg=hw["ntc_daq_cfg"])
     try:
         hw_mgr.connect_all()
     except HardwareInitError as e:
@@ -3959,6 +3960,9 @@ def _run_monitor_battery():
         storage.log_event(level="INFO", source="monitor_battery", message=f"SMU selected: {smu_name}")
         storage.log_event(level="INFO", source="monitor_battery", message=f"DMM selected: {dmm_name}")
         storage.log_event(level="INFO", source="monitor_battery", message=f"DAQ selected: {daq_name}")
+        if hw.get("ntc_daq_name"):
+            storage.log_event(level="INFO", source="monitor_battery",
+                               message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
         storage.log_event(level="INFO", source="monitor_battery", message="Operator confirmed execution")
         # Hardware identity traceability -- BEFORE relay activation/monitor
         # start, same requirement as the battery-config snapshot above (see
@@ -3976,11 +3980,12 @@ def _run_monitor_battery():
             safety = SafetyMonitor(Settings)
             sequence = MonitorBatterySequence(
                 smu=hw_mgr.smu, dmm=hw_mgr.dmm, relay=hw_mgr.relay, safety=safety,
-                storage=storage, settings=Settings,
+                storage=storage, settings=Settings, daq=hw_mgr.ntc_daq,
             )
             try:
                 sequence.run(
                     channel=channel, relay_address=relay_address,
+                    ntc_channel=ch_cfg.get("daq_ntc_ch"), battery_cfg=battery_cfg,
                     token=token,
                 )
             except OperationCancelledError:
@@ -4255,7 +4260,8 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}\n  {smu_cfg.get('resource', '')}\n")
     print(f"DMM (telemetry source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
 
-    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
+    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
+                             dmm_cfg=dmm_cfg, ntc_daq_cfg=hw["ntc_daq_cfg"])
     try:
         hw_mgr.connect_all()
     except HardwareInitError as e:
@@ -4299,6 +4305,9 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         storage.log_event(level="INFO", source=source, message=f"SMU selected: {smu_name}")
         storage.log_event(level="INFO", source=source, message=f"DMM selected: {dmm_name}")
         storage.log_event(level="INFO", source=source, message=f"DAQ selected: {daq_name}")
+        if hw.get("ntc_daq_name"):
+            storage.log_event(level="INFO", source=source,
+                               message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
         storage.log_event(level="INFO", source=source, message="Operator confirmed execution")
         for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
             storage.log_event(level="INFO", source=source, message=message)
@@ -4311,18 +4320,19 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
 
         try:
             safety = SafetyMonitor(Settings)
-            # daq=hw_mgr.daq passed through even though ChargeSequence/
-            # DischargeSequence don't read it yet -- see their constructors'
-            # comments. Keeps the handle available for a future DAQ
-            # integration without requiring test.py to change again.
+            # daq=hw_mgr.ntc_daq -- this group's NTC/temperature DAQ (see
+            # docs/architecture.md "Dual DAQ Ownership Model"), NOT the
+            # group's general daq_cfg -- ChargeSequence/DischargeSequence
+            # still use the DMM/SMU for voltage/current telemetry.
             sequence = sequence_cls(
-                smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.daq, relay=hw_mgr.relay,
+                smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.ntc_daq, relay=hw_mgr.relay,
                 safety=safety, storage=storage, settings=Settings,
             )
             try:
                 sequence.run(
                     channel=channel, relay_address=relay_address,
-                    battery_cfg=battery_cfg, test_setpoints=test_setpoints, token=token,
+                    battery_cfg=battery_cfg, test_setpoints=test_setpoints,
+                    ntc_channel=ch_cfg.get("daq_ntc_ch"), token=token,
                 )
                 print(f"\n{operation} complete.")
             except OperationCancelledError:

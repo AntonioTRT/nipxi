@@ -107,6 +107,23 @@ class SafetyMonitor:
 
         return SafetyStatus(True)
 
+    def check_temperature(self, temp_c: float) -> SafetyStatus:
+        """
+        Temperature-only check, reusing the same _temp_max() resolution as
+        check(). For workflows that do not source/sink current (Monitor
+        Battery) and therefore have no real current_a to pass into check()
+        -- calling check() with a placeholder current would also start
+        enforcing voltage/current limits Monitor Battery has never enforced
+        before, a behavior change beyond what a temperature-only integration
+        should introduce. temp_c=None is always safe (nothing to check yet).
+        """
+        if temp_c is None:
+            return SafetyStatus(True)
+        t_max = self._temp_max()
+        if temp_c > t_max:
+            return SafetyStatus(False, f"Overtemperature: {temp_c:.1f} C > {t_max} C")
+        return SafetyStatus(True)
+
     def is_safe_to_switch_relay(self, current_a: float) -> bool:
         """True if current is low enough to switch the relay without arcing."""
         return abs(current_a) <= self.s.ZERO_CURRENT_THRESHOLD_A

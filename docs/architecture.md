@@ -3630,3 +3630,271 @@ role is assigned. B1/C1: enabled, as already designed in Section 48.
 Position ownership, validator redesign, and the database migration
 (Section 47) should be implemented together, in that order, using these
 final names.
+
+---
+
+## 50. main.py Legacy Path Review -- Impact of the Approved Topology (Pre-Implementation Check)
+
+**Purpose:** before implementing the group topology (Section 49) and the
+position-ownership redesign, this section reviews `main.py` and every
+module reachable from it, to determine (a) whether it has any dependency
+on `BATTERY_GROUPS`/`BATTERY_CHANNELS` that the redesign could break, and
+(b) what would actually happen if `main.py` were executed today, exactly
+as it exists. **Documentation-only session -- no code was changed.**
+
+### Execution chain
+
+```
+main.py::main()
+  -> validate_settings(Settings)                          [utils/validators.py]
+  -> validate_devices_or_raise(dev_cfg)                    [utils/device_validator.py]
+  -> HardwareManager(Settings, relay_cfg=dev_cfg.NUMATO_RELAY_MATRIX_CONFIG)
+  -> hw.connect_all()
+  -> ResultManager(settings=Settings)                      [test_control/result_manager.py]
+  -> TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)  [test_control/test_executor.py]
+       -> constructs SafetyMonitor, ChargeCycle, DischargeCycle, BatteryTestSequence
+  -> executor.run(channels=args.channels, token=token)
+       -> BatteryTestSequence.run(channels or Settings.ACTIVE_CHANNELS, token)
+            for ch in channels:   # raw ints 1-8, never resolved via any group
+                relay.close(ch)
+                charge_cycle.run(ch, data_collector, token, battery_cfg=None)   # battery_cfg NEVER passed
+                discharge_cycle.run(ch, data_collector, token, battery_cfg=None)
+                relay.open(ch)
+  -> result_mgr.generate_report(result.run_id)   [data/report.py -- stub, no-op]
+  -> hw.disconnect_all()
+```
+
+### Key finding: this path is safety-blind if actually run today, independent of the topology work
+
+`ChargeCycle.run()`'s sampling loop reads `self.daq.read_all_batteries()`
+(`hardware/daq.py`), which has always been a hardcoded stub:
+```python
+def read_all_batteries(self) -> dict:
+    return {i: {"voltage_v": 0.0, "current_a": 0.0, "ntc_v": 0.0} for i in range(1, 9)}
+```
+Every voltage/current reading `ChargeCycle`/`DischargeCycle`/
+`BatteryTestSequence._read_current()` ever sees is hardcoded `0.0`,
+regardless of what's actually connected. If `main.py` were run today
+against a real battery: `SafetyMonitor.check()` is evaluated against fake
+zero readings and can never detect a real overvoltage/overcurrent; the
+EOC condition (`v >= voltage_limit_v`) is never true, so a charge cycle
+would run the full `CHARGE_TIMEOUT_S` (7200s / 2 hours) sourcing real
+current via the (real) SMU, completely unmonitored; `is_safe_to_switch_relay(0.0)`
+always returns `True`. No reverse-polarity check exists in `ChargeCycle`/
+`DischargeCycle` either (unlike `ChargeSequence`/`DischargeSequence`'s
+`_check_battery_polarity()`). Pre-existing, not introduced by this
+review's subject -- but it is the concrete, literal answer to "what would
+happen if executed today," and belongs on record as a standing risk.
+
+### Configuration dependency review
+
+| Dependency | Where | Conflicts with the approved topology? |
+|---|---|---|
+| `BATTERY_CHANNELS` | Not read anywhere in the execution chain. Only read by `utils/device_validator.py`'s checks, reachable from `main.py:82`. | Only at startup -- exactly the function Section 49 already plans to redesign. |
+| `BATTERY_GROUPS` | Same -- startup validation only (`_check_battery_groups()`), never read during execution. | Same. |
+| `relay_address` | Not referenced at all -- `BatteryTestSequence.run()` calls `relay.close(ch)` with the raw integer from `Settings.ACTIVE_CHANNELS`. | None. |
+| Global channel numbering | `Settings.ACTIVE_CHANNELS = list(range(1, 9))`. | Conceptually incompatible with group ownership, but not broken by it -- no shared code path. |
+| Group A/B/C/A1-C4 naming | Not referenced at all. | None. |
+| `NUMATO_RELAY_MATRIX_CONFIG` | `main.py:94`, hardcoded relay target. | Real, but pre-existing and unrelated to this redesign -- see below. |
+| Legacy aliases | `NUMATO_RELAY_MATRIX_CONFIG = ETHERNET_DEVICES["MATRIX_NUMATO_201"]`. | Same as above. |
+
+### What would happen today
+
+`main.py` would connect to `MATRIX_NUMATO_201` (via the legacy alias),
+`PRIMARY_SMU` (`HardwareManager`'s positional default), `MAIN_DAQ` -- and
+**no DMM at all** (`main.py:94` never passes `dmm_cfg`). Under the
+approved topology, `MATRIX_NUMATO_201` is A1's matrix, and **A1 is
+disabled with zero hardware assigned** -- `main.py` ignores this
+entirely; it never reads `BATTERY_GROUPS`/`enabled` at all. It would
+attempt to charge/discharge whatever is wired to channels 1-8 of
+`MATRIX_NUMATO_201` using global `Settings` defaults, **not** B1's or
+C1's real, approved hardware assignment. No workflow fails loudly --
+hardware connects and the sequence runs, blind to real telemetry, per the
+finding above. `main.py` has no concept of groups (old or new), so the
+naming change is invisible to it either way.
+
+### Legacy retirement impact
+
+The approved topology does not make `main.py` more fragile -- it has zero
+dependency on `BATTERY_GROUPS`/`BATTERY_CHANNELS` in its execution chain.
+What the topology work does is sharpen the existing Section 46 retirement
+prerequisite with a second, concrete reason: `main.py`'s hardcoded relay
+target is now, under the approved topology, an explicitly disabled group
+with no assigned hardware -- it targets exactly the one matrix everyone
+has agreed isn't ready, while ignoring the two that are. Hidden assumption
+worth surfacing: `BATTERY_GROUPS[group]["enabled"]` is enforced only by
+`test.py::_select_battery_group()` -- it provides zero protection against
+`main.py` operating on a disabled group's hardware, since `main.py` never
+consults it.
+
+### BATTERY_CHANNELS migration risk -- silent, not a crash
+
+`utils/device_validator.py::_check_duplicate_relay_identifiers()`/
+`_check_battery_groups()` read `BATTERY_CHANNELS` via `getattr(dev_cfg,
+"BATTERY_CHANNELS", {})` -- a graceful default, not a hard dependency. If
+`BATTERY_CHANNELS` is removed as part of the position-ownership redesign
+without updating these functions in the *same* change, they will not
+crash -- they will silently validate an empty dict and stop catching
+relay-duplicate/coverage bugs at all, with no error and no warning. This
+confirms (does not change) Milestone XV's existing plan: the validator
+rewrite must land together with the `positions` restructure, not after it.
+
+### Implementation readiness
+
+| Dependency | Readiness |
+|---|---|
+| `BATTERY_CHANNELS`/`BATTERY_GROUPS` in `main.py`'s execution chain | SAFE TO DEFER -- no dependency exists |
+| `BATTERY_CHANNELS`/`BATTERY_GROUPS` in `utils/device_validator.py` (reachable from `main.py:82`) | MUST BE CHANGED BEFORE/WITH IMPLEMENTATION -- same change as the `positions` restructure |
+| `relay_address` | SAFE TO DEFER -- unused |
+| Global channel numbering (`ACTIVE_CHANNELS`) | SAFE TO DEFER -- independent of this redesign; real fix is `main.py` retirement (Section 46) |
+| Group A/B/C/A1-C4 naming | SAFE TO DEFER -- unused |
+| `NUMATO_RELAY_MATRIX_CONFIG`/legacy aliases | NEEDS ATTENTION -- part of the standing `main.py` retirement work, now sharpened (targets a disabled, hardware-empty group) |
+| `DAQ.read_all_batteries()` stub (new finding) | NEEDS ATTENTION -- a real safety gap if `main.py` is ever run against real hardware before retirement; not caused by the topology work, surfaced by this review |
+
+### GO / NO-GO
+
+**GO for proceeding with the position-ownership redesign and validator
+rewrite as planned in Section 49** -- no blocker exists in `main.py`'s
+own execution chain. The two items needing attention (`main.py`'s
+hardcoded relay target, and the `DAQ.read_all_batteries()` stub) are
+pre-existing risks unrelated to this specific redesign, both already
+subsumed by the standing `main.py` retirement prerequisite (Section 46) --
+tracked, not blocking.
+
+---
+
+## 51. Temperature Monitoring as a First-Class Feature -- Dual DAQ Ownership Model (Option A) and NTC Acquisition Pipeline
+
+**Purpose:** implements real temperature acquisition for Monitor Battery,
+Charge Battery, and Discharge Battery, resolving the architectural
+question raised in a prior review (dual-DAQ ownership: a group's general
+`"daq"` role vs. its `"ntc_daq"` role, which may be a physically different
+instrument). **Implemented this session** -- not a design-review-only
+entry; see the Implementation Readiness table below for exactly what
+changed.
+
+### Decision: Option A -- HardwareManager owns a fifth device role
+
+```
+BATTERY_GROUPS -> hardware_for_group() -> HardwareManager
+                                             |- Relay
+                                             |- DMM
+                                             |- SMU
+                                             |- DAQ
+                                             `- NTC_DAQ
+```
+
+`HardwareManager.__init__()` gained an optional `ntc_daq_cfg` parameter
+(default `None`, fully backward compatible -- `main.py`'s call site is
+unaffected). Three outcomes, resolved once at construction:
+- `ntc_daq_cfg is None` -> `self._ntc_daq = None` (group has no NTC
+  acquisition capability yet -- e.g. A1, or any group before hardware is
+  assigned).
+- `ntc_daq_cfg is daq_cfg` (identity, not equality -- true exactly when
+  `hardware_for_group()`'s `"ntc_daq"` fell back to the group's own
+  `"daq"`) -> `self._ntc_daq = self._daq`. **The same physical instrument
+  is never connected twice** -- this is the eventual production shape,
+  one rack DAQ serving every role.
+- Otherwise -> `self._ntc_daq = DAQ(ntc_daq_cfg)`, a genuinely separate
+  driver instance and connection (today's real case: `MAIN_DAQ` vs. the
+  temporary `NTC_DAQ_USB6210`/`NTC_DAQ_USB6211`).
+
+`connect_all()` (both strict and lenient paths), `disconnect_all()`, and
+`health_check()` all handle the shared-instance case by identity check
+(`self._ntc_daq is not self._daq`) before treating it as a second device
+to connect/disconnect -- confirmed by direct test: constructing
+`HardwareManager` with a group whose `ntc_daq` falls back to `daq`
+produces `mgr.ntc_daq is mgr.daq == True`; a group with a genuinely
+separate NTC device produces two independent `DAQ` instances. Verified
+programmatically for both cases before this was considered done.
+
+### Per-position acquisition model (confirmed correct)
+
+Monitor Battery, Charge Battery, and Discharge Battery each read *only*
+the NTC channel for the position they are actively operating on
+(`BATTERY_CHANNELS[channel]["daq_ntc_ch"]`, resolved by the caller exactly
+where `relay_address` already is) -- once per sampling-loop iteration,
+the same cadence as their existing DMM/SMU reads. This deliberately does
+**not** continuously scan every position's NTC in the group; that remains
+NTC Group Scan's distinct job. Cycle Battery will inherit this model
+automatically once built as a composition over Charge/DischargeSequence.
+
+### Safety integration -- two different mechanisms, deliberately
+
+- **Charge/Discharge:** `SafetyMonitor.check(v, i, temp_c, mode=...)` already
+  existed and already evaluated `temp_c` -- it was simply never supplied a
+  non-`None` value. No change to `check()` itself; `t_c` in each sequence's
+  sampling loop is now the real, classified reading instead of a hardcoded
+  `None`.
+- **Monitor Battery:** does not source/sink current, so it has no real
+  `current_a` to pass into `check()` -- doing so would also silently start
+  enforcing voltage/current limits Monitor Battery has never enforced
+  before, a behavior change beyond a temperature-only integration. New
+  `SafetyMonitor.check_temperature(temp_c)` -- a small, additive method
+  reusing the existing `_temp_max()` resolution, changing nothing about
+  `check()` -- gives Monitor Battery the same overtemperature enforcement
+  without that side effect. `battery_cfg` is now threaded into
+  `MonitorBatterySequence.run()` (new, optional parameter) specifically so
+  `set_battery_limits()` can resolve the battery-type-specific
+  `max_temp_c`, not just the global `Settings.BAT_TEMP_MAX_C` fallback.
+- Both paths raise `SafetyViolationError` on an unsafe reading, routed
+  through the existing `run_guarded()` safety-shutdown branch unchanged --
+  no new shutdown mechanism.
+
+### NTC presence/fault handling in a continuous loop
+
+A reading classified `PRESENT` (`hardware/temperature.py::
+classify_ntc_presence()`) converts to Celsius; `ABSENT`/`FAULT` leaves
+`temp_c` as `None` (nothing to check or store) and logs one `event_log`
+`WARNING` **per state transition**, not per sample -- a persistent fault
+during an up-to-2-hour charge would otherwise write one row per ~1s
+sample. The same throttling applies to a `DAQError` on the read itself.
+
+### Implementation Readiness (what actually changed)
+
+| Component | Change |
+|---|---|
+| `test_control/hardware_manager.py` | `ntc_daq_cfg` param + `ntc_daq` property + connect/disconnect/health_check wiring (Option A, above) |
+| `test_control/safety_monitor.py` | New `check_temperature(temp_c)` method, additive, `check()` unchanged |
+| `test_control/monitor_battery_sequence.py` | `daq=None` constructor param; `run()` gains `ntc_channel`/`battery_cfg`; per-iteration NTC read -> `check_temperature()` -> `record_measurement(temp_c=...)`/`_render_frame(battery_temp=...)` |
+| `test_control/charge_sequence.py` / `discharge_sequence.py` | `run()` gains `ntc_channel`; per-iteration NTC read fills the previously-`None` `t_c` fed into the existing `check()` call |
+| `test.py` | `_run_monitor_battery()`/`_run_charge_or_discharge()`: pass `ntc_daq_cfg=hw["ntc_daq_cfg"]` into `HardwareManager`; pass `daq=hw_mgr.ntc_daq` into the sequence constructor (repurposing ChargeSequence/DischargeSequence's previously-unused `daq` parameter for exactly the extension point its own comment anticipated); pass `ntc_channel=ch_cfg.get("daq_ntc_ch")` into `sequence.run()`; log `"NTC DAQ selected: ..."` when configured |
+
+All changes are additive with `None`-safe defaults -- omitting `ntc_daq_cfg`/`ntc_channel`/`daq` anywhere preserves prior behavior exactly (temperature stays `"N/A"`, never checked). Verified: full compile check across all six modified files; `HardwareManager` dual-DAQ construction tested programmatically for both the shared-instance and distinct-instance cases; `SafetyMonitor.check_temperature()` unit-verified (None/safe/unsafe, with and without `battery_cfg`); `_run_monitor_battery()` and `_run_charge_battery()` dry-run end to end with no real hardware attached -- both fail cleanly at the expected real-network boundary (Numato relay matrix unreachable), with no exception from any new code path, confirming the full pipeline is wired correctly before real hardware is available.
+
+**Explicitly out of scope for this pass, tracked as follow-ups (docs/TODO.md):** a separate, non-fatal *warning* threshold (below the existing critical `max_temp_c`) is new logic, not yet built; `run_summary`-level temperature aggregation (min/max/avg per run, mirroring the still-deferred Charge/Discharge voltage-stat enrichment) is not added; legacy `main.py` integration remains out of scope, structurally blocked by its lack of group awareness (Section 50).
+
+### Database behavior
+
+**Tables containing temperature information:** `measurements` (`temp_c` column, pre-existing, now populated with real values for `test_type` in `{"monitor", "charge_battery", "discharge_battery"}` when NTC hardware is configured for the group) and `event_log` (new `"NTC DAQ selected: ..."` INFO entry, throttled `WARNING` entries on presence/fault transitions). **`run_summary` gains no new columns in this pass** -- deliberately deferred, mirroring the already-standing decision to defer Charge/Discharge's own voltage-stat aggregation.
+
+**Fields populated:** `measurements.temp_c` is a real float whenever (a) the group resolves an `ntc_daq` (directly or via the `"daq"` fallback), (b) the active position has a `daq_ntc_ch` entry, and (c) the NTC reading classifies `PRESENT`. Otherwise `NULL` -- the same graceful-degradation convention every other optional telemetry field in this schema already uses.
+
+**Querying temperature history:** no new query helper -- `DataStorage.get_measurements(run_id=..., channel=...)` already returns `temp_c` like any other column, e.g. `SELECT timestamp, channel, temp_c FROM measurements WHERE run_id=? AND temp_c IS NOT NULL ORDER BY id`.
+
+**Group History/Group Statistics reuse:** yes, once the already-pending `group_name`/`position_in_group` migration (Section 47) lands -- that migration, not this one, is what makes group-scoped cross-run queries possible at all. Temperature itself needs no additional migration; it already lives in `measurements` keyed by the same `run_id`/`channel` any future group-centric query already needs to join on.
+
+**Complete data flow:**
+```
+NTC divider voltage
+  -> DAQ.read_channel(ntc_channel)                    [hardware/daq.py, via HardwareManager.ntc_daq]
+  -> classify_ntc_presence(v)                          [hardware/temperature.py]
+       PRESENT -> ntc_voltage_to_celsius(v) -> temp_c
+       ABSENT/FAULT -> temp_c stays None; event_log WARNING (once per transition)
+  -> Safety check
+       Monitor Battery:   SafetyMonitor.check_temperature(temp_c)        [new]
+       Charge/Discharge:  SafetyMonitor.check(v, i, temp_c, mode=...)    [existing, now real]
+       unsafe -> SafetyViolationError -> run_guarded() -> emergency_stop()
+                 -> finish_run_summary(stop_reason=SAFETY_VIOLATION)
+  -> Database storage
+       storage.record_measurement(temp_c=temp_c, ...)  [measurements.temp_c]
+       storage.log_event(...)                          [NTC selection / fault-transition entries]
+  -> Reporting
+       _render_frame(battery_temp=temp_c, ...)          [live console display -- ExecutionFrame]
+       run_summary_report.py::render_run_summary()      [unchanged -- no temp_c surfaced yet,
+                                                           since run_summary has no aggregate column]
+```
+
+### USB -> PXI migration -- confirmed unchanged
+
+`HardwareManager` receives `ntc_daq_cfg` as a plain config dict; `hardware/daq.py::DAQ` remains device-form-factor-agnostic (pure `nidaqmx`, no PXI-vs-USB-specific code, confirmed in an earlier review). Migrating from the temporary USB NI DAQ to the future PXI DAQ requires exactly: repoint or remove `BATTERY_GROUPS[group]["ntc_daq"]` (falls back to `"daq"` automatically) and update `BATTERY_CHANNELS[...]["daq_ntc_ch"]` channel strings to the PXI DAQ's real per-position wiring. Zero changes to `HardwareManager`, `MonitorBatterySequence`/`ChargeSequence`/`DischargeSequence`, `SafetyMonitor`, or any database/UI code -- confirmed, not just asserted, by the fact that every new code path added this session reads `ntc_channel`/`daq` purely through parameters and config, never a hardcoded device identity.

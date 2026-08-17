@@ -57,10 +57,18 @@ battery's limit or the assigned SMU's capability. This class trusts that
 validation already happened; it does not re-validate `test_setpoints`
 itself.
 
-Temperature remains None -- NTC is not wired into this sequence, the same
-pre-existing gap ChargeCycle/DischargeCycle/MonitorBatterySequence all
-carry (SafetyMonitor.check() tolerates temp_c=None; this is a documented,
-tracked gap in docs/TODO.md, not a silent omission).
+Temperature: `ntc_channel` (this position's own BATTERY_CHANNELS[...]
+["daq_ntc_ch"], resolved by the caller), read via `self.daq` --
+HardwareManager's "ntc_daq" role (see docs/architecture.md "Dual DAQ
+Ownership Model"), NOT the general DAQ telemetry this class still doesn't
+use for voltage/current. A reading classified PRESENT
+(hardware/temperature.py::classify_ntc_presence()) is converted to
+Celsius and fed into the SAME safety.check() call below that already
+enforces voltage/current -- temp_c was always a real, checked parameter
+of check(), just never supplied a non-None value until now. `ntc_channel`
+omitted (or no `daq` configured for this group) preserves prior behavior
+exactly: temp_c stays None, check() never evaluates the overtemperature
+branch.
 
 Timeout: a charge timeout here raises NIPXITimeoutError, classified as
 StopReason.TIMEOUT (not the generic FAILED) in run_summary/event_log/
@@ -79,10 +87,11 @@ subclass -- before the SMU is ever enabled.
 import time
 
 from config.settings import Settings
+from hardware.temperature import NTCPresence, classify_ntc_presence, ntc_voltage_to_celsius
 from test_control.battery_operation_sequence import BatteryOperationSequence
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
-from utils.errors import NIPXITimeoutError, SafetyViolationError, ReversePolarityError
+from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, ReversePolarityError
 
 
 class ChargeSequence(BatteryOperationSequence):
@@ -97,7 +106,7 @@ class ChargeSequence(BatteryOperationSequence):
                           source="charge_battery", dmm=dmm, daq=daq)
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
-            test_setpoints: dict, token=None) -> bool:
+            test_setpoints: dict, ntc_channel: str = None, token=None) -> bool:
         """
         Run one complete CC-CV charge on `channel`/`relay_address`.
 
@@ -108,7 +117,10 @@ class ChargeSequence(BatteryOperationSequence):
         BATTERY_GROUPS[group]["test_setpoints"] entry -- REQUIRED, already
         validated by the caller via utils/validators.py::
         validate_group_test_config()) supplies the actual commanded
-        current/CV voltage.
+        current/CV voltage. `ntc_channel` (optional -- this position's
+        BATTERY_CHANNELS[...]["daq_ntc_ch"]) enables real temperature
+        acquisition into the existing safety check; omitted, temperature
+        stays "N/A" exactly as before.
 
         Returns True once EOC is reached. Raises SafetyViolationError,
         RelayError, NIPXITimeoutError, or OperationCancelledError on any
@@ -122,6 +134,7 @@ class ChargeSequence(BatteryOperationSequence):
         current_a = test_setpoints["charge_current_a"]
         voltage_limit_v = test_setpoints["charge_voltage_v"]
         self.safety.set_battery_limits(battery_cfg)
+        last_ntc_state = None  # throttles repeated NTC-fault/absent event_log noise to one entry per transition
 
         def _run_charge():
             check_cancellation(token)
@@ -155,6 +168,7 @@ class ChargeSequence(BatteryOperationSequence):
             # docs/architecture.md Section 27 "Interruptible Wait Mechanism"
             # (the exact latent-bug shape ChargeCycle's own fix avoided,
             # preserved here unchanged).
+            nonlocal last_ntc_state
             try:
                 interruptible_sleep(self.s.STABILIZATION_S, token=token)
 
@@ -179,7 +193,29 @@ class ChargeSequence(BatteryOperationSequence):
                     dmm_v = self.dmm.measure_dc_voltage()
                     v = dmm_v
                     i = smu_reading["current_a"]
-                    t_c = None  # NTC not wired in -- see module docstring
+
+                    t_c = None
+                    if self.daq is not None and ntc_channel is not None:
+                        try:
+                            ntc_v = self.daq.read_channel(ntc_channel)
+                            presence = classify_ntc_presence(ntc_v)
+                            if presence == NTCPresence.PRESENT:
+                                t_c = ntc_voltage_to_celsius(ntc_v)
+                            elif presence != last_ntc_state:
+                                self.storage.log_event(
+                                    level="WARNING", source="charge_battery",
+                                    channel=channel, relay=relay_address,
+                                    message=f"NTC reading {presence} -- temperature monitoring degraded",
+                                )
+                            last_ntc_state = presence
+                        except DAQError as e:
+                            if last_ntc_state != "fault":
+                                self.storage.log_event(
+                                    level="WARNING", source="charge_battery",
+                                    channel=channel, relay=relay_address,
+                                    message=f"NTC read failed -- {e}",
+                                )
+                            last_ntc_state = "fault"
 
                     status = self.safety.check(v, i, t_c, mode="charge")
                     if not status.safe:

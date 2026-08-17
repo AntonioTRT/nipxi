@@ -1816,3 +1816,79 @@ Once running, if the DMM is disconnected mid-loop, the same `DMMError` path appl
 **Risks:** Disabled groups should still be validated for internal consistency (not skipped) -- catches a `relay_address` collision between a real group and a disabled sibling on the same matrix before it can resurface as a real hardware conflict later.
 
 **Recommendation:** Implement all three changes together with the `positions` restructure.
+
+## SECTION 18 — TEMPERATURE MONITORING (Dual DAQ Ownership, NTC Acquisition Pipeline)
+
+*Findings below cover the implemented temperature-monitoring feature -- Option A dual-DAQ ownership and the NTC acquisition pipeline for Monitor Battery/Charge Battery/Discharge Battery. See docs/architecture.md Section 51 for the full technical writeup.*
+
+### Q: How does HardwareManager own two DAQ devices (general "daq" vs. NTC-specific "ntc_daq") without double-connecting when they're the same physical instrument?
+
+**Status:** Implemented
+
+**Answer:** `HardwareManager.__init__()` compares `ntc_daq_cfg` to `daq_cfg` by identity. If they're the same dict object (`hardware_for_group()`'s `"ntc_daq"` fell back to `"daq"`), `self._ntc_daq = self._daq` -- one instance, one connection. If they're genuinely different devices (today's real case: `MAIN_DAQ` vs. a temporary USB DAQ), a second `DAQ` instance is constructed. `connect_all()`/`disconnect_all()`/`health_check()` all check `self._ntc_daq is not self._daq` before treating it as a second device.
+
+**Evidence:** `test_control/hardware_manager.py` `__init__()`/`_connect_all_strict()`/`_connect_all_lenient()`/`disconnect_all()`/`health_check()`.
+
+**Risks:** None found -- verified programmatically for both cases (shared-instance and distinct-instance) before considering this done.
+
+**Recommendation:** None -- implemented as designed.
+
+### Q: Is "read only the active position's NTC" (vs. continuously scanning the whole group) the correct model for Monitor Battery/Charge/Discharge?
+
+**Status:** Confirmed correct, implemented
+
+**Answer:** Yes -- it mirrors exactly how these workflows already read only the active position's DMM/SMU, never the whole group's. Full-group scanning is already a separate, deliberate workflow (NTC Group Scan). Cycle Battery will inherit this model automatically once built as a composition over Charge/DischargeSequence.
+
+**Evidence:** `test_control/monitor_battery_sequence.py`/`charge_sequence.py`/`discharge_sequence.py` each read `ntc_channel` (this position's own `daq_ntc_ch`) once per loop iteration, at the same cadence as their existing telemetry.
+
+**Risks:** None.
+
+**Recommendation:** None -- implemented as designed.
+
+### Q: Why does Monitor Battery get a new `SafetyMonitor.check_temperature()` method instead of reusing the existing `check()`?
+
+**Status:** Implemented, deliberate design choice
+
+**Answer:** Monitor Battery never sources/sinks current, so it has no real `current_a` to pass into `check(v, i, temp_c, mode)`. Passing a placeholder (e.g. `0.0`) would also silently start enforcing voltage/current limits Monitor Battery has never enforced before -- a behavior change beyond what a temperature-only integration should introduce, and a real risk to the already-validated "just observe" nature of Monitor Battery. `check_temperature(temp_c)` is a small, additive method reusing the same `_temp_max()` resolution, changing nothing about `check()` itself.
+
+**Evidence:** `test_control/safety_monitor.py::check_temperature()`; `test_control/monitor_battery_sequence.py`'s NTC read block.
+
+**Risks:** None -- `check()` is untouched; existing Charge/Discharge behavior is unaffected.
+
+**Recommendation:** None -- implemented as designed.
+
+### Q: Does adding real temperature acquisition change Charge/Discharge Battery's existing safety behavior?
+
+**Status:** Implemented, additive only
+
+**Answer:** No new behavior beyond what `check()` was already designed to do. `SafetyMonitor.check(v, i, temp_c, mode=...)` already evaluated `temp_c` on every call -- it was simply always `None` before. The sequences now supply a real, classified reading; `check()` itself is unchanged.
+
+**Evidence:** `test_control/charge_sequence.py`/`discharge_sequence.py` -- `t_c` is now computed via `classify_ntc_presence()`/`ntc_voltage_to_celsius()` instead of hardcoded `None`.
+
+**Risks:** None -- an overtemperature stop was always possible in principle; it simply couldn't trigger without a real reading.
+
+**Recommendation:** None -- implemented as designed.
+
+### Q: What does the database look like after this change?
+
+**Status:** Implemented -- see docs/architecture.md Section 51 "Database behavior" for the full data-flow diagram
+
+**Answer:** `measurements.temp_c` (pre-existing column) now holds real values for `monitor`/`charge_battery`/`discharge_battery` runs when NTC hardware is configured; `event_log` gains an `"NTC DAQ selected: ..."` entry plus throttled `WARNING` entries on presence/fault transitions (once per transition, not per sample). `run_summary` gains no new columns in this pass -- deliberately deferred, mirroring the already-standing decision to defer Charge/Discharge's own voltage-stat aggregation. No new query helper needed -- `get_measurements()` already returns `temp_c`.
+
+**Evidence:** docs/architecture.md Section 51.
+
+**Risks:** None -- purely additive population of an existing column plus new, throttled event_log entries.
+
+**Recommendation:** `run_summary`-level temperature aggregation (min/max/avg per run) and a separate, non-fatal warning threshold remain tracked follow-ups, not part of this change.
+
+### Q: Does the USB-to-PXI DAQ migration still require only configuration changes after this implementation?
+
+**Status:** Confirmed, unchanged
+
+**Answer:** Yes. `HardwareManager` receives `ntc_daq_cfg` as a plain config dict; `DAQ` remains device-form-factor-agnostic. Migrating to the future PXI DAQ requires only repointing/removing `BATTERY_GROUPS[group]["ntc_daq"]` and updating `daq_ntc_ch` channel strings -- zero code changes anywhere in this session's implementation.
+
+**Evidence:** docs/architecture.md Section 51 "USB -> PXI migration".
+
+**Risks:** None.
+
+**Recommendation:** None -- confirmed as designed.

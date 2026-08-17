@@ -29,6 +29,21 @@ TEMPORARY IMPLEMENTATION -- voltage source is the DMM, not the DAQ:
     a single shared DMM. See docs/architecture.md Section 20 ("Temporary
     DMM-based monitoring" / "Future DAQ-based battery telemetry").
 
+Temperature (NTC), unlike voltage/current, IS wired in for real: `daq`
+(optional -- HardwareManager's "ntc_daq" role, see docs/architecture.md
+"Dual DAQ Ownership Model") and `ntc_channel` (this position's own
+BATTERY_CHANNELS[...]["daq_ntc_ch"], resolved by the caller) are read once
+per loop iteration, exactly like the DMM voltage read above -- the same
+per-position, read-only-what's-active model, not a continuous full-group
+NTC scan (that remains NTC Group Scan's job). A reading classified PRESENT
+(hardware/temperature.py::classify_ntc_presence()) is converted to
+Celsius and checked via SafetyMonitor.check_temperature() -- a
+temperature-only check, not the combined check() Charge/Discharge use,
+since Monitor Battery has no real current_a to pass into check() and must
+not start silently enforcing voltage/current limits it never enforced
+before. An overtemperature reading raises SafetyViolationError, routed
+through the existing run_guarded() safety-shutdown path unchanged.
+
 Per relay/channel:
     1. relay.close(channel) -- reuses hardware/relay_eth.py's mandatory
        force-all-off -> verify -> activate -> verify-single -> verify-all
@@ -62,9 +77,11 @@ Monitor-specific relay-only shutdown path.
 """
 
 from config.settings import Settings
+from hardware.temperature import NTCPresence, classify_ntc_presence, ntc_voltage_to_celsius
 from test_control.battery_operation_sequence import BatteryOperationSequence
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
+from utils.errors import DAQError, SafetyViolationError
 
 
 class _VoltageStats:
@@ -108,11 +125,18 @@ class _VoltageStats:
 
 
 class MonitorBatterySequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings):
+    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None):
+        # `daq` (optional, default None) -- HardwareManager's "ntc_daq" role
+        # for this group (see docs/architecture.md "Dual DAQ Ownership
+        # Model"), NOT the group's general "daq" role -- Monitor Battery's
+        # voltage source remains the DMM (see module docstring). None means
+        # this group has no NTC acquisition capability yet; temperature
+        # stays "N/A" exactly as before, no behavior change.
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
-                          source="monitor_battery", dmm=dmm)
+                          source="monitor_battery", dmm=dmm, daq=daq)
 
-    def run(self, channel: int, relay_address: int, sample_interval_s: float = 2.0, token=None):
+    def run(self, channel: int, relay_address: int, sample_interval_s: float = 2.0,
+            ntc_channel: str = None, battery_cfg: dict = None, token=None):
         """
         Continuously monitor one battery position -- no charging, no
         discharging. Closes the relay for `relay_address` once, then
@@ -121,6 +145,13 @@ class MonitorBatterySequence(BatteryOperationSequence):
         a real fault occurs. Cancellation is the EXPECTED way a monitoring
         session ends -- there is no natural "success" exit the way a
         bounded Proto Test relay cycle has one.
+
+        `ntc_channel` (this position's BATTERY_CHANNELS[...]["daq_ntc_ch"],
+        resolved by the caller) and `battery_cfg` (for
+        SafetyMonitor.set_battery_limits() -- so an overtemperature
+        threshold uses this battery's own max_temp_c, not just the global
+        Settings fallback) are both optional; omitting either preserves
+        prior behavior exactly (temperature stays "N/A", never checked).
 
         Run-level bookkeeping (start_run_summary()/battery-config snapshot,
         the pre-relay traceability event_log entries) is the caller's
@@ -132,6 +163,8 @@ class MonitorBatterySequence(BatteryOperationSequence):
         self.log.info("Monitor Battery starting. Channel: %d  Relay: %d", channel, relay_address)
         run_number = self._run_number()
         stats = _VoltageStats()
+        self.safety.set_battery_limits(battery_cfg)
+        last_ntc_state = None  # throttles repeated NTC-fault/absent event_log noise to one entry per transition
 
         def _loop():
             check_cancellation(token)
@@ -146,12 +179,39 @@ class MonitorBatterySequence(BatteryOperationSequence):
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state="ACTIVE")
 
+            nonlocal last_ntc_state
             while True:
                 check_cancellation(token)
 
                 voltage_v = self.dmm.measure_dc_voltage()
                 current_a = None  # DMM is voltage-only -- see module TODO
-                temp_c = None     # NTC not wired in yet -- same pre-existing TODO as charge/discharge cycles
+                temp_c = None
+                if self.daq is not None and ntc_channel is not None:
+                    try:
+                        ntc_v = self.daq.read_channel(ntc_channel)
+                        presence = classify_ntc_presence(ntc_v)
+                        if presence == NTCPresence.PRESENT:
+                            temp_c = ntc_voltage_to_celsius(ntc_v)
+                        elif presence != last_ntc_state:
+                            self.storage.log_event(
+                                level="WARNING", source="monitor_battery",
+                                channel=channel, relay=relay_address,
+                                message=f"NTC reading {presence} -- temperature monitoring degraded",
+                            )
+                        last_ntc_state = presence
+                    except DAQError as e:
+                        if last_ntc_state != "fault":
+                            self.storage.log_event(
+                                level="WARNING", source="monitor_battery",
+                                channel=channel, relay=relay_address,
+                                message=f"NTC read failed -- {e}",
+                            )
+                        last_ntc_state = "fault"
+
+                    status = self.safety.check_temperature(temp_c)
+                    if not status.safe:
+                        raise SafetyViolationError(f"Channel {channel}: {status.reason}")
+
                 stats.add(voltage_v)
 
                 self.storage.record_measurement(

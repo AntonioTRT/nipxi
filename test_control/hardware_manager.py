@@ -63,7 +63,8 @@ class HardwareManager:
     """
 
     def __init__(self, settings: Settings, relay_cfg: dict,
-                 smu_cfg: dict = None, daq_cfg: dict = None, dmm_cfg: dict = None):
+                 smu_cfg: dict = None, daq_cfg: dict = None, dmm_cfg: dict = None,
+                 ntc_daq_cfg: dict = None):
         """
         Build hardware driver objects from configuration.
 
@@ -90,6 +91,17 @@ class HardwareManager:
                        Optional -- the DMM is not required for charge/discharge
                        cycling (independent voltage verification only). Defaults
                        to None (no DMM constructed) unless explicitly passed.
+            ntc_daq_cfg: config/devices.py hardware_for_group()'s "ntc_daq_cfg"
+                       (a DAQ_CONFIGS[...] or USB_DAQ_DEVICES[...] entry) --
+                       the group's NTC/temperature-reading DAQ, which may be a
+                       physically different instrument from daq_cfg (e.g. a
+                       temporary USB DAQ) or may resolve to the SAME entry as
+                       daq_cfg (once one rack DAQ serves every role). Optional
+                       -- None means this group has no NTC acquisition
+                       capability yet. When it resolves to the identical cfg
+                       dict as daq_cfg, no second driver instance/connection is
+                       created -- see the identity check below -- so this
+                       never double-connects to one physical device.
 
         Raises:
             HardwareInitError: if required config keys are missing.
@@ -112,6 +124,20 @@ class HardwareManager:
         self._daq   = DAQ(daq_cfg)
         self._relay = RelayFactory.create(relay_cfg)
         self._dmm   = DMM(dmm_cfg) if dmm_cfg else None
+
+        # NTC/temperature DAQ -- a fifth, optional device role (see
+        # docs/architecture.md "Dual DAQ Ownership Model"). `ntc_daq_cfg is
+        # daq_cfg` (identity, not equality) is true exactly when
+        # hardware_for_group()'s "ntc_daq" fell back to the group's own
+        # "daq" -- the eventual production shape, one rack DAQ serving every
+        # role. In that case self._ntc_daq IS self._daq: the same physical
+        # instrument is never connected twice.
+        if ntc_daq_cfg is None:
+            self._ntc_daq = None
+        elif ntc_daq_cfg is daq_cfg:
+            self._ntc_daq = self._daq
+        else:
+            self._ntc_daq = DAQ(ntc_daq_cfg)
 
         relay_class = self._relay.__class__.__name__
         if relay_cfg.get("type", "serial").lower() == "ethernet":
@@ -156,6 +182,13 @@ class HardwareManager:
     def dmm(self):
         """DMM driver (independent voltage verification), or None if not configured."""
         return self._dmm
+
+    @property
+    def ntc_daq(self):
+        """NTC/temperature DAQ driver for this group, or None if not configured.
+        May be the same instance as `daq` (see __init__) -- callers must not
+        assume a distinct connection just because this property is non-None."""
+        return self._ntc_daq
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -205,6 +238,10 @@ class HardwareManager:
         try:
             self._daq.connect()
             connected.append(self._daq)
+
+            if self._ntc_daq is not None and self._ntc_daq is not self._daq:
+                self._ntc_daq.connect()
+                connected.append(self._ntc_daq)
 
             self._smu.connect()
             connected.append(self._smu)
@@ -268,6 +305,7 @@ class HardwareManager:
                 self.hardware_status[label] = {"connected": False, "error": str(e)}
 
         _try_connect(self._daq, "DAQ")
+        _try_connect(self._ntc_daq if self._ntc_daq is not self._daq else None, "NTC_DAQ")
         _try_connect(self._smu, "SMU")
         _try_connect(self._dmm, "DMM")
         _try_connect(self._relay, "Relay")
@@ -286,7 +324,7 @@ class HardwareManager:
                     "Aborting startup regardless of mode -- an unverifiable "
                     "PMU state is never acceptable."
                 )
-                for dev in (self._daq, self._smu, self._dmm, self._relay):
+                for dev in (self._daq, self._ntc_daq, self._smu, self._dmm, self._relay):
                     if dev is not None:
                         try:
                             if dev.connected:
@@ -315,7 +353,7 @@ class HardwareManager:
                     "Aborting startup regardless of mode -- an unverifiable "
                     "relay state is never acceptable.", e,
                 )
-                for dev in (self._daq, self._smu, self._dmm, self._relay):
+                for dev in (self._daq, self._ntc_daq, self._smu, self._dmm, self._relay):
                     if dev is not None:
                         try:
                             if dev.connected:
@@ -382,11 +420,14 @@ class HardwareManager:
                     "cannot be resolved immediately.", e,
                 )
 
-        # 3. Disconnect relay, DMM (if present), SMU, DAQ (reverse of connect order)
+        # 3. Disconnect relay, DMM (if present), SMU, DAQ, NTC_DAQ (if a
+        #    distinct instance) -- reverse of connect order.
         devices = [self._relay]
         if self._dmm is not None:
             devices.append(self._dmm)
         devices += [self._smu, self._daq]
+        if self._ntc_daq is not None and self._ntc_daq is not self._daq:
+            devices.append(self._ntc_daq)
         for dev in devices:
             try:
                 if dev.connected:
@@ -463,6 +504,8 @@ class HardwareManager:
         devices = (self._smu, self._daq, self._relay)
         if self._dmm is not None:
             devices += (self._dmm,)
+        if self._ntc_daq is not None and self._ntc_daq is not self._daq:
+            devices += (self._ntc_daq,)
 
         for dev in devices:
             key = dev.name
@@ -491,9 +534,15 @@ class HardwareManager:
 
     def __repr__(self):
         dmm_state = f" dmm={self._dmm.connected}" if self._dmm is not None else ""
+        if self._ntc_daq is None:
+            ntc_daq_state = ""
+        elif self._ntc_daq is self._daq:
+            ntc_daq_state = " ntc_daq=(shared with daq)"
+        else:
+            ntc_daq_state = f" ntc_daq={self._ntc_daq.connected}"
         return (
             f"<HardwareManager "
             f"smu={self._smu.connected} "
-            f"daq={self._daq.connected}{dmm_state} "
+            f"daq={self._daq.connected}{dmm_state}{ntc_daq_state} "
             f"relay={self._relay.connected}>"
         )
