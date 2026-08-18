@@ -2100,6 +2100,96 @@ def test_pxi_relay_matrix():
 # 6. Sensors (NTC temperature)
 # =============================================================================
 
+def _select_ntc_daq_device():
+    """
+    Runtime DAQ selection for Test Sensors (NTC) Test 6 -- diagnostic-only,
+    scoped to this one sensor-test session. Solves the mismatch where
+    config/devices.py's configured ntc_daq (e.g. "Dev2") doesn't match
+    what's actually enumerated on this machine right now (e.g. only
+    "usbdaq" is present) -- the operator picks the real device instead of
+    Test 6 failing outright.
+
+    Enumerates every NI-DAQmx device via hardware/daq.py::
+    DAQ.list_available_devices() -- dynamic, driver-level enumeration, so
+    this works unchanged for a USB DAQ today and a future PXI DAQ (e.g.
+    "PXI1Slot15") with zero USB-specific or PXI-specific logic here.
+
+    Never touches config/devices.py/BATTERY_GROUPS or any runtime DAQ-
+    assignment logic -- the returned device name is used exclusively by
+    this test_sensors() call, nowhere else.
+
+    The discovered device list is ALWAYS printed (even when there's only
+    one device, and it's auto-selected) -- the operator should always see
+    what was actually found on this machine, not just be told the outcome.
+
+    Returns the selected device name string. Returns None if no device is
+    enumerated, nidaqmx itself is unavailable, or the operator cancels --
+    the caller must abort the DAQ scan gracefully in that case (Tests 1-5
+    are unaffected either way).
+    """
+    from hardware.daq import DAQ
+    try:
+        devices = DAQ.list_available_devices()
+    except Exception as e:
+        print(f"\n[FAIL] Could not enumerate NI-DAQmx devices: {e}")
+        return None
+
+    if not devices:
+        print("\nNo NI-DAQmx DAQ devices detected.")
+        return None
+
+    print("\nAvailable DAQ Devices:\n")
+    for i, name in enumerate(devices, start=1):
+        print(f"{i}. {name}")
+
+    if len(devices) == 1:
+        print(f"\nUsing DAQ:\n    {devices[0]}")
+        return devices[0]
+
+    print("\n0. Cancel")
+    choice = input("\nChoice: ").strip()
+    if choice in ("", "0"):
+        return None
+    try:
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(devices):
+            raise ValueError()
+    except ValueError:
+        print("Invalid choice.")
+        return None
+    return devices[idx]
+
+
+def _ntc_summary_table_result(summary_rows: list):
+    """
+    Build the consolidated NTC Summary table (Battery/Channel/Raw
+    Voltage/Temperature/Status) from `summary_rows` -- one dict per
+    position, already collected by test_sensors()'s Test 6 loop from data
+    it already acquired. Builds a table ONLY -- never reads a DAQ channel
+    itself, never duplicates the acquisition loop above.
+
+    Returned as one additional TestResult, appended after every per-
+    channel PASS/WARN/FAIL result -- run_section() prints results in
+    order via print_detail(), so this renders last: one consolidated
+    overview after the existing per-channel output, unchanged above it.
+
+    Display only: voltage is formatted to 3 decimal places here (e.g.
+    "2.461"/"0.000") -- the underlying acquisition precision in
+    `summary_rows["voltage_v"]` (and whatever classify_ntc_presence()/
+    ntc_voltage_to_celsius() computed from it) is untouched.
+    """
+    header = f"{'Battery':<10}{'Channel':<16}{'Raw Voltage(V)':<16}{'Temperature(C)':<16}{'Status':<12}"
+    lines = [header, "-" * len(header)]
+    for row in summary_rows:
+        voltage_label = f"{row['voltage_v']:.3f}" if row["voltage_v"] is not None else "N/A"
+        temp_label = f"{row['temp_c']:.2f}" if row["temp_c"] is not None else "N/A"
+        lines.append(
+            f"{row['battery']:<10}{row['channel']:<16}{voltage_label:<16}{temp_label:<16}{row['status']:<12}"
+        )
+    return _ok("Sensors", "NTC Summary", "consolidated -- reuses this run's own scan results, no re-read",
+                "\n".join(lines))
+
+
 def test_sensors():
     """
     Two parts:
@@ -2129,7 +2219,15 @@ def test_sensors():
     Test 6 requires a real DAQ and is reported per-channel (PASS/FAIL) --
     a missing/unreachable DAQ fails every channel with a clear reason
     rather than raising, so this menu item still completes cleanly on a
-    laptop with no rack attached (Part 1 always runs regardless).
+    laptop with no rack attached (Part 1 always runs regardless). The DAQ
+    itself is chosen at runtime, this session only (see
+    _select_ntc_daq_device()) -- every discovered NI-DAQmx device is always
+    listed, even when there's only one and it's auto-selected.
+
+    After the per-channel results, one additional, consolidated "NTC
+    Summary" table (Battery/Channel/Raw Voltage/Temperature/Status) is
+    appended -- built entirely from data the scan loop already acquired
+    (see _ntc_summary_table_result()), never a second read of any channel.
     """
     config_ref = "hardware/temperature.py  Beta=3950 K  R25=10 kOhm  V_exc=5.0 V"
     results    = []
@@ -2137,7 +2235,7 @@ def test_sensors():
     # -- Module import + function test ----------------------------------------
     try:
         from hardware.temperature import (
-            ntc_voltage_to_celsius, TemperatureSensor,
+            ntc_voltage_to_celsius, TemperatureSensor, classify_ntc_presence, NTCPresence,
             NTC_BETA, NTC_R25_OHM, NTC_EXCITATION_V
         )
     except ImportError as e:
@@ -2208,11 +2306,9 @@ def test_sensors():
     # Test 6: DAQ-based NTC channel scan -- the future battery-temperature
     # acquisition architecture. Iterates every ENABLED position in Group
     # B1's positions' daq_ntc_ch -- config-driven, never a hardcoded channel
-    # list. Connects via Group B1's resolved "ntc_daq" (see config/devices.py
-    # ::hardware_for_group()) -- B1 is the only group with real positions
-    # today, and daq_ntc_ch currently points at the NI USB-6210 development
-    # DAQ (config/devices.py::USB_DAQ_DEVICES), not the DAQ_CONFIG default
-    # (MAIN_DAQ) used elsewhere in this file -- see docs/architecture.md.
+    # list. Group B1's configured "ntc_daq" (see config/devices.py::
+    # hardware_for_group()) supplies default model/voltage_range_v metadata
+    # only -- see docs/architecture.md.
     enabled_channels = {pos: ch for pos, ch in dev_cfg.BATTERY_GROUPS["B1"]["positions"].items() if ch.get("enabled")}
     if not enabled_channels:
         results.append(_warn("Sensors", "NTC DAQ scan", config_ref,
@@ -2224,33 +2320,100 @@ def test_sensors():
         results.append(_warn("Sensors", "NTC DAQ scan", config_ref,
                              "Group B1 has no ntc_daq/daq assigned -- nothing to scan"))
         return results
-    daq_ref = f"{ntc_daq_cfg.get('resource', '')} / {ntc_daq_cfg.get('model', '')}"
+
+    # Runtime DAQ selection (diagnostic-only, this session only -- see
+    # _select_ntc_daq_device()). Solves "configured Dev2, only usbdaq is
+    # actually enumerated" without touching config/devices.py/BATTERY_GROUPS
+    # or any runtime DAQ-assignment logic. Reuses ntc_daq_cfg's model/
+    # voltage_range_v (display/range-verification metadata only); only
+    # "resource" is overridden with the operator's selection.
+    selected_device = _select_ntc_daq_device()
+    if selected_device is None:
+        results.append(_warn("Sensors", "NTC DAQ scan", config_ref,
+                             "No DAQ selected -- NTC DAQ scan skipped"))
+        return results
+
+    daq_ref = f"{selected_device} / {ntc_daq_cfg.get('model', 'N/A')} (session-selected)"
     from hardware.daq import DAQ
-    daq = DAQ(ntc_daq_cfg)
+    session_daq_cfg = {**ntc_daq_cfg, "resource": selected_device}
+    daq = DAQ(session_daq_cfg)
+
+    # Consolidated NTC Summary rows -- built alongside the existing
+    # per-channel PASS/WARN/FAIL results below, from the SAME acquired
+    # voltage (never a second daq.read_channel() call). One row per
+    # enabled position, appended in the same order the scan runs.
+    summary_rows = []
+
     try:
         daq.connect()
     except Exception as e:
-        for i in enabled_channels:
+        for i, ch in enabled_channels.items():
             results.append(_fail("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
                                  f"[ERROR] DAQ not detected or connect failed\nReason: {e}"))
+            _, _, suffix = ch["daq_ntc_ch"].partition("/")
+            ntc_ch = f"{selected_device}/{suffix}" if suffix else ch["daq_ntc_ch"]
+            summary_rows.append({"battery": f"BAT_{i}", "channel": ntc_ch,
+                                  "voltage_v": None, "temp_c": None, "status": "READ_ERROR"})
+        results.append(_ntc_summary_table_result(summary_rows))
         return results
 
     try:
         for i, ch in enabled_channels.items():
-            ntc_ch = ch["daq_ntc_ch"]
+            # The configured daq_ntc_ch (e.g. "Dev2/ai0") embeds the
+            # CONFIGURED device's own alias -- only valid against that
+            # device. Rewrite the alias prefix to this session's selected
+            # device, keeping the channel-specific suffix (e.g. "ai0")
+            # unchanged, so the same position map still resolves correctly
+            # against whichever physical DAQ is actually connected.
+            _, _, suffix = ch["daq_ntc_ch"].partition("/")
+            ntc_ch = f"{selected_device}/{suffix}" if suffix else ch["daq_ntc_ch"]
             try:
                 v = daq.read_channel(ntc_ch)
-                t_c = ntc_voltage_to_celsius(v)
-                if t_c is None:
-                    results.append(_warn("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
-                                         f"Channel {ntc_ch}: {v:.4f} V -- out of NTC divider range "
-                                         f"(0 < V < {NTC_EXCITATION_V} V), no valid temperature"))
-                else:
+
+                # Classify presence FIRST, from the raw voltage alone --
+                # classify_ntc_presence() (hardware/temperature.py) is the
+                # single source of truth for "is this channel ABSENT" (its
+                # own ABSENT_VOLTAGE_THRESHOLD), never duplicated here.
+                # ntc_voltage_to_celsius() is deliberately NOT called for an
+                # ABSENT channel: microvolt-level noise near 0 V (an
+                # electrically open channel) still lands inside the
+                # Beta-equation's mathematically "valid" domain and would
+                # otherwise produce a real-looking but physically
+                # meaningless temperature (e.g. -102 degC on a disconnected
+                # channel) -- misleading during bench validation.
+                presence = classify_ntc_presence(v)
+                if presence == NTCPresence.ABSENT:
+                    t_c = None
                     results.append(_ok("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
-                                       f"Channel {ntc_ch}: {v:.4f} V -> {t_c:.2f} degC"))
+                                       f"Channel {ntc_ch}: {v:.3f} V -- ABSENT (no NTC connected), "
+                                       f"temperature not computed"))
+                else:
+                    t_c = ntc_voltage_to_celsius(v)
+                    if t_c is None:
+                        results.append(_warn("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
+                                             f"Channel {ntc_ch}: {v:.4f} V -- out of NTC divider range "
+                                             f"(0 < V < {NTC_EXCITATION_V} V), no valid temperature"))
+                    else:
+                        results.append(_ok("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
+                                           f"Channel {ntc_ch}: {v:.4f} V -> {t_c:.2f} degC"))
+
+                if presence == NTCPresence.ABSENT:
+                    status = "ABSENT"
+                elif presence == NTCPresence.FAULT:
+                    status = "FAULT"
+                elif t_c is None:
+                    status = "OUT_OF_RANGE"
+                else:
+                    status = "OK"
+                summary_rows.append({"battery": f"BAT_{i}", "channel": ntc_ch,
+                                      "voltage_v": v, "temp_c": t_c, "status": status})
             except Exception as e:
                 results.append(_fail("Sensors", f"NTC DAQ scan -- BAT_{i}", daq_ref,
                                      f"Channel {ntc_ch} read failed: {e}"))
+                summary_rows.append({"battery": f"BAT_{i}", "channel": ntc_ch,
+                                      "voltage_v": None, "temp_c": None, "status": "READ_ERROR"})
+
+        results.append(_ntc_summary_table_result(summary_rows))
     finally:
         try:
             daq.disconnect()

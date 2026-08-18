@@ -68,13 +68,22 @@ module docstring for the identical rationale, and docs/architecture.md
 Reverse Polarity Protection: see charge_sequence.py's module docstring --
 identical pre-output-enable DMM sanity check here, before
 set_discharge_mode()/output_enable().
+
+Post-Run Diagnostic Classification (Test Mode only, informational) -- see
+charge_sequence.py's identical rationale and test_control/
+battery_diagnostics.py::classify_discharge_behavior(). An empty position
+sinking current from an open circuit drives voltage toward the SMU's
+compliance floor almost immediately, tripping the undervoltage safety
+check -- `analysis_result` (NORMAL_DISCHARGE_BEHAVIOR/
+POSSIBLY_EMPTY_POSITION) distinguishes that from a genuine discharge,
+purely additively, never touching stop_reason/result.
 """
 
 import time
 
 from config.settings import Settings
 from hardware.temperature import NTCPresence, classify_ntc_presence, ntc_voltage_to_celsius
-from test_control.battery_operation_sequence import BatteryOperationSequence
+from test_control.battery_operation_sequence import BatteryOperationSequence, _ChargeDischargeStats
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, ReversePolarityError
@@ -148,6 +157,19 @@ class DischargeSequence(BatteryOperationSequence):
                 channel, target_v, floor_v,
             )
 
+        # Test Mode diagnostic classification ONLY (see
+        # test_control/battery_diagnostics.py) -- see charge_sequence.py's
+        # identical rationale. Accumulates the SAME voltage_v/current_a
+        # samples the loop below already computes, never a second read.
+        stats = _ChargeDischargeStats()
+        run_start_time = time.monotonic()
+
+        def _diagnostic_fields():
+            return self._discharge_diagnostic_fields(
+                stats, commanded_current_a=current_a, battery_cfg=battery_cfg,
+                duration_s=time.monotonic() - run_start_time,
+            )
+
         def _run_discharge():
             check_cancellation(token)
             self.relay.close(relay_address)
@@ -169,6 +191,13 @@ class DischargeSequence(BatteryOperationSequence):
             # RelayBase.open()/close(), hardware/relay.py) before returning.
             pre_enable_v = self.dmm.measure_dc_voltage()
             self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
+
+            # Diagnostic stats' initial_voltage_v is THIS reading -- see
+            # charge_sequence.py's identical rationale (taken with the SMU
+            # output still disabled, before compliance can mask an empty
+            # position as looking like a real, present cell). Reuses
+            # pre_enable_v itself, no new read.
+            stats.initial_voltage_v = pre_enable_v
 
             self.smu.set_discharge_mode(current_a=current_a, voltage_limit_v=compliance_voltage_v)
             self.smu.output_enable()
@@ -195,6 +224,7 @@ class DischargeSequence(BatteryOperationSequence):
                     dmm_v = self.dmm.measure_dc_voltage()
                     v = dmm_v
                     i = smu_reading["current_a"]
+                    stats.add(v, i)
 
                     t_c = None
                     if self.daq is not None and ntc_channel is not None:
@@ -272,9 +302,11 @@ class DischargeSequence(BatteryOperationSequence):
             _run_discharge, channel=channel, relay_address=relay_address,
             label="Discharge Battery", verb="discharging",
             cancel_message="Discharging stopped by operator",
+            extra_run_summary_fields_fn=_diagnostic_fields,
         )
         self.complete(
             channel=channel, relay_address=relay_address,
             log_message=f"Discharge complete on channel {channel} (EOD reached)",
+            **_diagnostic_fields(),
         )
         return completed

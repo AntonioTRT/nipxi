@@ -2019,6 +2019,68 @@ Real-hardware validation of Charge/Discharge Battery on Group B1 (still
 the highest-priority open item), then main.py legacy path retirement
 (Section 50's findings), then CycleSequence, then Runtime/Cycle Controller.
 
+## Milestone XIX: NTC Runtime DAQ Selection, USB-6211 RSE Fix, and Post-Run Charge/Discharge Diagnostic Classification
+
+Full technical detail in `docs/architecture.md` Section 54. Summary:
+
+- **Runtime DAQ selection (Test Sensors):** operator picks which enumerated
+  NI-DAQmx device serves one NTC scan session -- solves "configured Dev2,
+  only usbdaq present"; diagnostic-only, never touches
+  `config/devices.py`/`BATTERY_GROUPS`.
+- **USB-6211 real-hardware finding:** `hardware/daq.py::DAQ.read_channel()`
+  never set `terminal_config`, so nidaqmx's ambiguous `DEFAULT` let a
+  channel pair differentially with a floating counterpart -- readings of
+  6-8 V on a 5 V divider that read 0 V/2.5 V on a meter. Fixed by forcing
+  `RSE` explicitly (configurable, defaults to `RSE`) -- verified on real
+  hardware: disconnected channels now read ~0 V, the connected channel
+  reads 2.4578 V -> 24.24 degC, matching the meter.
+- **NTC Summary table + ABSENT fix:** one consolidated table appended
+  after Test 6's existing per-channel output (reuses already-acquired
+  data, no new reads); a real bug where microvolt noise on a disconnected
+  channel still computed and displayed a bogus temperature (e.g. -102.27
+  degC) is fixed by classifying presence before computing temperature.
+- **`analysis_result` diagnostic classification:** new `test_control/
+  battery_diagnostics.py` classifies Charge/Discharge post-run behavior
+  (`ALREADY_CHARGED`/`POSSIBLY_EMPTY_POSITION`/`NORMAL_CHARGE_BEHAVIOR`/
+  `NORMAL_DISCHARGE_BEHAVIOR`) from data the sampling loop already
+  collects -- purely informational, never gates/blocks a run, never
+  changes `stop_reason`/`result`. Verified: `analysis_result` persists to
+  a real, additive `run_summary` column and displays via
+  `run_summary_report.py`, confirmed with a fresh `DataStorage` instance
+  reading it back from disk after the writer closed.
+- **`main.py` legacy path reviewed and given the same classification:**
+  traced the complete chain (`main.py` -> `TestExecutor` ->
+  `BatteryTestSequence` -> `ChargeCycle`/`DischargeCycle`) and confirmed it
+  previously had **no** `run_summary` row at all (not just a missing
+  column) and no diagnostic classification. `ChargeCycle`/`DischargeCycle`
+  now reuse the exact same `battery_diagnostics.py` functions (no parallel
+  engine), logged via the existing logger and `event_log` where the
+  storage backend supports it -- with a documented limitation (no
+  pre-enable voltage reading to reuse, unlike the new architecture) and an
+  explicitly-deferred gap (still no `run_summary` row for a legacy run, a
+  bigger design decision than this pass's scope).
+
+### Milestone readiness decision
+
+**Implemented and verified for the diagnostic-classification and NTC
+usability work.** Real-hardware-confirmed RSE fix; all five classification
+cases verified against the real `ChargeSequence`/`DischargeSequence`/
+`ChargeCycle`/`DischargeCycle` code paths (not just the pure classifier),
+with `stop_reason`/`result` proven unchanged in every case.
+**Two items deliberately left open, not silently resolved:** the
+CycleSequence one-row-per-phase-vs-per-cycle `run_summary` question, and
+`analysis_result` persistence for `main.py`'s legacy path (blocked on the
+same granularity question, at multi-channel-run scale).
+
+### Recommended next milestone
+
+Resolve the `run_summary` granularity question (one row per position-
+operation vs. per whole run) before building CycleSequence -- it blocks
+both CycleSequence's own analysis_result persistence and closing the
+legacy-path gap above. Then continue: real-hardware validation of
+Charge/Discharge Battery on Group B1, main.py legacy path retirement,
+CycleSequence, Runtime/Cycle Controller.
+
 ---
 
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the

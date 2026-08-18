@@ -35,7 +35,11 @@ NTC_EXCITATION_V = 5.0       # divider excitation supply (NTC side) -- was named
 # An open NTC leg pulls the node to GND (v_ntc -> 0); a short across the NTC
 # (or a short from the excitation rail to the node) pulls it to V_exc. Real
 # ADC/wiring noise means neither rail is ever hit exactly, hence the margins.
-NTC_OPEN_VOLTAGE_MARGIN_V  = 0.05   # v_ntc <= this -> ABSENT (open circuit)
+# ABSENT_VOLTAGE_THRESHOLD is the single source of truth for "is this
+# channel electrically open" -- every caller (test_sensors() Test 6, the
+# group NTC pre-check, Monitor/Charge/Discharge's NTC read) goes through
+# classify_ntc_presence() below rather than re-implementing this check.
+ABSENT_VOLTAGE_THRESHOLD   = 0.05   # v_ntc <= this -> ABSENT (open circuit)
 NTC_SHORT_VOLTAGE_MARGIN_V = 0.05   # v_ntc >= V_exc - this -> FAULT (shorted)
 NTC_PLAUSIBLE_TEMP_MIN_C   = -20.0  # outside [MIN, MAX] with a valid divider
 NTC_PLAUSIBLE_TEMP_MAX_C   = 80.0   # reading -> FAULT (implausible), not accepted
@@ -91,7 +95,7 @@ def classify_ntc_presence(voltage_v: float, v_exc: float = NTC_EXCITATION_V) -> 
     excitation rail must not be silently reported as "no battery" -- that
     would hide a real wiring/sensor fault behind an empty-position reading.
     """
-    if voltage_v <= NTC_OPEN_VOLTAGE_MARGIN_V:
+    if voltage_v <= ABSENT_VOLTAGE_THRESHOLD:
         return NTCPresence.ABSENT
     if voltage_v >= v_exc - NTC_SHORT_VOLTAGE_MARGIN_V:
         return NTCPresence.FAULT

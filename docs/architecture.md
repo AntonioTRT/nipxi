@@ -4134,3 +4134,241 @@ row populates both columns).
 `Settings.BATTERY_POSITIONS`/`GROUP_SIZE` (a separate, still-functional
 legacy Proto Test Execution numbering system with zero references to any
 of the retired names).
+
+## 54. NTC Runtime DAQ Selection, USB-6211 RSE Fix, NTC Summary Table, and Post-Run Charge/Discharge Diagnostic Classification
+
+Four related usability/correctness passes on Test Sensors (NTC) and
+Charge/Discharge Battery, ending with a review of whether `main.py`'s
+legacy path inherits any of it.
+
+### Runtime DAQ selection (Test Sensors -- Test 6)
+
+**Problem:** Test 6 hardcoded the DAQ via `config/devices.py::
+hardware_for_group("B1")["ntc_daq_cfg"]`; if the configured device (e.g.
+`Dev2`) didn't match what NI-DAQmx actually enumerated (e.g. only
+`usbdaq` present), the whole scan failed even with a valid DAQ connected.
+
+**Fix:** `hardware/daq.py::DAQ.list_available_devices()` (a `@staticmethod`,
+the same `nidaqmx.system.System.local().devices` enumeration `connect()`
+already used for its own error message, exposed standalone). `test.py::
+_select_ntc_daq_device()` enumerates and **always** prints the discovered
+device list (even with exactly one device, auto-selected -- the operator
+should always see what was actually found, not just the outcome), prompts
+only when there's more than one, and returns `None` on empty/cancel (Test 6
+then skips gracefully -- Tests 1-5 unaffected). The session-selected device
+name is substituted only for the *resource* -- `daq_ntc_ch`'s configured
+alias prefix (e.g. `"Dev2/ai0"`) is rewritten to the selected device's own
+alias (`"usbdaq/ai0"`), since the channel *suffix* is what's actually
+position-specific. Diagnostic-only: never writes to `config/devices.py`/
+`BATTERY_GROUPS` (verified: `BATTERY_GROUPS["B1"]["ntc_daq"]` unchanged
+after a Test Sensors run), never touches group ownership or runtime DAQ-
+assignment logic. Config-driven, no USB-specific or PXI-specific logic --
+verified against the real device (a USB-6211) and via a mocked multi-device
+list (`["usbdaq", "PXI1Slot2", "PXI1Slot15"]`).
+
+### USB-6211 real-hardware finding: wrong AI terminal configuration
+
+Bench validation (meter on the actual DAQ pin) found NTC disconnected
+reads ~0 V and NTC connected reads ~2.5 V, but Test 6 reported values like
+6-8 V -- physically impossible for a 5 V divider.
+
+**Root cause:** `hardware/daq.py::DAQ.read_channel()`'s `add_ai_voltage_chan()`
+call never set `terminal_config`, leaving nidaqmx's own
+`TerminalConfiguration.DEFAULT` (`-1`) -- an ambiguous, device-dependent
+setting. On this USB-6211, with only `ai0`-`ai7` wired (an NTC-only DAQ)
+and `ai8`-`ai15` floating, `DEFAULT` let nidaqmx pair each channel
+differentially with its floating counterpart (`ai0`/`ai8`, etc.) instead of
+measuring it single-ended against common ground -- the value returned was
+genuinely what the ADC sampled (no software-side scaling/unit-conversion
+bug was found; range/channel/raw-vs-processed all checked clean), just the
+wrong physical quantity.
+
+**Fix:** `DAQ.__init__()` gained a `terminal_config` field (from
+`cfg["terminal_config"]`, defaulting to `"RSE"` -- Referenced Single-Ended,
+matching every analog signal this driver reads, all single-ended relative
+to common AI GND), validated against `nidaqmx.constants.TerminalConfiguration`'s
+real member names at construction (caught by
+`utils/device_validator.py`'s existing `_check_instantiable()` if
+misconfigured). `read_channel()` now always passes it explicitly.
+**Verified on the real USB-6211**: before the fix, every channel read
+6-8 V; after, disconnected channels read ~0 V and the connected channel
+read 2.4578 V -> 24.24 degC, matching the meter.
+
+### NTC Summary table + ABSENT presentation fix
+
+Test 6 now appends one additional, consolidated result (`_ntc_summary_table_result()`,
+`test.py`) after every per-channel PASS/WARN/FAIL line -- a
+Battery/Channel/Raw Voltage/Temperature/Status table built entirely from
+data the existing scan loop already acquired (`v`/`t_c` already computed;
+`classify_ntc_presence(v)` is a pure re-classification of the SAME `v`, not
+a second DAQ read). Voltage is displayed to 3 decimal places (display
+only -- the underlying float precision used for classification is
+untouched).
+
+A real bug surfaced during bench validation: microvolt-level noise on a
+disconnected channel (e.g. `-0.0001 V`) was correctly classified `ABSENT`
+in the table's Status column, but the per-channel line still called
+`ntc_voltage_to_celsius()` unconditionally and displayed a bogus
+temperature (e.g. `-102.27 degC`) -- mathematically "valid" (0 < v <
+v_exc) but physically meaningless for an open channel. Fixed by
+classifying presence **first** and skipping the temperature call entirely
+for `ABSENT` (`hardware/temperature.py::ABSENT_VOLTAGE_THRESHOLD`, renamed
+from `NTC_OPEN_VOLTAGE_MARGIN_V` -- same value, now the one place both
+`test_sensors()` and `classify_ntc_presence()` agree "electrically open"
+means, never a second/duplicate threshold). Verified end-to-end on real
+hardware: `ABSENT` channels now show `Temperature: N/A`; a real ~2.46 V
+reading through the identical path still correctly computes and displays
+`24.28 degC`.
+
+### Post-run Charge/Discharge diagnostic classification (`analysis_result`)
+
+**Problem:** Test Mode deliberately allows Charge/Discharge to run without
+NTC validation or battery-presence gating (so relay/SMU/DMM/SafetyMonitor/
+logging can be validated against partially assembled hardware) -- but that
+permissiveness makes an empty position deceptively look like a real
+result. Traced from the actual code: `ChargeSequence`'s CV compliance into
+an open circuit satisfies its own EOC condition (`v >= voltage_limit_v and
+abs(i) <= CHARGE_CUTOFF_A`) almost immediately, indistinguishable at a
+glance from a battery that was already fully charged; `DischargeSequence`
+sinking current from an open circuit drives voltage toward the SMU's
+compliance floor almost immediately, tripping `SafetyMonitor`'s
+undervoltage check instead.
+
+**Design:** new `test_control/battery_diagnostics.py` -- pure classification
+functions, zero hardware access, single source of truth for
+`ChargeDiagnosis`/`DischargeDiagnosis` (`ALREADY_CHARGED`/
+`POSSIBLY_EMPTY_POSITION`/`NORMAL_CHARGE_BEHAVIOR`/`NORMAL_DISCHARGE_BEHAVIOR`)
+and their message text (`message_for(result, mode)` -- `mode`-scoped
+because `ChargeDiagnosis.POSSIBLY_EMPTY_POSITION` and
+`DischargeDiagnosis.POSSIBLY_EMPTY_POSITION` deliberately share one string
+value, per spec, so a single result-keyed message dict would let one
+mode's wording silently clobber the other's -- caught during
+implementation, fixed before considering it done). A shared
+`_ChargeDischargeStats` accumulator (`battery_operation_sequence.py`) is
+fed the exact `voltage_v`/`current_a` each sequence's sampling loop already
+computes for `_record_measurement()` -- `add()` performs no read of its
+own. **Critical correction found during implementation:** classifying from
+the sampling loop's first sample doesn't work -- by then the SMU has
+already driven an empty position to its compliance limit for
+`Settings.STABILIZATION_S`, making it indistinguishable from a genuinely
+full battery. Fixed by using the **pre-enable** DMM reading (`pre_enable_v`,
+already computed for the existing reverse-polarity check,
+`BatteryOperationSequence._check_battery_polarity()`) as
+`stats.initial_voltage_v` instead -- reusing existing data, not a new read.
+A reverse-polarity abort deliberately does NOT also get an empty-position
+label (`stats.initial_voltage_v` is only set once the polarity check
+passes -- that scenario already has its own distinct `ReversePolarityError`
+event_log entry).
+
+Thresholds (`battery_diagnostics.py`, all tunable placeholders pending
+bench calibration): `NEAR_FULL_MARGIN_V=0.05` V, `EMPTY_POSITION_VOLTAGE_V=0.5`
+V (same order of magnitude as the existing `REVERSE_POLARITY_VOLTAGE_THRESHOLD_V=
+-0.5` V), `MIN_MEANINGFUL_CURRENT_FRACTION=0.05` (of the *commanded*
+setpoint current, not an absolute amp value, so it scales across groups),
+`SHORT_DURATION_S=15.0` (above the unavoidable `STABILIZATION_S(5.0)+1
+sample` floor, far below a realistic multi-hour run).
+
+**Integration point:** `BatteryOperationSequence.run_guarded()`'s existing
+`extra_run_summary_fields_fn` hook -- the same mechanism Monitor Battery
+already uses for its own voltage stats, called on every exit path
+(success via `complete()`, and all four `run_guarded()` failure branches).
+This mattered concretely: the Discharge-empty-position scenario exits via
+`SafetyViolationError`, never reaching `complete()` -- without this hook
+the classification would silently never fire for that case.
+`data/storage.py` gained an additive `analysis_result TEXT` column
+(`run_summary`, same `_migrate_add_missing_columns()` pattern as every
+prior addition) plus an entry in `finish_run_summary()`'s write allowlist
+(without it, the field would be silently dropped like any unlisted
+`**fields` key). `run_summary_report.py` displays it
+(`Diagnostic: <result> -- <message>`) for Charge/Discharge sections only.
+
+**Verified against the real code paths** (mocked SMU/DMM/relay, not just
+the pure classifier): all five cases (`ALREADY_CHARGED`,
+`POSSIBLY_EMPTY_POSITION` x2, `NORMAL_CHARGE_BEHAVIOR`,
+`NORMAL_DISCHARGE_BEHAVIOR`) produce the correct `analysis_result`, and
+`stop_reason`/`result` are byte-identical to what they'd be without this
+feature in every case (`COMPLETED`/`PASS` for both a real charge and an
+empty-position charge; `SAFETY_VIOLATION`/`FAIL` for an empty-position
+discharge) -- proving the classification never changes existing pass/fail
+semantics. Persistence proven with a fresh, independent `DataStorage`
+instance (no shared state with the writer) reading the row back from disk
+after the writer closed its connection, and with a raw `sqlite3` query
+bypassing `DataStorage` entirely.
+
+**CycleSequence inheritance (not yet buildable, design intent only):** the
+classification is wired inside `ChargeSequence.run()`/`DischargeSequence.run()`
+themselves (their own `run_guarded()`/`complete()` calls), not in `test.py`'s
+interactive wrapper -- so a future `CycleSequence` composing these two
+classes as its charge/discharge phases inherits the same classification
+automatically, with zero code of its own. **Caveat, unresolved:** if
+Cycle's charge and discharge phases share one `run_summary` row (one
+`run_id` for the whole cycle), the discharge phase's `finish_run_summary()`
+UPDATE would overwrite the charge phase's `analysis_result` (last-write-
+wins on the same row) -- one row per phase (matching today's one-
+`DataStorage`-per-run granularity) vs. one row per whole cycle is a design
+decision that needs making before CycleSequence is built, not something
+this pass resolved.
+
+### `main.py` legacy path review -- does NOT inherit any of this
+
+Traced the complete chain: `main.py` -> `TestExecutor` -> `BatteryTestSequence`
+-> `ChargeCycle`/`DischargeCycle` -> storage -> `ResultManager.generate_report()`
+-> `data/report.py::ReportGenerator`.
+
+- `ChargeCycle`/`DischargeCycle` (`test_control/charge_cycle.py`,
+  `discharge_cycle.py`) do **not** subclass `BatteryOperationSequence` --
+  standalone classes, a structurally separate architecture.
+- They call `data_collector.record(channel, sample)` -- the original,
+  narrow `StorageBackend.record()` method (`data/storage.py`'s `_COLUMNS`
+  only), never `record_measurement()`.
+- **No code anywhere in this chain calls `start_run_summary()`/
+  `finish_run_summary()`** (confirmed via grep across all four files) --
+  a legacy run has **no `run_summary` row at all**, not just a missing
+  column. `ResultManager.generate_report()` -> `data/report.py::
+  ReportGenerator.generate()` is an unimplemented placeholder (logs
+  "Report generation not yet implemented.", never queries the DB) --
+  `run_summary_report.py::render_run_summary()` is never called anywhere
+  in this chain (confirmed via grep: zero hits).
+- Therefore `POSSIBLY_EMPTY_POSITION`/`ALREADY_CHARGED` detection and its
+  display were both unavailable via `main.py` before this pass, for the
+  same root reason: the legacy path never touches `battery_diagnostics.py`,
+  `_ChargeDischargeStats`, or `run_summary` at all.
+
+**Minimum change implemented** (per explicit instruction: reuse the exact
+same classification logic, no parallel diagnostic engine): `ChargeCycle`/
+`DischargeCycle` now accumulate a `_ChargeDischargeStats` (imported from
+`battery_operation_sequence.py` -- reused, not duplicated) from the exact
+`v`/`i` values their existing `daq.read_all_batteries()` sampling loop
+already reads, and classify via the SAME `battery_diagnostics.py`
+functions in a `finally` block (so it fires on every exit -- normal
+completion, timeout, or a raised `SafetyViolationError` -- without
+touching any of those exit paths' existing control flow). Logged via the
+existing Python logger (`self.log.info(...)`, always available) and, if
+the storage backend duck-typing-supports it (`hasattr(data_collector,
+"log_event")` -- `log_event()` is not part of the abstract
+`StorageBackend` interface, so a plugged-in `MiniSQLStorage` without it
+still works, just without the DB-side event), via `event_log` too.
+Wrapped in its own `try/except` so a classification failure can never mask
+a genuine exception already propagating out of the cycle.
+
+**Known limitation, not silently worked around:** the legacy path has no
+pre-enable (SMU-disabled) voltage reading to reuse as `initial_voltage_v`
+-- there is no reverse-polarity check in `ChargeCycle`/`DischargeCycle` to
+borrow one from, and adding a new hardware read here would change this
+already-validated legacy path's behavior, which this pass deliberately
+does not do. The first in-loop sample is used instead, which is less
+reliable at distinguishing `ALREADY_CHARGED` from `POSSIBLY_EMPTY_POSITION`
+than the new architecture (by the first loop sample, an empty channel may
+already be compliance-limited toward the target too). **`analysis_result`
+is still never persisted to `run_summary` for a legacy run** -- fixing
+that requires resolving the same one-row-per-phase-vs-per-run granularity
+question flagged in the CycleSequence caveat above, scaled to a
+multi-channel run; deliberately not decided unilaterally here.
+
+Verified: `validate_devices_or_raise()` passes cleanly; both `ChargeCycle`/
+`DischargeCycle` mocked end-to-end (real code path, not just the pure
+classifier) -- an empty-position charge logs `ALREADY_CHARGED` via both
+the logger and `event_log`; an empty-position discharge still raises
+`SafetyViolationError` exactly as before, with the diagnostic logged via
+the logger alone when `log_event` isn't supported by the injected
+collector (duck-typing confirmed safe).

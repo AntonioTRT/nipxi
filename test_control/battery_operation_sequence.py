@@ -33,6 +33,37 @@ from utils.errors import (
 from utils.stop_reason import StopReason
 
 
+class _ChargeDischargeStats:
+    """
+    Running voltage/current statistics over a Charge/Discharge sampling
+    session -- Test Mode diagnostic classification ONLY (see
+    test_control/battery_diagnostics.py). Reuses the exact voltage_v/
+    current_a values ChargeSequence/DischargeSequence's sampling loop
+    already computes each iteration (the same values already passed to
+    _record_measurement()) -- add() performs no hardware read of its own.
+    Never consulted for stop_reason/result/safety decisions.
+    """
+
+    def __init__(self):
+        self.initial_voltage_v = None
+        self.final_voltage_v = None
+        self.max_current_a = 0.0
+        self._current_sum = 0.0
+        self.sample_count = 0
+
+    def add(self, voltage_v, current_a):
+        if self.initial_voltage_v is None:
+            self.initial_voltage_v = voltage_v
+        self.final_voltage_v = voltage_v
+        self.max_current_a = max(self.max_current_a, abs(current_a))
+        self._current_sum += abs(current_a)
+        self.sample_count += 1
+
+    @property
+    def avg_current_a(self):
+        return (self._current_sum / self.sample_count) if self.sample_count else 0.0
+
+
 class BatteryOperationSequence:
     """
     Common state + shared skeleton for a battery-position operation.
@@ -129,6 +160,45 @@ class BatteryOperationSequence:
                 message=message,
             )
             raise ReversePolarityError(message)
+
+    def _charge_diagnostic_fields(self, stats: _ChargeDischargeStats, *,
+                                   commanded_current_a: float, battery_cfg: dict,
+                                   duration_s: float) -> dict:
+        """
+        Test Mode post-run diagnostic classification for ChargeSequence --
+        see test_control/battery_diagnostics.py::classify_charge_behavior().
+        Purely additive/informational: returns {"analysis_result": ...} for
+        the caller to fold into finish_run_summary()/complete()'s existing
+        **fields -- never raises, never affects stop_reason/result. Called
+        from BOTH run_guarded()'s extra_run_summary_fields_fn (every
+        failure exit) and complete() (the normal-completion exit), so the
+        classification reflects whichever path the run actually took.
+        """
+        from test_control.battery_diagnostics import classify_charge_behavior, message_for
+        result = classify_charge_behavior(
+            initial_voltage_v=stats.initial_voltage_v, avg_current_a=stats.avg_current_a,
+            duration_s=duration_s, commanded_current_a=commanded_current_a, battery_cfg=battery_cfg,
+        )
+        message = message_for(result, mode="charge")
+        if message:
+            self.storage.log_event(level="INFO", source=self.source, message=f"Diagnostic: {message}")
+        return {"analysis_result": result}
+
+    def _discharge_diagnostic_fields(self, stats: _ChargeDischargeStats, *,
+                                      commanded_current_a: float, battery_cfg: dict,
+                                      duration_s: float) -> dict:
+        """DischargeSequence's counterpart to _charge_diagnostic_fields() --
+        see test_control/battery_diagnostics.py::classify_discharge_behavior()."""
+        from test_control.battery_diagnostics import classify_discharge_behavior, message_for
+        result = classify_discharge_behavior(
+            initial_voltage_v=stats.initial_voltage_v, final_voltage_v=stats.final_voltage_v,
+            avg_current_a=stats.avg_current_a, duration_s=duration_s,
+            commanded_current_a=commanded_current_a, battery_cfg=battery_cfg,
+        )
+        message = message_for(result, mode="discharge")
+        if message:
+            self.storage.log_event(level="INFO", source=self.source, message=f"Diagnostic: {message}")
+        return {"analysis_result": result}
 
     def run_guarded(self, fn, *, channel, relay_address, label, verb, cancel_message,
                      extra_run_summary_fields_fn=lambda: {}):

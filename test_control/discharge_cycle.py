@@ -10,6 +10,8 @@ import logging
 import time
 from config.settings import Settings
 from test_control.safety_monitor import SafetyMonitor
+from test_control.battery_operation_sequence import _ChargeDischargeStats
+from test_control.battery_diagnostics import classify_discharge_behavior, message_for
 from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import SafetyViolationError
 
@@ -88,6 +90,14 @@ class DischargeCycle:
         )
         self.smu.output_enable()
 
+        # Test Mode diagnostic classification ONLY -- see
+        # charge_cycle.py::ChargeCycle.run()'s identical rationale (same
+        # shared test_control/battery_diagnostics.py module, same
+        # first-in-loop-sample limitation vs. DischargeSequence's
+        # pre-enable reading).
+        stats = _ChargeDischargeStats()
+        run_start_time = time.monotonic()
+
         # PMU fail-safe: emergency_output_off() runs exactly once regardless
         # of how this block exits -- normal completion, timeout, a safety
         # violation, a cancellation, or any unhandled exception. See
@@ -117,6 +127,7 @@ class DischargeCycle:
                 v = sample.get("voltage_v", 0.0)
                 i = sample.get("current_a", 0.0)
                 t_c = None  # TODO: read from NTC
+                stats.add(v, i)
 
                 status = self.safety.check(v, i, t_c, mode="discharge")
                 if not status.safe:
@@ -137,3 +148,32 @@ class DischargeCycle:
                     "Channel %d: PMU output could not be verified OFF after discharge cycle.",
                     channel,
                 )
+            self._log_diagnostic(channel, stats, current_a, floor_v,
+                                  time.monotonic() - run_start_time, data_collector)
+
+    def _log_diagnostic(self, channel, stats, commanded_current_a, floor_v,
+                         duration_s, data_collector):
+        """
+        Test Mode diagnostic classification -- see charge_cycle.py::
+        ChargeCycle._log_diagnostic()'s identical rationale. `floor_v` (the
+        resolved safety floor -- either from battery_cfg["voltage_min_v"]
+        or the global BAT_VOLTAGE_MIN fallback, the SAME value
+        SafetyMonitor.check() enforces) is what classify_discharge_behavior()
+        needs as "voltage_min_v" -- not `cutoff_v` (the EOD detection
+        target, which may sit above the floor).
+        """
+        try:
+            if stats.initial_voltage_v is None:
+                return
+            result = classify_discharge_behavior(
+                initial_voltage_v=stats.initial_voltage_v, final_voltage_v=stats.final_voltage_v,
+                avg_current_a=stats.avg_current_a, duration_s=duration_s,
+                commanded_current_a=commanded_current_a, battery_cfg={"voltage_min_v": floor_v},
+            )
+            message = message_for(result, mode="discharge")
+            log_line = f"Diagnostic (channel {channel}): {result}" + (f" -- {message}" if message else "")
+            self.log.info(log_line)
+            if hasattr(data_collector, "log_event"):
+                data_collector.log_event(level="INFO", source="discharge_cycle", channel=channel, message=log_line)
+        except Exception as e:
+            self.log.warning("Channel %d: diagnostic classification failed -- %s", channel, e)

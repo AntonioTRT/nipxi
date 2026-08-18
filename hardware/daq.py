@@ -39,13 +39,63 @@ class DAQ(HardwareBase):
         ai16..ai23 - NTC thermistor voltages (8 channels)
     """
 
+    # Valid cfg["terminal_config"] values -- names of nidaqmx.constants.
+    # TerminalConfiguration members, resolved lazily in read_channel() (not
+    # at import time) so this module stays importable without nidaqmx
+    # installed. Validated here, at construction, so a config typo is
+    # caught by utils/device_validator.py's _check_instantiable() at
+    # startup, not on first real read.
+    _VALID_TERMINAL_CONFIGS = {"RSE", "NRSE", "DIFF", "PSEUDO_DIFF", "DEFAULT"}
+
     def __init__(self, cfg: dict):
         resource = cfg.get("resource", "")
         super().__init__(f"DAQ_{resource}")
         self.resource = resource
         self._model    = cfg.get("model", "NI-6363")
         self._range_v  = float(cfg.get("voltage_range_v", 5.0))
+        # AI terminal configuration -- RSE (Referenced Single-Ended) by
+        # default, matching every analog signal this driver reads today
+        # (voltage/current/NTC dividers are all single-ended, referenced to
+        # common AI GND -- the same quantity a multimeter reads channel-to-
+        # ground). Previously left unset (nidaqmx's own
+        # TerminalConfiguration.DEFAULT, -1): on a USB-6211 with only
+        # ai0-ai7 wired (NTC-only DAQ) and ai8-ai15 floating, DEFAULT does
+        # not reliably resolve to RSE -- it can pair ai_n with the floating
+        # ai_(n+8) as a differential channel, inflating readings far
+        # outside the real 0..V_exc divider range even though the physical
+        # pin genuinely reads 0 V/2.5 V on a meter. See docs/architecture.md.
+        # Configurable via cfg["terminal_config"] for a future wiring that
+        # genuinely needs NRSE/DIFF/PSEUDO_DIFF/DEFAULT; RSE is correct for
+        # every signal in this project today.
+        self._terminal_config_name = cfg.get("terminal_config", "RSE")
+        if self._terminal_config_name not in self._VALID_TERMINAL_CONFIGS:
+            raise DAQError(
+                f"DAQ {resource!r}: invalid terminal_config "
+                f"{self._terminal_config_name!r} -- must be one of "
+                f"{sorted(self._VALID_TERMINAL_CONFIGS)}"
+            )
         self._device   = None   # nidaqmx.system.Device, set by connect()
+
+    @staticmethod
+    def list_available_devices() -> list:
+        """
+        Enumerate every NI-DAQmx device currently visible on this machine
+        (nidaqmx.system.System.local().devices) -- the same enumeration
+        connect() itself already performs to build its "Available devices"
+        error message, exposed here as its own reusable call so a caller
+        can offer device selection BEFORE constructing/connecting a DAQ
+        instance. Returns a list of device name strings (e.g. ["usbdaq",
+        "PXI1Slot2"]), empty if none are present. Raises DAQError if the
+        nidaqmx package itself is not installed -- same failure mode as
+        connect(), never a raw ImportError.
+        """
+        try:
+            import nidaqmx.system
+        except ImportError as e:
+            raise DAQError(
+                "Library 'nidaqmx' is not installed. Run: pip install nidaqmx"
+            ) from e
+        return [d.name for d in nidaqmx.system.System.local().devices]
 
     def connect(self):
         self.log.info("Opening DAQ session: %s", self.resource)
@@ -91,13 +141,20 @@ class DAQ(HardwareBase):
     def read_channel(self, physical_channel: str) -> float:
         """
         Read a single analog input channel -- COMMAND (configure a
-        temporary AI voltage channel at the configured +/-voltage_range_v
-        and trigger a read) -> READBACK (the sampled value) -> VERIFY
-        (finite, within the configured range, +5% overrange margin) ->
-        return it. Raises DAQError on any failure, including a value that
-        is technically returned but fails verification -- a NaN, an
+        temporary AI voltage channel, at the configured terminal_config
+        (RSE by default -- see __init__) and +/-voltage_range_v, and
+        trigger a read) -> READBACK (the sampled value) -> VERIFY (finite,
+        within the configured range, +5% overrange margin) -> return it.
+        Raises DAQError on any failure, including a value that is
+        technically returned but fails verification -- a NaN, an
         out-of-range, or a stuck reading is a failure, not "the read call
         didn't throw." Mirrors hardware/dmm.py::DMM.measure_dc_voltage().
+
+        terminal_config is ALWAYS passed explicitly -- never left as
+        nidaqmx's own ambiguous TerminalConfiguration.DEFAULT, which on a
+        multi-channel device can silently pair this channel with an
+        unrelated (possibly floating) one in differential mode and return
+        a real-but-meaningless voltage. See __init__'s docstring.
         """
         if self._device is None:
             raise DAQError(f"DAQ {self.resource} is not connected")
@@ -105,9 +162,12 @@ class DAQ(HardwareBase):
         try:
             import nidaqmx
             import nidaqmx.errors
+            from nidaqmx.constants import TerminalConfiguration
+            terminal_config = getattr(TerminalConfiguration, self._terminal_config_name)
             with nidaqmx.Task() as task:
                 task.ai_channels.add_ai_voltage_chan(
-                    physical_channel, min_val=-self._range_v, max_val=self._range_v)
+                    physical_channel, terminal_config=terminal_config,
+                    min_val=-self._range_v, max_val=self._range_v)
                 value = task.read()
         except nidaqmx.errors.DaqError as e:
             raise DAQError(

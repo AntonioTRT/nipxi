@@ -10,6 +10,8 @@ import logging
 import time
 from config.settings import Settings
 from test_control.safety_monitor import SafetyMonitor
+from test_control.battery_operation_sequence import _ChargeDischargeStats
+from test_control.battery_diagnostics import classify_charge_behavior, message_for
 from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import SafetyViolationError, TimeoutError
 
@@ -68,6 +70,24 @@ class ChargeCycle:
         )
         self.smu.output_enable()
 
+        # Test Mode diagnostic classification ONLY (see
+        # test_control/battery_diagnostics.py -- the SAME module/functions
+        # ChargeSequence uses, reused here rather than a second/parallel
+        # diagnostic engine). Reuses the exact voltage_v/current_a samples
+        # the loop below already reads -- no new hardware access. LIMITATION
+        # vs. ChargeSequence: this legacy path has no pre-enable (SMU
+        # disabled) voltage reading to use as initial_voltage_v -- there is
+        # no reverse-polarity check here to reuse -- so the FIRST in-loop
+        # sample is used instead. By that point the SMU has already been
+        # sourcing current for STABILIZATION_S, so an empty channel's
+        # voltage may already be compliance-limited toward voltage_limit_v,
+        # making ALREADY_CHARGED vs. POSSIBLY_EMPTY_POSITION less reliable
+        # here than in ChargeSequence -- a known limitation, not silently
+        # worked around by adding a new hardware read to this
+        # already-validated legacy path. See docs/architecture.md.
+        stats = _ChargeDischargeStats()
+        run_start_time = time.monotonic()
+
         # PMU fail-safe: emergency_output_off() runs exactly once regardless
         # of how this block exits -- normal completion, timeout, a safety
         # violation, a cancellation, or any unhandled exception (e.g.
@@ -110,6 +130,7 @@ class ChargeCycle:
                 i = sample.get("current_a", 0.0)
                 # TODO: get temperature from NTC channel
                 t_c = None
+                stats.add(v, i)
 
                 status = self.safety.check(v, i, t_c, mode="charge")
                 if not status.safe:
@@ -133,3 +154,45 @@ class ChargeCycle:
                     "Channel %d: PMU output could not be verified OFF after charge cycle.",
                     channel,
                 )
+            self._log_diagnostic(channel, stats, current_a, voltage_limit_v,
+                                  time.monotonic() - run_start_time, data_collector)
+
+    def _log_diagnostic(self, channel, stats, commanded_current_a, voltage_limit_v,
+                         duration_s, data_collector):
+        """
+        Test Mode diagnostic classification -- reuses test_control/
+        battery_diagnostics.py::classify_charge_behavior(), the exact same
+        function ChargeSequence uses (single source of truth, no parallel
+        engine). Informational only: logged via the existing logger, and
+        via data_collector.log_event() if the storage backend supports it
+        (duck-typed -- log_event() is NOT part of the abstract
+        StorageBackend interface, so a plugged-in MiniSQLStorage without it
+        still works, just without the DB-side event). Never raises, never
+        affects this cycle's return value/control flow.
+
+        `voltage_limit_v` (the resolved CV target -- either from
+        battery_cfg or the global CHARGE_VOLTAGE_V fallback) doubles as the
+        "voltage_max_v" classify_charge_behavior() needs: it IS this
+        charge's own commanded target, the correct reference point for
+        "already at/near the target" regardless of which source it came
+        from -- no run_summary row exists in this legacy path to read a
+        real battery_cfg["voltage_max_v"] from either way.
+        """
+        try:
+            if stats.initial_voltage_v is None:
+                return
+            result = classify_charge_behavior(
+                initial_voltage_v=stats.initial_voltage_v, avg_current_a=stats.avg_current_a,
+                duration_s=duration_s, commanded_current_a=commanded_current_a,
+                battery_cfg={"voltage_max_v": voltage_limit_v},
+            )
+            message = message_for(result, mode="charge")
+            log_line = f"Diagnostic (channel {channel}): {result}" + (f" -- {message}" if message else "")
+            self.log.info(log_line)
+            if hasattr(data_collector, "log_event"):
+                data_collector.log_event(level="INFO", source="charge_cycle", channel=channel, message=log_line)
+        except Exception as e:
+            # Best-effort, informational only -- must never mask whatever
+            # exception (if any) is already propagating out of run()'s
+            # finally block (e.g. a genuine SafetyViolationError).
+            self.log.warning("Channel %d: diagnostic classification failed -- %s", channel, e)

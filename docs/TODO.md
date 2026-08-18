@@ -490,6 +490,67 @@ the bottom, with a pointer to where the real documentation lives
   often a group's pre-check found a non-PRESENT target position before an
   operation started) -- not built in this pass.
 
+### NTC Usability + Post-Run Diagnostic Classification follow-ups (see docs/architecture.md Section 54, Milestone XIX)
+
+- [x] **DONE:** Runtime DAQ selection for Test Sensors (Test 6) --
+  `hardware/daq.py::DAQ.list_available_devices()` + `test.py::
+  _select_ntc_daq_device()`. Diagnostic-only, never touches
+  `config/devices.py`/`BATTERY_GROUPS`.
+- [x] **DONE:** USB-6211 RSE terminal-configuration fix -- `DAQ.read_channel()`
+  now always passes `terminal_config` explicitly (default `"RSE"`),
+  fixing real 6-8 V readings on a 5 V divider caused by nidaqmx's
+  ambiguous `TerminalConfiguration.DEFAULT` pairing a channel
+  differentially with a floating counterpart. Verified on real hardware.
+- [ ] The RSE fix applies to every `read_channel()` caller (voltage/current
+  channels too, not just NTC) via the same shared driver method -- worth a
+  real-hardware re-check on the voltage/current path specifically, though
+  no symptom has been observed there yet.
+- [x] **DONE:** NTC Summary table (Battery/Channel/Raw Voltage/Temperature/
+  Status) appended after Test 6's existing per-channel output; ABSENT
+  channels no longer compute/display a bogus temperature
+  (`hardware/temperature.py::ABSENT_VOLTAGE_THRESHOLD`, renamed from
+  `NTC_OPEN_VOLTAGE_MARGIN_V`, same value).
+- [x] **DONE:** `analysis_result` post-run diagnostic classification
+  (`ALREADY_CHARGED`/`POSSIBLY_EMPTY_POSITION`/`NORMAL_CHARGE_BEHAVIOR`/
+  `NORMAL_DISCHARGE_BEHAVIOR`) for `ChargeSequence`/`DischargeSequence`,
+  via new `test_control/battery_diagnostics.py` -- informational only,
+  additive `run_summary` column, never affects `stop_reason`/`result`.
+  Verified against the real code paths and confirmed persisted (fresh
+  `DataStorage` instance reading back from disk, plus a raw `sqlite3`
+  query bypassing the class entirely).
+- [x] **DONE:** `main.py` legacy path (`ChargeCycle`/`DischargeCycle`) now
+  computes the SAME `analysis_result` classification (no parallel engine),
+  logged via the existing logger + `event_log` where the storage backend
+  supports it -- but see the two items below, deliberately not resolved
+  in this pass.
+- [ ] **[Design decision needed before CycleSequence]** Resolve whether a
+  future multi-phase run (CycleSequence, or a legacy multi-channel
+  `main.py` run) gets one `run_summary` row per phase/channel (matching
+  today's one-`DataStorage`-per-run granularity) or one row for the whole
+  run -- `finish_run_summary()`'s UPDATE-on-`run_id` semantics mean a
+  second phase sharing one row would silently overwrite the first phase's
+  `analysis_result`. Blocks both CycleSequence's own diagnostic
+  persistence and the item below.
+- [ ] `analysis_result` is still not persisted to `run_summary` for a
+  `main.py` legacy run -- no `run_summary` row exists at all for that path
+  (a separate, larger gap than the missing column; see docs/architecture.md
+  Section 54's `main.py` review) -- blocked on the granularity decision
+  above, deliberately not decided unilaterally in this pass.
+- [ ] Legacy path's diagnostic classification uses the sampling loop's
+  first sample as `initial_voltage_v` (no pre-enable/reverse-polarity
+  reading exists to reuse, unlike `ChargeSequence`/`DischargeSequence`) --
+  less reliable at distinguishing `ALREADY_CHARGED` from
+  `POSSIBLY_EMPTY_POSITION` there. Adding a new pre-enable read would
+  change this already-validated legacy path's behavior -- deliberately not
+  done; revisit only alongside `main.py`'s eventual retirement/rewrite.
+- [ ] Real-hardware validation of the diagnostic classification thresholds
+  (`NEAR_FULL_MARGIN_V`/`EMPTY_POSITION_VOLTAGE_V`/
+  `MIN_MEANINGFUL_CURRENT_FRACTION`/`SHORT_DURATION_S`,
+  `test_control/battery_diagnostics.py`) against a real battery and a
+  real empty position -- current values are best-effort starting points,
+  same "unconfirmed placeholder" status as `BATTERY_CONFIGS`'s assumed
+  limit fields.
+
 ---
 
 ## Optional / Future

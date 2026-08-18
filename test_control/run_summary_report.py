@@ -171,6 +171,16 @@ def _print_charge_or_discharge_section(run: dict, *, is_charge: bool):
         print("End Of Discharge: " + _fmt(run.get("stop_reason")))
         print("Energy Removed : " + _fmt(run.get("energy_wh")))
 
+    # Test Mode post-run diagnostic classification (informational only --
+    # see test_control/battery_diagnostics.py). Never affects Result/
+    # stop_reason above; NULL for a run predating this column or for
+    # NORMAL_CHARGE_BEHAVIOR/NORMAL_DISCHARGE_BEHAVIOR's empty message.
+    analysis_result = run.get("analysis_result")
+    if analysis_result:
+        from test_control.battery_diagnostics import message_for
+        message = message_for(analysis_result, mode="charge" if is_charge else "discharge")
+        print(f"Diagnostic     : {analysis_result}" + (f" -- {message}" if message else ""))
+
 
 def _print_cycle_section():
     # Cycle Battery is not implemented yet (see test.py::run_main_test()) --

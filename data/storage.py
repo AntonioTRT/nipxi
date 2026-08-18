@@ -220,7 +220,8 @@ CREATE TABLE IF NOT EXISTS run_summary (
     relay_matrix_resource              TEXT,
     relay_matrix_model                 TEXT,
     group_name                         TEXT,
-    position_in_group                  INTEGER
+    position_in_group                  INTEGER,
+    analysis_result                    TEXT
 );
 """
 
@@ -255,6 +256,13 @@ _RUN_SUMMARY_COLUMNS = [
     # position_in_group is NULL for a whole-group operation (Monitor
     # Battery Scan, NTC Group Scan) that has no single selected position.
     "group_name", "position_in_group",
+    # Test Mode post-run diagnostic classification (informational only --
+    # see test_control/battery_diagnostics.py) -- populated by
+    # ChargeSequence/DischargeSequence (and, once built, CycleSequence, by
+    # virtue of reusing them) at finish_run_summary() time. NULL for every
+    # other test_type. Never influences stop_reason/result -- a separate,
+    # additive column, not a replacement for either.
+    "analysis_result",
 ]
 
 # Runtime event history -- Milestone II. Fine-grained, timestamped narrative
@@ -335,6 +343,7 @@ _RUN_SUMMARY_MIGRATION_COLUMNS = [
     ("relay_matrix_model", "TEXT"),
     ("group_name", "TEXT"),
     ("position_in_group", "INTEGER"),
+    ("analysis_result", "TEXT"),
 ]
 
 
@@ -681,7 +690,8 @@ class DataStorage(StorageBackend):
         updates = {"end_time": end_time, "stop_reason": stop_reason, "result": result}
         for key in ("capacity_ah", "energy_wh", "cycle_count",
                     "start_voltage", "end_voltage", "min_voltage",
-                    "max_voltage", "average_voltage", "sample_count"):
+                    "max_voltage", "average_voltage", "sample_count",
+                    "analysis_result"):
             if key in fields:
                 updates[key] = fields[key]
         if "duration_s" in fields:

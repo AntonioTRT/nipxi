@@ -83,13 +83,25 @@ Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V (see
 BatteryOperationSequence._check_battery_polarity()). A reading at/below
 that threshold raises ReversePolarityError -- a SafetyViolationError
 subclass -- before the SMU is ever enabled.
+
+Post-Run Diagnostic Classification (Test Mode only, informational --
+see test_control/battery_diagnostics.py): this workflow deliberately does
+NOT gate or block on battery presence/NTC validation, so an empty
+position can look deceptively like "already charged" (SMU hits CV
+compliance, current near zero, EOC trips almost instantly). A
+BatteryOperationSequence._ChargeDischargeStats accumulator (fed the exact
+voltage_v/current_a this loop already computes -- no new read) is
+classified into `analysis_result` (ALREADY_CHARGED/POSSIBLY_EMPTY_POSITION/
+NORMAL_CHARGE_BEHAVIOR) and folded into run_summary via the existing
+`extra_run_summary_fields_fn`/`complete()` mechanism -- purely additive,
+never touches stop_reason/result.
 """
 
 import time
 
 from config.settings import Settings
 from hardware.temperature import NTCPresence, classify_ntc_presence, ntc_voltage_to_celsius
-from test_control.battery_operation_sequence import BatteryOperationSequence
+from test_control.battery_operation_sequence import BatteryOperationSequence, _ChargeDischargeStats
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, ReversePolarityError
@@ -137,6 +149,21 @@ class ChargeSequence(BatteryOperationSequence):
         self.safety.set_battery_limits(battery_cfg)
         last_ntc_state = None  # throttles repeated NTC-fault/absent event_log noise to one entry per transition
 
+        # Test Mode diagnostic classification ONLY (see
+        # test_control/battery_diagnostics.py) -- accumulates the SAME
+        # voltage_v/current_a samples the loop below already computes and
+        # records, never a second read. Timed from just before the relay
+        # closes so `duration_s` reflects however the run actually ended
+        # (EOC, cancelled, safety violation, timeout), not just the EOC path.
+        stats = _ChargeDischargeStats()
+        run_start_time = time.monotonic()
+
+        def _diagnostic_fields():
+            return self._charge_diagnostic_fields(
+                stats, commanded_current_a=current_a, battery_cfg=battery_cfg,
+                duration_s=time.monotonic() - run_start_time,
+            )
+
         def _run_charge():
             check_cancellation(token)
             self.relay.close(relay_address)
@@ -160,6 +187,17 @@ class ChargeSequence(BatteryOperationSequence):
             # RelayBase.open()/close(), hardware/relay.py) before returning.
             pre_enable_v = self.dmm.measure_dc_voltage()
             self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
+
+            # Diagnostic stats' initial_voltage_v is THIS reading -- taken
+            # with the SMU output still disabled, so it reflects whatever
+            # is actually connected (a real cell's resting voltage, or an
+            # empty position's near-0V open circuit). The sampling loop's
+            # own first sample is NOT used for this: by then the SMU has
+            # already been sourcing current for STABILIZATION_S, so an
+            # empty position would already read near the CV compliance
+            # target too -- indistinguishable from a genuinely full
+            # battery at that point. Reuses pre_enable_v itself, no new read.
+            stats.initial_voltage_v = pre_enable_v
 
             self.smu.set_charge_mode(current_a=current_a, voltage_limit_v=voltage_limit_v)
             self.smu.output_enable()
@@ -194,6 +232,7 @@ class ChargeSequence(BatteryOperationSequence):
                     dmm_v = self.dmm.measure_dc_voltage()
                     v = dmm_v
                     i = smu_reading["current_a"]
+                    stats.add(v, i)
 
                     t_c = None
                     if self.daq is not None and ntc_channel is not None:
@@ -272,9 +311,11 @@ class ChargeSequence(BatteryOperationSequence):
             _run_charge, channel=channel, relay_address=relay_address,
             label="Charge Battery", verb="charging",
             cancel_message="Charging stopped by operator",
+            extra_run_summary_fields_fn=_diagnostic_fields,
         )
         self.complete(
             channel=channel, relay_address=relay_address,
             log_message=f"Charge complete on channel {channel} (EOC reached)",
+            **_diagnostic_fields(),
         )
         return completed
