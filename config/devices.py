@@ -160,8 +160,11 @@ PXI_SLOTS = {
         "driver_family": "nidcpower",
         "category":      "smu",
         "role":          "Auxiliary 2-channel SMU bank -- candidate for future "
-                          "channel-count scaling. Not yet assigned to any battery "
-                          "channel.",
+                          "channel-count scaling. TEMPORARILY assigned as Group "
+                          "B1's SMU for real-hardware charge validation (see "
+                          "BATTERY_GROUPS[\"B1\"][\"smu\"] below) -- revert this "
+                          "note once B1 moves back to PRIMARY_SMU or a permanent "
+                          "assignment is made.",
         "enabled":       True,
         "channels":      [],
         # NI-DCPower channel name -- PXI-4130 has two channels ("0", "1"); this
@@ -570,16 +573,17 @@ BATTERY_GROUPS = {
     "B1": {
         "relay_matrix":   "MATRIX_NUMATO_202",
         "enabled":        True,
-        "smu":            "PRIMARY_SMU",
+        # TEMPORARY -- was "PRIMARY_SMU" (PXIe-4141, Slot 5, max_current_a
+        # 0.1 A). Reassigned to AUX_SMU_1 (PXI-4130, Slot 7, max_current_a
+        # 1.0 A -- see PXI_SLOTS[7] above) for the first real-hardware B1
+        # charge validation run. This group is still declared for SB
+        # (0.12/0.16 A limits) with a conservative test recipe below -- the
+        # SMU swap does not change what current is actually commanded, only
+        # which physical card sources it. Revert to "PRIMARY_SMU" once
+        # validation is done, unless this reassignment is made permanent.
+        "smu":            "AUX_SMU_1",
         "dmm":            "MAIN_DMM",
         "daq":            "MAIN_DAQ",
-        # PRIMARY_SMU (PXIe-4141) is rated to only 0.1 A per channel (see its
-        # max_current_a above) -- far below HUB's own limits (0.525/1.05 A),
-        # so this group is declared for SB (0.08/0.16 A limits) with a
-        # further-reduced, conservative test recipe that stays inside
-        # PRIMARY_SMU's real capability. HUB requires reassigning this
-        # group's "smu" to HIGH_POWER_SMU or AUX_SMU_1/2 first (a hardware/
-        # wiring decision -- not done here, see docs/TODO.md).
         "battery_type":   "SB",
         # TEMPORARY -- the rack DAQ this group's NTC channels will eventually
         # use (see "daq" above, MAIN_DAQ) is not yet available; this overrides
@@ -595,18 +599,19 @@ BATTERY_GROUPS = {
         # soldered wiring, ~3.5 V battery physically present in the
         # selected position). Reduced CV target (3.7 V, not SB's 4.2 V
         # voltage_max_v ceiling) + reduced commanded current (0.1 A) for a
-        # conservative first run. 0.1 A == PRIMARY_SMU's own max_current_a
-        # (0.1 A) -- zero hardware headroom on current; see SB's
+        # conservative first run. With "smu" now AUX_SMU_1 (max_current_a
+        # 1.0 A), 0.1 A has real hardware headroom (previously it sat at
+        # PRIMARY_SMU's full 0.1 A ceiling with none); see SB's
         # max_charge_current_a comment above for the matching ceiling bump.
         # Restore to the production recipe (0.05 A / 4.2 V, or whatever is
         # validated) once this run passes -- see docs/architecture.md.
         "test_setpoints": {
-            "charge_current_a":    0.1,    # TEMPORARY -- was 0.05. == PRIMARY_SMU max_current_a (0.1),
+            "charge_current_a":    0.1,    # TEMPORARY -- was 0.05. <= AUX_SMU_1 max_current_a (1.0),
                                             #    <= SB max_charge_current_a (0.12, temporarily raised)
             "charge_voltage_v":    3.7,    # TEMPORARY -- was 4.2 (SB voltage_max_v). Conservative CV
                                             #    target for the first real-battery run (~3.5 V resting).
             "discharge_current_a": 0.08,   # <= SB max_discharge_current_a (0.16) and
-                                            #    <= PRIMARY_SMU max_current_a (0.1)
+                                            #    <= AUX_SMU_1 max_current_a (1.0)
             "discharge_cutoff_v":  3.0,    # == SB voltage_min_v (the safety floor --
                                             #    see "Discharge Cutoff Policy")
         },
