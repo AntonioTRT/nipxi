@@ -466,7 +466,15 @@ BATTERY_CONFIGS = {
         "voltage_max_v":           4.2,        # unconfirmed placeholder -- assumed standard Li-ion window
         "voltage_min_v":           3.0,        # unconfirmed placeholder -- assumed standard Li-ion window
         "capacity_ah":             0.16,       # confirmed -- 160 mAh
-        "max_charge_current_a":    0.08,       # unconfirmed placeholder -- assumed 0.5C
+        # TEMPORARY -- raised from 0.08 to 0.12 for the first real-hardware
+        # B1 charge validation (see BATTERY_GROUPS["B1"]["test_setpoints"]
+        # below): the requested 0.1 A commanded current would otherwise
+        # exceed this ceiling and validate_group_test_config() would refuse
+        # to run. 0.12 A keeps this SafetyMonitor ceiling strictly above the
+        # 0.1 A setpoint (headroom against measurement noise) while staying
+        # well under any hazardous rate for a 160 mAh cell. Revert to 0.08
+        # (or the confirmed datasheet value) once validation is done.
+        "max_charge_current_a":    0.12,       # TEMPORARY -- was 0.08 (unconfirmed placeholder, 0.5C)
         "max_discharge_current_a": 0.16,       # unconfirmed placeholder -- assumed 1C
         "max_temp_c":              45.0,       # unconfirmed placeholder -- assumed standard Li-ion ceiling
     },
@@ -583,10 +591,20 @@ BATTERY_GROUPS = {
         # available -- hardware_for_group() then falls back to "daq"
         # automatically. Configuration-only; see docs/architecture.md.
         "ntc_daq":        "NTC_DAQ_USB6210",
+        # TEMPORARY -- first real-hardware charge validation recipe (hand-
+        # soldered wiring, ~3.5 V battery physically present in the
+        # selected position). Reduced CV target (3.7 V, not SB's 4.2 V
+        # voltage_max_v ceiling) + reduced commanded current (0.1 A) for a
+        # conservative first run. 0.1 A == PRIMARY_SMU's own max_current_a
+        # (0.1 A) -- zero hardware headroom on current; see SB's
+        # max_charge_current_a comment above for the matching ceiling bump.
+        # Restore to the production recipe (0.05 A / 4.2 V, or whatever is
+        # validated) once this run passes -- see docs/architecture.md.
         "test_setpoints": {
-            "charge_current_a":    0.05,   # <= SB max_charge_current_a (0.08) and
-                                            #    <= PRIMARY_SMU max_current_a (0.1)
-            "charge_voltage_v":    4.2,    # == SB voltage_max_v (CV target)
+            "charge_current_a":    0.1,    # TEMPORARY -- was 0.05. == PRIMARY_SMU max_current_a (0.1),
+                                            #    <= SB max_charge_current_a (0.12, temporarily raised)
+            "charge_voltage_v":    3.7,    # TEMPORARY -- was 4.2 (SB voltage_max_v). Conservative CV
+                                            #    target for the first real-battery run (~3.5 V resting).
             "discharge_current_a": 0.08,   # <= SB max_discharge_current_a (0.16) and
                                             #    <= PRIMARY_SMU max_current_a (0.1)
             "discharge_cutoff_v":  3.0,    # == SB voltage_min_v (the safety floor --
