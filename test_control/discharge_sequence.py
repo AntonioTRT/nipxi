@@ -190,14 +190,16 @@ class DischargeSequence(BatteryOperationSequence):
             # global relay settling/dead-time constant, enforced in
             # RelayBase.open()/close(), hardware/relay.py) before returning.
             pre_enable_v = self.dmm.measure_dc_voltage()
-            self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
 
-            # Diagnostic stats' initial_voltage_v is THIS reading -- see
-            # charge_sequence.py's identical rationale (taken with the SMU
-            # output still disabled, before compliance can mask an empty
-            # position as looking like a real, present cell). Reuses
-            # pre_enable_v itself, no new read.
+            # Captured BEFORE _check_battery_polarity() below -- see
+            # charge_sequence.py's identical rationale (must always be
+            # persisted, including on a ReversePolarityError raised by that
+            # very check; taken with the SMU output still disabled, before
+            # compliance can mask an empty position as looking like a real,
+            # present cell). Reuses pre_enable_v itself, no new read.
             stats.initial_voltage_v = pre_enable_v
+
+            self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
 
             self.smu.set_discharge_mode(current_a=current_a, voltage_limit_v=compliance_voltage_v)
             self.smu.output_enable()
@@ -263,6 +265,7 @@ class DischargeSequence(BatteryOperationSequence):
                     self._render_frame(
                         test_type="discharge", channel=channel, relay_address=relay_address,
                         run_number=run_number, state="ACTIVE", phase_detail="CC_DISCHARGE",
+                        elapsed_s=time.monotonic() - run_start_time,
                         smu_voltage=smu_reading["voltage_v"], smu_current=i, dmm_voltage=dmm_v,
                         battery_voltage=v, battery_current=i, battery_temp=t_c,
                     )

@@ -152,12 +152,19 @@ def _print_scan_section(run: dict, storage):
 
 
 def _print_charge_or_discharge_section(run: dict, *, is_charge: bool):
-    # Start/End/Min/Max voltage and actual charge/discharge current are not
-    # yet accumulated into run_summary for these workflows (no equivalent
-    # of Monitor Battery's _VoltageStats exists in charge_sequence.py/
-    # discharge_sequence.py today) -- N/A here, not computed from
-    # `measurements`, per the decision to ship the reporting framework
-    # first and treat statistics enrichment as a later, separate task.
+    # Start/End voltage: populated for every real run since
+    # docs/architecture.md Section 55 (ChargeSequence/DischargeSequence's
+    # own _ChargeDischargeStats.initial_voltage_v/final_voltage_v, folded
+    # into finish_run_summary() via _charge_diagnostic_fields()/
+    # _discharge_diagnostic_fields(), refreshed at the moment of an
+    # abnormal exit by run_guarded()'s own fresh reading) -- N/A only for
+    # a run that predates that change, or one that failed before any
+    # voltage was ever measured (e.g. a RelayError closing the relay).
+    # Min/Max voltage and the actual commanded charge/discharge current are
+    # NOT accumulated for these workflows (no equivalent of Monitor
+    # Battery's full _VoltageStats exists here, and commanded current has
+    # no run_summary column) -- still N/A, a deliberately separate,
+    # not-yet-scoped enhancement, not an oversight.
     print("Start Voltage  : " + _fmt_volts(run.get("start_voltage")))
     print("End Voltage    : " + _fmt_volts(run.get("end_voltage")))
     if is_charge:

@@ -605,13 +605,23 @@ class DataStorage(StorageBackend):
         self._db.commit()
         return cursor.lastrowid
 
-    def get_measurements(self, run_id: str = None, channel: int = None) -> list:
+    def get_measurements(self, run_id: str = None, channel: int = None,
+                          recent_limit: int = None) -> list:
         """
-        Return full measurement rows (every Milestone II column, not just
-        the original _COLUMNS subset query() returns) as a list of dicts,
+        Return measurement rows (every Milestone II column, not just the
+        original _COLUMNS subset query() returns) as a list of dicts,
         optionally filtered by run_id/channel. Defaults to all rows when
         both filters are None -- callers needing "this run only" should
         pass run_id explicitly (e.g. data/report.py::ReportGenerator).
+
+        `recent_limit` (default None -- unchanged behavior, every existing
+        caller unaffected): when given, returns only the most recent
+        `recent_limit` rows (still in chronological order), fetched via
+        `ORDER BY id DESC LIMIT ?` rather than pulling the full table and
+        slicing in Python -- see test_control/execution_screen.py's compact
+        "Recent Measurements" panel, which would otherwise re-query and
+        re-render the ENTIRE run's history on every single sample during a
+        long (multi-hour) run.
         """
         if self._db is None:
             return []
@@ -624,6 +634,15 @@ class DataStorage(StorageBackend):
             params.append(channel)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         try:
+            if recent_limit is not None:
+                cur = self._db.execute(
+                    f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
+                    f"{where} ORDER BY id DESC LIMIT ?",
+                    [*params, recent_limit],
+                )
+                rows = [dict(zip(_MEASUREMENT_ALL_COLUMNS, row)) for row in cur.fetchall()]
+                rows.reverse()
+                return rows
             cur = self._db.execute(
                 f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
                 f"{where} ORDER BY id",
@@ -633,6 +652,36 @@ class DataStorage(StorageBackend):
         except sqlite3.Error as e:
             self.log.error("DB query failed (get_measurements): %s", e)
             return []
+
+    def get_first_measurement(self, run_id: str = None, channel: int = None) -> dict:
+        """
+        Return just the earliest measurement row (by id) as a dict, or None
+        -- a cheap, single-row companion to get_measurements(recent_limit=...)
+        for a "captured at the very start of this run" display (see
+        test_control/execution_screen.py's "Initial" panel), without
+        fetching the whole table to find row one.
+        """
+        if self._db is None:
+            return None
+        conditions, params = [], []
+        if run_id is not None:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+        if channel is not None:
+            conditions.append("channel = ?")
+            params.append(channel)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        try:
+            cur = self._db.execute(
+                f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
+                f"{where} ORDER BY id ASC LIMIT 1",
+                params,
+            )
+            row = cur.fetchone()
+            return dict(zip(_MEASUREMENT_ALL_COLUMNS, row)) if row else None
+        except sqlite3.Error as e:
+            self.log.error("DB query failed (get_first_measurement): %s", e)
+            return None
 
     # ------------------------------------------------------------------
     # Run summary (Milestone II) -- one row per run, the entry point for

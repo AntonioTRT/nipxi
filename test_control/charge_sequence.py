@@ -186,18 +186,26 @@ class ChargeSequence(BatteryOperationSequence):
             # global relay settling/dead-time constant, enforced in
             # RelayBase.open()/close(), hardware/relay.py) before returning.
             pre_enable_v = self.dmm.measure_dc_voltage()
-            self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
 
-            # Diagnostic stats' initial_voltage_v is THIS reading -- taken
-            # with the SMU output still disabled, so it reflects whatever
-            # is actually connected (a real cell's resting voltage, or an
-            # empty position's near-0V open circuit). The sampling loop's
-            # own first sample is NOT used for this: by then the SMU has
-            # already been sourcing current for STABILIZATION_S, so an
-            # empty position would already read near the CV compliance
-            # target too -- indistinguishable from a genuinely full
-            # battery at that point. Reuses pre_enable_v itself, no new read.
+            # Captured BEFORE _check_battery_polarity() below, deliberately --
+            # this value must always be persisted (see REQUIREMENT 1 in
+            # docs/architecture.md's Start/End Voltage Persistence section),
+            # including on a ReversePolarityError raised by that very check.
+            # Capturing it only afterward (the previous ordering) meant a
+            # rejected polarity reading was silently lost -- the one
+            # measurement that would have explained the rejection never made
+            # it into run_summary/analysis_result. Taken with the SMU output
+            # still disabled, so it reflects whatever is actually connected
+            # (a real cell's resting voltage, or an empty position's near-0V
+            # open circuit). The sampling loop's own first sample is NOT
+            # used for this: by then the SMU has already been sourcing
+            # current for STABILIZATION_S, so an empty position would
+            # already read near the CV compliance target too --
+            # indistinguishable from a genuinely full battery at that point.
+            # Reuses pre_enable_v itself, no new read.
             stats.initial_voltage_v = pre_enable_v
+
+            self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
 
             self.smu.set_charge_mode(current_a=current_a, voltage_limit_v=voltage_limit_v)
             self.smu.output_enable()
@@ -271,6 +279,7 @@ class ChargeSequence(BatteryOperationSequence):
                     self._render_frame(
                         test_type="charge", channel=channel, relay_address=relay_address,
                         run_number=run_number, state="ACTIVE", phase_detail="CC_CV",
+                        elapsed_s=time.monotonic() - run_start_time,
                         smu_voltage=smu_reading["voltage_v"], smu_current=i, dmm_voltage=dmm_v,
                         battery_voltage=v, battery_current=i, battery_temp=t_c,
                     )

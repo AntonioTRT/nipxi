@@ -78,6 +78,8 @@ single safety-shutdown entry point for every mode, rather than a
 Monitor-specific relay-only shutdown path.
 """
 
+import time
+
 from config.settings import Settings
 from hardware.temperature import NTCPresence, classify_ntc_presence, ntc_voltage_to_celsius
 from test_control.battery_operation_sequence import BatteryOperationSequence
@@ -165,6 +167,7 @@ class MonitorBatterySequence(BatteryOperationSequence):
         self.log.info("Monitor Battery starting. Channel: %d  Relay: %d", channel, relay_address)
         run_number = self._run_number()
         stats = _VoltageStats()
+        run_start_time = time.monotonic()
         self.safety.set_battery_limits(battery_cfg)
         last_ntc_state = None  # throttles repeated NTC-fault/absent event_log noise to one entry per transition
 
@@ -237,6 +240,7 @@ class MonitorBatterySequence(BatteryOperationSequence):
                 self._render_frame(
                     test_type="monitor", channel=channel, relay_address=relay_address,
                     run_number=run_number, state="ACTIVE", phase_detail="MONITORING",
+                    elapsed_s=time.monotonic() - run_start_time,
                     battery_voltage=voltage_v, battery_current=current_a, battery_temp=temp_c,
                 )
 

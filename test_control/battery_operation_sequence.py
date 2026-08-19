@@ -25,7 +25,9 @@ by every operation, not where they are first resolved.
 import logging
 
 from test_control.safety_monitor import SafetyMonitor
-from test_control.execution_screen import ExecutionFrame, render_execution_frame
+from test_control.execution_screen import (
+    RECENT_MEASUREMENTS_DISPLAY_LIMIT, ExecutionFrame, render_execution_frame,
+)
 from utils.errors import (
     SafetyViolationError, RelayError, OperationCancelledError, ReversePolarityError,
     NIPXITimeoutError,
@@ -115,14 +117,31 @@ class BatteryOperationSequence:
                        state, phase_detail, **extra_fields):
         """
         Build and render one ExecutionFrame. recent_measurements/
-        recent_events are always pulled from storage here so no subclass
-        re-fetches them independently -- every other frame field is
-        operation-specific and passed through via `extra_fields`.
+        recent_events/initial_measurement are always pulled from storage
+        here so no subclass re-fetches them independently -- every other
+        frame field is operation-specific and passed through via
+        `extra_fields` (e.g. `elapsed_s`, threaded by the caller so the
+        compact execution screen can show a running indicator/elapsed time
+        without this shared method needing its own notion of "when did
+        this run start").
+
+        recent_measurements is bounded to the last
+        RECENT_MEASUREMENTS_DISPLAY_LIMIT rows (fetched directly via SQL
+        `ORDER BY id DESC LIMIT n`, not "fetch everything and slice") --
+        without this, a multi-hour run at 1 Hz re-queries and re-prints its
+        ENTIRE history on every single sample, which is both the "endless
+        scrolling" operator-UX complaint and a real, growing per-render
+        query cost. initial_measurement is a separate, single-row fetch so
+        the very first sample stays visible even once it has scrolled out
+        of the bounded recent-measurements window.
         """
         frame = ExecutionFrame.from_live(
             run_number=run_number, run_id=self.storage.run_id, test_type=test_type,
             channel=channel, relay=relay_address, state=state, phase_detail=phase_detail,
-            recent_measurements=self.storage.get_measurements(run_id=self.storage.run_id),
+            initial_measurement=self.storage.get_first_measurement(run_id=self.storage.run_id),
+            recent_measurements=self.storage.get_measurements(
+                run_id=self.storage.run_id, recent_limit=RECENT_MEASUREMENTS_DISPLAY_LIMIT,
+            ),
             recent_events=self.storage.get_recent_events(run_id=self.storage.run_id),
             **extra_fields,
         )
@@ -182,7 +201,23 @@ class BatteryOperationSequence:
         message = message_for(result, mode="charge")
         if message:
             self.storage.log_event(level="INFO", source=self.source, message=f"Diagnostic: {message}")
-        return {"analysis_result": result}
+        # start_voltage/end_voltage/sample_count are already-accepted
+        # run_summary columns (see data/storage.py::finish_run_summary()'s
+        # allowlist) -- MonitorBatterySequence's _VoltageStats has populated
+        # these from day one; ChargeSequence/DischargeSequence never folded
+        # their own already-tracked stats.initial_voltage_v/final_voltage_v
+        # into this dict before, so every Charge/Discharge run_summary row
+        # showed "Initial Voltage"/"End Voltage" as N/A regardless of what
+        # was actually measured. end_voltage may be overwritten by
+        # run_guarded()'s own fresher, defensive last-moment reading (taken
+        # closer to the actual relay-open instant on an abnormal exit) --
+        # see run_guarded()'s "final voltage" step below.
+        return {
+            "analysis_result": result,
+            "start_voltage": stats.initial_voltage_v,
+            "end_voltage": stats.final_voltage_v,
+            "sample_count": stats.sample_count,
+        }
 
     def _discharge_diagnostic_fields(self, stats: _ChargeDischargeStats, *,
                                       commanded_current_a: float, battery_cfg: dict,
@@ -198,7 +233,41 @@ class BatteryOperationSequence:
         message = message_for(result, mode="discharge")
         if message:
             self.storage.log_event(level="INFO", source=self.source, message=f"Diagnostic: {message}")
-        return {"analysis_result": result}
+        # See _charge_diagnostic_fields()'s identical comment -- same fix,
+        # same rationale, DischargeSequence's own side.
+        return {
+            "analysis_result": result,
+            "start_voltage": stats.initial_voltage_v,
+            "end_voltage": stats.final_voltage_v,
+            "sample_count": stats.sample_count,
+        }
+
+    def _safe_final_voltage_reading(self, context: str):
+        """
+        Best-effort FRESH voltage reading taken defensively at the moment a
+        run is ending abnormally (safety violation, relay fault, timeout,
+        or operator cancellation) -- while the position may still be
+        electrically connected, deliberately BEFORE the safety shutdown
+        that follows (safety.emergency_stop()/safe_cancel_shutdown()) opens
+        every relay. A DMM measurement is passive (hardware/dmm.py's own
+        docstring: "it only observes, it cannot source/energize anything"),
+        so attempting one here is safe regardless of what actually went
+        wrong with the SMU/relay.
+
+        Never raises, and never delays or blocks the real safety shutdown
+        that follows: returns None if no DMM is configured, or if the read
+        itself fails (logged as a WARNING, not escalated -- a missing
+        "last known voltage" is a traceability gap, not a safety-relevant
+        one; safety.check()'s own limits are the authoritative abort path,
+        not this best-effort reading).
+        """
+        if self.dmm is None:
+            return None
+        try:
+            return self.dmm.measure_dc_voltage()
+        except Exception as e:
+            self.log.warning("%s: final voltage reading failed -- %s", context, e)
+            return None
 
     def run_guarded(self, fn, *, channel, relay_address, label, verb, cancel_message,
                      extra_run_summary_fields_fn=lambda: {}):
@@ -232,9 +301,13 @@ class BatteryOperationSequence:
                 message=cancel_message,
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.CANCELLED)
+            fields = extra_run_summary_fields_fn()
+            final_v = self._safe_final_voltage_reading("operator cancellation")
+            if final_v is not None:
+                fields["end_voltage"] = final_v
             self.storage.finish_run_summary(
                 stop_reason=StopReason.CANCELLED, result="STOPPED_BY_OPERATOR",
-                **extra_run_summary_fields_fn(),
+                **fields,
             )
             self.safety.safe_cancel_shutdown(self.smu, self.relay, str(e))
             raise
@@ -246,9 +319,13 @@ class BatteryOperationSequence:
                 message=f"Safety violation -- {e}",
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.SAFETY_VIOLATION)
+            fields = extra_run_summary_fields_fn()
+            final_v = self._safe_final_voltage_reading("safety violation")
+            if final_v is not None:
+                fields["end_voltage"] = final_v
             self.storage.finish_run_summary(
                 stop_reason=StopReason.SAFETY_VIOLATION, result="FAIL",
-                **extra_run_summary_fields_fn(),
+                **fields,
             )
             self.safety.emergency_stop(self.smu, self.relay, str(e))
             raise
@@ -260,9 +337,13 @@ class BatteryOperationSequence:
                 message=f"Relay verification fault -- {e}",
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.FAILED)
+            fields = extra_run_summary_fields_fn()
+            final_v = self._safe_final_voltage_reading("relay fault")
+            if final_v is not None:
+                fields["end_voltage"] = final_v
             self.storage.finish_run_summary(
                 stop_reason=StopReason.FAILED, result="FAIL",
-                **extra_run_summary_fields_fn(),
+                **fields,
             )
             self.safety.emergency_stop(self.smu, self.relay, str(e))
             raise
@@ -278,9 +359,13 @@ class BatteryOperationSequence:
                 message=f"Timeout -- {e}",
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.TIMEOUT)
+            fields = extra_run_summary_fields_fn()
+            final_v = self._safe_final_voltage_reading("timeout")
+            if final_v is not None:
+                fields["end_voltage"] = final_v
             self.storage.finish_run_summary(
                 stop_reason=StopReason.TIMEOUT, result="FAIL",
-                **extra_run_summary_fields_fn(),
+                **fields,
             )
             self.safety.emergency_stop(self.smu, self.relay, str(e))
             raise
@@ -292,9 +377,13 @@ class BatteryOperationSequence:
                 message=f"Unexpected error -- {e}",
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.FAILED)
+            fields = extra_run_summary_fields_fn()
+            final_v = self._safe_final_voltage_reading("unexpected error")
+            if final_v is not None:
+                fields["end_voltage"] = final_v
             self.storage.finish_run_summary(
                 stop_reason=StopReason.FAILED, result="FAIL",
-                **extra_run_summary_fields_fn(),
+                **fields,
             )
             self.safety.emergency_stop(self.smu, self.relay, str(e))
             raise

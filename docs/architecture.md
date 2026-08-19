@@ -1380,6 +1380,8 @@ What changed, all storage/UI-layer only:
 
 **`recent_measurements`/`recent_events` are required fields, not an add-on:** both are populated from day one by both constructors -- `from_live()` from whatever in-memory buffer the calling sequence maintains, `from_database()` from `DataStorage.get_measurements()`/`get_recent_events()` -- so the same data source powers the Runtime Screen, `UI Preview Test`, and the Historical Results Viewer identically.
 
+**Post-first-hardware-validation redesign (see Section 55):** `recent_measurements` is now a bounded window (`RECENT_MEASUREMENTS_DISPLAY_LIMIT`, default 5), paired with a separate single-row `initial_measurement` field so the very first sample stays visible for the whole run; `elapsed_s` was added for an "Elapsed Time" line and a lightweight running indicator; and `render_execution_frame()` clears the screen before each frame instead of scrolling. See Section 55 for the full rationale and why this reaches Charge/Discharge/Monitor Battery/Monitor Battery Scan (and a future CycleSequence) without per-subclass duplication.
+
 ## 19. Battery Definitions, Groups, and Positions (Milestone II)
 
 **Battery types (`config/devices.py::BATTERY_CONFIGS`):** the operator-facing battery catalog is now the two real battery types -- `HUB` (1050 mAh, 3.7 V nominal) and `SB` (160 mAh, 3.7 V nominal). The previous placeholder `GENERIC_LIION_18650` entry was removed; voltage/current/temperature limit fields on each entry not yet confirmed against a datasheet are marked with an inline `# unconfirmed placeholder` comment rather than silently presented as verified.
@@ -4372,3 +4374,153 @@ the logger and `event_log`; an empty-position discharge still raises
 `SafetyViolationError` exactly as before, with the diagnostic logged via
 the logger alone when `log_event` isn't supported by the injected
 collector (duck-typing confirmed safe).
+
+## 55. Start/End Voltage Persistence and Compact Execution UI (post-first-hardware-validation usability pass)
+
+Prompted by the first real B1 charge validation: an operator cancelling
+(or a safety violation aborting) a run lost the initial/final battery
+voltage entirely -- `run_summary`'s `start_voltage`/`end_voltage` columns
+(already in the schema, already populated correctly by
+`MonitorBatterySequence`'s own `_VoltageStats` since that sequence was
+built) showed "N/A" for every Charge/Discharge run regardless of what was
+actually measured, because `ChargeSequence`/`DischargeSequence`'s own
+`_ChargeDischargeStats` (which already tracked `initial_voltage_v`/
+`final_voltage_v`, for `analysis_result` classification only) was never
+folded into the fields passed to `finish_run_summary()`. Separately, the
+execution screen's "Recent Measurements" panel re-queried and re-printed
+the run's ENTIRE measurement history on every single sample -- fine for a
+short run, an "endless scrolling list" (and a growing per-render query
+cost) on a multi-hour one.
+
+### What changed, and why these were the right insertion points
+
+**Initial voltage (`start_voltage`) -- `test_control/battery_operation_sequence.py::
+_charge_diagnostic_fields()`/`_discharge_diagnostic_fields()`:** now fold
+`stats.initial_voltage_v`/`stats.final_voltage_v`/`stats.sample_count`
+into the returned dict alongside the existing `analysis_result` -- these
+are the exact functions already threaded into every `run_guarded()`/
+`complete()` call via `extra_run_summary_fields_fn`/`**_diagnostic_fields()`
+in both `ChargeSequence.run()` and `DischargeSequence.run()`, so this one
+change reaches every exit path (`COMPLETED`/`CANCELLED`/`SAFETY_VIOLATION`/
+`TIMEOUT`/`FAILED`) with no new call sites. `start_voltage`/`end_voltage`/
+`sample_count` were already in `data/storage.py::finish_run_summary()`'s
+write allowlist (the same mechanism `MonitorBatterySequence` already
+used) -- no schema or signature change was needed anywhere.
+
+**A real ordering bug found in the process:** both `ChargeSequence.run()`
+and `DischargeSequence.run()` measured `pre_enable_v` (the DMM reading
+taken with the SMU output still disabled) and only assigned it to
+`stats.initial_voltage_v` *after* `_check_battery_polarity()` had already
+run -- so a run that failed `_check_battery_polarity()` itself
+(`ReversePolarityError`) never recorded the one reading that would have
+explained the rejection. Fixed by moving the assignment immediately after
+the DMM read, before the polarity check, in both files.
+
+**Final voltage (`end_voltage`), fresh at the moment of shutdown --
+`BatteryOperationSequence._safe_final_voltage_reading()` + `run_guarded()`:**
+a new base-class helper takes one more DMM reading, defensively (never
+raises -- returns `None` on any failure or if no DMM is configured; a DMM
+read is passive per `hardware/dmm.py`'s own docstring, safe to attempt
+regardless of what actually went wrong with the SMU/relay). `run_guarded()`
+calls this in **all five** of its exception branches
+(`OperationCancelledError`/`SafetyViolationError`/`RelayError`/
+`NIPXITimeoutError`/generic `Exception`), overlaying it onto
+`end_voltage` **only when the fresh reading is not `None`** (so a subclass
+that has no DMM, or whose own reading fails, keeps whatever
+`extra_run_summary_fields_fn()` already computed rather than being
+silently overwritten with a worse value). This happens *before*
+`safety.emergency_stop()`/`safe_cancel_shutdown()` -- both of which open
+every relay -- so the ordering matches the requested
+"measurement → persist summary → relay open → cleanup" sequence exactly.
+
+**Why the normal-completion path needed no equivalent change:** in both
+`_run_charge()`/`_run_discharge()`'s sampling loop, `stats.add(v, i)` runs
+on every iteration *before* that iteration's EOC/EOD `break` check --
+meaning `stats.final_voltage_v` already holds the exact sample that
+triggered a clean completion, captured before `self.relay.open()` runs a
+few lines later. Adding a *second* fresh DMM read inside `complete()`
+would actually be wrong: for Charge/Discharge, `complete()` is called
+*after* `run_guarded()` returns, by which point the happy-path relay is
+already open -- reading the DMM there would observe a now-disconnected
+position, not "one final measurement while still connected." `complete()`
+therefore continues to rely solely on whatever `**extra_run_summary_fields`
+the caller already computed.
+
+**Why this is safe for `MonitorBatterySequence`/`MonitorBatteryScanSequence`
+too, automatically:** both already subclass `BatteryOperationSequence` and
+call `run_guarded()` (`MonitorBatteryScanSequence` once per position); the
+`None`-guard above means `MonitorBatterySequence`'s own already-correct
+`_VoltageStats`-based `end_voltage` is only ever *improved* (overwritten
+with a fresher reading taken right at the cancellation instant, since that
+sequence never explicitly reopens its relay) — never regressed. No
+per-subclass code was added for either.
+
+**`CycleSequence` (still does not exist -- see Section 54's "not yet
+buildable" caveat):** the moment a future `CycleSequence` is built on
+`BatteryOperationSequence` and calls its inherited `run_guarded()`/
+`complete()` (as `ChargeSequence`/`DischargeSequence` already do), it
+receives initial/final voltage persistence and the compact execution UI
+below for free -- this section's changes live entirely in the shared base
+class and `execution_screen.py`, not in either concrete sequence.
+
+### Compact execution UI (`test_control/execution_screen.py`)
+
+- **Bounded measurement history, not a full re-fetch per render:**
+  `data/storage.py::get_measurements()` gained a `recent_limit` param
+  (`ORDER BY id DESC LIMIT n`, reversed to chronological order -- a real
+  SQL-level bound, not "fetch everything and slice in Python"), and a new
+  `get_first_measurement()` (`ORDER BY id ASC LIMIT 1`) for a cheap
+  single-row "Initial" reading. `BatteryOperationSequence._render_frame()`
+  now calls both -- `recent_limit=RECENT_MEASUREMENTS_DISPLAY_LIMIT` (5) --
+  instead of the previous unbounded `get_measurements(run_id=...)`, which
+  re-queried and re-printed the ENTIRE run history on every sample (up to
+  ~7200 rows by the end of a 2-hour run at 1 Hz). Existing callers of
+  `get_measurements()` that want the full history (e.g. CSV export/offline
+  analysis) are unaffected -- `recent_limit` defaults to `None`.
+- **`ExecutionFrame` gained `elapsed_s` and `initial_measurement` fields.**
+  `elapsed_s` is threaded from each sequence's own already-existing
+  `run_start_time = time.monotonic()` (added to `MonitorBatterySequence`,
+  which didn't track one before, and to `MonitorBatteryScanSequence` as a
+  `self._scan_start_time` instance attribute read by its `_render()`
+  wrapper, to avoid threading it through every intermediate per-position
+  call signature). `from_database()` computes it from
+  `run_summary.duration_s` for historical replay.
+- **Friendlier status + a lightweight running indicator:**
+  `_status_label()` maps the existing `state` value (`"ACTIVE"` or a real
+  `utils/stop_reason.py::StopReason` constant -- no new vocabulary) to
+  `RUNNING`/`COMPLETED`/`CANCELLED`/`SAFETY STOP`/`FAILED`/`TIMEOUT`.
+  `_running_indicator()` appends `"."`/`".."`/`"..."` cycling once per
+  second of `elapsed_s` (`int(elapsed_s) % 4`, recomputed fresh on every
+  render call -- no separate tick-counter state), and only while
+  `state == "ACTIVE"`; a finished run shows its final label with no dots.
+- **Screen refreshes in place instead of scrolling:** `render_execution_frame()`
+  now prints an ANSI clear-screen+cursor-home sequence
+  (`"\033[H\033[J"`) before each frame -- still plain `print()`, no
+  curses/TUI framework (the module's pre-existing constraint, unchanged).
+  Modern Windows terminals (Windows 10 1511+ conhost, Windows Terminal,
+  PowerShell) interpret this natively; a legacy console without ANSI/VT
+  processing enabled would show the raw escape sequence as visible
+  characters instead of clearing -- cosmetic only, every other line still
+  renders normally beneath it.
+- **"Initial" + "Recent (last 5)" measurement tables**, each showing
+  Time / DMM(V) / SMU(V) / Current(A) / Temp -- replacing the single
+  unbounded, SMU/DMM-only table. The Temp column is always present (not
+  conditionally shown only when NTC hardware exists) -- see the NTC note
+  below.
+
+### NTC hardware forward-compatibility (reviewed, no redesign needed)
+
+The new measurement table's Temp column reads `measurements.temp_c`,
+already written by `ChargeSequence`/`DischargeSequence`/
+`MonitorBatterySequence` whenever NTC is wired (`t_c`/`temp_c` stays
+`None` -- rendered `"N/A"` -- exactly as before when it isn't). Once real
+NTC hardware is connected, values appear in this same column with no
+layout change. NTC *presence*/*fault* transitions (`NTCPresence.PRESENT`/
+`ABSENT`/`FAULT` from `hardware/temperature.py::classify_ntc_presence()`)
+are not a `measurements` column at all in this codebase -- they already
+surface as `event_log` rows (`"NTC reading {presence} -- temperature
+monitoring degraded"` / `"NTC read failed -- {e}"`, throttled to one entry
+per transition), which the existing "Recent Events" panel already
+displays unchanged. No new schema column or renderer section was added
+for this speculatively -- the two existing surfaces (Temp column,
+Recent Events panel) already cover it.

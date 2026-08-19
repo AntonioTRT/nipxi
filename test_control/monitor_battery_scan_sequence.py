@@ -142,6 +142,10 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
         )
         run_number = self._run_number()
         total = len(positions_in_group)
+        # Set once, read by _render() below -- avoids threading elapsed_s
+        # through every intermediate _scan_this_position()/_scan_one_position()
+        # call signature just to reach the one place that needs it.
+        self._scan_start_time = time.monotonic()
 
         self.storage.log_event(level="INFO", source="monitor_battery_scan", message="Scan started")
 
@@ -420,6 +424,7 @@ class MonitorBatteryScanSequence(BatteryOperationSequence):
         self._render_frame(
             test_type="monitor_scan", channel=channel, relay_address=relay_address,
             run_number=run_number, state=state, phase_detail=current_step,
+            elapsed_s=time.monotonic() - self._scan_start_time,
             battery_voltage=battery_voltage, daq_channel_0_raw=daq_raw,
             battery_type=battery_type, group=group, position_in_group=position,
             relay_state=relay_state, current_step=current_step, scan_progress=scan_progress,

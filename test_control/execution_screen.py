@@ -40,6 +40,17 @@ Renderer:
 
 from dataclasses import dataclass, field
 
+from utils.stop_reason import StopReason
+
+# How many of the most recent measurement rows the "Recent Measurements"
+# panel shows -- see data/storage.py::DataStorage.get_measurements()'s
+# `recent_limit` param (queried directly via SQL, not fetched-then-sliced).
+# A separate, single-row "Initial" reading (data/storage.py::
+# get_first_measurement()) is always shown alongside this, so the very
+# first sample of a run stays visible even once it has scrolled out of this
+# bounded window during a multi-hour run.
+RECENT_MEASUREMENTS_DISPLAY_LIMIT = 5
+
 
 @dataclass
 class ExecutionFrame:
@@ -62,6 +73,12 @@ class ExecutionFrame:
     relay: int = None         # physical routing path used (provenance)
     state: str = None         # coarse status -- ACTIVE/COMPLETED/FAILED/...
     phase_detail: str = None  # fine-grained phase -- ACTIVATING/DWELLING/CC_CHARGE/...
+
+    # Elapsed wall-clock time since this run started, in seconds -- None
+    # for a test type/constructor that doesn't track it (rendered "N/A").
+    # Also drives the lightweight "RUNNING ..." activity indicator (see
+    # _running_indicator() below) -- no separate tick counter needed.
+    elapsed_s: float = None
 
     # Current measurements -- SMU/DMM (Proto Test / future Charge/Discharge
     # sourcing) and battery/DAQ (Monitor Battery -- a real DAQ.read_channel()
@@ -95,10 +112,24 @@ class ExecutionFrame:
     dwell_progress: str = None    # e.g. "15/30 s", during the CLOSED monitoring dwell
     dwell_remaining_s: float = None
 
+    # Initial measurement -- the run's very first recorded row (data/
+    # storage.py::DataStorage.get_first_measurement()), shown once,
+    # separately from recent_measurements below, so it stays visible for
+    # the whole run even after later samples have pushed it out of the
+    # bounded recent-measurements window. None if no measurement has been
+    # recorded yet (or ever, e.g. a run that failed before its first
+    # sample).
+    initial_measurement: dict = None
+
     # Recent measurements -- list of dicts, same row shape whether it came
     # from an in-memory buffer (live) or data/storage.py::DataStorage.
     # get_measurements() (historical). Required from day one -- not an
-    # add-on -- see the module docstring.
+    # add-on -- see the module docstring. Bounded to
+    # RECENT_MEASUREMENTS_DISPLAY_LIMIT rows (see that constant and
+    # get_measurements()'s `recent_limit` param) -- NOT the full run
+    # history; a caller that genuinely needs the full history (CSV export,
+    # offline analysis) reads data/storage.py directly, never through this
+    # display-oriented frame.
     recent_measurements: list = field(default_factory=list)
 
     # Recent events -- list of dicts, same shape as event_log rows
@@ -112,13 +143,13 @@ class ExecutionFrame:
 
     @classmethod
     def from_live(cls, *, run_id, test_type, channel, run_number=None, relay=None,
-                  state=None, phase_detail=None, smu_voltage=None, smu_current=None,
+                  state=None, phase_detail=None, elapsed_s=None, smu_voltage=None, smu_current=None,
                   dmm_voltage=None, battery_voltage=None, battery_current=None,
                   battery_temp=None, capacity=None, energy=None, cycle_count=None,
                   battery_type=None, group=None, position_in_group=None,
                   relay_state=None, daq_channel_0_raw=None, current_step=None,
                   scan_progress=None, dwell_progress=None, dwell_remaining_s=None,
-                  recent_measurements=None, recent_events=None) -> "ExecutionFrame":
+                  initial_measurement=None, recent_measurements=None, recent_events=None) -> "ExecutionFrame":
         """
         Build a frame from live, in-memory values during a real execution
         (Proto Test Execution / Monitor Battery / Monitor Battery Scan
@@ -130,6 +161,7 @@ class ExecutionFrame:
         return cls(
             run_number=run_number, run_id=run_id, test_type=test_type,
             channel=channel, relay=relay, state=state, phase_detail=phase_detail,
+            elapsed_s=elapsed_s,
             smu_voltage=smu_voltage, smu_current=smu_current, dmm_voltage=dmm_voltage,
             battery_voltage=battery_voltage, battery_current=battery_current,
             battery_temp=battery_temp,
@@ -138,6 +170,7 @@ class ExecutionFrame:
             relay_state=relay_state, daq_channel_0_raw=daq_channel_0_raw,
             current_step=current_step, scan_progress=scan_progress,
             dwell_progress=dwell_progress, dwell_remaining_s=dwell_remaining_s,
+            initial_measurement=initial_measurement,
             recent_measurements=list(recent_measurements) if recent_measurements else [],
             recent_events=list(recent_events) if recent_events else [],
         )
@@ -175,9 +208,13 @@ class ExecutionFrame:
             return None
 
         resolved_run_id = run_summary["run_id"]
-        measurements = storage.get_measurements(run_id=resolved_run_id)
-        latest = measurements[-1] if measurements else {}
-        recent = measurements[-recent_limit:] if measurements else []
+        # Bounded fetch (see RECENT_MEASUREMENTS_DISPLAY_LIMIT / data/
+        # storage.py::get_measurements()'s `recent_limit`) -- a historical
+        # replay of a multi-hour run must not re-pull its entire
+        # measurement history just to find the latest row either.
+        recent = storage.get_measurements(run_id=resolved_run_id, recent_limit=recent_limit)
+        latest = recent[-1] if recent else {}
+        initial_measurement = storage.get_first_measurement(run_id=resolved_run_id)
         events = storage.get_recent_events(run_id=resolved_run_id, limit=recent_limit)
 
         return cls(
@@ -188,6 +225,7 @@ class ExecutionFrame:
             relay=latest.get("relay"),
             state=run_summary.get("stop_reason"),
             phase_detail=latest.get("phase_detail"),
+            elapsed_s=run_summary.get("duration_s"),
             smu_voltage=latest.get("smu_measured_v"),
             smu_current=latest.get("smu_measured_i"),
             dmm_voltage=latest.get("dmm_measured_v"),
@@ -206,6 +244,7 @@ class ExecutionFrame:
             battery_type=run_summary.get("battery_type"),
             daq_channel_0_raw=latest.get("daq_channel_0_raw"),
             current_step=latest.get("phase_detail"),
+            initial_measurement=initial_measurement,
             recent_measurements=recent,
             recent_events=events,
         )
@@ -236,13 +275,103 @@ def _fmt_amps(value) -> str:
     return "N/A" if value is None else f"{value:.6f} A"
 
 
+def _fmt_temp(value) -> str:
+    return "N/A" if value is None else f"{value:.1f} C"
+
+
+def _fmt_elapsed(seconds) -> str:
+    """"HH:MM:SS" (or "MM:SS" under an hour) -- REQUIREMENT 4's "Elapsed
+    Time" line. "N/A" if the caller never threaded elapsed_s through (a
+    test type/constructor that doesn't track it)."""
+    if seconds is None:
+        return "N/A"
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+# Operator-friendly status labels (REQUIREMENT 4's "Current Status" line) --
+# "ACTIVE" is this codebase's own in-flight state string (not part of the
+# StopReason vocabulary, which only covers how a run ENDED); every other
+# key here is a real utils/stop_reason.py::StopReason value. A state not in
+# this table (None, or some future value) falls back to the raw string (or
+# "N/A") rather than crashing the renderer.
+_STATUS_LABELS = {
+    "ACTIVE": "RUNNING",
+    StopReason.COMPLETED: "COMPLETED",
+    StopReason.CANCELLED: "CANCELLED",
+    StopReason.SAFETY_VIOLATION: "SAFETY STOP",
+    StopReason.FAILED: "FAILED",
+    StopReason.TIMEOUT: "TIMEOUT",
+}
+
+
+def _status_label(state) -> str:
+    if state is None:
+        return "N/A"
+    return _STATUS_LABELS.get(state, state)
+
+
+def _running_indicator(state, elapsed_s) -> str:
+    """
+    Lightweight activity indicator (REQUIREMENT 5) -- "RUNNING", "RUNNING .",
+    "RUNNING ..", "RUNNING ...", cycling once per second of elapsed_s. No
+    extra tick-counter state to track: every render call recomputes this
+    purely from elapsed_s, which the run is already threading through for
+    the "Elapsed Time" line above. Only animates while state == "ACTIVE" --
+    a finished run just shows its final status label with no dots (nothing
+    left to indicate as "alive").
+    """
+    label = _status_label(state)
+    if state != "ACTIVE" or elapsed_s is None:
+        return label
+    dots = int(elapsed_s) % 4
+    return f"{label} {'.' * dots}" if dots else label
+
+
+def _clear_screen() -> None:
+    """
+    ANSI clear-screen + cursor-home, printed before every frame so a long
+    run's execution screen refreshes in place instead of scrolling forever
+    (REQUIREMENT 4's "endless scrolling list" complaint) -- still plain
+    print(), no curses/TUI framework (see this module's own docstring
+    constraint). Modern Windows terminals (Windows 10 1511+ conhost,
+    Windows Terminal, PowerShell) interpret this natively; a legacy console
+    without ANSI/VT processing enabled would show the raw escape sequence
+    as visible characters instead of clearing -- a cosmetic degradation
+    only, every other line still renders normally below it.
+    """
+    print("\033[H\033[J", end="")
+
+
+def _fmt_measurement_row(m: dict) -> str:
+    """One row of the Initial/Recent measurement tables -- timestamp, DMM
+    voltage, SMU voltage, current, temperature. Always shows all five
+    columns (never omits Temperature for a run type that doesn't have NTC
+    wired yet) -- see the NTC hardware note in docs/architecture.md: once
+    NTC readings are real, this column starts showing them with no
+    layout change."""
+    ts = m.get("timestamp") or ""
+    ts_short = ts.split("T")[-1][:8] if "T" in ts else ts
+    return (
+        f"{ts_short:<10}"
+        f"{_fmt_volts(m.get('dmm_measured_v')):<16}"
+        f"{_fmt_volts(m.get('smu_measured_v')):<16}"
+        f"{_fmt_amps(m.get('current_a')):<16}"
+        f"{_fmt_temp(m.get('temp_c'))}"
+    )
+
+
 def render_execution_frame(frame: ExecutionFrame) -> None:
     """
     Render `frame` to the console. Used identically by live execution
-    (Proto Test / future battery cycles) and historical replay (UI Preview
-    Test / Historical Results Viewer) -- this function never inspects how
-    `frame` was built, only what its fields contain.
+    (Proto Test / Monitor Battery / Monitor Battery Scan / Charge/Discharge
+    Battery) and historical replay (UI Preview Test / Historical Results
+    Viewer) -- this function never inspects how `frame` was built, only
+    what its fields contain.
     """
+    _clear_screen()
     print("=" * 60)
     print("Current Execution")
     print("=" * 60)
@@ -253,7 +382,8 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
     print(f"DUT / Channel  : {_fmt(frame.channel)}")
     print(f"Relay          : {_fmt(frame.relay)}")
     print()
-    print(f"State          : {_fmt(frame.state)}")
+    print(f"Current Status : {_running_indicator(frame.state, frame.elapsed_s)}")
+    print(f"Elapsed Time   : {_fmt_elapsed(frame.elapsed_s)}")
     print(f"Phase Detail   : {_fmt(frame.phase_detail)}")
     print()
     if frame.battery_type is not None or frame.group is not None or frame.scan_progress is not None:
@@ -268,14 +398,14 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
         print(f"Dwell Progress : {_fmt(frame.dwell_progress)}")
         print(f"Remaining Time : {_fmt(frame.dwell_remaining_s)}" + ("" if frame.dwell_remaining_s is None else " s"))
         print()
-    print("Current Measurements")
+    print("Voltage / Current / Temperature")
     print("-" * 60)
     print(f"SMU Voltage    : {_fmt_volts(frame.smu_voltage)}")
     print(f"SMU Current    : {_fmt_amps(frame.smu_current)}")
     print(f"DMM Voltage    : {_fmt_volts(frame.dmm_voltage)}")
     print(f"Battery Voltage: {_fmt_volts(frame.battery_voltage)}")
     print(f"Battery Current: {_fmt_amps(frame.battery_current)}")
-    print(f"Battery Temp   : {_fmt(frame.battery_temp)}" + ("" if frame.battery_temp is None else " C"))
+    print(f"Battery Temp   : {_fmt_temp(frame.battery_temp)}")
     print(f"DAQ Ch0 Raw    : {_fmt(frame.daq_channel_0_raw, '.6f')}" + ("" if frame.daq_channel_0_raw is None else " V (raw)"))
     print()
     print("Battery Metrics")
@@ -286,20 +416,23 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
     print()
 
     print("=" * 60)
-    print("Recent Measurements")
+    print("Measurement History")
     print("=" * 60)
+    header = f"{'Time':<10}{'DMM(V)':<16}{'SMU(V)':<16}{'Current(A)':<16}{'Temp':<10}"
+    print("Initial")
+    print(header)
+    print("-" * len(header))
+    if frame.initial_measurement:
+        print(_fmt_measurement_row(frame.initial_measurement))
+    else:
+        print("(none)")
+    print()
+    print(f"Recent (last {RECENT_MEASUREMENTS_DISPLAY_LIMIT})")
+    print(header)
+    print("-" * len(header))
     if frame.recent_measurements:
-        print(f"{'DUT':<5}{'Relay':<7}{'SMU(V)':<12}{'DMM(V)':<12}")
-        print("-" * 36)
         for m in frame.recent_measurements:
-            smu_v = m.get("smu_measured_v")
-            dmm_v = m.get("dmm_measured_v")
-            print(
-                f"{_fmt(m.get('channel')):<5}"
-                f"{_fmt(m.get('relay')):<7}"
-                f"{(f'{smu_v:.6f}' if smu_v is not None else 'N/A'):<12}"
-                f"{(f'{dmm_v:.6f}' if dmm_v is not None else 'N/A'):<12}"
-            )
+            print(_fmt_measurement_row(m))
     else:
         print("(none)")
     print()
