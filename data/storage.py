@@ -655,22 +655,43 @@ class DataStorage(StorageBackend):
 
     def get_first_measurement(self, run_id: str = None, channel: int = None) -> dict:
         """
-        Return just the earliest measurement row (by id) as a dict, or None
-        -- a cheap, single-row companion to get_measurements(recent_limit=...)
-        for a "captured at the very start of this run" display (see
-        test_control/execution_screen.py's "Initial" panel), without
-        fetching the whole table to find row one.
+        Return the earliest measurement row (by id) that has at least one
+        real electrical reading, as a dict, or None -- a cheap, single-row
+        companion to get_measurements(recent_limit=...) for a "captured at
+        the very start of this run" display (see test_control/
+        execution_screen.py's "Initial" panel), without fetching the whole
+        table to find it.
+
+        "At least one real electrical reading" means voltage_v/current_a/
+        smu_measured_v/dmm_measured_v is not all NULL -- this deliberately
+        skips a row that carries only a temperature (or nothing at all),
+        e.g. test.py::_ntc_group_snapshot()'s per-position NTC pre-check
+        row, which is written for the selected position BEFORE the relay
+        ever closes (voltage_v=None, no current/SMU/DMM fields at all) and
+        would otherwise be "row one" for that channel every time -- showing
+        the operator an Initial Measurement of all-N/A electrical values
+        even though the battery plainly had a real, valid voltage reading
+        (the pre-enable polarity check) before charging was ever allowed to
+        start. Once a row with real data exists, `ORDER BY id ASC LIMIT 1`
+        with this filter always returns that SAME row on every call (never
+        a later one) -- "store the first valid measurement permanently for
+        the rest of the run" falls out of the query itself, no separate
+        state needed. Returns None (rendered "N/A"/"(none)") if no such row
+        exists yet -- e.g. a run that failed before its first real sample.
         """
         if self._db is None:
             return None
-        conditions, params = [], []
+        conditions, params = [
+            "(voltage_v IS NOT NULL OR current_a IS NOT NULL "
+            "OR smu_measured_v IS NOT NULL OR dmm_measured_v IS NOT NULL)"
+        ], []
         if run_id is not None:
             conditions.append("run_id = ?")
             params.append(run_id)
         if channel is not None:
             conditions.append("channel = ?")
             params.append(channel)
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        where = "WHERE " + " AND ".join(conditions)
         try:
             cur = self._db.execute(
                 f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "

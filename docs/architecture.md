@@ -4734,3 +4734,60 @@ No changes to the voltage-measurement architecture, `SafetyMonitor`
 inputs, or EOC/EOD logic -- this section is the NTC acquisition-path
 migration plus a purely additive display block, per the standing decision
 reaffirmed across Sections 55/57/58.
+
+## 59. B1 battery_type: SB -> HUB (real battery under test is not an SB cell)
+
+The battery physically under test on B1 is not an SB cell -- `battery_type`
+changed from `"SB"` to `"HUB"` (`config/devices.py::BATTERY_GROUPS["B1"]`).
+The 0.5 A `test_setpoints.charge_current_a` (see the prior 0.1 A ->
+0.5 A change) is unchanged and was the reason this mismatch surfaced: 0.5 A
+against SB's declared 160 mAh capacity is ~3C (aggressive for that cell
+size), whereas HUB's declared 1.05 Ah/1050 mAh capacity puts the same
+0.5 A at a much more ordinary ~0.48C -- consistent with "the 500 mA rate
+was chosen for the larger battery under test."
+
+**Fields that actually differ between SB and HUB** (`BATTERY_CONFIGS` in
+`config/devices.py`) -- `chemistry`, `form_factor`, `nominal_voltage_v`,
+`voltage_max_v` (4.2 V), `voltage_min_v` (3.0 V), and `max_temp_c`
+(45.0 C) are IDENTICAL between the two profiles; only three fields change:
+
+| Field | SB | HUB |
+|---|---|---|
+| `capacity_ah` | 0.16 (160 mAh) | 1.05 (1050 mAh) |
+| `max_charge_current_a` | 0.6 (temporarily raised for the earlier 0.5 A/SB test) | 0.525 (unconfirmed placeholder, unchanged) |
+| `max_discharge_current_a` | 0.16 | 1.05 |
+
+**Validation re-checked, not assumed:** `validate_group_test_config("B1")`
+verified to still pass with `battery_type="HUB"` and `test_setpoints`
+unchanged (0.5 A charge / 3.7 V CV / 0.08 A discharge / 3.0 V cutoff).
+Notably, HUB's own `max_charge_current_a` (0.525 A) already exceeds the
+0.5 A commanded current with real headroom -- **no ceiling bump was
+needed for this switch**, unlike the SB profile, which required a
+temporary bump (0.12 -> 0.6) specifically because SB's own ceiling (0.12 A)
+could not otherwise accommodate 0.5 A. `charge_voltage_v` (3.7 V) stays
+well under HUB's `voltage_max_v` (4.2 V, identical to SB's) -- unaffected
+either way. SMU capability (`AUX_SMU_1`, 1.0 A) is independent of
+`battery_type` and was already satisfied.
+
+**No other logic depends on `battery_type` numerically** beyond the
+`BATTERY_CONFIGS` lookup above -- confirmed by re-tracing `SafetyMonitor`
+(limits resolved generically from whichever `battery_cfg` is passed in,
+never hardcoded to "SB"), EOC/EOD logic (compares against
+`test_setpoints`/`CHARGE_CUTOFF_A`, not `battery_type`), and
+`battery_diagnostics.py`'s classification thresholds (`NEAR_FULL_MARGIN_V`/
+`EMPTY_POSITION_VOLTAGE_V`/`MIN_MEANINGFUL_CURRENT_FRACTION` are all
+voltage/current-fraction based, not capacity-based). `capacity_ah`'s only
+effect is display/persistence -- the "Battery capacity: X mAh" event_log
+line and `run_summary.capacity_ah` -- no threshold or safety decision
+reads it.
+
+**Orphaned config, flagged not silently left stale:** SB's temporary
+`max_charge_current_a` bump (0.6) now serves no purpose -- B1 no longer
+references `BATTERY_CONFIGS["SB"]` at all. Left in place (not reverted)
+in case SB is assigned to a future group/test, with an explicit "ORPHANED"
+comment at the field itself so a future reader does not mistake it for a
+currently-meaningful ceiling. NTC mapping (Dev1/ai0-ai7, Section 58),
+DMM voltage authority, SMU current authority, and all UI additions
+(Sections 55/57/58) are untouched by this change -- none of them read
+`battery_type` for anything other than the `BATTERY_CONFIGS` lookup
+already covered above.

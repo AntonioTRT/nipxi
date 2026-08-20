@@ -469,15 +469,18 @@ BATTERY_CONFIGS = {
         "voltage_max_v":           4.2,        # unconfirmed placeholder -- assumed standard Li-ion window
         "voltage_min_v":           3.0,        # unconfirmed placeholder -- assumed standard Li-ion window
         "capacity_ah":             0.16,       # confirmed -- 160 mAh
-        # TEMPORARY -- raised from 0.08 to 0.12 for the first real-hardware
-        # B1 charge validation (see BATTERY_GROUPS["B1"]["test_setpoints"]
-        # below): the requested 0.1 A commanded current would otherwise
-        # exceed this ceiling and validate_group_test_config() would refuse
-        # to run. 0.12 A keeps this SafetyMonitor ceiling strictly above the
-        # 0.1 A setpoint (headroom against measurement noise) while staying
-        # well under any hazardous rate for a 160 mAh cell. Revert to 0.08
-        # (or the confirmed datasheet value) once validation is done.
-        "max_charge_current_a":    0.12,       # TEMPORARY -- was 0.08 (unconfirmed placeholder, 0.5C)
+        # TEMPORARY -- raised 0.12 -> 0.6 while B1 was declared "SB" and
+        # commanded at 0.5 A (see git history/docs/architecture.md).
+        # ORPHANED as of B1's battery_type change to "HUB"
+        # (BATTERY_GROUPS["B1"] below) -- B1 no longer reads this entry at
+        # all, so this bump is currently dead weight, not an active safety
+        # ceiling for anything. Left at 0.6 rather than reverted, since
+        # SB may still be assigned to some future group/test; revisit
+        # (likely back to 0.08, the original unconfirmed placeholder)
+        # whenever SB is next actually used, rather than assuming this
+        # value is still meaningful.
+        "max_charge_current_a":    0.6,        # ORPHANED (was 0.12, before that 0.08 unconfirmed placeholder) --
+                                                # no longer referenced by B1; see comment above
         "max_discharge_current_a": 0.16,       # unconfirmed placeholder -- assumed 1C
         "max_temp_c":              45.0,       # unconfirmed placeholder -- assumed standard Li-ion ceiling
     },
@@ -576,15 +579,24 @@ BATTERY_GROUPS = {
         # TEMPORARY -- was "PRIMARY_SMU" (PXIe-4141, Slot 5, max_current_a
         # 0.1 A). Reassigned to AUX_SMU_1 (PXI-4130, Slot 7, max_current_a
         # 1.0 A -- see PXI_SLOTS[7] above) for the first real-hardware B1
-        # charge validation run. This group is still declared for SB
-        # (0.12/0.16 A limits) with a conservative test recipe below -- the
-        # SMU swap does not change what current is actually commanded, only
-        # which physical card sources it. Revert to "PRIMARY_SMU" once
-        # validation is done, unless this reassignment is made permanent.
+        # charge validation run. The SMU swap does not change what current
+        # is actually commanded, only which physical card sources it.
+        # Revert to "PRIMARY_SMU" once validation is done, unless this
+        # reassignment is made permanent.
         "smu":            "AUX_SMU_1",
         "dmm":            "MAIN_DMM",
         "daq":            "MAIN_DAQ",
-        "battery_type":   "SB",
+        # battery_type: HUB, not SB -- the battery currently under test on
+        # B1 is not an SB cell (SB's declared 160 mAh capacity does not
+        # match it); HUB's declared 1.05 Ah/1050 mAh profile does. Changed
+        # from "SB" -- see docs/architecture.md Section 59 for the full
+        # before/after comparison and validation re-check. HUB's own
+        # max_charge_current_a (0.525 A, below) already accepts the 0.5 A
+        # commanded current in test_setpoints below with real headroom --
+        # no ceiling bump was needed for this switch, unlike SB's own
+        # temporary 0.6 A bump (BATTERY_CONFIGS["SB"] above), which B1 no
+        # longer references at all now that battery_type is "HUB".
+        "battery_type":   "HUB",
         # NTC acquisition migrated off the temporary NI USB-6210 dev DAQ
         # (NTC_DAQ_USB6210, resource "Dev2") to the rack DAQ -- bench
         # validation confirmed Dev1 (MAIN_DAQ) exists, is operational, and
@@ -599,22 +611,27 @@ BATTERY_GROUPS = {
         # below. See docs/architecture.md Section 58.
         # TEMPORARY -- first real-hardware charge validation recipe (hand-
         # soldered wiring, ~3.5 V battery physically present in the
-        # selected position). Reduced CV target (3.7 V, not SB's 4.2 V
-        # voltage_max_v ceiling) + reduced commanded current (0.1 A) for a
-        # conservative first run. With "smu" now AUX_SMU_1 (max_current_a
-        # 1.0 A), 0.1 A has real hardware headroom (previously it sat at
-        # PRIMARY_SMU's full 0.1 A ceiling with none); see SB's
-        # max_charge_current_a comment above for the matching ceiling bump.
-        # Restore to the production recipe (0.05 A / 4.2 V, or whatever is
-        # validated) once this run passes -- see docs/architecture.md.
+        # selected position). Reduced CV target (3.7 V, not HUB's own
+        # 4.2 V voltage_max_v ceiling) for a conservative first run. With
+        # "smu" now AUX_SMU_1 (max_current_a 1.0 A), the commanded current
+        # below has real hardware headroom. Restore to the production
+        # recipe (whatever is validated) once this run passes -- see
+        # docs/architecture.md.
         "test_setpoints": {
-            "charge_current_a":    0.1,    # TEMPORARY -- was 0.05. <= AUX_SMU_1 max_current_a (1.0),
-                                            #    <= SB max_charge_current_a (0.12, temporarily raised)
-            "charge_voltage_v":    3.7,    # TEMPORARY -- was 4.2 (SB voltage_max_v). Conservative CV
+            # TEMPORARY -- 0.5 A, for the larger (non-SB) battery currently
+            # under test on B1 -- see the "battery_type" comment above.
+            # EOC logic, SafetyMonitor, DMM voltage authority, and SMU
+            # current authority are all unchanged. Revert to whatever the
+            # validated production recipe turns out to be once this test
+            # passes.
+            "charge_current_a":    0.5,    # <= AUX_SMU_1 max_current_a (1.0),
+                                            #    <= HUB max_charge_current_a (0.525) -- fits
+                                            #    with real headroom, no ceiling bump needed
+            "charge_voltage_v":    3.7,    # TEMPORARY -- was 4.2 (HUB voltage_max_v). Conservative CV
                                             #    target for the first real-battery run (~3.5 V resting).
-            "discharge_current_a": 0.08,   # <= SB max_discharge_current_a (0.16) and
+            "discharge_current_a": 0.08,   # <= HUB max_discharge_current_a (1.05) and
                                             #    <= AUX_SMU_1 max_current_a (1.0)
-            "discharge_cutoff_v":  3.0,    # == SB voltage_min_v (the safety floor --
+            "discharge_cutoff_v":  3.0,    # == HUB voltage_min_v (the safety floor --
                                             #    see "Discharge Cutoff Policy")
         },
         "positions": {
