@@ -5365,9 +5365,10 @@ called from `main.py`'s real (non-`--show-topology`) path.
 
 To let `worker_runtime.py` reuse this logic instead of duplicating it,
 three pieces of already-existing `test.py` logic (candidates identified
-in the readiness review, Section prior) were extracted into shared,
+in an architecture readiness review) were extracted into shared,
 pure modules, with `test.py` reduced to a thin, behavior-preserving
-wrapper around each:
+wrapper around each. A fourth and fifth followed in Section 65 below,
+once a second readiness review found them still missing:
 
 - **`utils/group_hardware.py`** -- `resolve_group_hardware()`,
   `missing_hardware_roles()`, `validate_position_in_group()`. The two
@@ -5411,12 +5412,12 @@ in `test.py` is unchanged. Only the function *bodies* now delegate.
 
 ### Relationship to `RunSpec`
 
-None of the six decisions change `RunSpec`'s shape (Section prior) --
-`RunSpec.groups`/`positions` still resolve to `hardware_for_group()`-scoped
-work exactly as designed; decision #2 clarifies *how many* times that
-resolution happens (once per position, not once per group), and decision
-#6 clarifies that `RunSpec` resolution *is* the pre-flight gate, with
-nothing further to design there.
+None of the six decisions change `RunSpec`'s shape (Section 66, "RunSpec
+-- Final Contract") -- `RunSpec.groups`/`positions` still resolve to
+`hardware_for_group()`-scoped work exactly as designed; decision #2
+clarifies *how many* times that resolution happens (once per position,
+not once per group), and decision #6 clarifies that `RunSpec` resolution
+*is* the pre-flight gate, with nothing further to design there.
 
 ### Relationship to `Supervisor`
 
@@ -5437,3 +5438,427 @@ own wrapper functions still produce identical printed messages, return
 values, and delegate (rather than reimplement) to the shared modules,
 using stdout capture and spy patches; no hardware access in any of these
 four files.
+
+## 65. Remaining Helper Extraction Before worker_runtime.py (CURRENT IMPLEMENTATION)
+
+A second architecture readiness review (conducted after Section 64's
+preparation phase, before any `worker_runtime.py` code was written)
+re-walked `test.py`'s real `_run_charge_or_discharge()` flow end to end
+and found two more pure, `test.py`-only functions it calls that a future
+`worker_runtime.py` would also need, but that were not in the original
+four-candidate extraction list:
+
+- **`_hardware_snapshot_fields()`** (built the run_summary
+  hardware-identity snapshot dict -- `smu_name`/`smu_resource`/
+  `smu_model`, `dmm_*`, `daq_*`, `relay_matrix_*` -- from the same
+  resolved `config/devices.py` dicts `HardwareManager` was constructed
+  with). Already had no `print()`/`input()` -- a pure move, like
+  `ntc_group_snapshot()` in Section 64.
+- **`_start_run_summary_guarded()`** (calls `DataStorage.
+  start_run_summary()`, catching `sqlite3.Error` with an operator-facing
+  `[FAIL]` message instead of a raw traceback). Had the same `print()`-
+  on-failure pattern as `_open_storage_guarded()`/`_resolve_group_hardware()`
+  in Section 64, so it got the same `on_fail`-callback split.
+
+Both were extracted into `test_control/storage_session.py` (extending
+the module Section 64 created for `open_storage_guarded()`, rather than
+a new module -- all three functions cover the same "guarded storage
+session" concern: open storage, describe the hardware attached to this
+run, start the run's summary row) as `hardware_snapshot_fields()` and
+`start_run_summary_guarded(storage, test_type, on_fail=None, **fields)`.
+`test.py`'s `_hardware_snapshot_fields()`/`_start_run_summary_guarded()`
+keep their exact original names, signatures, and call sites, reduced to
+thin wrappers (`on_fail=print` for the latter) -- every existing call
+site in `test.py` (`test.py:4478-4481` and three others) is unchanged.
+
+Regression tests: `tests/test_storage_session.py` (new
+`HardwareSnapshotFieldsTests`/`StartRunSummaryGuardedTests` classes) for
+the shared implementations in isolation, and `tests/
+test_testpy_extraction_parity.py` (new `HardwareSnapshotFieldsParityTests`/
+`StartRunSummaryGuardedParityTests` classes) proving `test.py`'s wrappers
+still produce identical output and genuinely delegate. No hardware
+access in any of these tests.
+
+With this extraction, every pure helper `worker_runtime.py` needs from
+`test.py`'s validated flow now has exactly one shared implementation:
+group/hardware resolution and position validation
+(`utils/group_hardware.py`), the NTC pre-check (`test_control/
+ntc_snapshot.py`), and the full storage-session lifecycle -- open,
+snapshot, start, and (already existing, unchanged) `finish_run_summary()`
+(`test_control/storage_session.py`).
+
+## 66. RunSpec -- Final Contract (FUTURE PLANNED ARCHITECTURE, design persisted here for the first time)
+
+**This section exists because a readiness review found that `RunSpec`'s
+full design -- agreed upon in an earlier design discussion -- had never
+been written into this document or into any code.** Nothing in this
+section is implemented yet: there is no `RunSpec` class anywhere in this
+repository. This is the authoritative, persisted version of that design,
+so it survives independent of any single conversation. `worker_runtime.py`
+must be built against this contract.
+
+`RunSpec` is the one place "what should run right now" is described --
+deliberately separate from `config/devices.py::BATTERY_GROUPS` (hardware/
+setpoint truth, unchanged) and from `orchestration/workers.py::WorkerPlan`/
+`orchestration/execution_plan.py::ExecutionPlan` (pure, worker/SMU-
+granular, unchanged). It is the input `worker_runtime.py` will consume
+alongside an `ExecutionPlan`.
+
+### Required fields
+
+- **`operation`** -- exactly one of `"charge" | "discharge" | "cycle"`.
+  Registry-backed (`{"charge": ChargeSequence, "discharge":
+  DischargeSequence, "cycle": CycleSequence}`), extensible later to
+  `"monitor"` without changing this contract. One `RunSpec` = one
+  operation, applied uniformly to every group/position it selects -- no
+  mixed-operation runs in a single `RunSpec`.
+
+### Optional fields
+
+- **`groups: list[str] | None`** -- `None` (default) means "every group
+  in `BATTERY_GROUPS` that is `enabled` and owns an `smu`" -- i.e.
+  exactly `discover_workers()`'s own filter, so an omitted field
+  reproduces today's single-worker reality automatically.
+- **`positions: dict[str, list[int]] | None`** -- per-group explicit
+  position numbers. A group missing from this dict, or the field being
+  `None` entirely, means "every position in that group with
+  `positions[i]["enabled"] == True`, ascending."
+- **`cycle_count: int | None`** -- only meaningful when
+  `operation == "cycle"`; `None` behaves as `1`. Present with
+  `operation != "cycle"` is a construction-time validation error, not a
+  silently-ignored field -- matches `validate_group_test_config()`'s
+  existing "fail before hardware is touched" posture.
+- **`profile_name: str | None`** -- pure provenance/logging label (e.g.
+  which saved profile produced this `RunSpec`). Never read by dispatch
+  logic -- nothing behaves differently based on whether a `RunSpec` came
+  from a CLI flag or a file.
+
+Five fields total, one required.
+
+### Position-selection rules
+
+1. Default: all positions in the group with
+   `positions[i]["enabled"] == True`, ascending order.
+2. Explicit override (`positions={"B1": [3]}`): restricts to exactly
+   those numbers. A requested number that doesn't exist in the group's
+   `positions` dict, or exists but has `enabled: False`, is a
+   **validation error at resolution time** -- never a silent skip.
+3. Positions within one group always run sequentially, ascending order
+   -- matches existing hardware reality (one relay/SMU, one position
+   engaged at a time). No operator-controlled reordering in this
+   version of the contract.
+
+### Group-selection rules
+
+1. Default: every `enabled`, SMU-owning group -- identical to
+   `discover_workers()`'s own filter.
+2. Explicit list (`groups=["B1"]`): must be a subset of enabled,
+   SMU-owning groups; anything else is a resolution-time validation
+   error.
+3. **The one real piece of glue logic this contract requires:**
+   `groups` is group-granular; `build_execution_plan()`'s
+   `enabled_workers` is worker/SMU-granular, and one worker can own
+   multiple groups run sequentially ("Worker 1: B1, B2"). Resolution:
+   derive `enabled_workers = {worker.smu_name for worker whose .groups
+   intersects RunSpec.groups}`, pass that unchanged into
+   `build_execution_plan()`; then at execution time, `worker_runtime`
+   filters each `ExecutionStep.groups` down to the requested subset
+   before iterating. This belongs in the new `orchestration/run_spec.py`
+   module (see "Interaction with worker_runtime" below), not improvised
+   inside `worker_runtime.py` itself.
+
+### Operation-selection rules
+
+Covered above (required field, registry-backed, `cycle_count` gated to
+`cycle`, one operation per `RunSpec`).
+
+### `cycle_count` behavior
+
+Only legal alongside `operation == "cycle"`. `None`/absent behaves as
+`1` (a single charge -> rest -> discharge composition). An integer
+greater than 1 means `CycleSequence` repeats that composition that many
+times, each repetition constructing fresh `ChargeSequence`/
+`DischargeSequence` instances with fresh storage (see Section 67,
+"Cycle count handling") -- `RunSpec` itself does not repeat anything; it
+only carries the count through to `CycleSequence.run(cycle_count=...)`.
+
+### Future profile compatibility
+
+`RunSpec` is defined so a "profile" is *the same shape*, loaded from a
+file instead of `argparse` -- zero shape change, only a different
+construction path. `profile_name` is the provenance hook; no field's
+meaning depends on its origin.
+
+### Future automation compatibility
+
+Every field has a deterministic default (`None` -> "everything enabled,
+safely"), so a fully-specified `RunSpec` requires zero interactive input
+to resolve or run -- the prerequisite for any unattended/scheduled
+invocation. A future scheduler enqueuing several runs just constructs/
+loads multiple `RunSpec`s and runs them one after another; nothing about
+the contract changes to support that.
+
+### Examples
+
+**Charge one position:**
+```
+operation: "charge"
+groups: ["B1"]
+positions: {"B1": [3]}
+```
+
+**Charge all enabled positions:**
+```
+operation: "charge"
+groups: ["B1"]
+positions: None
+```
+
+**Discharge one group in full:**
+```
+operation: "discharge"
+groups: ["B1"]
+```
+
+**Run a complete cycle:**
+```
+operation: "cycle"
+groups: ["B1"]
+cycle_count: 1
+```
+
+**Future unattended execution:**
+```
+operation: "cycle"
+groups: None
+positions: None
+cycle_count: 3
+profile_name: "nightly_hub_cycle_v1"
+```
+
+### Interaction with worker_runtime
+
+`resolve_run_spec(run_spec, battery_groups=None)` (planned for a new
+`orchestration/run_spec.py` module, not yet built) is the pure function
+that applies every rule above and produces the `enabled_workers` set
+`build_execution_plan()` needs, plus the concrete per-group position
+lists. `worker_runtime.py` consumes that resolved result -- it never
+re-implements RunSpec's own selection rules.
+
+## 67. CycleSequence -- Final Design (FUTURE PLANNED ARCHITECTURE, design persisted here for the first time)
+
+**Same motivation as Section 66:** this design was agreed upon in an
+earlier design discussion and never written down. `CycleSequence` does
+not exist as code anywhere in this repository as of this section being
+written. This is the authoritative, persisted version, so `CycleSequence`
+can eventually be built against it without re-deriving these decisions.
+
+### Core structural decision
+
+`CycleSequence` subclasses `BatteryOperationSequence` directly -- a
+sibling of `ChargeSequence`/`DischargeSequence`, not a subclass of
+either. Internally, it **composes** fresh `ChargeSequence`/
+`DischargeSequence` instances and calls their complete, self-contained
+`.run()` -- it never reimplements a sampling loop, a safety check, an
+EOC/EOD condition, or a shutdown call. Everything hardware-touching
+stays exactly where it is already validated.
+
+### Lifecycle
+
+```
+run_guarded(_run_cycle) called on CycleSequence itself
+  for i in range(1, cycle_count + 1):
+      check_cancellation(token)                     # repetition checkpoint
+      charge_phase = ChargeSequence(<shared smu/dmm/relay/safety/settings/group_name>,
+                                     storage=storage_factory())     # fresh instance, fresh run_id
+      charge_phase.run(channel, relay_address, battery_cfg, test_setpoints, ntc_channel, token)
+      # -- fully self-contained: own run_guarded(), own complete(), own emergency_output_off(),
+      #    own relay.open(). If it raises, that exception propagates straight through --
+      #    CycleSequence adds no try/except of its own around this call.
+      _render_frame(state="RESTING", phase_detail="CYCLE_REST", ...)   # UI visibility only
+      interruptible_sleep(rest_s, token=token)        # cancellable dwell, reused primitive
+      discharge_phase = DischargeSequence(<same shared deps>, storage=storage_factory())
+      discharge_phase.run(channel, relay_address, battery_cfg, test_setpoints, ntc_channel, token)
+  return True
+complete(...) called on CycleSequence itself afterward, same as Charge/Discharge today
+```
+
+Each repetition gets a **brand-new** `ChargeSequence`/`DischargeSequence`
+instance with a **brand-new** storage instance -- never reused across
+repetitions. Reusing one instance/`run_id` across repetition 2 would
+silently overwrite repetition 1's row (`finish_run_summary()` is
+`UPDATE ... WHERE run_id=?`, last-write-wins). Fresh instances per
+repetition eliminate that risk structurally, at zero cost, without
+touching `ChargeSequence`/`DischargeSequence` at all.
+
+### Composition model
+
+`CycleSequence` composes `ChargeSequence.run()` and `DischargeSequence.run()`
+as complete, self-contained calls -- never inlining their bodies. This is
+what makes the classification/shutdown/storage guarantees those two
+classes already provide (Sections 30/33/35/39/60) apply automatically to
+`CycleSequence` with zero code of its own: the classification is wired
+inside `ChargeSequence.run()`/`DischargeSequence.run()` themselves (their
+own `run_guarded()`/`complete()` calls), not in a caller's wrapper.
+
+### State model
+
+No new state enum. Two existing, unmodified vocabularies are reused
+as-is:
+
+- **`StopReason`** (`COMPLETED`/`CANCELLED`/`SAFETY_VIOLATION`/`FAILED`/
+  `TIMEOUT`) -- `CycleSequence`'s own `run_guarded()` maps exceptions
+  through the *exact same table* Charge/Discharge already use.
+- **`phase_detail`** -- an opaque per-subclass string in the base class,
+  not an enum. `CycleSequence` introduces exactly one new value:
+  `"CYCLE_REST"`, used only for UI/log visibility during the dwell
+  period. The charge and discharge sub-phases keep writing their own
+  existing values (`"CC_CV"`, `"CC_DISCHARGE"`) completely unchanged.
+
+This is a different concept from `orchestration/worker_lifecycle.py::
+WorkerState` (Section 63) -- that is supervisor/plan-level bookkeeping, a
+different layer, tracking whether a *worker* is claiming/running/idle.
+`CycleSequence`'s state is about what is physically happening to one
+battery right now.
+
+### Cycle count handling
+
+`CycleSequence.run(..., cycle_count: int = 1)` -- a strict superset of
+`ChargeSequence`/`DischargeSequence`'s existing `run()` signature (same
+`channel`/`relay_address`/`battery_cfg`/`test_setpoints`/`ntc_channel`/
+`token`, plus this one addition). `battery_cfg`/`test_setpoints` are the
+*same dicts* its caller already resolved once, passed through unchanged
+to both internal phases every repetition -- no new parsing, no
+duplicated setpoint logic. A failed repetition stops the whole cycle
+immediately (see "Stop conditions" below).
+
+### Rest handling
+
+Exactly one rest phase per repetition, between charge and discharge --
+matching the documented "charge -> rest -> discharge" composition
+literally (Section 62/`docs/TODO.md`). No rest is added after discharge
+before the next repetition's charge begins -- an explicit non-goal; a
+future `rest_after_discharge_s` knob could be layered on without
+redesign if ever wanted. Implementation is
+`interruptible_sleep(rest_s, token=token)` -- the exact existing
+primitive (`utils/cancellation.py`), reused with zero new cancellation
+code. During rest, the SMU is already off and the relay already open
+(each phase's own `finally`/normal-exit path already did this at that
+phase's own end) -- rest is a genuinely passive dwell with nothing
+energized. `rest_s` lives in `test_setpoints` (e.g. `cycle_rest_s`),
+config-driven like every other setpoint, not a `RunSpec` field.
+
+### Cancellation behavior
+
+Cooperative, same token, same `check_cancellation()`/`interruptible_sleep()`
+primitives, no new mechanism. Checkpoints: top of each repetition (new,
+small), inside each sub-phase's own existing checkpoints (inherited,
+free), and during rest (via `interruptible_sleep`, inherited, free). If
+cancelled during a charge/discharge sub-phase, that sub-phase's own
+`run_guarded()` catches `OperationCancelledError`, calls
+`safe_cancel_shutdown()`, finishes its own phase-level row as
+`CANCELLED`, then re-raises. That propagates up through `CycleSequence`'s
+own `run_guarded()`, which also calls `safe_cancel_shutdown()` (again,
+redundant but safe -- `emergency_output_off()`/`open_all()` are already
+idempotent by design, per Section 60) and marks the cycle-level row
+`CANCELLED` too. This double-shutdown-call behavior is intentional
+redundancy, not a bug.
+
+### Stop conditions
+
+1. **Normal completion** -- all `cycle_count` repetitions finish; cycle-
+   level row -> `COMPLETED`/`PASS`, each phase's own row also `PASS`.
+2. **Operator cancellation** -- at any checkpoint above; whichever phase
+   is active gets `CANCELLED`, propagates to the cycle-level row too.
+3. **Safety violation / relay error / timeout / any exception** in
+   either sub-phase -- that phase's own `run_guarded()` already ran
+   `emergency_stop()` and finished its own row as `FAIL`; the exception
+   propagates unchanged, `CycleSequence`'s own `run_guarded()` runs
+   `emergency_stop()` again and marks the cycle-level row `FAIL`. **The
+   cycle stops entirely -- no remaining repetitions run, no attempt to
+   finish "the other half" of the current repetition.** Direct
+   extension of "unknown state = unsafe state" to the cycle level.
+4. `CycleSequence` adds **no new safety check of its own** -- the only
+   new logic it introduces is the per-repetition cancellation
+   checkpoint; every safety decision remains inside `SafetyMonitor.check()`,
+   called only from within the sub-phases, exactly as today.
+
+### Reporting model
+
+Resolves the "one row per phase vs. one row per whole cycle" question
+(flagged as unresolved when this design was first discussed) as
+**both, via the existing mechanism, with zero schema change**:
+
+- One **cycle-level** `run_summary` row (`test_type="cycle_battery"`) --
+  `CycleSequence`'s own storage instance, own `run_id`, written via its
+  own inherited `run_guarded()`/`complete()` -- the exact same mechanism
+  every other sequence already uses. **Verified against the current
+  schema while writing this section:** `data/storage.py::
+  finish_run_summary()` already accepts `cycle_count` as a recognized
+  kwarg (alongside `capacity_ah`/`energy_wh`/`analysis_result`), and
+  `run_summary`'s schema already has a `cycle_count` column
+  (`docs/CONFIGURATION.md`'s `run_summary` table description) --
+  `CycleSequence`'s cycle-level summary write requires **zero
+  `data/storage.py` changes**. This is what `run_summary_report.py`'s
+  already-stubbed `_print_cycle_section()` (Section 54) is waiting for.
+- One **phase-level** row per Charge sub-phase and one per Discharge
+  sub-phase, per repetition -- each via a fresh, independent
+  `DataStorage` instance, in the *exact existing shape*
+  (`test_type="charge_battery"`/`"discharge_battery"`), completely
+  unchanged from today's standalone-invocation behavior.
+- Repetition ordering, if ever needed by a report, is already
+  recoverable from each phase's own timestamp-based `run_id` -- no new
+  linking column is required for this design to be complete.
+
+### `storage_factory` concept
+
+`worker_runtime.py` passes a `storage_factory` callable (something that
+builds a fresh `DataStorage`, e.g. closing over `Settings`) into
+`CycleSequence`'s constructor -- a parameter unique to `CycleSequence`,
+**not** added to `BatteryOperationSequence`'s shared base signature,
+keeping the base class's constructor contract unchanged for every other
+subclass. `CycleSequence` calls it twice per repetition (once for that
+repetition's Charge phase, once for Discharge) and is responsible for
+closing each resulting storage instance itself once that phase's `.run()`
+returns or raises, before constructing the next -- the one lifecycle
+responsibility that moves inside the sequence for `CycleSequence`
+specifically, since `BatteryOperationSequence` subclasses never close
+their own `storage` today (the caller does, in its own `finally`); a
+composing `CycleSequence` is the first sequence that constructs more
+than one storage-scoped sub-phase per invocation, so it is the first for
+which that responsibility has to move inside the sequence itself.
+
+### Interaction with RunSpec
+
+`RunSpec.operation == "cycle"` selects `CycleSequence` from the
+dispatch registry (Section 66). `RunSpec.cycle_count` feeds
+`CycleSequence.run()`'s `cycle_count` parameter directly, with the same
+default-to-1 rule specified in Section 66. Group/position selection
+rules are unaffected -- `CycleSequence` runs once per selected position,
+`cycle_count` repetitions each, exactly like Charge/Discharge run once
+per selected position today.
+
+### Interaction with worker_runtime
+
+`worker_runtime.py`'s dispatch loop stays **uniform across all three
+operations** -- construct `HardwareManager`/`SafetyMonitor`/one storage
+instance, look up the sequence class from the registry, call `.run(...)`
+with the shared kwargs. The one Cycle-specific addition:
+`worker_runtime.py` also passes a `storage_factory` callable into
+`CycleSequence`'s constructor, and conditionally includes
+`cycle_count=run_spec.cycle_count` in the call kwargs only when
+`RunSpec.operation == "cycle"` -- the one small, expected piece of
+per-operation glue that belongs at the `worker_runtime` layer, not
+inside the sequence classes or the pure `orchestration/` modules.
+
+### What this design deliberately does not touch
+
+`BatteryOperationSequence`'s constructor, `run_guarded()`'s exception
+table, `ChargeSequence`/`DischargeSequence`'s internals (sampling loops,
+EOC/EOD logic, safety calls, shutdown calls), `SafetyMonitor`,
+`data/storage.py`'s schema, and `run_summary_report.py`'s per-row
+dispatch logic (only its already-existing Cycle stub gets filled in
+later, at implementation time) -- all confirmed unchanged by this
+design. `CycleSequence` adds exactly: one new class, one new
+`phase_detail` value, one new constructor parameter (`storage_factory`)
+scoped to itself only, and a per-repetition composition loop.

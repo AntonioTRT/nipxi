@@ -28,7 +28,11 @@ from utils.group_hardware import (
     resolve_group_hardware as _shared_resolve_group_hardware,
     validate_position_in_group as _shared_validate_position_in_group,
 )
-from test_control.storage_session import open_storage_guarded as _shared_open_storage_guarded
+from test_control.storage_session import (
+    open_storage_guarded as _shared_open_storage_guarded,
+    hardware_snapshot_fields as _shared_hardware_snapshot_fields,
+    start_run_summary_guarded as _shared_start_run_summary_guarded,
+)
 from test_control.ntc_snapshot import ntc_group_snapshot as _shared_ntc_group_snapshot
 
 # Suppress NI driver / serial noise during tests
@@ -3728,23 +3732,14 @@ def _hardware_snapshot_fields(smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, da
     `dmm_name`/`dmm_cfg` may be None (the DMM is optional for some
     workflows) -- every other role is always present, since HardwareManager
     always constructs an SMU/DAQ/relay driver.
+
+    Thin wrapper: the actual (already pure) logic lives in
+    test_control/storage_session.py::hardware_snapshot_fields() so a
+    future worker_runtime.py shares exactly this implementation -- see
+    docs/architecture.md "Remaining Helper Extraction Before
+    worker_runtime.py".
     """
-    fields = {
-        "smu_name": smu_name, "smu_resource": smu_cfg.get("resource"), "smu_model": smu_cfg.get("model"),
-        "daq_name": daq_name, "daq_resource": daq_cfg.get("resource"), "daq_model": daq_cfg.get("model"),
-        "relay_matrix_name": relay_cfg.get("name"),
-        "relay_matrix_model": relay_cfg.get("driver"),
-        "relay_matrix_resource": (
-            f"{relay_cfg.get('ip', '')}:{relay_cfg.get('port', '')}"
-            if relay_cfg.get("type", "").lower() == "ethernet"
-            else str(relay_cfg.get("port", ""))
-        ),
-    }
-    if dmm_cfg is not None:
-        fields["dmm_name"] = dmm_name
-        fields["dmm_resource"] = dmm_cfg.get("resource")
-        fields["dmm_model"] = dmm_cfg.get("model")
-    return fields
+    return _shared_hardware_snapshot_fields(smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg)
 
 
 def _select_battery_group():
@@ -3905,15 +3900,15 @@ def _start_run_summary_guarded(storage, test_type: str, **fields) -> bool:
     exception logging further up the call stack (Python's default
     traceback capture in the caller's own except Exception handling, if
     any) -- this only replaces the operator-facing message.
+
+    Thin wrapper: the actual open/error-handling logic lives in
+    test_control/storage_session.py::start_run_summary_guarded() so a
+    future worker_runtime.py shares exactly this implementation -- see
+    docs/architecture.md "Remaining Helper Extraction Before
+    worker_runtime.py". `on_fail=print` reproduces the exact
+    operator-facing messages this function has always printed.
     """
-    import sqlite3
-    try:
-        storage.start_run_summary(test_type=test_type, **fields)
-        return True
-    except sqlite3.Error as e:
-        print(f"\n[FAIL] Database unavailable -- could not start run_summary: {e}")
-        print("       See logs for full diagnostic detail. Aborting, no hardware activated.")
-        return False
+    return _shared_start_run_summary_guarded(storage, test_type, on_fail=print, **fields)
 
 
 def _missing_hardware_roles(hw: dict, required_roles=("relay_matrix", "smu", "dmm", "daq")):

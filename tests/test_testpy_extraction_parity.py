@@ -1,10 +1,12 @@
 """
 Parity regression tests for the test.py extraction (see docs/
 architecture.md "Preparation Phase: Six Resolved Decisions Before
+worker_runtime.py" and "Remaining Helper Extraction Before
 worker_runtime.py"): _resolve_group_hardware(), _open_storage_guarded(),
-_select_battery_position()'s bounds-check, and _ntc_group_snapshot() were
-turned into thin wrappers over utils/group_hardware.py,
-test_control/storage_session.py, and test_control/ntc_snapshot.py.
+_select_battery_position()'s bounds-check, _ntc_group_snapshot(),
+_hardware_snapshot_fields(), and _start_run_summary_guarded() were all
+turned into thin wrappers over utils/group_hardware.py and
+test_control/storage_session.py/ntc_snapshot.py.
 
 These tests exist specifically to prove test.py's own operator-facing
 behavior (exact printed messages, exact return values, exact call
@@ -18,6 +20,7 @@ No hardware access anywhere in this file.
 import io
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -162,6 +165,89 @@ class NtcGroupSnapshotParityTests(unittest.TestCase):
     def test_none_daq_is_still_a_no_op_through_the_wrapper(self):
         result = test_module._ntc_group_snapshot(None, None, "B1", 4, "charge_battery")
         self.assertEqual(result, [])
+
+
+class HardwareSnapshotFieldsParityTests(unittest.TestCase):
+    _RELAY_CFG = {"name": "MATRIX_NUMATO_202", "driver": "RELAY32ETHRL00",
+                  "type": "ethernet", "ip": "169.254.1.202", "port": 23}
+
+    def test_delegates_to_shared_implementation_with_same_arguments(self):
+        calls = []
+
+        def _spy(smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg):
+            calls.append((smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg))
+            return {"sentinel": True}
+
+        with patch.object(test_module, "_shared_hardware_snapshot_fields", _spy):
+            result = test_module._hardware_snapshot_fields(
+                "AUX_SMU_1", {"resource": "PXI1Slot7"}, "MAIN_DMM", {"resource": "PXI1Slot3"},
+                "MAIN_DAQ", {"resource": "PXI1Slot2"}, self._RELAY_CFG,
+            )
+        self.assertEqual(result, {"sentinel": True})
+        self.assertEqual(calls, [(
+            "AUX_SMU_1", {"resource": "PXI1Slot7"}, "MAIN_DMM", {"resource": "PXI1Slot3"},
+            "MAIN_DAQ", {"resource": "PXI1Slot2"}, self._RELAY_CFG,
+        )])
+
+    def test_real_output_matches_pre_extraction_shape(self):
+        fields = test_module._hardware_snapshot_fields(
+            "AUX_SMU_1", {"resource": "PXI1Slot7", "model": "PXI-4130"},
+            "MAIN_DMM", {"resource": "PXI1Slot3", "model": "PXI-4065"},
+            "MAIN_DAQ", {"resource": "PXI1Slot2", "model": "PXIe-6363"},
+            self._RELAY_CFG,
+        )
+        self.assertEqual(fields["smu_name"], "AUX_SMU_1")
+        self.assertEqual(fields["relay_matrix_resource"], "169.254.1.202:23")
+        self.assertEqual(fields["dmm_model"], "PXI-4065")
+
+
+class StartRunSummaryGuardedParityTests(unittest.TestCase):
+    class _FakeStorage:
+        def __init__(self, raise_error=False):
+            self.calls = []
+            self._raise_error = raise_error
+
+        def start_run_summary(self, test_type, **fields):
+            self.calls.append((test_type, fields))
+            if self._raise_error:
+                raise sqlite3.OperationalError("simulated database unavailability")
+
+    def test_success_prints_nothing_and_returns_true(self):
+        storage = self._FakeStorage()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = test_module._start_run_summary_guarded(storage, "charge_battery", battery_type="HUB")
+        self.assertTrue(result)
+        self.assertEqual(buf.getvalue(), "")
+        self.assertEqual(storage.calls, [("charge_battery", {"battery_type": "HUB"})])
+
+    def test_failure_prints_identical_fail_message_and_returns_false(self):
+        storage = self._FakeStorage(raise_error=True)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = test_module._start_run_summary_guarded(storage, "charge_battery")
+        self.assertFalse(result)
+        printed = buf.getvalue()
+        self.assertIn("[FAIL] Database unavailable -- could not start run_summary", printed)
+        self.assertIn("Aborting, no hardware activated", printed)
+
+    def test_delegates_to_shared_implementation_with_on_fail_print(self):
+        calls = []
+
+        def _spy(storage, test_type, on_fail=None, **fields):
+            calls.append((storage, test_type, on_fail, fields))
+            return True
+
+        storage = self._FakeStorage()
+        with patch.object(test_module, "_shared_start_run_summary_guarded", _spy):
+            result = test_module._start_run_summary_guarded(storage, "discharge_battery", battery_type="SB")
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 1)
+        called_storage, called_test_type, called_on_fail, called_fields = calls[0]
+        self.assertIs(called_storage, storage)
+        self.assertEqual(called_test_type, "discharge_battery")
+        self.assertIs(called_on_fail, print)
+        self.assertEqual(called_fields, {"battery_type": "SB"})
 
 
 if __name__ == "__main__":

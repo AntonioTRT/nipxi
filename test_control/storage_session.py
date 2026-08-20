@@ -1,10 +1,17 @@
 """
-Guarded DataStorage open -- pure setup/error-handling logic extracted
-from test.py so a future worker_runtime.py does not need its own copy
-(see docs/architecture.md "Preparation Phase: Six Resolved Decisions
+Guarded DataStorage session lifecycle -- pure setup/error-handling logic
+extracted from test.py so a future worker_runtime.py does not need its
+own copy (see docs/architecture.md "Preparation Phase: Six Resolved
+Decisions Before worker_runtime.py" and "Remaining Helper Extraction
 Before worker_runtime.py"). No `input()` anywhere; the only operator-
 facing surface is the optional `on_fail` callback, which test.py's own
-wrapper passes as `print` to keep today's exact messages unchanged.
+wrappers pass as `print` to keep today's exact messages unchanged.
+
+Covers the three steps every hardware-activating workflow performs, in
+order, before touching a relay/SMU: open storage
+(`open_storage_guarded()`), build the hardware-identity snapshot that
+will be recorded on the run_summary row (`hardware_snapshot_fields()`),
+and start that row (`start_run_summary_guarded()`).
 """
 
 from __future__ import annotations
@@ -53,3 +60,58 @@ def open_storage_guarded(settings, hw_mgr=None, on_fail=None):
                             "physically disconnect power if this cannot be resolved immediately.")
         return None
     return storage
+
+
+def hardware_snapshot_fields(smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg) -> dict:
+    """
+    Build the run_summary hardware-identity snapshot dict (see
+    data/storage.py's run_summary schema and docs/architecture.md
+    "Hardware Identity Traceability") from the SAME resolved
+    config/devices.py dicts HardwareManager was actually constructed
+    with -- single source of truth, no independent re-derivation.
+
+    `dmm_name`/`dmm_cfg` may be None (the DMM is optional for some
+    workflows) -- every other role is always present, since
+    HardwareManager always constructs an SMU/DAQ/relay driver. Pure --
+    no I/O, no printing, nothing to inject via `on_fail`.
+    """
+    fields = {
+        "smu_name": smu_name, "smu_resource": smu_cfg.get("resource"), "smu_model": smu_cfg.get("model"),
+        "daq_name": daq_name, "daq_resource": daq_cfg.get("resource"), "daq_model": daq_cfg.get("model"),
+        "relay_matrix_name": relay_cfg.get("name"),
+        "relay_matrix_model": relay_cfg.get("driver"),
+        "relay_matrix_resource": (
+            f"{relay_cfg.get('ip', '')}:{relay_cfg.get('port', '')}"
+            if relay_cfg.get("type", "").lower() == "ethernet"
+            else str(relay_cfg.get("port", ""))
+        ),
+    }
+    if dmm_cfg is not None:
+        fields["dmm_name"] = dmm_name
+        fields["dmm_resource"] = dmm_cfg.get("resource")
+        fields["dmm_model"] = dmm_cfg.get("model")
+    return fields
+
+
+def start_run_summary_guarded(storage, test_type: str, on_fail=None, **fields) -> bool:
+    """
+    Call DataStorage.start_run_summary() with guarded error handling
+    instead of a raw traceback if the database becomes unavailable
+    between open() and here (e.g. the underlying file/volume
+    disappears). Returns True on success, False on failure -- callers
+    must abort (no relay activation/PSU output) on False, exactly as on
+    any other Stage validation failure. Diagnostic detail is preserved
+    via normal exception logging further up the call stack -- `on_fail`
+    only replaces what an interactive caller additionally displays.
+
+    `on_fail`, if given, is called once per operator-facing line, same
+    convention as open_storage_guarded() above.
+    """
+    try:
+        storage.start_run_summary(test_type=test_type, **fields)
+        return True
+    except sqlite3.Error as e:
+        if on_fail is not None:
+            on_fail(f"\n[FAIL] Database unavailable -- could not start run_summary: {e}")
+            on_fail("       See logs for full diagnostic detail. Aborting, no hardware activated.")
+        return False

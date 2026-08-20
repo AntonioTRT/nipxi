@@ -1,20 +1,29 @@
 """
 Tests for test_control/storage_session.py -- the extraction of test.py's
-_open_storage_guarded() into a shared, on_fail-injectable helper (see
-docs/architecture.md "Preparation Phase: Six Resolved Decisions Before
+_open_storage_guarded(), _hardware_snapshot_fields(), and
+_start_run_summary_guarded() into shared, on_fail-injectable helpers
+(see docs/architecture.md "Preparation Phase: Six Resolved Decisions
+Before worker_runtime.py" and "Remaining Helper Extraction Before
 worker_runtime.py").
 
 Uses a real (temp-directory) DataStorage.open() to exercise the true
-success/failure paths -- no mocking of sqlite3 internals, no hardware
-access anywhere in this file.
+open_storage_guarded() success/failure paths -- no mocking of sqlite3
+internals there. hardware_snapshot_fields()/start_run_summary_guarded()
+are tested with plain dicts/fakes since they don't need a real database.
+No hardware access anywhere in this file.
 """
 
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 
-from test_control.storage_session import open_storage_guarded
+from test_control.storage_session import (
+    hardware_snapshot_fields,
+    open_storage_guarded,
+    start_run_summary_guarded,
+)
 
 
 class _FakeSettings:
@@ -99,6 +108,85 @@ class OpenStorageGuardedFailureTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertTrue(any("[CRITICAL]" in c and "Hardware shutdown failed" in c for c in calls))
         self.assertTrue(any("physically disconnect power" in c for c in calls))
+
+
+class _FakeStorageForRunSummary:
+    """Records start_run_summary() calls; raises sqlite3.Error when
+    configured to, to exercise the guarded failure path without a real
+    database."""
+
+    def __init__(self, raise_error=False):
+        self.calls = []
+        self._raise_error = raise_error
+
+    def start_run_summary(self, test_type, **fields):
+        self.calls.append((test_type, fields))
+        if self._raise_error:
+            raise sqlite3.OperationalError("simulated database unavailability")
+
+
+class HardwareSnapshotFieldsTests(unittest.TestCase):
+    _RELAY_CFG_ETHERNET = {
+        "name": "MATRIX_NUMATO_202", "driver": "RELAY32ETHRL00",
+        "type": "ethernet", "ip": "169.254.1.202", "port": 23,
+    }
+
+    def test_full_snapshot_with_dmm(self):
+        fields = hardware_snapshot_fields(
+            "AUX_SMU_1", {"resource": "PXI1Slot7", "model": "PXI-4130"},
+            "MAIN_DMM", {"resource": "PXI1Slot3", "model": "PXI-4065"},
+            "MAIN_DAQ", {"resource": "PXI1Slot2", "model": "PXIe-6363"},
+            self._RELAY_CFG_ETHERNET,
+        )
+        self.assertEqual(fields["smu_name"], "AUX_SMU_1")
+        self.assertEqual(fields["smu_resource"], "PXI1Slot7")
+        self.assertEqual(fields["daq_model"], "PXIe-6363")
+        self.assertEqual(fields["relay_matrix_resource"], "169.254.1.202:23")
+        self.assertEqual(fields["dmm_name"], "MAIN_DMM")
+
+    def test_dmm_none_omits_dmm_fields_entirely(self):
+        fields = hardware_snapshot_fields(
+            "AUX_SMU_1", {"resource": "PXI1Slot7", "model": "PXI-4130"},
+            None, None,
+            "MAIN_DAQ", {"resource": "PXI1Slot2", "model": "PXIe-6363"},
+            self._RELAY_CFG_ETHERNET,
+        )
+        self.assertNotIn("dmm_name", fields)
+        self.assertNotIn("dmm_resource", fields)
+        self.assertNotIn("dmm_model", fields)
+
+    def test_non_ethernet_relay_uses_port_only_as_resource(self):
+        relay_cfg = {"name": "RELAY_SERIAL", "driver": "SOME_DRIVER", "type": "serial", "port": "COM3"}
+        fields = hardware_snapshot_fields(
+            "AUX_SMU_1", {"resource": "PXI1Slot7", "model": "PXI-4130"},
+            None, None, "MAIN_DAQ", {"resource": "PXI1Slot2", "model": "PXIe-6363"},
+            relay_cfg,
+        )
+        self.assertEqual(fields["relay_matrix_resource"], "COM3")
+
+
+class StartRunSummaryGuardedTests(unittest.TestCase):
+    def test_success_returns_true_and_calls_no_on_fail(self):
+        storage = _FakeStorageForRunSummary()
+        calls = []
+        result = start_run_summary_guarded(storage, "charge_battery", on_fail=calls.append,
+                                            battery_type="HUB")
+        self.assertTrue(result)
+        self.assertEqual(calls, [])
+        self.assertEqual(storage.calls, [("charge_battery", {"battery_type": "HUB"})])
+
+    def test_failure_returns_false_and_reports_via_on_fail(self):
+        storage = _FakeStorageForRunSummary(raise_error=True)
+        calls = []
+        result = start_run_summary_guarded(storage, "charge_battery", on_fail=calls.append)
+        self.assertFalse(result)
+        self.assertTrue(any("[FAIL]" in c and "could not start run_summary" in c for c in calls))
+        self.assertTrue(any("logs for full diagnostic detail" in c for c in calls))
+
+    def test_on_fail_omitted_does_not_raise_on_failure(self):
+        storage = _FakeStorageForRunSummary(raise_error=True)
+        result = start_run_summary_guarded(storage, "charge_battery")
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":
