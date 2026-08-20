@@ -4563,6 +4563,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             sequence = sequence_cls(
                 smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.ntc_daq, relay=hw_mgr.relay,
                 safety=safety, storage=storage, settings=Settings, group_name=group,
+                ntc_daq_name=hw["ntc_daq_name"],
             )
             try:
                 sequence.run(

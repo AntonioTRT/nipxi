@@ -108,15 +108,21 @@ from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, Reve
 
 
 class ChargeSequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None, group_name=None):
-        # `daq` (optional, default None) -- accepted and stored now so a
-        # future DAQ integration (Section 31 "Telemetry Source Strategy",
-        # deliberately deferred) only needs to change the two telemetry
-        # lines inside run()'s sampling loop, not this constructor or any
-        # caller that doesn't pass one. Not read anywhere in this class
-        # today -- DMM + SMU.measure() remain the active telemetry source.
+    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None,
+                 group_name=None, ntc_daq_name=None):
+        # `daq` -- this group's NTC/temperature DAQ (see docs/architecture.md
+        # "Dual DAQ Ownership Model"); DMM + SMU.measure() remain the active
+        # voltage/current telemetry source (see module docstring), `daq` is
+        # read only for the NTC channel in run()'s sampling loop.
+        # `ntc_daq_name` (optional -- config/devices.py::hardware_for_group()'s
+        # resolved "ntc_daq_name", e.g. "MAIN_DAQ") is display-only: the
+        # operator-facing NTC block (see docs/architecture.md Section 58)
+        # needs the device's own nickname, which `daq` (the connected driver
+        # instance) does not carry itself -- only its `resource` attribute
+        # does.
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
                           source="charge_battery", dmm=dmm, daq=daq, group_name=group_name)
+        self.ntc_daq_name = ntc_daq_name
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
             test_setpoints: dict, ntc_channel: str = None, token=None) -> bool:
@@ -243,6 +249,7 @@ class ChargeSequence(BatteryOperationSequence):
                     stats.add(v, i)
 
                     t_c = None
+                    presence = None
                     if self.daq is not None and ntc_channel is not None:
                         try:
                             ntc_v = self.daq.read_channel(ntc_channel)
@@ -282,6 +289,8 @@ class ChargeSequence(BatteryOperationSequence):
                         elapsed_s=time.monotonic() - run_start_time,
                         smu_voltage=smu_reading["voltage_v"], smu_current=i, dmm_voltage=dmm_v,
                         battery_voltage=v, battery_current=i, battery_temp=t_c,
+                        ntc_device=self.ntc_daq_name, ntc_resource=getattr(self.daq, "resource", None),
+                        ntc_channel=ntc_channel, ntc_status=presence,
                     )
 
                     # End of charge: CV taper -- voltage at/above the CV

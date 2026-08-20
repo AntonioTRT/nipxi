@@ -585,16 +585,18 @@ BATTERY_GROUPS = {
         "dmm":            "MAIN_DMM",
         "daq":            "MAIN_DAQ",
         "battery_type":   "SB",
-        # TEMPORARY -- the rack DAQ this group's NTC channels will eventually
-        # use (see "daq" above, MAIN_DAQ) is not yet available; this overrides
-        # NTC acquisition specifically to the NI USB-6210 development DAQ
-        # (see USB_DAQ_DEVICES above) without touching "daq" itself, which
-        # MonitorBatteryScanSequence's already real-hardware-validated
-        # DAQ_CHANNEL_0 read still depends on. Migration to the rack DAQ:
-        # delete this line (or point it at the rack DAQ's own name) once
-        # available -- hardware_for_group() then falls back to "daq"
-        # automatically. Configuration-only; see docs/architecture.md.
-        "ntc_daq":        "NTC_DAQ_USB6210",
+        # NTC acquisition migrated off the temporary NI USB-6210 dev DAQ
+        # (NTC_DAQ_USB6210, resource "Dev2") to the rack DAQ -- bench
+        # validation confirmed Dev1 (MAIN_DAQ) exists, is operational, and
+        # is successfully used by the NTC test, on channels ai0-ai7
+        # specifically (bench-confirmed wiring -- NOT ai16-ai23; an earlier
+        # revision of this migration assumed ai16-ai23 from
+        # Settings.DAQ_NTC_CHANNELS/hardware/daq.py's documented-but-never-
+        # bench-validated channel plan, which turned out not to match this
+        # rack's actual wiring). No "ntc_daq" override left here means
+        # hardware_for_group() falls back to this group's own "daq"
+        # (MAIN_DAQ) automatically -- see hardware_for_group()'s docstring
+        # below. See docs/architecture.md Section 58.
         # TEMPORARY -- first real-hardware charge validation recipe (hand-
         # soldered wiring, ~3.5 V battery physically present in the
         # selected position). Reduced CV target (3.7 V, not SB's 4.2 V
@@ -616,14 +618,30 @@ BATTERY_GROUPS = {
                                             #    see "Discharge Cutoff Policy")
         },
         "positions": {
-            # daq_ntc_ch is TEMPORARY -- "Dev2" is the NI USB-6210 dev DAQ
-            # (see "ntc_daq" above); migration to the rack DAQ repoints this
-            # at that device's own per-position channels, config-only.
+            # daq_ntc_ch is Dev1/ai0-ai7 -- bench-confirmed real wiring (see
+            # the "ntc_daq" comment above), NOT Settings.DAQ_NTC_CHANNELS'
+            # ai16-ai23 (that constant, and hardware/daq.py::DAQ's class
+            # docstring describing the same layout, are an aspirational
+            # channel plan for a future DEDICATED rack DAQ -- a different,
+            # not-yet-existing device -- never bench-validated against
+            # Dev1's actual wiring; left as-is, not corrected, since they
+            # describe that future device, not this one).
+            #
+            # daq_voltage_ch/daq_current_ch below are INACTIVE placeholders
+            # for the current Charge/Discharge architecture: voltage comes
+            # from the DMM and current from the SMU (see charge_sequence.py/
+            # discharge_sequence.py module docstrings' "Telemetry Source
+            # Strategy") -- Dev1 is being used for NTC acquisition only
+            # today. Their numeric overlap with daq_ntc_ch below (both
+            # Dev1/ai0-ai7 per position) is therefore not a live conflict;
+            # do not use this overlap to infer or redesign a future DAQ-
+            # voltage/current channel plan -- that is a separate, dedicated
+            # rack DAQ, integrated later. See docs/architecture.md Section 58.
             i: {
                 "relay_address":  i,
                 "daq_voltage_ch": f"Dev1/ai{i - 1}",
                 "daq_current_ch": f"Dev1/ai{i + 7}",
-                "daq_ntc_ch":     f"Dev2/ai{i - 1}",
+                "daq_ntc_ch":     f"Dev1/ai{i - 1}",
                 "fuse_rating_a":  2.0,
                 "enabled":        True,
             }

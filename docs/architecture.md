@@ -4621,3 +4621,116 @@ voltage source, SMU as authoritative current source, polarity check flow,
 SafetyMonitor voltage path, EOC/EOD logic) -- this section is display/
 query scoping only, per the standing decision in Section 55 and reaffirmed
 for this change.
+
+## 58. B1 NTC Migration to MAIN_DAQ (Dev1) + Operator-Facing NTC Block
+
+Bench validation confirmed Dev1 exists on the rack, is operational, and
+is successfully used by the NTC test -- migrating B1 off the temporary
+NI USB-6210 dev DAQ (`NTC_DAQ_USB6210`, resource `Dev2`, flagged
+"placeholder -- confirm/update" since it was introduced) is no longer a
+theoretical config review, per Section 51/52's original temporary-DAQ
+rationale.
+
+**Config change** (`config/devices.py`):
+- Removed `BATTERY_GROUPS["B1"]["ntc_daq"] = "NTC_DAQ_USB6210"` entirely.
+  `hardware_for_group()`'s own documented fallback (`ntc_daq_key =
+  grp.get("ntc_daq") or grp["daq"]`) now resolves B1's NTC role to its
+  existing `"daq"` -- `MAIN_DAQ` -- automatically. No new device entry was
+  created; `hardware_for_group("B1")` was verified to now return
+  `ntc_daq_name="MAIN_DAQ"`, `ntc_daq_cfg={"resource": "PXI1Slot2", "model":
+  "PXIe-6363", ...}`.
+- Each position's `daq_ntc_ch` changed from `Dev2/ai{i-1}` to
+  `Dev1/ai{i-1}` (Position 1 -> `Dev1/ai0` ... Position 8 -> `Dev1/ai7`) --
+  **bench-confirmed real wiring**, per direct operator observation. See
+  "Correction" below: an earlier revision of this migration used
+  `Dev1/ai16..ai23` instead, based on `Settings.DAQ_NTC_CHANNELS`/
+  `hardware/daq.py::DAQ`'s documented (but never bench-validated) channel
+  plan -- wrong for this rack's actual wiring.
+- Verified end-to-end: `hardware_for_group("B1")` no longer resolves
+  `NTC_DAQ_USB6210`/`Dev2` anywhere, and every position's `daq_ntc_ch`
+  correctly maps to `Dev1/ai0..ai7`.
+
+**Correction (bench-validated, supersedes the first pass of this
+migration):** the initial implementation used `Dev1/ai16..ai23`, inferred
+from `Settings.DAQ_NTC_CHANNELS` (`config/settings.py`) and
+`hardware/daq.py::DAQ`'s class docstring, both of which document that
+range as the NTC block. Neither is bench-validated, and neither is read
+by any runtime code path (confirmed by repo-wide grep -- `DAQ_NTC_CHANNELS`
+appears only in its own declaration). Direct bench observation established
+the real wiring is `Dev1/ai0..ai7`; `Settings.DAQ_NTC_CHANNELS`/`DAQ`'s
+docstring are left unchanged, since they describe a *different*,
+not-yet-integrated dedicated rack DAQ's intended future layout, not Dev1's
+current, temporary NTC-only role. The lesson generalized: "documented as
+the intended channel" is not the same claim as "confirmed real wiring" --
+exactly the distinction this codebase's own "unconfirmed placeholder"
+convention already exists to flag, and should have been applied here
+before the first pass shipped.
+
+**`daq_voltage_ch`/`daq_current_ch` overlap with `daq_ntc_ch` (both now
+`Dev1/ai0..ai7` per position) -- intentional, not a conflict, for the
+current architecture:** Dev1/MAIN_DAQ is being used for NTC acquisition
+only today. `daq_voltage_ch`/`daq_current_ch` are inactive placeholders --
+Charge/Discharge source voltage from the DMM and current from the SMU
+(see charge_sequence.py/discharge_sequence.py's "Telemetry Source
+Strategy"); `DAQ.read_all_batteries()` remains an unimplemented stub. Two
+diagnostic-only call sites do read position 1's `daq_voltage_ch` today
+(`test.py`'s "DAQ Functional Validation" test, and
+`MonitorBatteryScanSequence`'s module-level `DAQ_CHANNEL_0` constant) --
+both treat the value as raw/uninterpreted, so reading the NTC divider's
+output under that label is harmless, not a functional break. Future DAQ-
+based voltage/current acquisition is expected to use a *different*,
+dedicated rack DAQ, not Dev1 -- this overlap must not be used to infer or
+redesign that future channel plan.
+
+**Operator-facing NTC block** (Charge/Discharge, and any future
+`CycleSequence` for free via the shared base class):
+- `test_control/execution_screen.py::ExecutionFrame` gained `ntc_device`,
+  `ntc_resource`, `ntc_channel`, `ntc_status` fields (temperature reuses
+  the existing `battery_temp` field, not duplicated) -- threaded through
+  `from_live()`'s explicit parameter list (this constructor does not
+  accept `**kwargs`, unlike `_render_frame()`'s passthrough, so each new
+  field needs an explicit parameter here). `render_execution_frame()`
+  prints a new "NTC" block (Device / Resource / Channel / Status /
+  Temperature) whenever `ntc_device`/`ntc_channel` is set, right after the
+  Voltage/Current/Temperature block.
+- `ChargeSequence`/`DischargeSequence` gained an `ntc_daq_name` constructor
+  param (mirroring the existing `group_name` param) -- display-only,
+  since the connected `daq` driver instance carries its own `resource`
+  attribute but not its config-level nickname (e.g. `"MAIN_DAQ"`).
+  `test.py::_run_charge_or_discharge()` passes
+  `ntc_daq_name=hw["ntc_daq_name"]` (already resolved by
+  `hardware_for_group()` at setup time) when constructing the sequence.
+- The sampling loop's `presence` variable (previously used only for
+  event-log throttling) is now initialized to `None` alongside `t_c` and
+  passed into `_render_frame()` as `ntc_status`, alongside
+  `ntc_resource=getattr(self.daq, "resource", None)` and the already-local
+  `ntc_channel`.
+- **Naming note**: the rendered "Resource" line shows the device's
+  registered VISA/slot descriptor (`PXI1Slot2` for MAIN_DAQ), not the
+  DAQmx alias `"Dev1"` -- these are two different identifiers this
+  codebase's config already models separately (`resource` = slot
+  descriptor; the `DevN` alias only ever appears embedded in channel
+  strings, e.g. `daq_voltage_ch`/`daq_ntc_ch`). `"Dev1"` itself is visible
+  in the "Channel" line (`Dev1/ai0`). If a literal `"Dev1"` on the
+  "Resource" line specifically is wanted, that would need a new field on
+  `PXI_SLOTS[2]`/`DAQ_CONFIGS["MAIN_DAQ"]` capturing the DAQmx alias
+  separately from `resource` -- not added here, since the existing
+  `resource` field already answers "which physical device" correctly and
+  no code path needs a second identifier for it today.
+
+Verified with a rendered frame built from `hardware_for_group("B1")`'s
+actual resolved values for Position 1:
+```
+NTC
+------------------------------------------------------------
+Device         : MAIN_DAQ
+Resource       : PXI1Slot2
+Channel        : Dev1/ai0
+Status         : PRESENT
+Temperature    : 24.8 C
+```
+
+No changes to the voltage-measurement architecture, `SafetyMonitor`
+inputs, or EOC/EOD logic -- this section is the NTC acquisition-path
+migration plus a purely additive display block, per the standing decision
+reaffirmed across Sections 55/57/58.

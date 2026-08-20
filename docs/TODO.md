@@ -52,8 +52,14 @@ the bottom, with a pointer to where the real documentation lives
   (`PXI_SLOTS` slot 17, currently commented out), point
   `BATTERY_GROUPS["B2"]["daq"]` at it instead of `MAIN_DAQ`, and give it
   its own `positions` dict for 9-16 using per-group-relative channel
-  numbering (mirroring `B1`'s `ai0-7`/`ai8-15`/`ai16-23` shape on
-  `EXPANSION_DAQ`, not continuing global numbering onto a shared device).
+  numbering on `EXPANSION_DAQ`, not continuing global numbering onto a
+  shared device. Note: `B1`'s own current shape is `daq_voltage_ch`/
+  `daq_current_ch` = `ai0-7`/`ai8-15` (inactive placeholders -- DMM/SMU are
+  the active voltage/current telemetry, see docs/architecture.md Section
+  58) and `daq_ntc_ch` = `ai0-7` (bench-confirmed real Dev1 wiring, NOT
+  `ai16-23` as an earlier revision assumed) -- do not mirror the old
+  `ai0-7`/`ai8-15`/`ai16-23` three-way split onto B2/EXPANSION_DAQ without
+  first bench-confirming EXPANSION_DAQ's own real NTC wiring the same way.
 - [x] `SMU.set_charge_mode()`/`set_discharge_mode()`/`output_enable()`/
   `output_disable()`/`measure()` -- **DONE.** All five are now real
   (`output_disable()` was already real). `set_discharge_mode()` is
@@ -426,8 +432,10 @@ the bottom, with a pointer to where the real documentation lives
   until then, per Milestone XV's decision.
 - [ ] `USB_DAQ_DEVICES` needs a second entry, `NTC_DAQ_USB6211`, and `C1`
   needs its `ntc_daq` assigned to it (C1 is otherwise still a disabled,
-  hardware-less placeholder after Milestone XVIII) -- distinct from the
-  existing `NTC_DAQ_USB6210` (B1), neither replaces the other.
+  hardware-less placeholder after Milestone XVIII). `NTC_DAQ_USB6210`
+  itself remains in `USB_DAQ_DEVICES` (the physical unit still exists) but
+  is no longer referenced by B1 -- B1's NTC migrated to MAIN_DAQ/Dev1, see
+  docs/architecture.md Section 58.
 - [x] **DONE (Milestone XVIII):** Added `group_name`/`position_in_group` as
   additive `run_summary`/`measurements` columns (same migration pattern as
   `battery_type`), using final `A1`/`B1`/`C1`-style names directly.

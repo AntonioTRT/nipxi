@@ -90,12 +90,16 @@ from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, Reve
 
 
 class DischargeSequence(BatteryOperationSequence):
-    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None, group_name=None):
-        # `daq` (optional, default None) -- see charge_sequence.py::
-        # ChargeSequence.__init__()'s identical comment. Not read anywhere
-        # in this class today.
+    def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None,
+                 group_name=None, ntc_daq_name=None):
+        # `daq` -- see charge_sequence.py::ChargeSequence.__init__()'s
+        # identical comment (this group's NTC DAQ; DMM/SMU remain the
+        # voltage/current telemetry source). `ntc_daq_name` -- see the same
+        # comment for its display-only purpose (operator-facing NTC block,
+        # docs/architecture.md Section 58).
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
                           source="discharge_battery", dmm=dmm, daq=daq, group_name=group_name)
+        self.ntc_daq_name = ntc_daq_name
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
             test_setpoints: dict, ntc_channel: str = None, token=None) -> bool:
@@ -229,6 +233,7 @@ class DischargeSequence(BatteryOperationSequence):
                     stats.add(v, i)
 
                     t_c = None
+                    presence = None
                     if self.daq is not None and ntc_channel is not None:
                         try:
                             ntc_v = self.daq.read_channel(ntc_channel)
@@ -268,6 +273,8 @@ class DischargeSequence(BatteryOperationSequence):
                         elapsed_s=time.monotonic() - run_start_time,
                         smu_voltage=smu_reading["voltage_v"], smu_current=i, dmm_voltage=dmm_v,
                         battery_voltage=v, battery_current=i, battery_temp=t_c,
+                        ntc_device=self.ntc_daq_name, ntc_resource=getattr(self.daq, "resource", None),
+                        ntc_channel=ntc_channel, ntc_status=presence,
                     )
 
                     # End of discharge: voltage at/below the (floor-clamped)

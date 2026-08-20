@@ -93,6 +93,20 @@ class ExecutionFrame:
     battery_current: float = None
     battery_temp: float = None
 
+    # NTC block (Charge/Discharge/future Cycle -- see docs/architecture.md
+    # Section 58) -- which physical device/channel this run's temperature
+    # reading actually came from, for the active battery position only.
+    # ntc_device is the config/devices.py nickname (e.g. "MAIN_DAQ");
+    # ntc_resource is that device's own resource string (e.g. "PXI1Slot2");
+    # ntc_channel is the actual per-position analog input path used (e.g.
+    # "Dev1/ai0"); ntc_status is a hardware/temperature.py::NTCPresence
+    # value ("present"/"absent"/"fault"). battery_temp above already
+    # carries the converted Celsius reading -- not duplicated here.
+    ntc_device: str = None
+    ntc_resource: str = None
+    ntc_channel: str = None
+    ntc_status: str = None
+
     # Battery metrics -- N/A for Proto Test, populated once Battery
     # Charge/Discharge/cycle execution computes them
     capacity: float = None
@@ -145,7 +159,8 @@ class ExecutionFrame:
     def from_live(cls, *, run_id, test_type, channel, run_number=None, relay=None,
                   state=None, phase_detail=None, elapsed_s=None, smu_voltage=None, smu_current=None,
                   dmm_voltage=None, battery_voltage=None, battery_current=None,
-                  battery_temp=None, capacity=None, energy=None, cycle_count=None,
+                  battery_temp=None, ntc_device=None, ntc_resource=None, ntc_channel=None,
+                  ntc_status=None, capacity=None, energy=None, cycle_count=None,
                   battery_type=None, group=None, position_in_group=None,
                   relay_state=None, daq_channel_0_raw=None, current_step=None,
                   scan_progress=None, dwell_progress=None, dwell_remaining_s=None,
@@ -165,6 +180,8 @@ class ExecutionFrame:
             smu_voltage=smu_voltage, smu_current=smu_current, dmm_voltage=dmm_voltage,
             battery_voltage=battery_voltage, battery_current=battery_current,
             battery_temp=battery_temp,
+            ntc_device=ntc_device, ntc_resource=ntc_resource, ntc_channel=ntc_channel,
+            ntc_status=ntc_status,
             capacity=capacity, energy=energy, cycle_count=cycle_count,
             battery_type=battery_type, group=group, position_in_group=position_in_group,
             relay_state=relay_state, daq_channel_0_raw=daq_channel_0_raw,
@@ -408,6 +425,15 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
     print(f"Battery Temp   : {_fmt_temp(frame.battery_temp)}")
     print(f"DAQ Ch0 Raw    : {_fmt(frame.daq_channel_0_raw, '.6f')}" + ("" if frame.daq_channel_0_raw is None else " V (raw)"))
     print()
+    if frame.ntc_device is not None or frame.ntc_channel is not None:
+        print("NTC")
+        print("-" * 60)
+        print(f"Device         : {_fmt(frame.ntc_device)}")
+        print(f"Resource       : {_fmt(frame.ntc_resource)}")
+        print(f"Channel        : {_fmt(frame.ntc_channel)}")
+        print(f"Status         : {_fmt(frame.ntc_status.upper() if frame.ntc_status else None)}")
+        print(f"Temperature    : {_fmt_temp(frame.battery_temp)}")
+        print()
     print("Battery Metrics")
     print("-" * 60)
     print(f"Capacity       : {_fmt(frame.capacity)}")
