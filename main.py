@@ -51,6 +51,12 @@ def parse_args():
         "--dry-run", action="store_true",
         help="Validate configuration only -- do not connect to hardware"
     )
+    parser.add_argument(
+        "--show-topology", action="store_true",
+        help="Print a read-only topology/worker/dependency/execution-plan "
+             "report (orchestration/reporting.py) and exit -- does not "
+             "connect hardware, validate configuration, or run any test."
+    )
     return parser.parse_args()
 
 
@@ -64,6 +70,18 @@ def main():
 
     mode_policy = get_mode_policy(Settings)
     log.info("System mode: %s -- %s", mode_policy.mode.value, mode_policy.description)
+
+    # --- Read-only orchestration report (future architecture seam) ---------
+    # Consumes only orchestration/reporting.py (itself built on topology.py/
+    # workers.py/resource_graph.py/execution_plan.py) -- all pure functions
+    # over config/devices.py::BATTERY_GROUPS. No hardware connection, no
+    # config validation, no test execution: returns immediately after
+    # printing, before anything below this block runs. See docs/
+    # architecture.md "Future Architecture: main.py Integration Seam".
+    if args.show_topology:
+        from orchestration.reporting import full_report
+        print(full_report())
+        return
 
     # --- 2. Configuration validation -----------------------------------------
     # Settings first (voltages/currents/timeouts), then every configured

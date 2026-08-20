@@ -4902,6 +4902,9 @@ scratch scripts and never captured durably in the repo:
   `MAIN_DAQ`/`Dev1`/`ai0`-`ai7` (Section 58), including a guard against
   reintroducing the `ai16`-`ai23` assumption that was found and corrected.
 - `tests/test_orchestration.py` -- Section 62 below.
+- `tests/test_execution_plan.py`, `test_worker_lifecycle.py`,
+  `test_supervisor.py`, `test_reporting.py`, `test_main_show_topology.py`
+  -- Section 63 below.
 
 **Gotcha found and worked around:** `test.py:28` calls
 `logging.disable(logging.CRITICAL)` at import time (a deliberate,
@@ -5066,9 +5069,231 @@ complete:**
   experiment), and nothing to test it against until a second real worker
   exists.
 - `orchestration/supervisor.py`'s real multi-worker execution logic -- a
-  supervisor with one worker to supervise validates nothing.
-- Any change to `main.py` -- no orchestration runtime exists yet for it
-  to delegate to.
+  supervisor with one worker to supervise validates nothing. (Its
+  *interface*, plus a hardware-free single-worker reference
+  implementation, was added in Section 63 below -- that is not this.)
+- Real, hardware-affecting `main.py` integration (worker execution,
+  supervisor execution) -- no orchestration runtime exists yet for it to
+  delegate to. (A read-only reporting flag was added in Section 63 below
+  -- that is not this: it prints, it does not execute.)
 - The analogous `_connect_all_strict()` startup-rollback gap flagged in
   Section 60 -- a real fix, deliberately deferred to keep this pass
   scoped to the originally-identified `disconnect_all()` gap.
+
+**Superseded/extended by Section 63:** Section 63 adds Execution
+Planning, Worker Lifecycle, a Supervisor interface + reference
+implementation, a Reporting layer, and one read-only `main.py`
+integration point -- all still read-only/hardware-free, deliberately
+narrower than the "must wait" items above.
+
+## 63. Future Architecture: Execution Planning, Worker Lifecycle, Supervisor Interface, Reporting, and the main.py Integration Seam
+
+**FUTURE PLANNED ARCHITECTURE, with a CURRENT IMPLEMENTATION of four more
+read-only/hardware-free modules plus one deliberately narrow, read-only
+`main.py` integration point.** This section extends Section 62 in
+response to a change in stated goal: the objective is no longer "prepare
+for a bigger future rack" but "once `ChargeSequence`/`DischargeSequence`/
+`CycleSequence` are validated, reach a production-oriented `main.py` with
+as little remaining architectural work as possible." Everything below is
+additive to Section 62 -- `topology.py`/`workers.py`/`resource_graph.py`/
+`arbiter.py` are unchanged, and this section changes nothing about when
+or how `ChargeSequence`/`DischargeSequence`/`BatteryOperationSequence`/a
+future `CycleSequence` run. `git diff --stat` against those three files
+is empty for this task.
+
+### Execution Planning -- `orchestration/execution_plan.py` (CURRENT IMPLEMENTATION, unused by anything real)
+
+`build_execution_plan(battery_groups=None, enabled_workers=None)` turns
+Worker Discovery + the Resource Dependency Graph into an `ExecutionPlan`:
+
+- `steps` -- every included worker (`ExecutionStep(smu_name, groups,
+  depends_on)`), in an order that never places a worker before another
+  worker it conflicts with.
+- `parallel_batches` -- the same workers grouped so that no two workers
+  in one batch conflict; a greedy graph-coloring pass over the conflict
+  graph from `resource_graph.py`. **Informational only** -- nothing
+  reads this to actually run two workers at once today, and nothing
+  should until a real cross-process `Arbiter` exists (Section 62). It
+  exists so that when concurrency *is* built, the "which workers are
+  even eligible to overlap" analysis does not need to be invented then.
+- `excluded_workers` -- any discovered worker left out by the caller's
+  `enabled_workers` selection (worker enable/disable without touching
+  `config/devices.py`), always listed explicitly rather than silently
+  dropped.
+
+Against today's real config: one step, one single-worker batch, no
+exclusions -- `build_execution_plan()` with no arguments reproduces
+exactly what running `test.py` today already does, by construction.
+Against a synthetic two-worker config sharing a relay matrix (the same
+Rack-B-shaped fixture from Section 62's tests), the two workers land in
+separate batches with an explicit dependency edge; against a synthetic
+config with two genuinely independent workers, both land in the same
+batch with zero dependencies -- proving the planner neither over- nor
+under-serializes. See `tests/test_execution_plan.py`.
+
+### Worker Lifecycle -- `orchestration/worker_lifecycle.py` (CURRENT IMPLEMENTATION, unused by anything real)
+
+A `WorkerState` enum (`IDLE, DISCOVERED, READY, CLAIMING, RUNNING,
+COMPLETED, FAILED, ABORTED`) plus an explicit `ALLOWED_TRANSITIONS` table
+and a `WorkerLifecycle` object that enforces it (`transition_to()` raises
+`InvalidWorkerTransitionError` on an illegal move, never silently
+ignores one). No runtime behavior lives here -- it is a state machine
+definition and validator only, with no hardware or `test_control/`
+coupling whatsoever.
+
+Two properties were deliberately designed in, both discovered to matter
+during implementation (see "Recommendations" below):
+
+1. **`ABORTED` is reachable from every non-terminal state, not just
+   `RUNNING`.** This mirrors the existing cooperative-cancellation
+   philosophy in `utils/cancellation.py` (`check_cancellation()`
+   checkpoints between atomic operations, not just mid-operation) --
+   a cancellation requested while a worker sits `IDLE` between two
+   sequential groups must be representable, not just one requested
+   mid-`RUNNING`.
+2. **Terminal states (`COMPLETED`/`FAILED`/`ABORTED`) return only to
+   `IDLE`, never directly to `CLAIMING`/`RUNNING`.** This is what makes
+   "Worker 1: B1, B2" (Section 62's "Worker = SMU-anchored but
+   broker-dependent") representable as a real state sequence: a second
+   group must re-enter through `IDLE -> DISCOVERED -> READY -> CLAIMING`
+   like the first one did, never skip the queue.
+
+See `tests/test_worker_lifecycle.py`.
+
+### Supervisor Interface -- `orchestration/supervisor.py` (interface CURRENT IMPLEMENTATION; real runtime FUTURE PLANNED)
+
+`Supervisor.start()/stop()/status()` is the abstract contract a future
+`worker_runtime.py` (still not built -- explicitly out of this task's
+scope) will implement for real, mirroring the same interface-now/
+implementation-later pattern already used by `arbiter.py::Arbiter`.
+
+`SequentialSupervisor` is a reference implementation proving the contract
+is sufficient for **today's actual behavior** -- one worker, groups run
+one at a time, synchronously, in the caller's own thread, exactly what
+`main.py`/`test.py` already do. It takes an injected `run_group(name) ->
+bool` callable rather than importing `test_control/` or constructing a
+`ChargeSequence`/`DischargeSequence`/`CycleSequence` itself -- so it can
+be fully exercised in tests with a fake, with zero coupling to the
+sequence layer and zero hardware access. `stop()` is cooperative (a
+request, not a guaranteed-immediate halt), consistent with the rest of
+this codebase's cancellation model; it can only take effect either
+before `start()` is called, between groups, or from inside the injected
+`run_group` callback itself, since nothing here is threaded.
+
+A future `worker_runtime.py` would provide a *different* `Supervisor`
+implementation that actually constructs and runs sequences (and may run
+on a separate thread/process) -- callers written against `Supervisor`
+today do not change when that happens. See `tests/test_supervisor.py`.
+
+### Reporting Layer -- `orchestration/reporting.py` (CURRENT IMPLEMENTATION, read-only)
+
+Pure string formatters over the four data-producing modules above:
+`topology_report()`, `worker_report()`, `dependency_report()`,
+`conflict_report()`, `execution_plan_report()`, and `full_report()`
+(all five, in a fixed order). No hardware access, no side effects beyond
+returning a string -- callers decide whether/where to print it. This is
+the one orchestration module with a real, live `main.py` caller today
+(see below), specifically because rendering a report changes nothing
+about test execution or hardware state -- there was no safety reason to
+keep it disconnected the way the other modules deliberately are. See
+`tests/test_reporting.py`.
+
+### The `main.py` Integration Seam -- read-only today, the seam future work extends
+
+`main.py --show-topology` prints `orchestration.reporting.full_report()`
+and returns immediately -- **before** logging-level configuration
+validation, hardware construction, or test execution. It is checked
+first among `main()`'s branches specifically so it can never be reached
+after any hardware-affecting step has already run.
+
+```python
+if args.show_topology:
+    from orchestration.reporting import full_report
+    print(full_report())
+    return
+```
+
+This is deliberately the *only* line of production `main.py` that
+imports anything from `orchestration/` today. `tests/
+test_main_show_topology.py` enforces the safety properties directly:
+it patches `main.HardwareManager`/`validate_settings`/
+`validate_devices_or_raise` to raise `AssertionError` if called at all,
+then asserts `main()` still completes and prints every report section --
+proving the flag genuinely returns before any of them, not just that it
+happens to work when they succeed. A second test inspects the source of
+the `--show-topology` branch directly and asserts it contains no
+`connect_all`/`HardwareManager(` call -- a regression guard against a
+future edit accidentally moving the branch below the hardware section.
+
+**Why this is the safe integration point and worker/supervisor execution
+is not:** printing a report is idempotent, side-effect-free, and
+reversible by construction -- there is no state it could leave wrong.
+Wiring `discover_workers()`/`build_execution_plan()`/`Supervisor` into
+`main.py` for *real* execution is a different category of change (it
+would decide what hardware gets touched and when) and stays exactly
+where Section 62 already put it: waiting for Charge/Discharge/Cycle
+validation to finish first.
+
+### Planned migration path -- from today's validation workflow to a future production `main.py`
+
+1. **Today (implemented):** `main.py` drives the legacy `TestExecutor`
+   path for validation; `--show-topology` is a side door that reports on
+   the *future* config-driven view without affecting that path at all.
+2. **Once `CycleSequence` is validated:** `worker_runtime.py` gets
+   written for the first time -- but by this point `execution_plan.py`,
+   `worker_lifecycle.py`, and the `Supervisor` contract already exist,
+   are already tested against both today's config and synthetic
+   multi-worker configs, and already have a reference implementation
+   proving the contract fits single-worker reality. The new work is
+   narrowed to: replace `SequentialSupervisor`'s injected `run_group`
+   stand-in with real construction of a validated
+   `ChargeSequence`/`DischargeSequence`/`CycleSequence`, and give
+   `main.py` a real (not reporting-only) code path that builds a plan
+   and runs it -- still single-worker, still sequential, no concurrency
+   yet.
+3. **Only if/when true concurrent multi-worker execution is wanted:** a
+   real cross-process `Arbiter` (Section 62), SQLite WAL/concurrency
+   hardening (flagged as a recommendation below), and a `Supervisor`
+   implementation that can actually run on a separate thread/process.
+   Nothing above requires this step; it is deliberately the last one.
+
+### What requires `CycleSequence` validation first
+
+Only step 2 above -- `worker_runtime.py`'s real body must call an actual
+validated sequence class, and `CycleSequence` does not exist yet. The
+interface/lifecycle/planning/reporting layers built in this task do not
+depend on `CycleSequence` at all (they were exercised entirely with
+synthetic configs and injected fakes) and needed no changes for it.
+
+### What requires future concurrency work
+
+Everything in Section 62's "must wait" list, unchanged: a real
+cross-process `Arbiter`, `Supervisor` implementations that run on a
+separate thread/process, and any `main.py` code path that decides what
+hardware to touch based on more than one worker's plan.
+
+### Recommendations discovered during implementation
+
+- **`WorkerState.ABORTED` needed to be reachable from `IDLE`, not just
+  `RUNNING`.** The first draft of `ALLOWED_TRANSITIONS` only allowed
+  `ABORTED` from `RUNNING`/`CLAIMING`/etc.; `SequentialSupervisor`'s own
+  tests (`stop()` requested between two groups, while the worker sits
+  `IDLE`) failed against that draft. Fixed by allowing `ABORTED` from
+  every non-terminal state -- documented above as a deliberate design
+  property, not a special case.
+- **A worker with more than one group must re-enter `DISCOVERED ->
+  READY` before every group, not just the first.** The first draft of
+  `SequentialSupervisor.start()` transitioned `IDLE -> DISCOVERED ->
+  READY` once before its loop; the second group in a two-group plan then
+  tried `IDLE -> CLAIMING` directly, which `ALLOWED_TRANSITIONS`
+  correctly rejects (caught by `tests/test_supervisor.py`, not by manual
+  inspection). This is the concrete evidence that the lifecycle table
+  and the reference supervisor needed to be built and tested together,
+  not one validated by inspection and the other assumed correct from it.
+- **SQLite concurrency hardening remains unaddressed** (`sqlite3.connect()`
+  with no `timeout=`/WAL pragma today) -- still not urgent, since nothing
+  in this task or Section 62 writes concurrently, but it remains on the
+  list for step 3 of the migration path above, before any real
+  concurrent worker writes to storage.
+- The `_connect_all_strict()` startup-rollback gap (Section 60) remains
+  open, unrelated to this task's scope.
