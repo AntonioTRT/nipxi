@@ -112,6 +112,16 @@ class Settings:
     # -------------------------------------------------------------------------
     ZERO_CURRENT_THRESHOLD_A = 0.01  # A - "current is zero" threshold for relay safety
 
+    # hardware/smu.py::SMU.emergency_output_off() bounded retry (see
+    # docs/architecture.md "Shutdown Safety -- Bounded Retry + Distinct
+    # Failure Modes"). Only affects the FAILURE path -- a first-attempt
+    # success returns immediately with zero added latency. The delay
+    # exists purely to give a transient verification-communication
+    # failure a real chance to resolve before the caller
+    # (hardware_manager.py::disconnect_all(), safety_monitor.py) gives up.
+    EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS = 3     # attempts before giving up
+    EMERGENCY_OUTPUT_OFF_RETRY_DELAY_S = 0.3  # s - delay between retry attempts
+
     # Pre-output-enable reverse-polarity sanity check (ChargeSequence/
     # DischargeSequence -- see docs/architecture.md "Reverse Polarity
     # Protection"). A correctly-connected, intact Li-ion cell never reads

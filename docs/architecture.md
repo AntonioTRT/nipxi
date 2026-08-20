@@ -4791,3 +4791,284 @@ DMM voltage authority, SMU current authority, and all UI additions
 (Sections 55/57/58) are untouched by this change -- none of them read
 `battery_type` for anything other than the `BATTERY_CONFIGS` lookup
 already covered above.
+
+## 60. Shutdown Safety -- Bounded Retry + Distinct Failure Modes (CURRENT IMPLEMENTATION)
+
+Follow-up to Section 56's Ctrl+C safety review, which found and
+instrumented (via `[SHUTDOWN-TRACE]` logging, not yet a behavior change)
+a real gap: `HardwareManager.disconnect_all()` would log CRITICAL when
+`SMU.emergency_output_off()` could not verify output was off, then
+proceed to call `SMU.disconnect()` (`session.close()`) on that SMU
+anyway. Closing an NI-DCPower session does not guarantee the instrument
+returns output to a safe state if `output_enabled` was never confirmed
+`False` -- this section fixes that, and is now implemented, not just
+diagnosed.
+
+**`hardware/smu.py`:**
+- New `OutputVerificationResult` (plain string constants, same convention
+  as `NTCPresence`/`StopReason`): `DISABLED`, `STILL_ENABLED`,
+  `VERIFICATION_COMM_FAILURE`. New `_check_output_disabled_detailed()`
+  distinguishes the two failure modes a verification attempt can produce
+  -- the instrument genuinely still reports output enabled (a real
+  electrical fact) versus the readback query itself raising (a
+  communication failure that says nothing about the actual physical
+  state; the preceding `output_disable()` command may have succeeded).
+  **`verify_output_disabled()` itself is completely unchanged** -- same
+  bool contract, same call sites -- because it is also used by
+  `force_output_off_and_verify()`, called from
+  `_configure_current_source()` at the *start* of every
+  `set_charge_mode()`/`set_discharge_mode()` call, i.e. part of
+  `ChargeSequence`'s/`DischargeSequence`'s already-validated operational
+  path. This fix does not touch that path at all.
+- `emergency_output_off()` now retries up to
+  `Settings.EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS` (3) times, with
+  `Settings.EMERGENCY_OUTPUT_OFF_RETRY_DELAY_S` (0.3 s) between attempts,
+  returning `True` immediately on the first attempt that verifies OFF --
+  **zero added latency on the common, first-attempt-succeeds path**. Only
+  the failure path is slower, and only by a bounded amount (at most
+  2 × 0.3 s = 0.6 s across 3 attempts). When every attempt fails, the
+  final `CRITICAL` log line always distinguishes which failure mode
+  occurred -- "output STILL ENABLED" vs "output state UNKNOWN... treated
+  as unsafe per policy" -- never a single generic "verification failed"
+  message. Per "unknown state = unsafe state": both failure modes still
+  return `False`; the retry and the distinction change *why* and *how
+  clearly* a failure is recorded, never *whether* it is treated as safe.
+
+**`config/settings.py`:** two new tuning constants
+(`EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS`, `EMERGENCY_OUTPUT_OFF_RETRY_DELAY_S`)
+-- deliberately in `Settings`, not `config/devices.py`, since these are
+retry-policy tuning, not hardware topology.
+
+**`test_control/hardware_manager.py::disconnect_all()`:** no longer
+proceeds to `SMU.disconnect()` when `emergency_output_off()` (now
+internally retried) still fails. The SMU session is deliberately left
+open under this process's control rather than closed unverified -- the
+relay is still force-opened and the other devices (DMM/DAQ/relay) are
+still disconnected regardless, since physically isolating the battery
+matters *more*, not less, when the SMU's own state is uncertain.
+**Operational tradeoff, worth knowing:** leaving the session open means
+that specific SMU resource may be unavailable to a subsequent
+`connect_all()` call until the process actually exits (the OS-level
+session/resource lock is not released until the session object is closed
+or garbage-collected) -- a deliberate choice, since the alternative
+(closing an unverified session) risks silently abandoning a PMU that may
+still be live.
+
+**Known, related, NOT fixed here (flagged, not addressed -- out of this
+task's approved scope):** `HardwareManager._connect_all_strict()`'s
+startup-failure rollback path has an analogous gap -- if
+`emergency_output_off("startup safety check")` fails there, the `except`
+block's rollback still calls `.disconnect()` on every already-connected
+device, including the SMU, without the same guard. Worth the same fix
+later; not touched in this pass to keep this change scoped to the
+originally-identified `disconnect_all()` gap.
+
+**Tests:** `tests/test_smu_emergency_shutdown.py` -- a fake NI-DCPower
+session (no real hardware, no `nidcpower` import required) exercising:
+first-attempt success (zero added latency), a transient readback failure
+that recovers on retry, a genuinely-stuck-enabled output exhausting all
+retries, a persistent communication failure exhausting all retries, that
+the two failure modes produce distinguishable `CRITICAL` log records, and
+that `verify_output_disabled()`'s pre-existing bool contract is
+byte-for-byte unchanged.
+
+## 61. Regression Test Suite (CURRENT IMPLEMENTATION)
+
+A permanent `tests/` package (stdlib `unittest`, zero new dependencies --
+run with `python -m unittest discover -s tests -v`) capturing fixes from
+this validation cycle that were previously verified only with one-off
+scratch scripts and never captured durably in the repo:
+
+- `tests/test_smu_emergency_shutdown.py` -- Section 60 above.
+- `tests/test_storage_measurement_scoping.py` -- `get_first_measurement()`'s
+  `NTC_PRECHECK` exclusion (Section 57; including the corrected root
+  cause -- the pre-check row's `voltage_v` holds a real, non-NULL raw NTC
+  divider reading, not `NULL`, so exclusion must key on `phase_detail`,
+  not column-nullness alone), `get_recent_events(channel=...)`'s
+  channel-scoping (Section 57), and `get_measurements(recent_limit=...)`'s
+  ordering/limit behavior (Section 55).
+- `tests/test_cancellation.py` -- the SIGINT-before-`connect_all()`
+  ordering fix (Section 56), verified via the same source-inspection
+  technique used when the fix was originally confirmed live, across all
+  six `test.py`/`main.py` entry points; `install_sigint_handler()`'s and
+  `CancellationToken.check()`'s `[SHUTDOWN-TRACE]` logging.
+- `tests/test_group_validation.py` -- `validate_group_test_config()`
+  behavior for B1's current config (Section 59), plus the negative cases
+  (a setpoint exceeding the battery ceiling, the SMU capability ceiling,
+  or the discharge safety floor must always raise before any hardware is
+  touched) -- the exact class of mistake the SB-ceiling/HUB-migration
+  review caught mid-cycle.
+- `tests/test_ntc_config.py` -- the B1 NTC migration to
+  `MAIN_DAQ`/`Dev1`/`ai0`-`ai7` (Section 58), including a guard against
+  reintroducing the `ai16`-`ai23` assumption that was found and corrected.
+- `tests/test_orchestration.py` -- Section 62 below.
+
+**Gotcha found and worked around:** `test.py:28` calls
+`logging.disable(logging.CRITICAL)` at import time (a deliberate,
+process-global choice for its own interactive-CLI UX). Because
+`logging.disable()` is process-global, importing `test`/`main` in
+`test_cancellation.py` silently broke log-capture assertions in `python -m
+unittest discover` runs that also loaded other test files needing real
+log records. Fixed via a shared `tests/_logging_helpers.py::
+reenable_logging_for_this_test()` helper that any log-asserting test calls
+for itself (via `addCleanup`), rather than relying on file-import order.
+
+## 62. Future Architecture: Configuration-Driven Multi-Group Execution
+
+**FUTURE PLANNED ARCHITECTURE, with a CURRENT IMPLEMENTATION of its
+read-only foundation layer only.** Nothing described here changes when or
+how `ChargeSequence`/`DischargeSequence`/`BatteryOperationSequence`/a
+future `CycleSequence` run today. The `orchestration/` package exists,
+is fully unit-tested, and is imported by nothing on the current execution
+path -- confirmed by grep against `test.py`/`main.py`/`test_control/`.
+Building worker execution, supervisor execution, a real cross-process
+broker, or any `main.py` integration is explicitly deferred until
+Charge/Discharge/Cycle hardware validation is complete.
+
+### Philosophy (unchanged, extended)
+
+`config/devices.py` remains the single source of truth. The goal is a
+portable NIPXI platform deployable on racks with different hardware
+inventories (one PSU/one group up to many PSUs/many groups) running the
+*same* software, differing only in configuration. The number of workers
+must be *derived* from configuration, never hardcoded -- exactly the
+existing philosophy `hardware_for_group()`/`BATTERY_GROUPS` already
+embody, extended one layer up.
+
+### Topology Discovery -- `orchestration/topology.py` (CURRENT IMPLEMENTATION, unused by anything real)
+
+`discover_topology(battery_groups=None)` returns
+`{ResourceKey(role, resource_name): {group_names using it}}` for every
+`enabled` group. Deliberately does **not** call
+`config/devices.py::hardware_for_group()` -- that function always reads
+the real, global `BATTERY_GROUPS`/`SMU_ASSIGNMENTS`/etc. regardless of
+any dict passed to it, which would make topology discovery untestable
+against a synthetic rack config. Instead it reads the same plain
+role-name fields directly and replicates `hardware_for_group()`'s one
+non-trivial rule (`ntc_daq` falling back to `daq`) inline, with a comment
+pointing back at the authoritative source of that rule.
+
+Against today's real config this produces exactly today's reality: B1 is
+the only enabled group, so five `ResourceKey`s each map to `{"B1"}`.
+Against a synthetic config shaped like a bigger rack, it produces the
+richer picture with the exact same code.
+
+### Worker Discovery -- `orchestration/workers.py` (CURRENT IMPLEMENTATION, unused by anything real)
+
+`discover_workers(battery_groups=None)` partitions `enabled` groups by
+their declared `smu` field into `WorkerPlan(smu_name, groups,
+shared_dependencies)` objects. A group with no `smu` assigned is not a
+worker candidate. Against today's config this produces exactly one
+worker (`AUX_SMU_1` → `["B1"]`).
+
+**Worker = SMU-anchored but broker-dependent.** "Worker 1: B1, B2" does
+**not** mean B1 and B2 charge simultaneously -- an SMU is a strictly
+exclusive, one-battery-at-a-time resource by construction, so a worker
+with multiple groups runs them *sequentially*. It means "this worker
+serializes between B1 and B2, while running independently *alongside*
+any other worker" -- and "independently" is qualified by the resource
+graph below, since relay matrices, the DMM, and MAIN_DAQ remain
+deliberately shared across every worker by design (per the stated future
+architecture: DMM stays the authoritative voltage source, MAIN_DAQ stays
+responsible for NTC acquisition, for *all* concurrently-active PSU
+flows, not one each).
+
+### Resource Dependency Graph -- `orchestration/resource_graph.py` (CURRENT IMPLEMENTATION, unused by anything real)
+
+`build_resource_graph(battery_groups=None)` combines the two modules
+above (over the *same* input, so they can never disagree about which
+config they describe) into a `ResourceGraph(workers, conflicts)`, where
+`conflicts` is `{(smu_name_a, smu_name_b): {shared resource names}}` for
+every pair of workers that depend on at least one resource in common.
+
+This is the piece that catches what a naive "group by SMU" derivation
+would miss: today's B1-B4 already share one relay matrix
+(`MATRIX_NUMATO_202`); a config where B1 and B2 both got their own SMU
+would produce two workers that LOOK independent but are not.
+`tests/test_orchestration.py::SyntheticRackScalingTests` proves this
+exact scenario is detected correctly against a synthetic Rack-B-shaped
+config, and that two workers on genuinely separate relay matrices
+correctly produce zero conflicts (no over-reporting of sharing that
+doesn't exist).
+
+### Shared-Resource Arbitration -- `orchestration/arbiter.py` (interface + trivial placeholder only)
+
+`Arbiter.claim(resource_name, owner) -> ClaimHandle` /
+`Arbiter.release(handle)` -- an interface only. `InProcessArbiter` is a
+trivial, single-process, dict-backed implementation, correct *only*
+because there is exactly one worker today; it exists to let the calling
+shape be designed and tested now, not to solve real concurrent
+contention. **A real cross-process broker must replace it before any
+second concurrent worker is ever allowed to run against real hardware**
+-- this explicitly waits (see the phase list below).
+
+### Why `BatteryOperationSequence` remains the execution unit, unchanged
+
+`ChargeSequence`/`DischargeSequence`/a future `CycleSequence` are not
+asked to become concurrency-aware. Their constructor-injected dependencies
+(`smu`/`dmm`/`relay`/`daq`/`storage`) and `run_guarded()`-driven lifecycle
+are exactly the right shape for "one instance, one flow, running inside
+one worker" -- adding locking/scheduling concerns into these classes
+would make them worse at the one thing they do cleanly today. A future
+worker is a wrapper *around* this layer (claims hardware via the
+`Arbiter`, constructs the sequence exactly as `test.py` does today, runs
+it, reports status) -- never a rewrite of it.
+
+### Why orchestration is intentionally separated from sequence execution
+
+Two different concerns, two different lifetimes: "how do I safely charge
+one battery" (validated today, changing slowly) versus "which of several
+batteries gets hardware access right now" (not yet needed, will change
+as rack sizes grow). Conflating them into one layer means every future
+rack-scaling change risks touching the exact code currently under real-
+hardware validation. Keeping them separate means the answer to "did this
+change affect Charge/Discharge validation?" is always answerable by
+"does it live in `orchestration/`?" -- confirmed today by the zero-import
+grep above, and worth re-confirming with the same grep after any future
+change to this area.
+
+### Thin `main.py` -- eventual shape, not yet implemented
+
+```
+validate_settings() / validate_devices_or_raise()   # unchanged, already exist
+topology = discover_topology()
+workers  = discover_workers()
+graph    = build_resource_graph()
+# print worker/graph summary; let the operator enable/disable
+supervisor.run(enabled_workers, graph)              # everything past here lives
+                                                     # in orchestration/supervisor.py,
+                                                     # NOT main.py -- not yet built
+```
+
+`main.py` today still drives the legacy `TestExecutor`/
+`BatteryTestSequence` path (pre-Group-Ownership, doesn't read
+`BATTERY_GROUPS` at all -- see the Section 54 "`main.py` legacy path
+review"). This future shape would finally give a reason to retire that
+path, but **no change to `main.py` is made or proposed as part of this
+task.**
+
+### Phased plan -- what is safe now vs. what must wait
+
+**Implemented now (this task):** `orchestration/topology.py`,
+`workers.py`, `resource_graph.py`, `arbiter.py` (interface +
+`InProcessArbiter` placeholder only), all unit-tested against both
+today's real config and synthetic multi-rack configs, zero imports from
+anywhere on the current execution path.
+
+**Must wait until Charge/Discharge/Cycle hardware validation is
+complete:**
+- `orchestration/worker_runtime.py` -- would construct and run
+  `ChargeSequence`/`DischargeSequence`/`CycleSequence` from a second code
+  path alongside `test.py`'s current, validated one; doubles the surface
+  area needing validation for zero present benefit.
+- A real cross-process `Arbiter` implementation -- needs NI-driver
+  concurrent-access behavior verified first (documentation or bench
+  experiment), and nothing to test it against until a second real worker
+  exists.
+- `orchestration/supervisor.py`'s real multi-worker execution logic -- a
+  supervisor with one worker to supervise validates nothing.
+- Any change to `main.py` -- no orchestration runtime exists yet for it
+  to delegate to.
+- The analogous `_connect_all_strict()` startup-rollback gap flagged in
+  Section 60 -- a real fix, deliberately deferred to keep this pass
+  scoped to the originally-identified `disconnect_all()` gap.

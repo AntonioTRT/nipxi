@@ -31,7 +31,7 @@ from config.settings import Settings
 from config import devices as dev_cfg
 from config.system_mode import get_mode_policy
 from data.logger import setup as setup_logging
-from utils.cancellation import CancellationToken
+from utils.cancellation import CancellationToken, install_sigint_handler
 from utils.errors import HardwareInitError, ValidationError, DeviceConfigError
 from utils.stop_reason import StopReason
 from utils.validators import validate_settings
@@ -113,9 +113,7 @@ def main():
     # window of altered behavior no wider than necessary) behaves normally
     # again.
     token = CancellationToken(owner="main")
-    previous_sigint_handler = signal.signal(
-        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-    )
+    previous_sigint_handler = install_sigint_handler(token, owner="main")
 
     # --- 4/5. Run the test + shutdown --------------------------------------
     # Shutdown (hw.disconnect_all()) is always attempted, no matter how the

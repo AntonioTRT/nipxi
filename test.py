@@ -1571,12 +1571,10 @@ def test_relay_matrix_scan(name=None, cfg=None, channel_start=None, channel_end=
     # cooperative cancellation checked before each relay channel, rather
     # than raising KeyboardInterrupt mid-scan.
     import signal
-    from utils.cancellation import CancellationToken
+    from utils.cancellation import CancellationToken, install_sigint_handler
 
     token = CancellationToken(owner="test.py:relay_matrix_scan")
-    previous_sigint_handler = signal.signal(
-        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-    )
+    previous_sigint_handler = install_sigint_handler(token, owner="test.py:relay_matrix_scan")
     print("\nPress Ctrl+C to cancel safely.\n")
     try:
         with _numato_relay_debug_logging():
@@ -1758,13 +1756,11 @@ def test_relay_ethernet_test(name=None, cfg=None):
     # never mid-index (never between write_all(0)/write(relay_index, True)/
     # verify_all()).
     import signal
-    from utils.cancellation import CancellationToken, check_cancellation
+    from utils.cancellation import CancellationToken, install_sigint_handler, check_cancellation
     from utils.errors import OperationCancelledError
 
     token = CancellationToken(owner="test.py:relay_ethernet_test")
-    previous_sigint_handler = signal.signal(
-        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-    )
+    previous_sigint_handler = install_sigint_handler(token, owner="test.py:relay_ethernet_test")
     print("\nPress Ctrl+C to cancel safely.\n")
 
     try:
@@ -4082,9 +4078,7 @@ def _run_monitor_battery():
     # architecture.md's Ctrl+C review. Shutdown logic itself is unchanged;
     # only when the handler is active changes.
     token = CancellationToken(owner="test.py:_run_monitor_battery")
-    previous_sigint_handler = signal.signal(
-        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-    )
+    previous_sigint_handler = install_sigint_handler(token, owner="test.py:_run_monitor_battery")
     try:
         hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
                                  dmm_cfg=dmm_cfg, ntc_daq_cfg=hw["ntc_daq_cfg"])
@@ -4279,9 +4273,7 @@ def _run_monitor_battery_scan():
     # architecture.md's Ctrl+C review. Shutdown logic itself is unchanged;
     # only when the handler is active changes.
     token = CancellationToken(owner="test.py:_run_monitor_battery_scan")
-    previous_sigint_handler = signal.signal(
-        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-    )
+    previous_sigint_handler = install_sigint_handler(token, owner="test.py:_run_monitor_battery_scan")
     try:
         hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
         try:
@@ -4468,8 +4460,8 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     # architecture.md's Ctrl+C review. Shutdown logic itself is unchanged;
     # only when the handler is active changes.
     token = CancellationToken(owner=f"test.py:_run_charge_or_discharge:{source}")
-    previous_sigint_handler = signal.signal(
-        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    previous_sigint_handler = install_sigint_handler(
+        token, owner=f"test.py:_run_charge_or_discharge:{source}"
     )
     try:
         hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
@@ -4903,9 +4895,7 @@ def run_proto_test_execution():
     # logic itself (disconnect_all()/emergency_stop()/safe_cancel_shutdown())
     # is unchanged; only when the handler is active changes.
     token = CancellationToken(owner="test.py:run_proto_test_execution")
-    previous_sigint_handler = signal.signal(
-        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-    )
+    previous_sigint_handler = install_sigint_handler(token, owner="test.py:run_proto_test_execution")
     try:
         # DMM is required for this workflow (unlike run_main_test(), which
         # leaves it optional) -- pass dmm_cfg explicitly so HardwareManager

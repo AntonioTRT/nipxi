@@ -655,35 +655,52 @@ class DataStorage(StorageBackend):
 
     def get_first_measurement(self, run_id: str = None, channel: int = None) -> dict:
         """
-        Return the earliest measurement row (by id) that has at least one
-        real electrical reading, as a dict, or None -- a cheap, single-row
+        Return the earliest measurement row (by id) that represents a real
+        battery-telemetry sample, as a dict, or None -- a cheap, single-row
         companion to get_measurements(recent_limit=...) for a "captured at
         the very start of this run" display (see test_control/
         execution_screen.py's "Initial" panel), without fetching the whole
         table to find it.
 
-        "At least one real electrical reading" means voltage_v/current_a/
-        smu_measured_v/dmm_measured_v is not all NULL -- this deliberately
-        skips a row that carries only a temperature (or nothing at all),
-        e.g. test.py::_ntc_group_snapshot()'s per-position NTC pre-check
-        row, which is written for the selected position BEFORE the relay
-        ever closes (voltage_v=None, no current/SMU/DMM fields at all) and
-        would otherwise be "row one" for that channel every time -- showing
-        the operator an Initial Measurement of all-N/A electrical values
-        even though the battery plainly had a real, valid voltage reading
-        (the pre-enable polarity check) before charging was ever allowed to
-        start. Once a row with real data exists, `ORDER BY id ASC LIMIT 1`
-        with this filter always returns that SAME row on every call (never
-        a later one) -- "store the first valid measurement permanently for
-        the rest of the run" falls out of the query itself, no separate
-        state needed. Returns None (rendered "N/A"/"(none)") if no such row
+        Excludes rows tagged `phase_detail = 'NTC_PRECHECK'` explicitly --
+        NOT just "voltage_v is NULL". A first attempt at this filter (see
+        git history) checked only for at least one non-NULL electrical
+        column, on the wrong assumption that test.py::_ntc_group_snapshot()
+        ever's pre-check row leaves `voltage_v` NULL. It does not:
+        _ntc_group_snapshot() stores the RAW NTC DIVIDER VOLTAGE in that
+        same `voltage_v` column (see its own docstring/_run_ntc_group_scan()'s
+        "voltage_v=<raw divider volts>") -- a real, non-NULL float that
+        satisfied the old filter's OR-condition despite `dmm_measured_v`/
+        `smu_measured_v`/`current_a` (the columns the "Initial" panel
+        actually displays) staying NULL on that row. The pre-check row is
+        written for the selected position BEFORE the relay ever closes and
+        would otherwise still be "row one" for that channel every time --
+        showing the operator an Initial Measurement of DMM/SMU/Current
+        all N/A even though the battery plainly had a real, valid voltage
+        reading (the pre-enable polarity check) before charging was ever
+        allowed to start.
+
+        The non-NULL-electrical-column check is kept as a second, general
+        guard (any future phase_detail that also writes an all-NULL row
+        stays excluded too) -- safe to combine with the phase_detail
+        exclusion since MonitorBatteryScanSequence's own real per-position
+        rows (OPEN_BEFORE/CLOSED/OPEN_AFTER) are never tagged
+        NTC_PRECHECK and do populate `voltage_v` for real (the averaged
+        DMM reading), so they are unaffected by either condition.
+
+        Once a row passing both conditions exists, `ORDER BY id ASC
+        LIMIT 1` always returns that SAME row on every call (never a later
+        one) -- "store the first valid measurement permanently for the
+        rest of the run" falls out of the query itself, no separate state
+        needed. Returns None (rendered "N/A"/"(none)") if no such row
         exists yet -- e.g. a run that failed before its first real sample.
         """
         if self._db is None:
             return None
         conditions, params = [
+            "(phase_detail IS NULL OR phase_detail != 'NTC_PRECHECK')",
             "(voltage_v IS NOT NULL OR current_a IS NOT NULL "
-            "OR smu_measured_v IS NOT NULL OR dmm_measured_v IS NOT NULL)"
+            "OR smu_measured_v IS NOT NULL OR dmm_measured_v IS NOT NULL)",
         ], []
         if run_id is not None:
             conditions.append("run_id = ?")

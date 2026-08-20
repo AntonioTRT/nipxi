@@ -145,6 +145,7 @@ class SafetyMonitor:
              as CRITICAL.)
         Mirrors the 'Safe shutdown' node in the VI flowchart.
         """
+        self.log.warning("[SHUTDOWN-TRACE] emergency_stop() entered (reason=%s)", reason)
         self.log.error("EMERGENCY STOP: %s", reason)
         if not smu.emergency_output_off(reason):
             self.log.critical(
@@ -152,8 +153,10 @@ class SafetyMonitor:
                 "actively sourcing/sinking current -- physically disconnect power if "
                 "this cannot be resolved immediately."
             )
+        self.log.warning("[SHUTDOWN-TRACE] Relay open command sending (open_all())")
         try:
             relay_matrix.open_all()
+            self.log.warning("[SHUTDOWN-TRACE] Relay open command sent -- open_all() returned normally")
         except Exception as e:
             self.log.critical(
                 "Relay open-all FAILED during e-stop: %s. Hardware may still be "
@@ -172,6 +175,7 @@ class SafetyMonitor:
         than "EMERGENCY STOP", so log output does not read as a fault when
         the operator asked for exactly this. Never raises.
         """
+        self.log.warning("[SHUTDOWN-TRACE] safe_cancel_shutdown() entered (reason=%s)", reason)
         self.log.warning("SAFE CANCELLATION: %s -- entering safe shutdown", reason)
         if not smu.emergency_output_off(reason):
             self.log.critical(
@@ -179,8 +183,10 @@ class SafetyMonitor:
                 "PMU may still be actively sourcing/sinking current -- physically "
                 "disconnect power if this cannot be resolved immediately."
             )
+        self.log.warning("[SHUTDOWN-TRACE] Relay open command sending (open_all())")
         try:
             relay_matrix.open_all()
+            self.log.warning("[SHUTDOWN-TRACE] Relay open command sent -- open_all() returned normally")
         except Exception as e:
             self.log.critical(
                 "Relay open-all FAILED during cancellation shutdown: %s. Hardware may "

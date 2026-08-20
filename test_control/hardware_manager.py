@@ -384,25 +384,51 @@ class HardwareManager:
         """
         Disconnect all hardware in the safe shutdown order.
 
-        Order: disable SMU output -> open all relays -> disconnect relay ->
-               disconnect SMU -> disconnect DAQ.
+        Order: disable SMU output (retried, verified -- see
+               hardware/smu.py::SMU.emergency_output_off()) -> open all
+               relays -> disconnect relay -> disconnect SMU (SKIPPED if its
+               output state could not be verified -- see step 1) ->
+               disconnect DAQ.
 
         Errors during disconnect are logged but not re-raised, so that a
         failure on one device does not prevent the others from disconnecting.
         """
+        self.log.warning("[SHUTDOWN-TRACE] disconnect_all() entered")
         self.log.info("Disconnecting hardware...")
 
-        # 1. PMU output OFF, verified (see docs/architecture.md "PMU
-        #    Shutdown Safe State"). Never raises; a failure to verify is
-        #    logged as CRITICAL, not a warning -- the PMU may still be
-        #    actively sourcing/sinking current, which is the exact condition
-        #    this shutdown step exists to prevent.
+        # 1. PMU output OFF, verified -- emergency_output_off() itself now
+        #    retries internally (Settings.EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS)
+        #    and distinguishes "genuinely still enabled" from "verification
+        #    communication failure" (see hardware/smu.py::
+        #    OutputVerificationResult). If every attempt still fails, this
+        #    is logged as CRITICAL, not a warning, and -- unlike before --
+        #    the SMU is deliberately EXCLUDED from step 3's disconnect()
+        #    loop below: closing an NI-DCPower session does not guarantee
+        #    the instrument returns output to a safe state if
+        #    output_enabled was never successfully verified False, so
+        #    closing an unverified session would trade a known-unsafe,
+        #    still-monitorable state for an unknown, abandoned one. Per
+        #    "unknown state = unsafe state," the session is left open
+        #    under this process's control instead. See docs/architecture.md
+        #    "Shutdown Safety -- Bounded Retry + Distinct Failure Modes"
+        #    for the full rationale and the operational tradeoff this
+        #    implies (the SMU resource may stay unavailable to a later
+        #    connect_all() call until this process exits).
+        smu_output_verified_safe = True
         if self._smu.connected:
-            if not self._smu.emergency_output_off("normal shutdown"):
+            smu_output_verified_safe = self._smu.emergency_output_off("normal shutdown")
+            if not smu_output_verified_safe:
                 self.log.critical(
-                    "SMU output could not be verified OFF during shutdown. PMU may "
-                    "still be actively sourcing/sinking current -- physically "
+                    "SMU output could not be verified OFF during shutdown after retries. "
+                    "PMU may still be actively sourcing/sinking current -- physically "
                     "disconnect power if this cannot be resolved immediately."
+                )
+                self.log.critical(
+                    "[SHUTDOWN-TRACE] disconnect_all(): SMU session will NOT be closed -- "
+                    "output state could not be verified even after retries. Leaving the "
+                    "session open under software control rather than closing an unverified "
+                    "session. This SMU resource may remain unavailable to a subsequent "
+                    "connect_all() until this process exits."
                 )
 
         # 2. Open all relays -- physically disconnect all batteries. By the
@@ -410,6 +436,10 @@ class HardwareManager:
         #    emergency-shutdown attempt (see NumatoRelayMatrix.verify_all()/
         #    _emergency_all_off()) -- a failure here is therefore already a
         #    second failed attempt and is logged as CRITICAL, not a warning.
+        #    Always attempted regardless of the SMU outcome above -- opening
+        #    the relay physically isolates the battery from the SMU circuit,
+        #    which matters MORE, not less, when the SMU's own state is
+        #    uncertain.
         if self._relay.connected:
             try:
                 self._relay.open_all()
@@ -420,12 +450,15 @@ class HardwareManager:
                     "cannot be resolved immediately.", e,
                 )
 
-        # 3. Disconnect relay, DMM (if present), SMU, DAQ, NTC_DAQ (if a
-        #    distinct instance) -- reverse of connect order.
+        # 3. Disconnect relay, DMM (if present), SMU (only if its output was
+        #    verified OFF in step 1), DAQ, NTC_DAQ (if a distinct instance)
+        #    -- reverse of connect order.
         devices = [self._relay]
         if self._dmm is not None:
             devices.append(self._dmm)
-        devices += [self._smu, self._daq]
+        if smu_output_verified_safe:
+            devices.append(self._smu)
+        devices.append(self._daq)
         if self._ntc_daq is not None and self._ntc_daq is not self._daq:
             devices.append(self._ntc_daq)
         for dev in devices:
@@ -436,6 +469,7 @@ class HardwareManager:
                 self.log.warning("disconnect() failed for %s: %s", dev.name, e)
 
         self.log.info("All hardware disconnected.")
+        self.log.warning("[SHUTDOWN-TRACE] disconnect_all() completed")
 
     def _atexit_relay_shutdown(self):
         """

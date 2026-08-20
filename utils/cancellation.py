@@ -24,9 +24,12 @@ Design (see docs/architecture.md "Safe Cancellation Architecture"):
 """
 
 import logging
+import signal
 import time
 
 from utils.errors import OperationCancelledError
+
+_shutdown_trace_log = logging.getLogger("nipxi.cancellation")
 
 
 class CancellationToken:
@@ -84,7 +87,39 @@ class CancellationToken:
         must only invoke this between atomic hardware operations.
         """
         if self._requested:
+            self.log.warning(
+                "[SHUTDOWN-TRACE] OperationCancelledError raised%s (reason=%s)",
+                f" ({self.owner})" if self.owner else "", self._reason,
+            )
             raise OperationCancelledError(self._reason or "cancellation requested")
+
+
+def install_sigint_handler(token, owner: str = ""):
+    """
+    Install the standard cooperative-cancellation SIGINT handler for
+    `token` and return the previous handler (pass to
+    signal.signal(signal.SIGINT, ...) later to restore it -- identical
+    contract to calling signal.signal() directly, which is all this
+    replaces at each of its call sites in test.py/main.py).
+
+    Logs "[SHUTDOWN-TRACE] SIGINT handler entered" every time the OS
+    actually delivers SIGINT to this process and Python dispatches it to
+    this handler -- BEFORE token.request_cancel() (which separately logs
+    "Cancellation requested" via CancellationToken, and is a no-op on any
+    signal after the first). Diagnostic-only: added to trace the exact
+    shutdown sequence a real Ctrl+C event triggers end-to-end (see
+    docs/architecture.md "Ctrl+C Safety Review"), not a behavior change --
+    every previous call site did exactly
+    `signal.signal(signal.SIGINT, lambda signum, frame:
+    token.request_cancel("Ctrl+C"))`, which this wraps unchanged.
+    """
+    def _handler(signum, frame):
+        _shutdown_trace_log.warning(
+            "[SHUTDOWN-TRACE] SIGINT handler entered%s (signum=%s)",
+            f" ({owner})" if owner else "", signum,
+        )
+        token.request_cancel("Ctrl+C")
+    return signal.signal(signal.SIGINT, _handler)
 
 
 def check_cancellation(token):

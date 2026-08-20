@@ -72,11 +72,30 @@ config/settings.py).
 """
 
 import math
+import time
 
 from config.settings import Settings
 from hardware.base import HardwareBase
 from utils.cancellation import interruptible_sleep
 from utils.errors import OperationCancelledError, SMUError, SMUStateVerificationError
+
+
+class OutputVerificationResult:
+    """
+    Fine-grained outcome of a single output-disable verification attempt --
+    used only by emergency_output_off()'s retry loop (see docs/
+    architecture.md "Shutdown Safety -- Bounded Retry + Distinct Failure
+    Modes"). Distinguishes "the instrument told us output is still
+    enabled" (a real electrical fact -- PMU is genuinely still sourcing/
+    sinking) from "we could not ask the instrument at all" (a
+    communication failure, which says nothing about the actual physical
+    state -- the preceding output_disable() command may have succeeded).
+    Plain string constants, same convention as hardware/temperature.py::
+    NTCPresence / utils/stop_reason.py::StopReason.
+    """
+    DISABLED = "disabled"
+    STILL_ENABLED = "still_enabled"
+    VERIFICATION_COMM_FAILURE = "verification_comm_failure"
 
 
 class SMU(HardwareBase):
@@ -410,6 +429,34 @@ class SMU(HardwareBase):
             )
             return False
 
+    def _check_output_disabled_detailed(self) -> str:
+        """
+        Fine-grained companion to verify_output_disabled() -- used only by
+        emergency_output_off()'s retry loop, which needs to distinguish
+        "the instrument confirms output is still enabled"
+        (OutputVerificationResult.STILL_ENABLED) from "we could not read
+        the instrument's state at all"
+        (OutputVerificationResult.VERIFICATION_COMM_FAILURE). Never raises.
+
+        verify_output_disabled() itself is left completely unchanged (same
+        query, same bool contract, same call sites) -- it is also relied on
+        by force_output_off_and_verify(), which runs at the START of every
+        set_charge_mode()/set_discharge_mode() call (via
+        _configure_current_source()) -- part of ChargeSequence's/
+        DischargeSequence's already-validated operational path, which this
+        shutdown-safety work must not alter.
+        """
+        if self._session is None:
+            return OutputVerificationResult.DISABLED
+        try:
+            enabled = bool(self._session.output_enabled)
+        except Exception as e:
+            self.log.error(
+                "SMU %s: failed to read back output_enabled state: %s", self.resource, e
+            )
+            return OutputVerificationResult.VERIFICATION_COMM_FAILURE
+        return OutputVerificationResult.STILL_ENABLED if enabled else OutputVerificationResult.DISABLED
+
     # ------------------------------------------------------------------
     # PSU Safety Verification Pattern (see docs/architecture.md) -- mirrors
     # hardware/relay_eth.py's Relay Safety Verification Pattern:
@@ -553,35 +600,106 @@ class SMU(HardwareBase):
         """
         Single, public, non-recursive PMU fail-safe reflex. Never raises.
 
-        COMMAND (output_disable) -> READBACK+VERIFY (verify_output_disabled)
-        -> log CRITICAL and return False if either step fails or leaves
-        output verified-on, else return True.
+        COMMAND (output_disable) -> READBACK+VERIFY, retried up to
+        Settings.EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS times (a short
+        Settings.EMERGENCY_OUTPUT_OFF_RETRY_DELAY_S delay between attempts)
+        -> log CRITICAL and return False if every attempt still fails or
+        leaves output verified-on, else return True as soon as ANY attempt
+        verifies OFF (no added latency on the common, first-attempt-
+        succeeds path).
+
+        Why retry, and why distinguish failure modes (see
+        OutputVerificationResult / _check_output_disabled_detailed()):
+        a verification failure can mean two electrically different things
+        -- the output is genuinely still enabled (STILL_ENABLED), or the
+        readback query itself failed for an unrelated communication
+        reason while the disable command may have actually succeeded
+        (VERIFICATION_COMM_FAILURE). Collapsing both into one generic
+        "verification failed" (the previous behavior) meant a single
+        transient comms glitch was indistinguishable from a genuine stuck-
+        output fault, and gave a transient failure no chance to resolve
+        itself before the caller (e.g. hardware_manager.py::disconnect_all())
+        gave up. Per "unknown state = unsafe state": neither failure mode
+        is ever treated as safe (both still return False), but WHICH one
+        occurred is always explicitly recorded in the final CRITICAL log
+        line -- this method never silently proceeds without recording the
+        exact failure condition.
 
         Callers (charge_cycle.py / discharge_cycle.py on any exception,
-        safety_monitor.py::emergency_stop(), hardware_manager.py at startup
-        and shutdown) must treat a False return as "PMU may still be
-        sourcing/sinking current" -- unknown PMU state is unsafe state.
+        safety_monitor.py::emergency_stop()/safe_cancel_shutdown(),
+        hardware_manager.py at startup and shutdown) must treat a False
+        return as "PMU may still be sourcing/sinking current" -- unknown
+        PMU state is unsafe state.
         """
+        self.log.warning(
+            "[SHUTDOWN-TRACE] emergency_output_off() entered -- SMU %s (%s)",
+            self.resource, reason,
+        )
         self.log.warning("SMU %s: emergency output off -- %s", self.resource, reason)
-        try:
-            self.output_disable()
-        except Exception as e:
+
+        max_attempts = Settings.EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS
+        last_result = OutputVerificationResult.VERIFICATION_COMM_FAILURE
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.output_disable()
+            except Exception as e:
+                self.log.critical(
+                    "SMU %s: emergency output off command FAILED on attempt %d/%d (%s).",
+                    self.resource, attempt, max_attempts, e,
+                )
+                last_result = OutputVerificationResult.VERIFICATION_COMM_FAILURE
+            else:
+                self.log.warning(
+                    "[SHUTDOWN-TRACE] PSU output disabled -- output_disable() command sent "
+                    "for SMU %s (attempt %d/%d), verifying...",
+                    self.resource, attempt, max_attempts,
+                )
+                last_result = self._check_output_disabled_detailed()
+                if last_result == OutputVerificationResult.DISABLED:
+                    self.log.warning(
+                        "[SHUTDOWN-TRACE] PSU output disable verified TRUE (output confirmed "
+                        "OFF) for SMU %s on attempt %d/%d.",
+                        self.resource, attempt, max_attempts,
+                    )
+                    self.log.info("SMU %s: emergency output off verified safe.", self.resource)
+                    return True
+                self.log.warning(
+                    "[SHUTDOWN-TRACE] PSU output disable verification result on attempt "
+                    "%d/%d for SMU %s: %s", attempt, max_attempts, self.resource, last_result,
+                )
+
+            if attempt < max_attempts:
+                time.sleep(Settings.EMERGENCY_OUTPUT_OFF_RETRY_DELAY_S)
+
+        # All attempts exhausted -- never silently proceed. The exact
+        # failure condition is always distinguished and recorded here,
+        # never collapsed into one generic "verification failed" message.
+        if last_result == OutputVerificationResult.STILL_ENABLED:
             self.log.critical(
-                "SMU %s: emergency output off FAILED (%s) -- PMU may still be actively "
-                "sourcing/sinking current. Physically disconnect power if this cannot "
-                "be resolved immediately.", self.resource, e,
+                "SMU %s: output STILL ENABLED after %d attempt(s) -- the instrument "
+                "confirms output is still on. PMU may be actively sourcing/sinking "
+                "current. Physically disconnect power if this cannot be resolved "
+                "immediately.", self.resource, max_attempts,
             )
-            return False
-        if not self.verify_output_disabled():
             self.log.critical(
-                "SMU %s: output disable command sent but verification shows output "
-                "still enabled -- PMU may still be actively sourcing/sinking current. "
-                "Physically disconnect power if this cannot be resolved immediately.",
-                self.resource,
+                "[SHUTDOWN-TRACE] SMU %s: FINAL RESULT after %d attempt(s) -- %s "
+                "(output electrically confirmed still enabled).",
+                self.resource, max_attempts, OutputVerificationResult.STILL_ENABLED,
             )
-            return False
-        self.log.info("SMU %s: emergency output off verified safe.", self.resource)
-        return True
+        else:
+            self.log.critical(
+                "SMU %s: output state UNKNOWN after %d attempt(s) -- could not "
+                "communicate with the instrument to verify output state. Treated as "
+                "unsafe per policy: physically disconnect power if this cannot be "
+                "resolved immediately.", self.resource, max_attempts,
+            )
+            self.log.critical(
+                "[SHUTDOWN-TRACE] SMU %s: FINAL RESULT after %d attempt(s) -- %s "
+                "(never electrically confirmed enabled OR disabled -- state is "
+                "genuinely unknown, not assumed safe).",
+                self.resource, max_attempts, OutputVerificationResult.VERIFICATION_COMM_FAILURE,
+            )
+        return False
 
     def measure(self) -> dict:
         """
