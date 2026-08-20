@@ -5297,3 +5297,143 @@ hardware to touch based on more than one worker's plan.
   concurrent worker writes to storage.
 - The `_connect_all_strict()` startup-rollback gap (Section 60) remains
   open, unrelated to this task's scope.
+
+## 64. Preparation Phase: Six Resolved Decisions Before worker_runtime.py
+
+**FUTURE PLANNED ARCHITECTURE decisions, with a CURRENT IMPLEMENTATION of
+the shared-helper extraction they depend on.** A readiness review of the
+accepted `RunSpec`/`CycleSequence`/orchestration designs (Sections
+62-63) surfaced six concrete decisions that had to be made before
+`worker_runtime.py` could be written without immediately needing
+rework. All six are now accepted. This section records what was decided
+and why, and what preparation work in this repository already exists to
+support each one. **`worker_runtime.py` itself is still not built** --
+nothing in this section changes execution behavior, and nothing here is
+called from `main.py`'s real (non-`--show-topology`) path.
+
+### The six decisions
+
+1. **A shared `CancellationToken` will be passed to both `Supervisor`
+   and `worker_runtime`; `Supervisor.stop()` will call
+   `token.request_cancel()`.** Chosen because `Supervisor`'s own
+   `_stop_requested` flag and `CancellationToken`/`check_cancellation()`
+   (already used throughout `ChargeSequence`/`DischargeSequence`) are
+   two independent mechanisms today -- without this, a `stop()` call
+   would never actually interrupt a running sequence's own cancellation
+   checkpoints. **Not yet implemented in `orchestration/supervisor.py`**
+   -- this is a small, additive constructor parameter
+   (`cancellation_token=None`) to be added when `worker_runtime.py`
+   itself is built, not part of this preparation phase's scope (this
+   phase touches `test.py` extraction only). Documented here so the two
+   pieces of work aren't designed independently and then found to
+   disagree.
+2. **Hardware connection granularity stays one connect/disconnect cycle
+   per position**, matching `test.py`'s exact validated pattern
+   (`test.py:4467-4473`) -- not a new "stay connected across positions"
+   pattern. Chosen to avoid introducing an unvalidated hardware-usage
+   pattern in the same change that's supposed to reduce risk; efficiency
+   gains from holding a connection open across positions can be
+   revisited later, once `worker_runtime.py` itself has been validated
+   against real hardware in this simpler form first.
+3. **`CycleSequence` owns the open/close lifecycle of any storage
+   instances it internally constructs** for its charge/discharge
+   sub-phases -- `BatteryOperationSequence` subclasses never close their
+   own `storage` today (the caller does, in its own `finally`); a
+   composing `CycleSequence` is the first sequence for which that
+   responsibility has to move inside the sequence itself, since it is
+   the only one that constructs more than one storage-scoped sub-phase
+   per invocation.
+4. **The NTC pre-check remains mandatory** and is explicitly a
+   `worker_runtime.py` responsibility, not something the RunSpec/
+   execution-plan/supervisor design was allowed to silently drop. This
+   is why `test_control/ntc_snapshot.py` (see below) was extracted in
+   this same phase, rather than left as a `test.py`-only detail to
+   rediscover later.
+5. **Reporting follows `test.py`'s validated pattern** -- raw
+   `DataStorage` + `render_run_summary()` -- **not** `main.py`'s legacy
+   `ResultManager.generate_report()` path, because the former is what
+   has actually been exercised against real hardware during this
+   validation cycle and the latter has not.
+6. **RunSpec resolution + execution-plan reporting (`orchestration/
+   reporting.py`) is the non-interactive replacement for
+   `_confirm_operation()`** -- there is no automated equivalent of an
+   operator's Y/N gate, so a production run's "confirmation" is that the
+   plan was built and printed/logged from validated configuration before
+   any hardware is touched, not a runtime prompt.
+
+### Preparation completed in this phase
+
+To let `worker_runtime.py` reuse this logic instead of duplicating it,
+three pieces of already-existing `test.py` logic (candidates identified
+in the readiness review, Section prior) were extracted into shared,
+pure modules, with `test.py` reduced to a thin, behavior-preserving
+wrapper around each:
+
+- **`utils/group_hardware.py`** -- `resolve_group_hardware()`,
+  `missing_hardware_roles()`, `validate_position_in_group()`. The two
+  resolution functions took an added `on_fail` callback (defaulting to
+  nothing) so the pure logic and the operator-facing `[FAIL]` message
+  are separable -- `test.py`'s wrappers pass `on_fail=print` and are
+  therefore byte-for-byte unchanged in behavior; a future
+  `worker_runtime.py` passes a logger or nothing and inspects the
+  return value itself.
+- **`test_control/storage_session.py`** -- `open_storage_guarded()`,
+  same `on_fail`-callback pattern, same "no behavior change to
+  `test.py`" guarantee.
+- **`test_control/ntc_snapshot.py`** -- `ntc_group_snapshot()`, moved
+  as-is (it already had no `print()`/`input()` before this phase) --
+  this is a pure relocation, not a refactor, done specifically so a
+  future `worker_runtime.py` does not have to import `test.py` (and
+  inherit `test.py:28`'s `logging.disable(logging.CRITICAL)` import-time
+  side effect -- see Section 61's "gotcha") just to reuse it.
+
+`test.py`'s own functions (`_resolve_group_hardware`,
+`_missing_hardware_roles`, `_open_storage_guarded`, `_ntc_group_snapshot`,
+and the bounds-check inside `_select_battery_position`) keep their exact
+original names, signatures, and call sites -- every existing call site
+in `test.py` is unchanged. Only the function *bodies* now delegate.
+
+### How `worker_runtime.py` is expected to use these
+
+- Calls `utils.group_hardware.resolve_group_hardware()` directly (not
+  via `test.py`), passing `on_fail=None` or a logger, then constructs
+  `HardwareManager` exactly as `test.py` does today, once per selected
+  position (decision #2).
+- Calls `test_control.ntc_snapshot.ntc_group_snapshot()` for the
+  mandatory pre-check (decision #4) before constructing `SafetyMonitor`,
+  matching `test.py`'s existing ordering.
+- Calls `test_control.storage_session.open_storage_guarded()` to obtain
+  a raw `DataStorage`, then reports via `render_run_summary()` on
+  completion (decision #5), never via `ResultManager`.
+- Receives a shared `CancellationToken` from `main.py` (decision #1) and
+  threads it into both the `Supervisor` it's paired with and every
+  sequence `.run()` call it makes.
+
+### Relationship to `RunSpec`
+
+None of the six decisions change `RunSpec`'s shape (Section prior) --
+`RunSpec.groups`/`positions` still resolve to `hardware_for_group()`-scoped
+work exactly as designed; decision #2 clarifies *how many* times that
+resolution happens (once per position, not once per group), and decision
+#6 clarifies that `RunSpec` resolution *is* the pre-flight gate, with
+nothing further to design there.
+
+### Relationship to `Supervisor`
+
+Decision #1 is the only one that eventually touches
+`orchestration/supervisor.py`, and it is deliberately **not implemented
+in this phase** -- `SequentialSupervisor`'s contract and reference
+implementation (Section 63) are unchanged by this preparation phase. It
+is recorded here so that when `worker_runtime.py` is built, the small
+`cancellation_token` constructor addition to `Supervisor` is made as
+part of that same effort, already agreed rather than re-litigated.
+
+### Regression tests added
+
+`tests/test_group_hardware.py`, `test_storage_session.py`,
+`test_ntc_snapshot.py` -- unit tests for the three new shared modules in
+isolation. `tests/test_testpy_extraction_parity.py` -- proves `test.py`'s
+own wrapper functions still produce identical printed messages, return
+values, and delegate (rather than reimplement) to the shared modules,
+using stdout capture and spy patches; no hardware access in any of these
+four files.

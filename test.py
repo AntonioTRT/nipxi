@@ -23,6 +23,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config.settings import Settings
 from config import devices as dev_cfg
+from utils.group_hardware import (
+    missing_hardware_roles as _shared_missing_hardware_roles,
+    resolve_group_hardware as _shared_resolve_group_hardware,
+    validate_position_in_group as _shared_validate_position_in_group,
+)
+from test_control.storage_session import open_storage_guarded as _shared_open_storage_guarded
+from test_control.ntc_snapshot import ntc_group_snapshot as _shared_ntc_group_snapshot
 
 # Suppress NI driver / serial noise during tests
 logging.disable(logging.CRITICAL)
@@ -3774,7 +3781,9 @@ def _select_battery_group():
 
 def _select_battery_position(group: str):
     """Position selection is always relative to the selected group (e.g.
-    "Group A Position 3"), never a raw global position number."""
+    "Group A Position 3"), never a raw global position number. Bounds-
+    checking itself is shared with any future non-interactive caller --
+    see utils/group_hardware.py::validate_position_in_group()."""
     size = dev_cfg.group_size(group)
     choice = input(f"\nPosition within Group {group} (1-{size}): ").strip()
     try:
@@ -3782,7 +3791,7 @@ def _select_battery_position(group: str):
     except ValueError:
         print("Invalid selection.")
         return None
-    if not (1 <= pos <= size):
+    if not _shared_validate_position_in_group(group, pos):
         print(f"Position {pos} out of range (1-{size}).")
         return None
     return pos
@@ -3801,26 +3810,16 @@ def _resolve_group_hardware(group: str, required_roles=("relay_matrix", "smu", "
     failure (missing hardware role for `required_roles`, or unset/unknown
     battery_type) -- an operator-facing [FAIL] message has already been
     printed in that case and the caller must abort, no hardware activated.
-    """
-    hw = dev_cfg.hardware_for_group(group)
-    missing = _missing_hardware_roles(hw, required_roles=required_roles)
-    if missing:
-        print(f"\n[FAIL] Group {group} has no {', '.join(missing)} assigned -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
-        return None
 
-    battery_type = dev_cfg.group_test_config(group)["battery_type"]
-    if battery_type is None:
-        print(f"\n[FAIL] Group {group} has no battery_type configured -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}]. Aborting, no hardware activated.")
-        return None
-    if battery_type not in dev_cfg.BATTERY_CONFIGS:
-        print(f"\n[FAIL] Group {group} references unknown battery_type {battery_type!r} -- "
-              f"see config/devices.py::BATTERY_GROUPS[{group!r}] and BATTERY_CONFIGS. "
-              f"Aborting, no hardware activated.")
-        return None
-    battery_cfg = dev_cfg.BATTERY_CONFIGS[battery_type]
-    return hw, battery_type, battery_cfg
+    Thin wrapper: the actual resolution logic lives in
+    utils/group_hardware.py::resolve_group_hardware() so a future
+    worker_runtime.py shares exactly this implementation instead of a
+    second copy -- see docs/architecture.md "Preparation Phase: Six
+    Resolved Decisions Before worker_runtime.py". `on_fail=print`
+    reproduces the exact operator-facing messages this function has
+    always printed.
+    """
+    return _shared_resolve_group_hardware(group, required_roles=required_roles, on_fail=print)
 
 
 def _select_group_with_hardware_summary(required_roles=("relay_matrix", "smu", "dmm", "daq")):
@@ -3884,25 +3883,15 @@ def _open_storage_guarded(hw_mgr=None):
     failure, if `hw_mgr` (an already-connected HardwareManager) is given,
     it is disconnected before returning -- no hardware is left connected
     just because the database could not be opened.
-    """
-    import sqlite3
-    from data.storage import DataStorage
 
-    storage = DataStorage(settings=Settings)
-    try:
-        storage.open()
-    except (OSError, sqlite3.Error) as e:
-        print(f"\n[FAIL] Database unavailable -- could not open storage: {e}")
-        print("       See logs for full diagnostic detail. Aborting, no hardware activated.")
-        if hw_mgr is not None:
-            try:
-                hw_mgr.disconnect_all()
-            except Exception as shutdown_err:
-                print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
-                print("           Hardware may still be energized -- "
-                      "physically disconnect power if this cannot be resolved immediately.")
-        return None
-    return storage
+    Thin wrapper: the actual open/error-handling logic lives in
+    test_control/storage_session.py::open_storage_guarded() so a future
+    worker_runtime.py shares exactly this implementation -- see docs/
+    architecture.md "Preparation Phase: Six Resolved Decisions Before
+    worker_runtime.py". `on_fail=print` reproduces the exact
+    operator-facing messages this function has always printed.
+    """
+    return _shared_open_storage_guarded(Settings, hw_mgr=hw_mgr, on_fail=print)
 
 
 def _start_run_summary_guarded(storage, test_type: str, **fields) -> bool:
@@ -3931,8 +3920,14 @@ def _missing_hardware_roles(hw: dict, required_roles=("relay_matrix", "smu", "dm
     """Return the subset of `required_roles` whose config/devices.py::
     hardware_for_group() cfg resolved to None -- i.e. no device assigned to
     that role for this group. Never silently substitute another device for
-    a missing role; the caller must abort before any hardware activation."""
-    return [role for role in required_roles if hw[f"{role}_cfg"] is None]
+    a missing role; the caller must abort before any hardware activation.
+
+    Thin wrapper over utils/group_hardware.py::missing_hardware_roles() --
+    kept here, unchanged in name/signature, in case anything still calls
+    it directly; _resolve_group_hardware() above no longer needs it
+    itself (it delegates to the shared resolve_group_hardware(), which
+    calls the shared missing_hardware_roles() internally)."""
+    return _shared_missing_hardware_roles(hw, required_roles=required_roles)
 
 
 def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
@@ -4628,87 +4623,20 @@ def _ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
     through the relay matrix -- this never touches a relay, the SMU, or the
     PMU, so it's safe to call before any of those are ever engaged.
 
-    Records one measurements row per position (test_type=`source`,
-    phase_detail=`phase_detail` if given, else the presence value itself --
-    NTC Group Scan's original, unchanged behavior) and, if `log_summary`
-    is True, one event_log line per position summarizing presence/
-    temperature (NTC Group Scan itself does not log a summary line for a
-    normal PRESENT/ABSENT reading, only for the two failure cases below --
-    unchanged; callers that need per-position traceability, e.g. a
-    pre-operation group NTC pre-check, opt in explicitly).
-
-    Returns a list of {"position", "channel", "presence", "temp_c",
-    "readable"} dicts in position order. `readable` is True only when a
-    real ADC value was obtained and classified -- False for both "no
-    daq_ntc_ch configured" (a config gap) and a DAQError on the read
-    itself (a DAQ connectivity problem). Both still record `presence` as
-    FAULT (informative -- "no reliable reading available") but callers
-    that gate an operation on presence must check `readable` too: a DAQ
-    comms hiccup is an infrastructure problem, not a signal that the
-    battery/sensor at that position is actually faulted, and must not be
-    treated the same as a real, successfully-read ABSENT/FAULT signal --
-    the active-monitoring loops (Monitor Battery/Charge/Discharge's own
-    sampling loops) already degrade gracefully on the identical DAQError,
-    never aborting the run over it; this pre-check must not be stricter
-    than the loop it precedes.
-
     No-op (returns []) if `daq` is None -- a group with no NTC hardware
-    assigned behaves exactly as if this were never called.
+    assigned behaves exactly as if this were never called. See
+    test_control/ntc_snapshot.py::ntc_group_snapshot()'s own docstring
+    for the full return-value/`readable` contract this preserves exactly.
 
-    Shared by NTC Group Scan and the pre-operation group NTC pre-check
-    (Charge/Discharge/Monitor Battery) so there is exactly one place this
-    scan loop is implemented -- not two independent copies of the same logic.
+    Thin wrapper: this function already had no print()/input() of its
+    own, so the extraction to test_control/ntc_snapshot.py (shared with
+    NTC Group Scan, the pre-operation group NTC pre-check, and a future
+    worker_runtime.py -- see docs/architecture.md "Preparation Phase:
+    Six Resolved Decisions Before worker_runtime.py") is a pure move,
+    not a behavior change.
     """
-    from hardware.temperature import ntc_voltage_to_celsius, classify_ntc_presence, NTCPresence
-    from utils.errors import DAQError
-
-    if daq is None:
-        return []
-
-    results = []
-    for position in range(1, size + 1):
-        ch_cfg = dev_cfg.BATTERY_GROUPS[group]["positions"].get(position)
-        ntc_ch = ch_cfg["daq_ntc_ch"] if ch_cfg else None
-        channel = position
-
-        voltage_v = None
-        temp_c = None
-        readable = True
-        if ntc_ch is None:
-            presence = NTCPresence.FAULT
-            readable = False
-            storage.log_event(level="WARNING", source=source, channel=channel,
-                               message=f"Position {position}: no daq_ntc_ch configured")
-        else:
-            try:
-                voltage_v = daq.read_channel(ntc_ch)
-                presence = classify_ntc_presence(voltage_v)
-                if presence == NTCPresence.PRESENT:
-                    temp_c = ntc_voltage_to_celsius(voltage_v)
-            except DAQError as e:
-                presence = NTCPresence.FAULT
-                readable = False
-                storage.log_event(level="WARNING", source=source, channel=channel,
-                                   message=f"Position {position}: DAQ read failed -- {e}")
-
-        storage.record_measurement(
-            test_type=source, channel=channel,
-            phase_detail=phase_detail if phase_detail is not None else presence,
-            voltage_v=voltage_v, temp_c=temp_c,
-            group_name=group, position_in_group=position,
-        )
-        if log_summary:
-            temp_label = f" -- {temp_c:.1f} C" if temp_c is not None else ""
-            storage.log_event(
-                level="INFO" if presence == NTCPresence.PRESENT else "WARNING",
-                source=source, channel=channel,
-                message=f"NTC snapshot -- Position {position} (channel {channel}): {presence}{temp_label}",
-            )
-        results.append({
-            "position": position, "channel": channel, "presence": presence,
-            "temp_c": temp_c, "readable": readable,
-        })
-    return results
+    return _shared_ntc_group_snapshot(storage, daq, group, size, source,
+                                       phase_detail=phase_detail, log_summary=log_summary)
 
 
 def _run_ntc_group_scan():
