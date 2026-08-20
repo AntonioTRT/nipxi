@@ -4524,3 +4524,100 @@ per transition), which the existing "Recent Events" panel already
 displays unchanged. No new schema column or renderer section was added
 for this speculatively -- the two existing surfaces (Temp column,
 Recent Events panel) already cover it.
+
+## 56. Ctrl+C Safety Review -- SIGINT Handler Installed Before Hardware Init (Fix #1)
+
+Prompted by an observed Proto Test Execution Ctrl+C where the SMU appeared
+to remain enabled. Full trace (`test.py::run_proto_test_execution()`,
+`ProtoTestSequence`, `hardware/smu.py::source_dc_voltage_point()`,
+`SafetyMonitor.emergency_stop()`/`safe_cancel_shutdown()`,
+`HardwareManager.disconnect_all()`, and the `atexit`-registered
+`_atexit_smu_shutdown()`/`_atexit_relay_shutdown()` backstops) found the
+*dwell/active-sourcing* cancellation path already triple-redundant and
+correct. The one confirmed gap: in every hardware-activating entry point
+(`run_proto_test_execution()`, `_run_monitor_battery()`,
+`_run_monitor_battery_scan()`, `_run_charge_or_discharge()` in `test.py`,
+and `main()`), the `CancellationToken`/`signal.signal(SIGINT, ...)`
+installation happened *after* `HardwareManager(...).connect_all()` and
+storage initialization. A Ctrl+C landing inside that window was a raw
+`KeyboardInterrupt` (not cooperative cancellation), which propagated past
+every safety mechanism in the entry point itself and was ultimately caught
+by `test.py::_dispatch_menu_choice()`'s bare `except KeyboardInterrupt` --
+which prints a message and returns to the menu **without exiting the
+process**, so the `atexit` backstops (which only fire at actual interpreter
+shutdown) never got a chance to run either.
+
+**Fix implemented** (Fix #1 only -- shutdown logic itself, i.e.
+`emergency_output_off()`/`emergency_stop()`/`safe_cancel_shutdown()`/
+`disconnect_all()`/the `atexit` backstops, is byte-for-byte unchanged):
+in all five `test.py` entry points and `main()`, `token =
+CancellationToken(...)` + `signal.signal(SIGINT, ...)` now install
+*before* `HardwareManager(...)`/`connect_all()`/storage open, wrapping
+that code (including its own early-return failure paths) inside the same
+outer `try/finally` that restores the previous SIGINT handler -- so the
+handler's protected window now covers hardware connect, not just the
+sequence's own `run()` call. Verified programmatically (not just by
+inspection) against the live module objects: for every one of the six
+entry points, the handler installs before `connect_all()`/storage open,
+and exactly one restore call remains per function (no duplicate
+`CancellationToken`/`disconnect_all()` call sites introduced by the
+restructuring).
+
+**Remaining, unchanged-by-design gaps** (out of scope for Fix #1): the
+narrow window before the handler installs (menu/position-selection
+prompts, `_confirm_operation()`'s blocking `input()` -- nothing hardware-
+related has been touched yet at that point); non-checkpointed hardware
+calls (relay verify sequences, SMU commit/initiate) remain
+non-interruptible mid-operation by the cooperative-cancellation model's
+own design rule (`utils/cancellation.py`: checkpoints only ever go
+*between* atomic hardware operations); and `ProtoTestSequence` still does
+not use `BatteryOperationSequence.run_guarded()` (a separate, hand-mirrored
+exception-handling skeleton, per its own module docstring) -- unrelated to
+Ctrl+C timing, untouched by this fix.
+
+## 57. NTC Display Scoped to the Position Under Test
+
+`test.py::_ntc_group_snapshot()` (the group-wide NTC pre-check run before
+Charge/Discharge/Monitor Battery ever closes a relay -- see Section 52)
+records one `measurements` row and one `event_log` line **per position in
+the group**, each correctly tagged `channel=<that position>`. That
+per-position tagging was always correct for the database record, but
+`BatteryOperationSequence._render_frame()`'s three storage reads
+(`get_first_measurement()`, `get_measurements()`, `get_recent_events()`)
+were only ever scoped by `run_id` -- never by `channel` -- so the live
+execution screen for, say, Position 5 could show Position 1's pre-check
+reading as its "Initial Measurement," and every other scanned position's
+"NTC snapshot -- Position N..." event line in "Recent Events," until
+enough of Position 5's own real samples pushed the bounded 5-row window
+clear of the noise.
+
+**Fix:** `data/storage.py::get_recent_events()` gained an optional
+`channel` param (mirroring the `channel` param `get_first_measurement()`/
+`get_measurements()` already had from the Section 55 UI work) --
+restricts to event_log rows tagged with that exact channel. `_render_frame()`
+now passes `channel=channel` (the position this call is actually
+rendering for) to all three reads. Effect: the "Initial"/"Recent"
+measurement panels and "Recent Events" list for Charge/Discharge (and any
+future `CycleSequence`, which inherits this for free via the same shared
+base class -- see Section 55's identical inheritance rationale) now show
+only the position under test's own data. Run-level setup messages logged
+with no channel at all (`"Run started"`, `"Battery selected: ..."`) are
+naturally excluded once a channel filter is given -- these were already
+printed directly to the console at the time they happened, so nothing is
+lost, only not repeated in the live panel. Monitor Battery is a no-op
+change (single position for the whole run). Monitor Battery Scan is a
+positive side effect: each scanned position's live frame now shows only
+its own OPEN_BEFORE/CLOSED/OPEN_AFTER readings, not a mix with whichever
+position was scanned immediately before it.
+
+Verified against a live SQLite instance: seeded 8 positions' NTC
+pre-check rows/events plus one real sample for Position 5, then confirmed
+`get_first_measurement(channel=5)`/`get_measurements(channel=5)`/
+`get_recent_events(channel=5)` return only Position 5's rows -- the other
+seven positions' pre-check noise is fully excluded.
+
+No changes to the voltage-measurement architecture (DMM as authoritative
+voltage source, SMU as authoritative current source, polarity check flow,
+SafetyMonitor voltage path, EOC/EOD logic) -- this section is display/
+query scoping only, per the standing decision in Section 55 and reaffirmed
+for this change.

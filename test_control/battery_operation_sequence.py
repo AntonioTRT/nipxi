@@ -134,15 +134,31 @@ class BatteryOperationSequence:
         query cost. initial_measurement is a separate, single-row fetch so
         the very first sample stays visible even once it has scrolled out
         of the bounded recent-measurements window.
+
+        All three storage reads are scoped to `channel` (this call's own
+        position under test) -- without this, the group-wide NTC pre-check
+        (test.py::_ntc_group_snapshot(), which records one measurements row
+        and one event_log line per position across the WHOLE group before
+        the target relay ever closes) would leak other positions' NTC
+        readings into this position's "Initial"/"Recent" measurement panels
+        and "Recent Events" list -- e.g. Position 1's pre-check row showing
+        up as the "Initial Measurement" for a run actually charging
+        Position 5. Run-level setup messages logged with no channel at all
+        (e.g. "Run started") are naturally excluded from the events panel
+        once a channel filter is given -- see get_recent_events()'s own
+        docstring.
         """
         frame = ExecutionFrame.from_live(
             run_number=run_number, run_id=self.storage.run_id, test_type=test_type,
             channel=channel, relay=relay_address, state=state, phase_detail=phase_detail,
-            initial_measurement=self.storage.get_first_measurement(run_id=self.storage.run_id),
-            recent_measurements=self.storage.get_measurements(
-                run_id=self.storage.run_id, recent_limit=RECENT_MEASUREMENTS_DISPLAY_LIMIT,
+            initial_measurement=self.storage.get_first_measurement(
+                run_id=self.storage.run_id, channel=channel,
             ),
-            recent_events=self.storage.get_recent_events(run_id=self.storage.run_id),
+            recent_measurements=self.storage.get_measurements(
+                run_id=self.storage.run_id, channel=channel,
+                recent_limit=RECENT_MEASUREMENTS_DISPLAY_LIMIT,
+            ),
+            recent_events=self.storage.get_recent_events(run_id=self.storage.run_id, channel=channel),
             **extra_fields,
         )
         render_execution_frame(frame)

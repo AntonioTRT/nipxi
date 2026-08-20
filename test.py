@@ -4077,100 +4077,104 @@ def _run_monitor_battery():
     print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
     print(f"DMM (temporary voltage source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
 
-    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
-                             dmm_cfg=dmm_cfg, ntc_daq_cfg=hw["ntc_daq_cfg"])
+    # SIGINT handler installed BEFORE hw_mgr.connect_all()/storage init --
+    # see run_proto_test_execution()'s identical comment / docs/
+    # architecture.md's Ctrl+C review. Shutdown logic itself is unchanged;
+    # only when the handler is active changes.
+    token = CancellationToken(owner="test.py:_run_monitor_battery")
+    previous_sigint_handler = signal.signal(
+        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    )
     try:
-        hw_mgr.connect_all()
-    except HardwareInitError as e:
-        print(f"[FAIL] Hardware initialization failed: {e}")
-        return
-
-    storage = _open_storage_guarded(hw_mgr)
-    if storage is None:
-        return
-
-    try:
-        # CRITICAL traceability requirement: every selected-configuration
-        # fact is recorded via event_log BEFORE relay activation/monitor
-        # start/measurement acquisition -- see docs/architecture.md
-        # "Configuration Traceability".
-        hardware_snapshot = _hardware_snapshot_fields(
-            smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
-        )
-        if not _start_run_summary_guarded(
-            storage, test_type="monitor",
-            battery_type=battery_type,
-            battery_voltage_max_v=battery_cfg["voltage_max_v"],
-            battery_voltage_min_v=battery_cfg["voltage_min_v"],
-            battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
-            battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
-            capacity_ah=battery_cfg["capacity_ah"],
-            group_name=group, position_in_group=position,
-            **hardware_snapshot,
-        ):
-            return
-        storage.log_event(level="INFO", source="monitor_battery", message="Run started")
-        storage.log_event(level="INFO", source="monitor_battery", message="Operation selected: Monitor Battery")
-        storage.log_event(level="INFO", source="monitor_battery", message=f"Battery selected: {battery_type}")
-        storage.log_event(level="INFO", source="monitor_battery",
-                           message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
-        storage.log_event(level="INFO", source="monitor_battery", message=f"Group selected: {group}")
-        storage.log_event(level="INFO", source="monitor_battery",
-                           channel=channel, relay=relay_address,
-                           message=f"Position selected: {position} (Group {group} Position {position})")
-        storage.log_event(level="INFO", source="monitor_battery",
-                           message="Configuration snapshot recorded")
-        storage.log_event(level="INFO", source="monitor_battery", message="Hardware assignment resolved")
-        storage.log_event(level="INFO", source="monitor_battery", message=f"Relay matrix selected: {hw['relay_matrix_name']}")
-        storage.log_event(level="INFO", source="monitor_battery", message=f"SMU selected: {smu_name}")
-        storage.log_event(level="INFO", source="monitor_battery", message=f"DMM selected: {dmm_name}")
-        storage.log_event(level="INFO", source="monitor_battery", message=f"DAQ selected: {daq_name}")
-        if hw.get("ntc_daq_name"):
-            storage.log_event(level="INFO", source="monitor_battery",
-                               message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
-        storage.log_event(level="INFO", source="monitor_battery", message="Operator confirmed execution")
-        # Hardware identity traceability -- BEFORE relay activation/monitor
-        # start, same requirement as the battery-config snapshot above (see
-        # docs/architecture.md "Hardware Identity Traceability").
-        for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
-            storage.log_event(level="INFO", source="monitor_battery", message=message)
-
-        # Group NTC pre-check -- one-time snapshot of every position's NTC
-        # in this group, BEFORE the target relay ever closes (NTC channels
-        # are independent DAQ analog inputs, never routed through the
-        # relay matrix -- see _ntc_group_snapshot()). No-op if this group
-        # has no ntc_daq/daq assigned. Aborts (no relay activation) only if
-        # the SELECTED position was actually READ (see "readable" in
-        # _ntc_group_snapshot()'s docstring) and came back not PRESENT --
-        # a DAQ comms failure on the read itself does NOT abort, matching
-        # the active-monitoring loop's own graceful degradation on the
-        # identical DAQError. An absent/faulted NTC on some OTHER position
-        # in the group is recorded but never blocks this run either, since
-        # it isn't part of what's being monitored.
-        size = dev_cfg.group_size(group)
-        ntc_snapshot = _ntc_group_snapshot(
-            storage, hw_mgr.ntc_daq, group, size, source="monitor",
-            phase_detail="NTC_PRECHECK", log_summary=True,
-        )
-        target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
-        if target_ntc is not None and target_ntc["readable"] and target_ntc["presence"] != NTCPresence.PRESENT:
-            storage.log_event(
-                level="ERROR", source="monitor_battery", channel=channel, relay=relay_address,
-                message=f"NTC pre-check failed for selected position -- {target_ntc['presence']}",
-            )
-            storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
-            storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
-            print(f"\n[FAIL] NTC pre-check failed for the selected position "
-                  f"({target_ntc['presence']}) -- aborting, no relay activated.")
+        hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
+                                 dmm_cfg=dmm_cfg, ntc_daq_cfg=hw["ntc_daq_cfg"])
+        try:
+            hw_mgr.connect_all()
+        except HardwareInitError as e:
+            print(f"[FAIL] Hardware initialization failed: {e}")
             return
 
-        token = CancellationToken(owner="test.py:_run_monitor_battery")
-        previous_sigint_handler = signal.signal(
-            signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-        )
-        print("\nPress Ctrl+C to stop monitoring safely.\n")
+        storage = _open_storage_guarded(hw_mgr)
+        if storage is None:
+            return
 
         try:
+            # CRITICAL traceability requirement: every selected-configuration
+            # fact is recorded via event_log BEFORE relay activation/monitor
+            # start/measurement acquisition -- see docs/architecture.md
+            # "Configuration Traceability".
+            hardware_snapshot = _hardware_snapshot_fields(
+                smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
+            )
+            if not _start_run_summary_guarded(
+                storage, test_type="monitor",
+                battery_type=battery_type,
+                battery_voltage_max_v=battery_cfg["voltage_max_v"],
+                battery_voltage_min_v=battery_cfg["voltage_min_v"],
+                battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
+                battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
+                capacity_ah=battery_cfg["capacity_ah"],
+                group_name=group, position_in_group=position,
+                **hardware_snapshot,
+            ):
+                return
+            storage.log_event(level="INFO", source="monitor_battery", message="Run started")
+            storage.log_event(level="INFO", source="monitor_battery", message="Operation selected: Monitor Battery")
+            storage.log_event(level="INFO", source="monitor_battery", message=f"Battery selected: {battery_type}")
+            storage.log_event(level="INFO", source="monitor_battery",
+                               message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
+            storage.log_event(level="INFO", source="monitor_battery", message=f"Group selected: {group}")
+            storage.log_event(level="INFO", source="monitor_battery",
+                               channel=channel, relay=relay_address,
+                               message=f"Position selected: {position} (Group {group} Position {position})")
+            storage.log_event(level="INFO", source="monitor_battery",
+                               message="Configuration snapshot recorded")
+            storage.log_event(level="INFO", source="monitor_battery", message="Hardware assignment resolved")
+            storage.log_event(level="INFO", source="monitor_battery", message=f"Relay matrix selected: {hw['relay_matrix_name']}")
+            storage.log_event(level="INFO", source="monitor_battery", message=f"SMU selected: {smu_name}")
+            storage.log_event(level="INFO", source="monitor_battery", message=f"DMM selected: {dmm_name}")
+            storage.log_event(level="INFO", source="monitor_battery", message=f"DAQ selected: {daq_name}")
+            if hw.get("ntc_daq_name"):
+                storage.log_event(level="INFO", source="monitor_battery",
+                                   message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
+            storage.log_event(level="INFO", source="monitor_battery", message="Operator confirmed execution")
+            # Hardware identity traceability -- BEFORE relay activation/monitor
+            # start, same requirement as the battery-config snapshot above (see
+            # docs/architecture.md "Hardware Identity Traceability").
+            for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
+                storage.log_event(level="INFO", source="monitor_battery", message=message)
+
+            # Group NTC pre-check -- one-time snapshot of every position's NTC
+            # in this group, BEFORE the target relay ever closes (NTC channels
+            # are independent DAQ analog inputs, never routed through the
+            # relay matrix -- see _ntc_group_snapshot()). No-op if this group
+            # has no ntc_daq/daq assigned. Aborts (no relay activation) only if
+            # the SELECTED position was actually READ (see "readable" in
+            # _ntc_group_snapshot()'s docstring) and came back not PRESENT --
+            # a DAQ comms failure on the read itself does NOT abort, matching
+            # the active-monitoring loop's own graceful degradation on the
+            # identical DAQError. An absent/faulted NTC on some OTHER position
+            # in the group is recorded but never blocks this run either, since
+            # it isn't part of what's being monitored.
+            size = dev_cfg.group_size(group)
+            ntc_snapshot = _ntc_group_snapshot(
+                storage, hw_mgr.ntc_daq, group, size, source="monitor",
+                phase_detail="NTC_PRECHECK", log_summary=True,
+            )
+            target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
+            if target_ntc is not None and target_ntc["readable"] and target_ntc["presence"] != NTCPresence.PRESENT:
+                storage.log_event(
+                    level="ERROR", source="monitor_battery", channel=channel, relay=relay_address,
+                    message=f"NTC pre-check failed for selected position -- {target_ntc['presence']}",
+                )
+                storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
+                storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
+                print(f"\n[FAIL] NTC pre-check failed for the selected position "
+                      f"({target_ntc['presence']}) -- aborting, no relay activated.")
+                return
+
+            print("\nPress Ctrl+C to stop monitoring safely.\n")
+
             safety = SafetyMonitor(Settings)
             sequence = MonitorBatterySequence(
                 smu=hw_mgr.smu, dmm=hw_mgr.dmm, relay=hw_mgr.relay, safety=safety,
@@ -4188,26 +4192,26 @@ def _run_monitor_battery():
                 print("\nMonitor Battery interrupted by user (Ctrl+C).")
             except Exception as e:
                 print(f"\n[FAIL] Monitor Battery aborted: {e}")
+
+            # Post-run summary -- printed after the safe-shutdown sequence above
+            # completes, from run_summary/measurements the sequence already
+            # wrote (storage is still open here) -- see test_control/
+            # run_summary_report.py. No hardware read, no new data source.
+            _print_post_run_summary(storage)
+
         finally:
-            signal.signal(signal.SIGINT, previous_sigint_handler)
-
-        # Post-run summary -- printed after the safe-shutdown sequence above
-        # completes, from run_summary/measurements the sequence already
-        # wrote (storage is still open here) -- see test_control/
-        # run_summary_report.py. No hardware read, no new data source.
-        _print_post_run_summary(storage)
-
+            try:
+                storage.close()
+            except Exception as e:
+                print(f"[WARNING] Storage close failed: {e}")
+            try:
+                hw_mgr.disconnect_all()
+            except Exception as shutdown_err:
+                print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+                print("           Hardware may still be energized -- "
+                      "physically disconnect power if this cannot be resolved immediately.")
     finally:
-        try:
-            storage.close()
-        except Exception as e:
-            print(f"[WARNING] Storage close failed: {e}")
-        try:
-            hw_mgr.disconnect_all()
-        except Exception as shutdown_err:
-            print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
-            print("           Hardware may still be energized -- "
-                  "physically disconnect power if this cannot be resolved immediately.")
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
 def _run_monitor_battery_scan():
@@ -4270,61 +4274,65 @@ def _run_monitor_battery_scan():
     print(f"DAQ:\n  {dev_cfg.device_display_name(daq_cfg)}\n  {daq_cfg.get('resource', '')}\n")
     print("PSU/SMU: connected for safety-shutdown only -- output never enabled.\n")
 
-    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
+    # SIGINT handler installed BEFORE hw_mgr.connect_all()/storage init --
+    # see run_proto_test_execution()'s identical comment / docs/
+    # architecture.md's Ctrl+C review. Shutdown logic itself is unchanged;
+    # only when the handler is active changes.
+    token = CancellationToken(owner="test.py:_run_monitor_battery_scan")
+    previous_sigint_handler = signal.signal(
+        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    )
     try:
-        hw_mgr.connect_all()
-    except HardwareInitError as e:
-        print(f"[FAIL] Hardware initialization failed: {e}")
-        return
-
-    storage = _open_storage_guarded(hw_mgr)
-    if storage is None:
-        return
-
-    try:
-        # Configuration Snapshot + Hardware Traceability Snapshot -- BEFORE
-        # any relay activation, same requirement as _run_monitor_battery().
-        hardware_snapshot = _hardware_snapshot_fields(
-            smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
-        )
-        if not _start_run_summary_guarded(
-            storage, test_type="monitor_scan",
-            battery_type=battery_type,
-            battery_voltage_max_v=battery_cfg["voltage_max_v"],
-            battery_voltage_min_v=battery_cfg["voltage_min_v"],
-            battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
-            battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
-            capacity_ah=battery_cfg["capacity_ah"],
-            group_name=group,
-            **hardware_snapshot,
-        ):
+        hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
+        try:
+            hw_mgr.connect_all()
+        except HardwareInitError as e:
+            print(f"[FAIL] Hardware initialization failed: {e}")
             return
-        storage.log_event(level="INFO", source="monitor_battery_scan", message="Run started")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message="Operation selected: Monitor Battery Scan")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Battery selected: {battery_type}")
-        storage.log_event(level="INFO", source="monitor_battery_scan",
-                           message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Group selected: {group}")
-        storage.log_event(level="INFO", source="monitor_battery_scan",
-                           message=f"Scan scope: Single Group -- Group {group}, positions 1-{size}")
-        storage.log_event(level="INFO", source="monitor_battery_scan",
-                           message="Configuration snapshot recorded")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message="Hardware assignment resolved")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Relay matrix selected: {hw['relay_matrix_name']}")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"SMU selected: {smu_name}")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"DMM selected: {dmm_name}")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message=f"DAQ selected: {daq_name}")
-        storage.log_event(level="INFO", source="monitor_battery_scan", message="Operator confirmed execution")
-        for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
-            storage.log_event(level="INFO", source="monitor_battery_scan", message=message)
 
-        token = CancellationToken(owner="test.py:_run_monitor_battery_scan")
-        previous_sigint_handler = signal.signal(
-            signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-        )
-        print("\nPress Ctrl+C to stop the scan safely.\n")
+        storage = _open_storage_guarded(hw_mgr)
+        if storage is None:
+            return
 
         try:
+            # Configuration Snapshot + Hardware Traceability Snapshot -- BEFORE
+            # any relay activation, same requirement as _run_monitor_battery().
+            hardware_snapshot = _hardware_snapshot_fields(
+                smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
+            )
+            if not _start_run_summary_guarded(
+                storage, test_type="monitor_scan",
+                battery_type=battery_type,
+                battery_voltage_max_v=battery_cfg["voltage_max_v"],
+                battery_voltage_min_v=battery_cfg["voltage_min_v"],
+                battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
+                battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
+                capacity_ah=battery_cfg["capacity_ah"],
+                group_name=group,
+                **hardware_snapshot,
+            ):
+                return
+            storage.log_event(level="INFO", source="monitor_battery_scan", message="Run started")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message="Operation selected: Monitor Battery Scan")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Battery selected: {battery_type}")
+            storage.log_event(level="INFO", source="monitor_battery_scan",
+                               message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Group selected: {group}")
+            storage.log_event(level="INFO", source="monitor_battery_scan",
+                               message=f"Scan scope: Single Group -- Group {group}, positions 1-{size}")
+            storage.log_event(level="INFO", source="monitor_battery_scan",
+                               message="Configuration snapshot recorded")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message="Hardware assignment resolved")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message=f"Relay matrix selected: {hw['relay_matrix_name']}")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message=f"SMU selected: {smu_name}")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message=f"DMM selected: {dmm_name}")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message=f"DAQ selected: {daq_name}")
+            storage.log_event(level="INFO", source="monitor_battery_scan", message="Operator confirmed execution")
+            for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
+                storage.log_event(level="INFO", source="monitor_battery_scan", message=message)
+
+            print("\nPress Ctrl+C to stop the scan safely.\n")
+
             safety = SafetyMonitor(Settings)
             sequence = MonitorBatteryScanSequence(
                 smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.daq, relay=hw_mgr.relay, safety=safety,
@@ -4342,22 +4350,22 @@ def _run_monitor_battery_scan():
                 print("\nMonitor Battery Scan interrupted by user (Ctrl+C).")
             except Exception as e:
                 print(f"\n[FAIL] Monitor Battery Scan aborted: {e}")
+
+            _print_post_run_summary(storage)
+
         finally:
-            signal.signal(signal.SIGINT, previous_sigint_handler)
-
-        _print_post_run_summary(storage)
-
+            try:
+                storage.close()
+            except Exception as e:
+                print(f"[WARNING] Storage close failed: {e}")
+            try:
+                hw_mgr.disconnect_all()
+            except Exception as shutdown_err:
+                print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+                print("           Hardware may still be energized -- "
+                      "physically disconnect power if this cannot be resolved immediately.")
     finally:
-        try:
-            storage.close()
-        except Exception as e:
-            print(f"[WARNING] Storage close failed: {e}")
-        try:
-            hw_mgr.disconnect_all()
-        except Exception as shutdown_err:
-            print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
-            print("           Hardware may still be energized -- "
-                  "physically disconnect power if this cannot be resolved immediately.")
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
 def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_line_fn):
@@ -4455,94 +4463,98 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}\n  {smu_cfg.get('resource', '')}\n")
     print(f"DMM (telemetry source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
 
-    hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
-                             dmm_cfg=dmm_cfg, ntc_daq_cfg=hw["ntc_daq_cfg"])
+    # SIGINT handler installed BEFORE hw_mgr.connect_all()/storage init --
+    # see run_proto_test_execution()'s identical comment / docs/
+    # architecture.md's Ctrl+C review. Shutdown logic itself is unchanged;
+    # only when the handler is active changes.
+    token = CancellationToken(owner=f"test.py:_run_charge_or_discharge:{source}")
+    previous_sigint_handler = signal.signal(
+        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    )
     try:
-        hw_mgr.connect_all()
-    except HardwareInitError as e:
-        print(f"[FAIL] Hardware initialization failed: {e}")
-        return
-
-    storage = _open_storage_guarded(hw_mgr)
-    if storage is None:
-        return
-
-    try:
-        # CRITICAL traceability requirement: every selected-configuration
-        # fact is recorded via event_log BEFORE relay activation/PSU
-        # output -- same requirement as _run_monitor_battery().
-        hardware_snapshot = _hardware_snapshot_fields(
-            smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
-        )
-        if not _start_run_summary_guarded(
-            storage, test_type=source,
-            battery_type=battery_type,
-            battery_voltage_max_v=battery_cfg["voltage_max_v"],
-            battery_voltage_min_v=battery_cfg["voltage_min_v"],
-            battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
-            battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
-            capacity_ah=battery_cfg["capacity_ah"],
-            group_name=group, position_in_group=position,
-            **hardware_snapshot,
-        ):
-            return
-        storage.log_event(level="INFO", source=source, message="Run started")
-        storage.log_event(level="INFO", source=source, message=f"Operation selected: {operation}")
-        storage.log_event(level="INFO", source=source, message=f"Battery selected: {battery_type}")
-        storage.log_event(level="INFO", source=source,
-                           message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
-        storage.log_event(level="INFO", source=source, message=f"Group selected: {group}")
-        storage.log_event(level="INFO", source=source,
-                           channel=channel, relay=relay_address,
-                           message=f"Position selected: {position} (Group {group} Position {position})")
-        storage.log_event(level="INFO", source=source, message="Configuration snapshot recorded")
-        storage.log_event(level="INFO", source=source, message="Hardware assignment resolved")
-        storage.log_event(level="INFO", source=source, message=f"Relay matrix selected: {hw['relay_matrix_name']}")
-        storage.log_event(level="INFO", source=source, message=f"SMU selected: {smu_name}")
-        storage.log_event(level="INFO", source=source, message=f"DMM selected: {dmm_name}")
-        storage.log_event(level="INFO", source=source, message=f"DAQ selected: {daq_name}")
-        if hw.get("ntc_daq_name"):
-            storage.log_event(level="INFO", source=source,
-                               message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
-        storage.log_event(level="INFO", source=source, message="Operator confirmed execution")
-        for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
-            storage.log_event(level="INFO", source=source, message=message)
-
-        # Group NTC pre-check -- one-time snapshot of every position's NTC
-        # in this group, BEFORE the target relay ever closes -- see
-        # _ntc_group_snapshot()'s docstring (test.py) for why this is safe
-        # to do before any relay/SMU activity. Measurement rows use the
-        # SAME short test_type ChargeSequence/DischargeSequence's own
-        # sampling-loop rows already use ("charge"/"discharge", not
-        # "charge_battery"/"discharge_battery") so this run's measurements
-        # stay internally consistent -- see docs/architecture.md Section 46
-        # for the pre-existing run_summary-vs-measurements vocabulary split
-        # this deliberately does not add a third variant to.
-        size = dev_cfg.group_size(group)
-        measurement_test_type = {"charge_battery": "charge", "discharge_battery": "discharge"}.get(source, source)
-        ntc_snapshot = _ntc_group_snapshot(
-            storage, hw_mgr.ntc_daq, group, size, source=measurement_test_type,
-            phase_detail="NTC_PRECHECK", log_summary=True,
-        )
-        target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
-        if target_ntc is not None and target_ntc["readable"] and target_ntc["presence"] != NTCPresence.PRESENT:
-            storage.log_event(
-                level="ERROR", source=source, channel=channel, relay=relay_address,
-                message=f"NTC pre-check failed for selected position -- {target_ntc['presence']}",
-            )
-            storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
-            storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
-            print(f"\n[FAIL] NTC pre-check failed for the selected position "
-                  f"({target_ntc['presence']}) -- aborting, no relay activated.")
+        hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
+                                 dmm_cfg=dmm_cfg, ntc_daq_cfg=hw["ntc_daq_cfg"])
+        try:
+            hw_mgr.connect_all()
+        except HardwareInitError as e:
+            print(f"[FAIL] Hardware initialization failed: {e}")
             return
 
-        token = CancellationToken(owner=f"test.py:_run_charge_or_discharge:{source}")
-        previous_sigint_handler = signal.signal(
-            signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-        )
-        print(f"\nPress Ctrl+C to stop {operation.lower()} safely.\n")
+        storage = _open_storage_guarded(hw_mgr)
+        if storage is None:
+            return
 
         try:
+            # CRITICAL traceability requirement: every selected-configuration
+            # fact is recorded via event_log BEFORE relay activation/PSU
+            # output -- same requirement as _run_monitor_battery().
+            hardware_snapshot = _hardware_snapshot_fields(
+                smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
+            )
+            if not _start_run_summary_guarded(
+                storage, test_type=source,
+                battery_type=battery_type,
+                battery_voltage_max_v=battery_cfg["voltage_max_v"],
+                battery_voltage_min_v=battery_cfg["voltage_min_v"],
+                battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
+                battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
+                capacity_ah=battery_cfg["capacity_ah"],
+                group_name=group, position_in_group=position,
+                **hardware_snapshot,
+            ):
+                return
+            storage.log_event(level="INFO", source=source, message="Run started")
+            storage.log_event(level="INFO", source=source, message=f"Operation selected: {operation}")
+            storage.log_event(level="INFO", source=source, message=f"Battery selected: {battery_type}")
+            storage.log_event(level="INFO", source=source,
+                               message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
+            storage.log_event(level="INFO", source=source, message=f"Group selected: {group}")
+            storage.log_event(level="INFO", source=source,
+                               channel=channel, relay=relay_address,
+                               message=f"Position selected: {position} (Group {group} Position {position})")
+            storage.log_event(level="INFO", source=source, message="Configuration snapshot recorded")
+            storage.log_event(level="INFO", source=source, message="Hardware assignment resolved")
+            storage.log_event(level="INFO", source=source, message=f"Relay matrix selected: {hw['relay_matrix_name']}")
+            storage.log_event(level="INFO", source=source, message=f"SMU selected: {smu_name}")
+            storage.log_event(level="INFO", source=source, message=f"DMM selected: {dmm_name}")
+            storage.log_event(level="INFO", source=source, message=f"DAQ selected: {daq_name}")
+            if hw.get("ntc_daq_name"):
+                storage.log_event(level="INFO", source=source,
+                                   message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
+            storage.log_event(level="INFO", source=source, message="Operator confirmed execution")
+            for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
+                storage.log_event(level="INFO", source=source, message=message)
+
+            # Group NTC pre-check -- one-time snapshot of every position's NTC
+            # in this group, BEFORE the target relay ever closes -- see
+            # _ntc_group_snapshot()'s docstring (test.py) for why this is safe
+            # to do before any relay/SMU activity. Measurement rows use the
+            # SAME short test_type ChargeSequence/DischargeSequence's own
+            # sampling-loop rows already use ("charge"/"discharge", not
+            # "charge_battery"/"discharge_battery") so this run's measurements
+            # stay internally consistent -- see docs/architecture.md Section 46
+            # for the pre-existing run_summary-vs-measurements vocabulary split
+            # this deliberately does not add a third variant to.
+            size = dev_cfg.group_size(group)
+            measurement_test_type = {"charge_battery": "charge", "discharge_battery": "discharge"}.get(source, source)
+            ntc_snapshot = _ntc_group_snapshot(
+                storage, hw_mgr.ntc_daq, group, size, source=measurement_test_type,
+                phase_detail="NTC_PRECHECK", log_summary=True,
+            )
+            target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
+            if target_ntc is not None and target_ntc["readable"] and target_ntc["presence"] != NTCPresence.PRESENT:
+                storage.log_event(
+                    level="ERROR", source=source, channel=channel, relay=relay_address,
+                    message=f"NTC pre-check failed for selected position -- {target_ntc['presence']}",
+                )
+                storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
+                storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
+                print(f"\n[FAIL] NTC pre-check failed for the selected position "
+                      f"({target_ntc['presence']}) -- aborting, no relay activated.")
+                return
+
+            print(f"\nPress Ctrl+C to stop {operation.lower()} safely.\n")
+
             safety = SafetyMonitor(Settings)
             # daq=hw_mgr.ntc_daq -- this group's NTC/temperature DAQ (see
             # docs/architecture.md "Dual DAQ Ownership Model"), NOT the
@@ -4565,22 +4577,22 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
                 print(f"\n{operation} interrupted by user (Ctrl+C).")
             except Exception as e:
                 print(f"\n[FAIL] {operation} aborted: {e}")
+
+            _print_post_run_summary(storage)
+
         finally:
-            signal.signal(signal.SIGINT, previous_sigint_handler)
-
-        _print_post_run_summary(storage)
-
+            try:
+                storage.close()
+            except Exception as e:
+                print(f"[WARNING] Storage close failed: {e}")
+            try:
+                hw_mgr.disconnect_all()
+            except Exception as shutdown_err:
+                print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+                print("           Hardware may still be energized -- "
+                      "physically disconnect power if this cannot be resolved immediately.")
     finally:
-        try:
-            storage.close()
-        except Exception as e:
-            print(f"[WARNING] Storage close failed: {e}")
-        try:
-            hw_mgr.disconnect_all()
-        except Exception as shutdown_err:
-            print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
-            print("           Hardware may still be energized -- "
-                  "physically disconnect power if this cannot be resolved immediately.")
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
 def _run_charge_battery():
@@ -4880,46 +4892,55 @@ def run_proto_test_execution():
     print(f"DMM:\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
     print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}\n  {relay_cfg.get('ip', '')}\n")
 
-    # DMM is required for this workflow (unlike run_main_test(), which
-    # leaves it optional) -- pass dmm_cfg explicitly so HardwareManager
-    # actually constructs and connects it. daq_cfg is now passed explicitly
-    # too (previously left to HardwareManager's internal default) so the
-    # hardware-identity snapshot below matches, 1:1, the exact cfg dict
-    # HardwareManager actually built the DAQ driver from -- same value as
-    # before (DAQ_CONFIG), no behavior change.
-    hw = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
-
+    # SIGINT handler installed BEFORE hw.connect_all()/storage init -- a raw
+    # KeyboardInterrupt during hardware connect previously bypassed this
+    # workflow's own cleanup entirely (caught only by test.py's outer menu
+    # dispatcher, which returns to the menu without exiting the process --
+    # so the atexit safety nets never got a chance to fire either). From
+    # this point on, Ctrl+C is cooperative cancellation via `token`, not a
+    # raw interrupt -- see docs/architecture.md's Ctrl+C review. Shutdown
+    # logic itself (disconnect_all()/emergency_stop()/safe_cancel_shutdown())
+    # is unchanged; only when the handler is active changes.
+    token = CancellationToken(owner="test.py:run_proto_test_execution")
+    previous_sigint_handler = signal.signal(
+        signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
+    )
     try:
-        hw.connect_all()
-    except HardwareInitError as e:
-        print(f"[FAIL] Hardware initialization failed: {e}")
-        return
-
-    storage = _open_storage_guarded(hw)
-    if storage is None:
-        return
-
-    try:
-        last_state = storage.get_last_execution_state()
-        print("\nPrevious execution found:\n" if last_state else "\nNo previous execution found.\n")
-        if last_state:
-            print(f"    Relay:     {last_state['relay']}")
-            print(f"    State:     {last_state['state']}")
-            print(f"    Timestamp: {last_state['timestamp']}")
-        print("\n(Display only -- no automatic resume.)")
-
-        relays  = Settings.ACTIVE_CHANNELS
-        dwell_s = Settings.PROTO_TEST_DWELL_S
-        print(f"\nRelays to cycle: {relays}")
-        print(f"Dwell per relay: {dwell_s:.0f}s")
-
-        token = CancellationToken(owner="test.py:run_proto_test_execution")
-        previous_sigint_handler = signal.signal(
-            signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
-        )
-        print("\nPress Ctrl+C to cancel safely.\n")
+        # DMM is required for this workflow (unlike run_main_test(), which
+        # leaves it optional) -- pass dmm_cfg explicitly so HardwareManager
+        # actually constructs and connects it. daq_cfg is now passed explicitly
+        # too (previously left to HardwareManager's internal default) so the
+        # hardware-identity snapshot below matches, 1:1, the exact cfg dict
+        # HardwareManager actually built the DAQ driver from -- same value as
+        # before (DAQ_CONFIG), no behavior change.
+        hw = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg, dmm_cfg=dmm_cfg)
 
         try:
+            hw.connect_all()
+        except HardwareInitError as e:
+            print(f"[FAIL] Hardware initialization failed: {e}")
+            return
+
+        storage = _open_storage_guarded(hw)
+        if storage is None:
+            return
+
+        try:
+            last_state = storage.get_last_execution_state()
+            print("\nPrevious execution found:\n" if last_state else "\nNo previous execution found.\n")
+            if last_state:
+                print(f"    Relay:     {last_state['relay']}")
+                print(f"    State:     {last_state['state']}")
+                print(f"    Timestamp: {last_state['timestamp']}")
+            print("\n(Display only -- no automatic resume.)")
+
+            relays  = Settings.ACTIVE_CHANNELS
+            dwell_s = Settings.PROTO_TEST_DWELL_S
+            print(f"\nRelays to cycle: {relays}")
+            print(f"Dwell per relay: {dwell_s:.0f}s")
+
+            print("\nPress Ctrl+C to cancel safely.\n")
+
             safety   = SafetyMonitor(Settings)
             sequence = ProtoTestSequence(
                 smu=hw.smu, dmm=hw.dmm, relay=hw.relay, safety=safety,
@@ -4940,20 +4961,20 @@ def run_proto_test_execution():
                 print("\nProto Test Execution interrupted by user (Ctrl+C).")
             except Exception as e:
                 print(f"\n[FAIL] Proto Test Execution aborted: {e}")
-        finally:
-            signal.signal(signal.SIGINT, previous_sigint_handler)
 
+        finally:
+            try:
+                storage.close()
+            except Exception as e:
+                print(f"[WARNING] Storage close failed: {e}")
+            try:
+                hw.disconnect_all()
+            except Exception as shutdown_err:
+                print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+                print("           Hardware may still be energized -- "
+                      "physically disconnect power if this cannot be resolved immediately.")
     finally:
-        try:
-            storage.close()
-        except Exception as e:
-            print(f"[WARNING] Storage close failed: {e}")
-        try:
-            hw.disconnect_all()
-        except Exception as shutdown_err:
-            print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
-            print("           Hardware may still be energized -- "
-                  "physically disconnect power if this cannot be resolved immediately.")
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
 # =============================================================================

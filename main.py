@@ -93,25 +93,6 @@ def main():
     # (serial) is kept only for bench diagnostics via test.py.
     hw = HardwareManager(Settings, relay_cfg=dev_cfg.NUMATO_RELAY_MATRIX_CONFIG)
 
-    try:
-        hw.connect_all()
-    except HardwareInitError as e:
-        log.error("Hardware initialization failed: %s", e)
-        sys.exit(1)
-
-    # In DEVELOPMENT/VALIDATION, connect_all() does not raise for a merely
-    # missing device (see config/system_mode.py) -- surface what's actually
-    # available before running anything, so a laptop run without the PXI
-    # chassis attached is obvious from the log, not a silent surprise.
-    missing = [name for name, status in hw.hardware_status.items() if not status["connected"]]
-    if missing:
-        log.warning("Proceeding with missing hardware (%s mode): %s",
-                    mode_policy.mode.value, missing)
-
-    # --- 4. Run the test ---------------------------------------------------
-    result_mgr = ResultManager(settings=Settings)
-    executor   = TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)
-
     # Safe Cancellation (see docs/architecture.md "Safe Cancellation
     # Architecture"): Ctrl+C no longer raises KeyboardInterrupt while this
     # handler is installed -- it instead requests a cooperative, checkpoint-
@@ -120,18 +101,26 @@ def main():
     # polls this same token and unwinds through its existing PMU-off/
     # relay-open safety logic (see safety_monitor.py::safe_cancel_shutdown())
     # rather than an uncontrolled interrupt landing on an arbitrary line.
-    # Restored to Python's default in the finally below so Ctrl+C at any
-    # later input() prompt (there are none after this point today, but
-    # this keeps the window of altered behavior no wider than necessary)
-    # behaves normally again.
+    #
+    # Installed BEFORE hw.connect_all() (moved here from just before
+    # executor.run() -- see docs/architecture.md's Ctrl+C review): a raw
+    # KeyboardInterrupt during hardware connect previously bypassed
+    # hw.disconnect_all() entirely, relying solely on the atexit-registered
+    # backstop (HardwareManager._atexit_smu_shutdown/_atexit_relay_shutdown)
+    # -- which only fires if the process actually exits. Restored to
+    # Python's default in the finally below so Ctrl+C at any later input()
+    # prompt (there are none after this point today, but this keeps the
+    # window of altered behavior no wider than necessary) behaves normally
+    # again.
     token = CancellationToken(owner="main")
     previous_sigint_handler = signal.signal(
         signal.SIGINT, lambda signum, frame: token.request_cancel("Ctrl+C")
     )
 
-    # --- 5. Shutdown ---------------------------------------------------------
-    # Always attempted, no matter how the block below exits (normal
-    # completion, a cancellation, KeyboardInterrupt, any other exception) --
+    # --- 4/5. Run the test + shutdown --------------------------------------
+    # Shutdown (hw.disconnect_all()) is always attempted, no matter how the
+    # block below exits (normal completion, a cancellation, KeyboardInterrupt,
+    # any other exception, or a HardwareInitError from connect_all() itself) --
     # Python's finally always runs. disconnect_all() itself never raises by
     # design (every step is individually caught and logged), but this is
     # wrapped defensively anyway so a shutdown failure is never silently
@@ -139,6 +128,25 @@ def main():
     # see docs/architecture.md "Emergency Shutdown Strategy".
     try:
         try:
+            try:
+                hw.connect_all()
+            except HardwareInitError as e:
+                log.error("Hardware initialization failed: %s", e)
+                sys.exit(1)
+
+            # In DEVELOPMENT/VALIDATION, connect_all() does not raise for a
+            # merely missing device (see config/system_mode.py) -- surface
+            # what's actually available before running anything, so a
+            # laptop run without the PXI chassis attached is obvious from
+            # the log, not a silent surprise.
+            missing = [name for name, status in hw.hardware_status.items() if not status["connected"]]
+            if missing:
+                log.warning("Proceeding with missing hardware (%s mode): %s",
+                            mode_policy.mode.value, missing)
+
+            result_mgr = ResultManager(settings=Settings)
+            executor   = TestExecutor(hw=hw, storage=result_mgr.storage, settings=Settings)
+
             with result_mgr:
                 result = executor.run(channels=args.channels, token=token)
 
@@ -159,7 +167,7 @@ def main():
             # Defensive fallback only -- should not normally fire while the
             # SIGINT handler above is installed. Kept in case a
             # KeyboardInterrupt is still raised from somewhere the handler
-            # doesn't cover (e.g. before it was installed).
+            # doesn't cover.
             log.warning("Test interrupted by user (Ctrl+C).")
 
         except Exception as e:

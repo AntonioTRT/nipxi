@@ -823,19 +823,37 @@ class DataStorage(StorageBackend):
         self._db.commit()
         return cursor.lastrowid
 
-    def get_recent_events(self, run_id: str = None, limit: int = 20) -> list:
+    def get_recent_events(self, run_id: str = None, limit: int = 20, channel: int = None) -> list:
         """
         Return the most recent `limit` event_log rows for `run_id`
         (defaults to this DataStorage instance's own run_id), oldest first
         (natural reading order for a "recent events" panel).
+
+        `channel` (default None -- unchanged behavior, every existing
+        caller unaffected): when given, restricts to rows tagged with that
+        exact channel -- e.g. Charge/Discharge/Monitor Battery Scan's live
+        execution screen showing only the position currently under test,
+        not the group-wide NTC pre-check's per-position summary lines for
+        every OTHER position (see test.py::_ntc_group_snapshot(), which
+        already tags each position's own log_event() call with
+        channel=<that position>). Run-level setup messages logged with no
+        channel at all (e.g. "Run started", "Battery selected: ...") are
+        excluded when a channel filter is given -- those were already
+        printed to the console directly at the time they happened; the
+        live panel's job is "what's happening now for this position", not
+        replaying one-time setup traceability.
         """
         if self._db is None:
             return []
         run_id = run_id or self.run_id
+        conditions, params = ["run_id = ?"], [run_id]
+        if channel is not None:
+            conditions.append("channel = ?")
+            params.append(channel)
         cur = self._db.execute(
             f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log "
-            f"WHERE run_id = ? ORDER BY id DESC LIMIT ?",
-            (run_id, limit),
+            f"WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ?",
+            [*params, limit],
         )
         rows = [dict(zip(_EVENT_LOG_COLUMNS, row)) for row in cur.fetchall()]
         return list(reversed(rows))
