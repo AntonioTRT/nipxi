@@ -4020,7 +4020,7 @@ def _run_monitor_battery():
     from test_control.hardware_manager import HardwareManager
     from test_control.monitor_battery_sequence import MonitorBatterySequence
     from test_control.safety_monitor import SafetyMonitor
-    from utils.cancellation import CancellationToken
+    from utils.cancellation import CancellationToken, install_sigint_handler
     from utils.errors import HardwareInitError, OperationCancelledError
 
     selection = _select_group_with_hardware_summary()
@@ -4229,7 +4229,7 @@ def _run_monitor_battery_scan():
     from test_control.hardware_manager import HardwareManager
     from test_control.monitor_battery_scan_sequence import MonitorBatteryScanSequence
     from test_control.safety_monitor import SafetyMonitor
-    from utils.cancellation import CancellationToken
+    from utils.cancellation import CancellationToken, install_sigint_handler
     from utils.errors import HardwareInitError, OperationCancelledError
 
     selection = _select_group_with_hardware_summary()
@@ -4383,7 +4383,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     from hardware.temperature import NTCPresence
     from test_control.hardware_manager import HardwareManager
     from test_control.safety_monitor import SafetyMonitor
-    from utils.cancellation import CancellationToken
+    from utils.cancellation import CancellationToken, install_sigint_handler
     from utils.errors import (
         ConfigurationError, GroupConfigurationError, HardwareConfigurationError,
         HardwareInitError, OperationCancelledError,
@@ -4785,7 +4785,7 @@ def run_proto_test_execution():
     from test_control.hardware_manager import HardwareManager
     from test_control.proto_test_sequence import ProtoTestSequence
     from test_control.safety_monitor import SafetyMonitor
-    from utils.cancellation import CancellationToken
+    from utils.cancellation import CancellationToken, install_sigint_handler
     from utils.errors import HardwareInitError, OperationCancelledError
 
     # Named explicitly via Settings.PROTO_TEST_SMU_NAME -- NOT

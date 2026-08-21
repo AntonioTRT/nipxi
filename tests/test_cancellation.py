@@ -164,6 +164,55 @@ class SigintInstalledBeforeHardwareInitTests(unittest.TestCase):
 
         self.assertTrue(checked_any, "no entry points were actually checked -- test setup is broken")
 
+    def test_every_install_sigint_handler_call_has_a_matching_import(self):
+        """
+        Regression test for a real bug: a prior commit added
+        `install_sigint_handler(...)` calls to _run_monitor_battery(),
+        _run_monitor_battery_scan(), _run_charge_or_discharge(), and
+        run_proto_test_execution() without updating those same functions'
+        local `from utils.cancellation import CancellationToken` line to
+        also import `install_sigint_handler` -- each function imports its
+        own dependencies locally rather than at module scope, and only
+        two of six call sites (relay_matrix_scan/relay_ethernet_test) got
+        their import line updated at the time. This produced a real
+        `NameError: name 'install_sigint_handler' is not defined` the
+        moment an operator actually ran Charge Battery on real hardware
+        -- undetected by test_handler_installed_before_connect_all_in_
+        every_entry_point() above, which only checks the CALL's presence
+        and ordering, never whether the name is actually importable in
+        that function's own scope.
+        """
+        candidates = list(self.ENTRY_POINTS)
+        for name in ("relay_matrix_scan", "relay_ethernet_test"):
+            fn = getattr(test_module, name, None)
+            if fn is not None:
+                candidates = [(n, f) if n != name else (n, fn) for n, f in candidates]
+
+        checked_any = False
+        for name, fn in candidates:
+            if fn is None:
+                continue
+            src = inspect.getsource(fn)
+            if "install_sigint_handler(" not in src:
+                continue
+            checked_any = True
+            import_lines = [
+                line.strip() for line in src.splitlines()
+                if line.strip().startswith("from utils.cancellation import")
+            ]
+            imported_locally = any("install_sigint_handler" in line for line in import_lines)
+            imported_at_module_scope = "install_sigint_handler" in getattr(fn, "__globals__", {})
+
+            with self.subTest(entry_point=name):
+                self.assertTrue(
+                    imported_locally or imported_at_module_scope,
+                    f"{name}: calls install_sigint_handler(...) but never imports it in scope "
+                    f"-- would raise NameError at runtime, the exact real-hardware bug this "
+                    f"test exists to catch",
+                )
+
+        self.assertTrue(checked_any, "no entry points calling install_sigint_handler(...) were found")
+
 
 if __name__ == "__main__":
     unittest.main()
