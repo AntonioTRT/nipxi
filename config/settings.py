@@ -96,6 +96,19 @@ class Settings:
                                  #      two different questions (objective vs. floor).
     DISCHARGE_TIMEOUT_S = 7200  # s  - max discharge time
 
+    # Hard ceiling for a per-group test_setpoints["charge_timeout_s"]/
+    # ["discharge_timeout_s"] validation override (see docs/architecture.md
+    # "Configurable Validation Timeout"). Deliberately NOT a way to disable
+    # the timeout entirely -- "unknown state = unsafe state" means a charge/
+    # discharge must always have *some* finite wall-clock ceiling, even
+    # during validation. 86400s (24h) is generously larger than any
+    # legitimate single Charge/Discharge Battery validation session should
+    # need while still guaranteeing a run can never be effectively
+    # unattended-indefinite. utils/validators.py::validate_group_test_config()
+    # rejects any override above this value, and rejects the override
+    # existing at all while Settings.SYSTEM_MODE is PRODUCTION.
+    MAX_TIMEOUT_OVERRIDE_S = 86400  # s - 24h hard ceiling, validation only
+
     # -------------------------------------------------------------------------
     # Stabilization and sampling
     # -------------------------------------------------------------------------

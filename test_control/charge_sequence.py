@@ -227,12 +227,24 @@ class ChargeSequence(BatteryOperationSequence):
 
                 t_start = time.monotonic()
                 dt = 1.0 / self.s.SAMPLE_RATE_HZ
+                # Per-group validation override (see docs/architecture.md
+                # "Configurable Validation Timeout") -- defaults to the
+                # unchanged global Settings.CHARGE_TIMEOUT_S when absent, so
+                # every group not explicitly opting in behaves exactly as
+                # before. Read once here, not re-read every iteration:
+                # test_setpoints is caller-owned and must not change mid-run.
+                # Already validated (positive, <= MAX_TIMEOUT_OVERRIDE_S, and
+                # refused outright in PRODUCTION mode) by
+                # utils/validators.py::validate_group_test_config() before
+                # this sequence was ever constructed -- trusted here exactly
+                # like every other test_setpoints value already is.
+                charge_timeout_s = test_setpoints.get("charge_timeout_s", self.s.CHARGE_TIMEOUT_S)
 
                 while True:
                     check_cancellation(token)
 
                     elapsed = time.monotonic() - t_start
-                    if elapsed > self.s.CHARGE_TIMEOUT_S:
+                    if elapsed > charge_timeout_s:
                         raise NIPXITimeoutError(
                             f"Channel {channel}: charge timeout after {elapsed:.0f}s (EOC not reached)"
                         )

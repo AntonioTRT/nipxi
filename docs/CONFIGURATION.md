@@ -72,6 +72,43 @@ These are safety hard limits. The system raises `SafetyViolationError` if any is
 
 > **Warning:** `DISCHARGE_CUTOFF_V` (3.0 V) is below `BAT_VOLTAGE_MIN` (3.5 V).
 > The safety monitor triggers on `BAT_VOLTAGE_MIN` first if discharge is still running.
+
+### Per-group timeout override (validation only)
+
+`CHARGE_TIMEOUT_S`/`DISCHARGE_TIMEOUT_S` above are process-wide defaults. A
+single group's `config/devices.py::BATTERY_GROUPS[group]["test_setpoints"]`
+may declare `charge_timeout_s`/`discharge_timeout_s` to use a different,
+still-finite ceiling for that group only -- e.g. while validating EOC/EOD
+termination on hardware whose actual charge/discharge rate is slower than
+the 2-hour default assumes (see `docs/architecture.md` "Configurable
+Validation Timeout" for the full design rationale and why this is
+deliberately a **value override, never a boolean "disable timeout"**):
+
+```python
+"B1": {
+    ...
+    "test_setpoints": {
+        "charge_current_a": 0.15,
+        "charge_voltage_v": 3.7,
+        "discharge_current_a": 0.15,
+        "discharge_cutoff_v": 3.0,
+        # VALIDATION ONLY -- remove before production use of this group.
+        # See docs/architecture.md "Configurable Validation Timeout".
+        "charge_timeout_s": 21600,     # 6h, vs. the 2h global default
+        "discharge_timeout_s": 21600,  # 6h
+    },
+},
+```
+
+Both keys are optional -- omitting them (the default for every group today)
+reproduces the exact prior behavior. `utils/validators.py::
+validate_group_test_config()` rejects: a non-positive or non-numeric value,
+a value above `Settings.MAX_TIMEOUT_OVERRIDE_S` (86400s / 24h -- a hard
+ceiling; this is never a way to make a run effectively unbounded), and
+**the override being present at all while `Settings.SYSTEM_MODE` is
+`PRODUCTION`** -- an operator must explicitly remove it before running
+that group in production, rather than the software silently protecting
+them from a leftover validation setting.
 > Verify these two values match your battery chemistry and update as needed.
 
 ### Stabilization and sampling

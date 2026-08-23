@@ -2,7 +2,7 @@
 
 from config import devices as dev_cfg
 from config.settings import Settings
-from config.system_mode import parse_system_mode
+from config.system_mode import SystemMode, parse_system_mode
 from utils.errors import (
     ConfigurationError,
     GroupConfigurationError,
@@ -62,12 +62,13 @@ _REQUIRED_TEST_SETPOINTS = (
 
 def validate_group_test_config(group: str) -> dict:
     """
-    Three-stage validation pipeline for a Charge/Discharge Battery request,
+    Four-stage validation pipeline for a Charge/Discharge Battery request,
     run BEFORE any hardware is touched (no HardwareManager constructed, no
     relay closed, no PSU output enabled on any failure):
 
         Group Configuration -> Battery Limits Validation ->
-        Hardware Capability Validation -> (caller proceeds to) Execution
+        Hardware Capability Validation -> Timeout Override Validation ->
+        (caller proceeds to) Execution
 
     Battery type is NEVER an operator choice and never a second source of
     truth -- it is read here directly from config/devices.py
@@ -96,9 +97,17 @@ def validate_group_test_config(group: str) -> dict:
                                        capability of the SMU assigned to
                                        this group (PXI_SLOTS[...]
                                        ["max_current_a"]).
+        GroupConfigurationError    -- (Stage 4) test_setpoints declares a
+                                       charge_timeout_s/discharge_timeout_s
+                                       validation override while
+                                       Settings.SYSTEM_MODE is PRODUCTION.
+        ConfigurationError         -- (Stage 4) a declared timeout override
+                                       is not a positive number, or exceeds
+                                       Settings.MAX_TIMEOUT_OVERRIDE_S.
 
     See docs/architecture.md "Battery Group Test Configuration
-    Architecture" for the full design rationale.
+    Architecture" and "Configurable Validation Timeout" for the full
+    design rationale.
     """
     # -- Stage 1: Group Configuration --------------------------------------
     if group not in dev_cfg.BATTERY_GROUPS:
@@ -192,6 +201,46 @@ def validate_group_test_config(group: str) -> dict:
                 f"Group {group!r}: configured discharge_current_a "
                 f"({test_setpoints['discharge_current_a']:.3f} A) exceeds "
                 f"{hw['smu_name']}'s rated capability ({smu_max_a:.3f} A)."
+            )
+
+    # -- Stage 4: Timeout Override Validation -------------------------------
+    # Validation-only escape hatch (see docs/architecture.md "Configurable
+    # Validation Timeout"): a group's test_setpoints MAY declare
+    # charge_timeout_s/discharge_timeout_s to override
+    # Settings.CHARGE_TIMEOUT_S/DISCHARGE_TIMEOUT_S for that group only.
+    # Deliberately not a boolean "disable timeout" -- there is always a
+    # finite ceiling, and ChargeSequence/DischargeSequence's timeout-check
+    # code never special-cases "no timeout" (see hardware/smu.py-style
+    # "unknown state = unsafe state" philosophy applied to timing here: an
+    # unbounded charge/discharge is itself an unsafe state, even for
+    # validation). Rejected outright, not silently ignored, if the group's
+    # own config declares this override while the system is in PRODUCTION
+    # mode -- an operator must explicitly remove the override before
+    # running that group in production, rather than the software silently
+    # protecting them from their own leftover validation config.
+    for key in ("charge_timeout_s", "discharge_timeout_s"):
+        if key not in test_setpoints:
+            continue
+        if Settings.SYSTEM_MODE == SystemMode.PRODUCTION:
+            raise GroupConfigurationError(
+                f"Group {group!r}: test_setpoints[{key!r}] is a validation-only "
+                f"timeout override and must not be present while "
+                f"Settings.SYSTEM_MODE is PRODUCTION -- remove it from "
+                f"config/devices.py::BATTERY_GROUPS[{group!r}][\"test_setpoints\"] "
+                f"before running this group in production."
+            )
+        value = test_setpoints[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            raise ConfigurationError(
+                f"Group {group!r}: test_setpoints[{key!r}] must be a positive "
+                f"number of seconds if present, got {value!r}."
+            )
+        if value > Settings.MAX_TIMEOUT_OVERRIDE_S:
+            raise ConfigurationError(
+                f"Group {group!r}: test_setpoints[{key!r}] ({value:.0f}s) exceeds "
+                f"the hard ceiling Settings.MAX_TIMEOUT_OVERRIDE_S "
+                f"({Settings.MAX_TIMEOUT_OVERRIDE_S:.0f}s) -- a validation timeout "
+                f"override may be large, but must never be effectively unbounded."
             )
 
     return {"battery_type": battery_type, "test_setpoints": test_setpoints}

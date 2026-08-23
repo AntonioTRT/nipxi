@@ -6036,3 +6036,174 @@ verification mechanism (Section 60 remains unchanged). It does not
 claim to explain or fix the wiring-resistance/charge-timeout
 investigation from the same hardware session -- that remains a separate,
 unresolved hardware question.
+
+## 69. Configurable Validation Timeout (CURRENT IMPLEMENTATION)
+
+**Origin:** a real ChargeSequence run timed out (`Settings.CHARGE_TIMEOUT_S`,
+2h) before reaching EOC -- a real, legitimate timeout (see Section 68's
+origin story and the shutdown-hypothesis reviews it grew out of), not a
+software defect. This created a validation gap: the timeout path and
+emergency-shutdown path were now well-exercised on real hardware, but
+EOC termination, EOD termination, normal completion, and normal cleanup
+had NOT been -- because the 2h ceiling kept cutting the run short before
+any of them could be reached on this specific hardware's actual
+charge/discharge rate.
+
+### Design review -- the four candidate options
+
+- **Option A (`timeout_enabled: false`) / Option B (`disable_timeout: true`)**
+  -- rejected. Both are booleans that remove the timeout entirely, which
+  conflicts with this codebase's "unknown state = unsafe state"
+  philosophy applied to timing: a charge/discharge run must always have
+  *some* finite wall-clock ceiling, even during validation, or a fault
+  that nothing else catches (a stuck sensor, a miscalibrated safety
+  limit, an operator walking away) can leave hardware energized for a
+  genuinely unbounded, unattended period. A boolean flag also invites a
+  `None`-valued special case in the sampling loop's timeout comparison
+  (`if timeout_enabled: if elapsed > timeout_s: ...`) -- a new branch in
+  code that has been real-hardware-validated in its current, branch-free
+  form, for a benefit (skipping the check entirely) that a large finite
+  value already provides without the new branch.
+- **Option C (`timeout_s: null`)** -- rejected for the same reason as A/B
+  from a different angle: `None` propagating into `elapsed > None` either
+  crashes (`TypeError`) or requires the same new conditional the boolean
+  options do to avoid crashing. Same risk, different spelling.
+- **Option D (chosen): make the timeout a configurable VALUE, not a
+  switch.** A group's `test_setpoints` may declare
+  `charge_timeout_s`/`discharge_timeout_s` to override
+  `Settings.CHARGE_TIMEOUT_S`/`DISCHARGE_TIMEOUT_S` for that group only,
+  defaulting to the existing global constants when absent. The sampling
+  loop's timeout comparison (`if elapsed > charge_timeout_s:`) is
+  identical in shape whether the value is 7200 or 21600 -- **zero new
+  branches, zero new code path, in the exact loop that has already been
+  validated on real hardware.**
+
+### Q4 -- disable entirely, or use a large timeout?
+
+**A large, explicit, finite timeout -- never true disablement.** This is
+the central design decision and is enforced structurally, not just by
+convention: there is no code path anywhere in `ChargeSequence`/
+`DischargeSequence` that skips the timeout check. `Settings.
+MAX_TIMEOUT_OVERRIDE_S` (86400s / 24h) is a hard ceiling `utils/
+validators.py::validate_group_test_config()` enforces on any override --
+generous enough for any legitimate single validation session, small
+enough that a run can never become effectively unattended-indefinite.
+
+### Q2 -- global, per-group, or per-sequence?
+
+**Per-group**, via the group's existing `test_setpoints` dict -- the same
+config surface `charge_current_a`/`charge_voltage_v`/etc. already live
+in, per this codebase's standing rule that test parameters are always
+engineering-configured per group, never operator-supplied per invocation
+(`docs/architecture.md` "Battery Group Test Configuration Architecture").
+Not global: a global `Settings`-level toggle would silently affect every
+group in the system, including ones with no validation need for a longer
+ceiling, and would be far easier to leave on by accident. Not
+per-invocation/per-sequence-call: that would reintroduce exactly the
+operator-supplied-test-parameter pattern this codebase has deliberately
+avoided everywhere else.
+
+### Q3 -- preventing accidental production use
+
+Two independent, structural guards, both enforced at config-validation
+time (Stage 4 of `validate_group_test_config()`, before any hardware is
+touched -- see `utils/validators.py`):
+
+1. **Deliberate opt-in only.** The override requires adding a specific,
+   named key to a specific group's `test_setpoints` -- nothing implicit,
+   no global switch, nothing that could be toggled by a stray unrelated
+   change.
+2. **Refused outright in PRODUCTION mode.** If `Settings.SYSTEM_MODE ==
+   "PRODUCTION"` and a group's `test_setpoints` still declares
+   `charge_timeout_s`/`discharge_timeout_s`, `validate_group_test_config()`
+   raises `GroupConfigurationError` -- it does **not** silently fall back
+   to the global default. An operator must explicitly remove the leftover
+   validation override before that group can run in production at all.
+   This is deliberately louder than "silently ignored" -- a leftover
+   override silently doing nothing in production would look identical to
+   correctly-configured production behavior in the logs, while a raised
+   error forces the mismatch to be noticed and resolved.
+
+Convention (not enforced by code, matching this codebase's existing
+practice for other temporary per-group overrides -- see B1's own
+config history): any group using this override should carry an inline
+`# VALIDATION ONLY` comment, per the example in `docs/CONFIGURATION.md`
+"Per-group timeout override (validation only)".
+
+### Q5/Q6 -- ChargeSequence, DischargeSequence, and future CycleSequence
+
+`ChargeSequence`/`DischargeSequence` each resolve their own timeout once,
+at the top of their sampling loop setup:
+```python
+charge_timeout_s = test_setpoints.get("charge_timeout_s", self.s.CHARGE_TIMEOUT_S)
+...
+if elapsed > charge_timeout_s:
+    raise NIPXITimeoutError(...)
+```
+(and the discharge equivalent, symmetrically). `test_setpoints` is
+already a required, caller-supplied, pre-validated parameter to both --
+no signature change, no new constructor parameter, no new call site.
+
+**`CycleSequence` inherits this entirely from its child sequences --
+it does not get its own timeout configuration.** Per its accepted design
+(Section 67), `CycleSequence` composes fresh `ChargeSequence`/
+`DischargeSequence` instances and passes the *same* `test_setpoints`
+dict through to both, unchanged, every repetition. Each sub-phase
+resolves its own override from that shared dict exactly as it would
+standalone -- `CycleSequence` needs zero new code and zero new config
+surface for this. (`CycleSequence` itself has no wall-clock ceiling of
+its own today -- its only bound is `cycle_count`, a repetition count, not
+a timer -- so there is no analogous "cycle-level timeout" to design; if
+one is ever wanted, it would wrap the whole repeat loop as a new,
+separate, optional `test_setpoints["cycle_timeout_s"]`, but nothing in
+the current design requires it.)
+
+### Production behavior verification
+
+No group in `config/devices.py::BATTERY_GROUPS` declares
+`charge_timeout_s`/`discharge_timeout_s` today -- every group's timeout
+behavior is byte-for-byte unchanged from before this section, confirmed
+by `tests/test_configurable_timeout.py`'s backward-compatibility tests
+running against B1's real, current config.
+
+### Operational guidance
+
+- **Keep the timeout at its default (or a modest override) for any run
+  where a human isn't actively watching it.** The timeout is the last
+  backstop if EOC/EOD is never reached for a reason nothing else catches.
+- **A validation override is appropriate when:** the operator is present
+  for the session, the hardware's actual charge/discharge rate is known
+  (or being characterized) to exceed the 2h default, and the goal is
+  specifically to observe EOC/EOD/normal-completion/normal-cleanup rather
+  than to exercise the timeout path itself (already validated -- see
+  Section 68's origin).
+- **Risk of using a large override:** hardware can remain energized for
+  up to the overridden ceiling if something goes wrong that
+  `SafetyMonitor.check()`'s own voltage/current/temperature limits don't
+  catch. This is why `Settings.MAX_TIMEOUT_OVERRIDE_S` exists as a hard
+  ceiling rather than trusting operators to always pick a reasonable
+  number, and why the override must be removed (not just left inert)
+  before production use of that group.
+- **Do not use this to "fix" a run that isn't reaching EOC/EOD for a real
+  electrical reason** (e.g. the wiring-resistance investigation this
+  session's Charge validation surfaced) -- a longer timeout only gives a
+  slow, otherwise-healthy charge/discharge more time to finish; it does
+  not change whether the underlying electrical behavior is actually
+  correct.
+
+### Tests
+
+`tests/test_configurable_timeout.py` -- Stage 4 validation rules
+(backward compatibility, valid overrides accepted in
+DEVELOPMENT/VALIDATION mode, invalid values rejected [zero, negative,
+non-numeric, `bool`, above the ceiling], PRODUCTION mode refusing the
+override outright even for an otherwise-valid value) using the same
+snapshot/restore pattern as `tests/test_group_validation.py`; plus
+source-level checks (matching the technique already established in
+`tests/test_cancellation.py`/`tests/test_post_isolation_zeroing_ordering.py`)
+confirming both `ChargeSequence`/`DischargeSequence` actually resolve
+and use the override variable in their timeout comparison, not merely
+accept it as a config value. A full fake-hardware `ChargeSequence.run()`
+integration test reaching real EOC was deliberately not built -- see
+that test file's own docstring for why the source-level check already
+covers the realistic failure mode at much lower cost/fragility.

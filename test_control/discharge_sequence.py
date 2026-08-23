@@ -214,12 +214,18 @@ class DischargeSequence(BatteryOperationSequence):
 
                 t_start = time.monotonic()
                 dt = 1.0 / self.s.SAMPLE_RATE_HZ
+                # Per-group validation override -- see charge_sequence.py's
+                # identical rationale and docs/architecture.md "Configurable
+                # Validation Timeout". Already validated by
+                # validate_group_test_config() before this sequence was
+                # constructed.
+                discharge_timeout_s = test_setpoints.get("discharge_timeout_s", self.s.DISCHARGE_TIMEOUT_S)
 
                 while True:
                     check_cancellation(token)
 
                     elapsed = time.monotonic() - t_start
-                    if elapsed > self.s.DISCHARGE_TIMEOUT_S:
+                    if elapsed > discharge_timeout_s:
                         raise NIPXITimeoutError(
                             f"Channel {channel}: discharge timeout after {elapsed:.0f}s (EOD not reached)"
                         )
