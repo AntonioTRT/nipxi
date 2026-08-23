@@ -60,18 +60,50 @@ class _MutatesB1TestSetpoints(unittest.TestCase):
 
 
 class BackwardCompatibilityTests(_MutatesB1TestSetpoints):
-    """Timeout enabled (default): no override present -- Stage 4 must be a
-    complete no-op, exactly matching pre-existing behavior."""
+    """
+    Timeout enabled (default): no override present -- Stage 4 must be a
+    complete no-op, exactly matching pre-existing behavior.
 
-    def test_b1_real_config_has_no_override_and_validates_cleanly(self):
-        self.assertNotIn("charge_timeout_s", self._original_test_setpoints)
-        self.assertNotIn("discharge_timeout_s", self._original_test_setpoints)
+    Deliberately constructs a "no override" scenario by stripping the
+    override keys from a copy, rather than assuming B1's real config
+    currently has none -- B1 itself now legitimately uses this feature
+    (docs/architecture.md "B1 Validation Update: 1.0 A / 4.0 V"), so it is
+    no longer the right fixture for "prove behavior when the feature is
+    entirely absent." That absent-feature case must still be provable on
+    its own terms, independent of which group happens to use the feature
+    today.
+    """
+
+    def _strip_overrides(self):
+        setpoints = dict(self._original_test_setpoints)
+        setpoints.pop("charge_timeout_s", None)
+        setpoints.pop("discharge_timeout_s", None)
+        dev_cfg.BATTERY_GROUPS["B1"]["test_setpoints"] = setpoints
+        return setpoints
+
+    def test_no_override_present_validates_cleanly(self):
+        setpoints = self._strip_overrides()
+        self.assertNotIn("charge_timeout_s", setpoints)
+        self.assertNotIn("discharge_timeout_s", setpoints)
         result = validate_group_test_config("B1")  # must not raise
         self.assertNotIn("charge_timeout_s", result["test_setpoints"])
 
     def test_production_mode_with_no_override_is_unaffected(self):
+        self._strip_overrides()
         Settings.SYSTEM_MODE = "PRODUCTION"
         validate_group_test_config("B1")  # must not raise -- no override, nothing to reject
+
+    def test_production_mode_currently_rejects_b1s_real_config(self):
+        """
+        Documents the current, real consequence of B1's validation-only
+        override: as long as it's present, B1 cannot be run with
+        Settings.SYSTEM_MODE=PRODUCTION at all -- exactly the intended
+        "prevent accidental production use" guardrail, now exercised
+        against B1's actual live config rather than only a synthetic one.
+        """
+        Settings.SYSTEM_MODE = "PRODUCTION"
+        with self.assertRaises(GroupConfigurationError):
+            validate_group_test_config("B1")
 
 
 class ValidOverrideAcceptedInNonProductionTests(_MutatesB1TestSetpoints):

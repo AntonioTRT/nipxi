@@ -458,7 +458,22 @@ BATTERY_CONFIGS = {
         "voltage_max_v":           4.2,        # unconfirmed placeholder -- assumed standard Li-ion window
         "voltage_min_v":           3.0,        # unconfirmed placeholder -- assumed standard Li-ion window
         "capacity_ah":             1.05,       # confirmed -- 1050 mAh
-        "max_charge_current_a":    0.525,      # unconfirmed placeholder -- assumed 0.5C
+        # TEMPORARY -- raised 0.525 -> 1.5 (~0.5C -> ~1.43C) at explicit
+        # operator request for the B1 1.0 A charge-current validation run
+        # (see docs/architecture.md "B1 Validation Update: 1.0 A / 4.0 V").
+        # Both the old and new values are UNCONFIRMED placeholders, not a
+        # manufacturer datasheet figure being overridden -- 0.525 A was
+        # itself only an assumed 0.5C default, never a verified limit. This
+        # is a real RUNTIME safety-ceiling change, not just a config-
+        # validation-time number: SafetyMonitor.check() reads
+        # max_charge_current_a directly from this dict once
+        # set_battery_limits(battery_cfg) is called (which every Charge/
+        # Discharge Battery run does) -- it does NOT fall back to the
+        # global Settings.BAT_CURRENT_MAX (1.0 A) once a battery_cfg is
+        # set. Global HUB-typed scope: every group with battery_type="HUB"
+        # inherits this raised ceiling, not just B1. Revisit once the real
+        # cell's datasheet charge-rate rating is confirmed.
+        "max_charge_current_a":    1.5,
         "max_discharge_current_a": 1.05,       # unconfirmed placeholder -- assumed 1C
         "max_temp_c":              45.0,       # unconfirmed placeholder -- assumed standard Li-ion ceiling
     },
@@ -591,11 +606,10 @@ BATTERY_GROUPS = {
         # match it); HUB's declared 1.05 Ah/1050 mAh profile does. Changed
         # from "SB" -- see docs/architecture.md Section 59 for the full
         # before/after comparison and validation re-check. HUB's own
-        # max_charge_current_a (0.525 A, below) already accepts the 0.5 A
-        # commanded current in test_setpoints below with real headroom --
-        # no ceiling bump was needed for this switch, unlike SB's own
-        # temporary 0.6 A bump (BATTERY_CONFIGS["SB"] above), which B1 no
-        # longer references at all now that battery_type is "HUB".
+        # max_charge_current_a was raised to 1.5 A (see BATTERY_CONFIGS
+        # above) specifically to accommodate this group's current 1.0 A
+        # validation setpoint below -- see docs/architecture.md "B1
+        # Validation Update: 1.0 A / 4.0 V".
         "battery_type":   "HUB",
         # NTC acquisition migrated off the temporary NI USB-6210 dev DAQ
         # (NTC_DAQ_USB6210, resource "Dev2") to the rack DAQ -- bench
@@ -609,30 +623,38 @@ BATTERY_GROUPS = {
         # hardware_for_group() falls back to this group's own "daq"
         # (MAIN_DAQ) automatically -- see hardware_for_group()'s docstring
         # below. See docs/architecture.md Section 58.
-        # TEMPORARY -- first real-hardware charge validation recipe (hand-
-        # soldered wiring, ~3.5 V battery physically present in the
-        # selected position). Reduced CV target (3.7 V, not HUB's own
-        # 4.2 V voltage_max_v ceiling) for a conservative first run. With
-        # "smu" now AUX_SMU_1 (max_current_a 1.0 A), the commanded current
-        # below has real hardware headroom. Restore to the production
-        # recipe (whatever is validated) once this run passes -- see
-        # docs/architecture.md.
+        # TEMPORARY -- VALIDATION ONLY. B1 validation update: 1.0 A / 4.0 V
+        # (see docs/architecture.md "B1 Validation Update: 1.0 A / 4.0 V"
+        # for the full review, the wiring-resistance analysis behind the
+        # expected-behavior note below, and the explicit operator
+        # confirmation that raised HUB's own max_charge_current_a ceiling
+        # to allow this). Supersedes the earlier 0.5 A / 3.7 V first-run
+        # recipe. charge_timeout_s/discharge_timeout_s use the
+        # config-driven validation-timeout override (docs/architecture.md
+        # "Configurable Validation Timeout") -- remove all four
+        # VALIDATION-ONLY keys before any production use of this group.
         "test_setpoints": {
-            # TEMPORARY -- 0.5 A, for the larger (non-SB) battery currently
-            # under test on B1 -- see the "battery_type" comment above.
-            # EOC logic, SafetyMonitor, DMM voltage authority, and SMU
-            # current authority are all unchanged. Revert to whatever the
-            # validated production recipe turns out to be once this test
-            # passes.
-            "charge_current_a":    0.5,    # <= AUX_SMU_1 max_current_a (1.0),
-                                            #    <= HUB max_charge_current_a (0.525) -- fits
-                                            #    with real headroom, no ceiling bump needed
-            "charge_voltage_v":    3.7,    # TEMPORARY -- was 4.2 (HUB voltage_max_v). Conservative CV
-                                            #    target for the first real-battery run (~3.5 V resting).
-            "discharge_current_a": 0.08,   # <= HUB max_discharge_current_a (1.05) and
+            "charge_current_a":    1.0,    # <= AUX_SMU_1 max_current_a (1.0), exactly at capability;
+                                            #    <= HUB max_charge_current_a (1.5, raised for this run --
+                                            #    see BATTERY_CONFIGS["HUB"] above). EXPECTED BEHAVIOR:
+                                            #    given the ~0.8 ohm wiring resistance characterized during
+                                            #    the 0.5 A/3.7 V run, this commanded current is well above
+                                            #    the estimated ~0.4-0.5 A resistance-clamp threshold at a
+                                            #    4.0 V target -- do NOT expect a clean 1.0 A CC phase;
+                                            #    expect early voltage-clamping similar in character to the
+                                            #    original run, but at a higher settled/tapering current and
+                                            #    a more realistic (higher) CV target, giving EOC a real
+                                            #    chance of being reached within the extended timeout below.
+            "charge_voltage_v":    4.0,    # VALIDATION ONLY -- was 3.7. Still <= HUB voltage_max_v (4.2)
+                                            #    with margin. More realistic full-charge target for a
+                                            #    nominal 3.7 V Li-ion cell than 3.7 V was.
+            "discharge_current_a": 0.08,   # unchanged -- <= HUB max_discharge_current_a (1.05) and
                                             #    <= AUX_SMU_1 max_current_a (1.0)
-            "discharge_cutoff_v":  3.0,    # == HUB voltage_min_v (the safety floor --
+            "discharge_cutoff_v":  3.0,    # unchanged -- == HUB voltage_min_v (the safety floor --
                                             #    see "Discharge Cutoff Policy")
+            "charge_timeout_s":    28800,  # VALIDATION ONLY -- 8h, vs. the 2h global default. See
+                                            #    docs/architecture.md "Configurable Validation Timeout".
+            "discharge_timeout_s": 28800,  # VALIDATION ONLY -- 8h, symmetric with charge_timeout_s.
         },
         "positions": {
             # daq_ntc_ch is Dev1/ai0-ai7 -- bench-confirmed real wiring (see

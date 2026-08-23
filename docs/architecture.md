@@ -6207,3 +6207,144 @@ accept it as a config value. A full fake-hardware `ChargeSequence.run()`
 integration test reaching real EOC was deliberately not built -- see
 that test file's own docstring for why the source-level check already
 covers the realistic failure mode at much lower cost/fragility.
+
+## 70. B1 Validation Update: 1.0 A / 4.0 V
+
+**Context:** a final readiness review before a planned real-battery
+validation session (following commit `b0c07b6`, the configurable
+validation timeout) confirmed no blocker in `ChargeSequence`/
+`DischargeSequence`, the timeout override, or the recent shutdown
+hardening (`b12d914`, `22c4e2a`). B1's operator then requested a specific
+new charge recipe -- `charge_current_a = 1.0`, `charge_voltage_v = 4.0`
+-- for that session.
+
+### Review of the proposed values
+
+`charge_voltage_v = 4.0` was accepted as proposed: it is within `HUB`'s
+`voltage_max_v` (4.2 V) with margin, and is a materially more realistic
+full-charge target for a nominal-3.7V Li-ion cell than the previous
+3.7 V (which sat notably below typical full-charge voltage -- part of
+why EOC was so hard to reach in the original 500 mA run).
+
+`charge_current_a = 1.0` was **not** accepted as proposed without
+review: it exceeded `BATTERY_CONFIGS["HUB"]["max_charge_current_a"]`
+(0.525 A at the time) by ~90%, and `utils/validators.py::
+validate_group_test_config()` was confirmed (empirically, not just by
+inspection) to already reject it:
+```
+ConfigurationError: Group 'B1': configured charge_current_a (1.000 A)
+exceeds HUB's max_charge_current_a (0.525 A).
+```
+This was raised as a blocking concern before any implementation, per
+this codebase's standing practice of not silently substituting a safer
+value or proceeding past a hard, already-validated limit.
+
+### Resolution: HUB's own ceiling was explicitly raised, with the operator's informed confirmation
+
+The operator, presented with this finding, chose to raise
+`BATTERY_CONFIGS["HUB"]["max_charge_current_a"]` from 0.525 A to 1.5 A
+(~0.5C -> ~1.43C for this cell's 1.05 Ah capacity) rather than reduce the
+commanded current, and explicitly confirmed this choice after being told:
+
+- This is a change to the battery's own declared safety ceiling, not a
+  per-test setting -- and, importantly, a **real runtime** one:
+  `SafetyMonitor.check()` reads `max_charge_current_a` directly from
+  `battery_cfg` once `set_battery_limits(battery_cfg)` is called (every
+  Charge/Discharge Battery run does this) -- it does **not** fall back to
+  the global `Settings.BAT_CURRENT_MAX` (1.0 A) once a `battery_cfg` is
+  set. Raising this value genuinely raises what `SafetyMonitor` will
+  allow through during a live run, not just what `validate_group_test_config()`
+  accepts before hardware is touched.
+- It is global to every group with `battery_type: "HUB"`, not scoped to
+  B1 alone.
+- Both the old (0.525 A) and new (1.5 A) values are **unconfirmed
+  placeholders** -- `config/devices.py`'s own long-standing header
+  comment already flagged `max_charge_current_a` as "assumed 0.5C,"
+  never a manufacturer datasheet figure. This change replaces one
+  unconfirmed assumption with another, explicitly and knowingly, not a
+  verified limit being overridden -- but it is not risk-free for exactly
+  that reason: neither number is confirmed against a real datasheet for
+  this cell.
+- This project has hit this exact pattern once before (the `SB` battery
+  type's earlier temporary `max_charge_current_a` bump, later flagged
+  orphaned once B1 moved to `HUB`) -- recorded here explicitly so this
+  one does not go unnoticed the same way if `HUB` usage or setpoints
+  change again later.
+
+The operator confirmed explicitly, in response to being shown this exact
+tradeoff, to proceed with the 1.5 A ceiling and the 1.0 A test current.
+
+### Expected behavior, given the previously observed current-limitation behavior
+
+**Do not expect a clean, full 1.0 A CC phase.** The ~0.8 ohm wiring
+series resistance characterized during the original 500 mA/3.7V run
+(from the DMM-vs-SMU voltage delta observed on that run, cross-checked
+against the standalone PSU test and Section 68's shutdown-path review)
+does not go away with a higher current ceiling. Using the same model
+(`V_smu_needed = V_battery + I x R`, clamp begins once this reaches the
+CV target):
+
+```
+i_crit(V_battery) = (4.0 - V_battery) / 0.8
+```
+
+At a plausible current battery voltage (~3.6-3.65 V, likely higher than
+the original 3.554 V baseline given charge already delivered by the
+100 mA validation run), `i_crit` is roughly **0.4-0.5 A** -- well below
+the newly-commanded 1.0 A. **Expect early, likely near-immediate,
+voltage-clamping, similar in character to the original 500 mA run** --
+the SMU will very likely enter CV-limited operation quickly, and the
+actual delivered current will settle well below the commanded 1.0 A.
+
+This is not expected to be a wasted run, for two reasons the original
+500 mA/3.7V run didn't have:
+- **A higher, more realistic CV target (4.0 V vs. 3.7 V)** means more
+  voltage headroom is available before the ceiling is hit at any given
+  battery voltage -- the settled/tapering current should be meaningfully
+  *higher* than the ~130-174 mA observed in the original run, even though
+  it is still resistance-clamped rather than a true 1.0 A CC phase.
+- **The extended, config-driven timeout** (`charge_timeout_s = 28800`,
+  8h, via Section 69's mechanism) gives this resistance-limited taper
+  real room to actually reach 4.0 V and the `CHARGE_CUTOFF_A` threshold,
+  where the original run's 2h ceiling did not.
+
+If this run also clamps immediately and does not complete within 8h,
+that is further evidence the wiring resistance -- not the current
+setpoint -- is the binding constraint, and should be investigated
+physically (per the earlier shutdown-path/resistance reviews) rather
+than addressed with a still-higher current or ceiling.
+
+### Configuration changes
+
+`config/devices.py`:
+- `BATTERY_CONFIGS["HUB"]["max_charge_current_a"]`: `0.525` -> `1.5`.
+- `BATTERY_GROUPS["B1"]["test_setpoints"]`: `charge_current_a` `0.5` ->
+  `1.0`; `charge_voltage_v` `3.7` -> `4.0`; added `charge_timeout_s:
+  28800` and `discharge_timeout_s: 28800` (8h each, via Section 69's
+  per-group override mechanism). `discharge_current_a`/
+  `discharge_cutoff_v` unchanged.
+
+All four `test_setpoints` additions/changes are marked `VALIDATION ONLY`
+in the config's own comments, per Section 69's established convention --
+remove before any production use of B1.
+
+### Consequence: B1 cannot currently run in PRODUCTION mode
+
+Because `charge_timeout_s`/`discharge_timeout_s` are present in B1's
+`test_setpoints`, `validate_group_test_config("B1")` now raises
+`GroupConfigurationError` whenever `Settings.SYSTEM_MODE == "PRODUCTION"`
+-- exactly Section 69's intended guardrail, now exercised against a real
+group's live config rather than only a synthetic test fixture. This is
+expected and correct: B1 is explicitly in a validation configuration
+right now, not a production one.
+
+### Tests
+
+Two `tests/test_configurable_timeout.py` tests that had asserted "B1's
+real config has no override" (true when written, no longer true once B1
+adopted the feature) were updated to construct that scenario explicitly
+(stripping the override keys from a copy) rather than relying on B1's
+then-current state -- the fix is to the test's fixture assumption, not
+the feature. A new test,
+`test_production_mode_currently_rejects_b1s_real_config`, documents the
+real, current consequence above. Full suite: 170/170 passing.
