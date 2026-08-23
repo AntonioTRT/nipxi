@@ -701,6 +701,54 @@ class SMU(HardwareBase):
             )
         return False
 
+    def zero_output_setpoint_best_effort(self, context: str = "") -> bool:
+        """
+        Post-isolation defense-in-depth step -- NOT part of the safety-
+        critical disable chain. Every real caller invokes this only AFTER
+        emergency_output_off() has already been commanded (output_enabled
+        already set False) AND, for every battery-involving caller, only
+        AFTER the relay isolating this channel from its battery has
+        already been opened (or at least attempted) -- see docs/
+        architecture.md "Post-Isolation SMU Setpoint Zeroing". At that
+        point the battery is already electrically isolated, so driving
+        the SMU's own commanded setpoint to zero cannot affect it either
+        way; this exists purely to leave the SMU's own internal state
+        unambiguous should a technician probe its output terminals after
+        a run, regardless of root cause of any residual reading.
+
+        Zeros whichever setpoint is actually active for the session's
+        current `output_function` -- `current_level` for DC_CURRENT
+        (ChargeSequence/DischargeSequence's CC mode), `voltage_level` for
+        DC_VOLTAGE (the standalone PSU test's mode) -- since those are two
+        different NI-DCPower properties and only one applies at a time.
+
+        Never raises, never blocks, and is never retried -- a single
+        best-effort attempt. Any failure is logged as a WARNING (not
+        CRITICAL: this step is cosmetic, not safety-critical, and its
+        failure must never be confused with an emergency_output_off()
+        failure in the logs) and swallowed. Returns True if the zero
+        command was applied without error, False otherwise -- callers are
+        not required to check this return value, and shutdown must (and
+        does, at every call site) proceed identically either way.
+        """
+        if self._session is None:
+            return True
+        prefix = f"{context}: " if context else ""
+        try:
+            import nidcpower
+            if self._session.output_function == nidcpower.OutputFunction.DC_CURRENT:
+                self._session.current_level = 0.0
+            else:
+                self._session.voltage_level = 0.0
+            self._session.commit()
+            return True
+        except Exception as e:
+            self.log.warning(
+                "%sSMU %s: post-isolation setpoint-zeroing failed (non-critical, "
+                "shutdown already complete): %s", prefix, self.resource, e,
+            )
+            return False
+
     def measure(self) -> dict:
         """
         Real ADC readback of the SMU's own sourced/sunk output -- COMMAND

@@ -163,6 +163,19 @@ class SafetyMonitor:
                 "energized -- physically disconnect power if this cannot be "
                 "resolved immediately.", e,
             )
+        # Post-isolation defense-in-depth, not safety-critical -- attempted
+        # unconditionally, regardless of the open_all() outcome above,
+        # since the SMU output was already commanded off before this point
+        # either way. Wrapped defensively even though
+        # zero_output_setpoint_best_effort() itself never raises -- this
+        # step must never be able to prevent "Emergency stop complete"
+        # from being reached. See docs/architecture.md "Post-Isolation
+        # SMU Setpoint Zeroing".
+        try:
+            smu.zero_output_setpoint_best_effort(reason)
+        except Exception as e:
+            self.log.warning("Post-isolation SMU setpoint-zeroing raised unexpectedly "
+                              "(non-critical, shutdown already complete): %s", e)
         self.log.warning("Emergency stop complete.")
 
     def safe_cancel_shutdown(self, smu, relay_matrix, reason: str):
@@ -193,4 +206,11 @@ class SafetyMonitor:
                 "still be energized -- physically disconnect power if this cannot be "
                 "resolved immediately.", e,
             )
+        # Post-isolation defense-in-depth, not safety-critical -- see
+        # emergency_stop()'s identical comment above.
+        try:
+            smu.zero_output_setpoint_best_effort(reason)
+        except Exception as e:
+            self.log.warning("Post-isolation SMU setpoint-zeroing raised unexpectedly "
+                              "(non-critical, shutdown already complete): %s", e)
         self.log.info("Safe cancellation shutdown complete.")

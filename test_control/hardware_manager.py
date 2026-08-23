@@ -450,6 +450,19 @@ class HardwareManager:
                     "cannot be resolved immediately.", e,
                 )
 
+        # 2b. Post-isolation defense-in-depth, not safety-critical --
+        #     attempted unconditionally (regardless of the SMU/relay
+        #     outcomes above, and before the SMU session is possibly
+        #     closed in step 3 below), since the SMU output was already
+        #     commanded off in step 1 either way. See docs/architecture.md
+        #     "Post-Isolation SMU Setpoint Zeroing".
+        if self._smu.connected:
+            try:
+                self._smu.zero_output_setpoint_best_effort("normal shutdown")
+            except Exception as e:
+                self.log.warning("Post-isolation SMU setpoint-zeroing raised unexpectedly "
+                                  "(non-critical, shutdown already complete): %s", e)
+
         # 3. Disconnect relay, DMM (if present), SMU (only if its output was
         #    verified OFF in step 1), DAQ, NTC_DAQ (if a distinct instance)
         #    -- reverse of connect order.

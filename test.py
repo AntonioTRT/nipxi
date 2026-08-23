@@ -949,6 +949,13 @@ def _functional_smu(name: str, cfg: dict):
             results.append(_fail("SMU Functional", display, config_ref,
                                  "[ERROR] Output disable could not be verified -- "
                                  "physically check the SMU output"))
+        # Post-isolation defense-in-depth, not safety-critical -- no relay
+        # in this circuit, so attempted immediately after output-off. See
+        # docs/architecture.md "Post-Isolation SMU Setpoint Zeroing".
+        try:
+            smu.zero_output_setpoint_best_effort("SMU Functional Validation complete/cancelled/failed")
+        except Exception:
+            pass
         try:
             smu.disconnect()
         except Exception:

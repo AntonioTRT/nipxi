@@ -1747,6 +1747,8 @@ Disable Output -> Query PSU State -> Verify Output OFF
 
 **Explicitly not done:** no threshold/tolerance was chosen, no DMM wiring was added, and `cross_validate_output_state()` is not called from anywhere -- this section documents where the hook belongs, per the review's explicit instruction not to implement external validation yet.
 
+**Related, but not a substitute for this section:** Section 68 ("Post-Isolation SMU Setpoint Zeroing") adds a root-cause-agnostic defense-in-depth step motivated by a real-hardware observation that looks exactly like the "PSU reports OFF, but voltage is still physically present" scenario described above. It does not implement `cross_validate_output_state()` or answer whether that scenario is actually occurring -- it remains open here.
+
 ## 27. Interruptible Wait Mechanism
 
 **Root cause (from `docs/TIMING_ANALYSIS.md`, the timing/delay/settling-time review):** several real dwells in this codebase held hardware energized for their full configured duration with **no cancellation checkpoint at all** inside the wait itself:
@@ -4872,6 +4874,12 @@ the two failure modes produce distinguishable `CRITICAL` log records, and
 that `verify_output_disabled()`'s pre-existing bool contract is
 byte-for-byte unchanged.
 
+**Extended by Section 68:** `emergency_output_off()`/`verify_output_disabled()`
+themselves are unchanged by Section 68's later post-isolation zeroing
+step -- that step is a separate, non-safety-critical method
+(`zero_output_setpoint_best_effort()`) called strictly after this
+bounded-retry chain (and after relay-open) completes, never inside it.
+
 ## 61. Regression Test Suite (CURRENT IMPLEMENTATION)
 
 A permanent `tests/` package (stdlib `unittest`, zero new dependencies --
@@ -4905,6 +4913,8 @@ scratch scripts and never captured durably in the repo:
 - `tests/test_execution_plan.py`, `test_worker_lifecycle.py`,
   `test_supervisor.py`, `test_reporting.py`, `test_main_show_topology.py`
   -- Section 63 below.
+- `tests/test_smu_post_isolation_zeroing.py`, `test_safety_monitor_shutdown.py`,
+  `test_post_isolation_zeroing_ordering.py` -- Section 68 below.
 
 **Gotcha found and worked around:** `test.py:28` calls
 `logging.disable(logging.CRITICAL)` at import time (a deliberate,
@@ -5862,3 +5872,167 @@ later, at implementation time) -- all confirmed unchanged by this
 design. `CycleSequence` adds exactly: one new class, one new
 `phase_detail` value, one new constructor parameter (`storage_factory`)
 scoped to itself only, and a per-repetition composition loop.
+
+## 68. Post-Isolation SMU Setpoint Zeroing (CURRENT IMPLEMENTATION)
+
+**Origin:** a real-hardware investigation following a `ChargeSequence`
+timeout. An operator measured ~3.7-4.1 V directly at the SMU's own
+output terminals after a timeout, after `emergency_output_off()` and
+`SafetyMonitor.emergency_stop()` both reported success, and after the
+relay was confirmed open. A shutdown-path comparison against the
+standalone PSU test (`test.py::_functional_smu()`/`hardware/smu.py::
+source_dc_voltage_point()`) -- known-good on the same physical hardware
+-- found that **the SMU-disable command sequence is already identical
+across every path** (`output_disable()`: `session.abort()` ->
+`session.output_enabled = False`; `verify_output_disabled()`: readback
+of that same flag). There was no evidence of a sequencing defect. The
+leading hypotheses that remained (see the shutdown-hypothesis reviews
+this section's change grew out of) were a high-impedance/floating
+output artifact, or an independent relay-verification gap (Section 26)
+-- neither confirmed, neither ruled out. **This change does not claim to
+fix either** -- it is deliberately root-cause-agnostic defense-in-depth,
+whose only goal is to leave the SMU's own commanded state unambiguous
+once a run has ended, regardless of which hypothesis (if either) turns
+out to be correct.
+
+### The new sequence
+
+```
+Existing (unchanged, safety-critical):
+    SMU output OFF, verified      (emergency_output_off())
+    Relay OPEN                    (relay.open() / relay_matrix.open_all())
+
+New (added, NOT safety-critical):
+    SMU setpoint -> 0             (zero_output_setpoint_best_effort())
+    commit
+```
+
+The existing SMU-off-before-relay-open ordering is **unchanged and
+untouched** -- this was an explicit, approved constraint on this change,
+not merely preserved incidentally. The new step is appended strictly
+*after* both existing steps, everywhere a relay is involved.
+
+### Why relay-open-before-zeroing is safe
+
+Reversing this (zeroing or opening the relay *before* confirming SMU
+output is off) was explicitly evaluated and rejected in the review that
+preceded this change: breaking a live connection with a relay contact
+(hot-switching) risks contact wear/arcing, and an SMU still in active
+current regulation facing a suddenly-opened circuit can slew toward its
+voltage-compliance ceiling. The approved design keeps the SMU-off step
+first for exactly this reason. Zeroing the setpoint is ordered *after*
+relay-open specifically because, by that point, the SMU has already been
+commanded to `output_enabled = False` (regardless of whether that
+command was later verified) -- writing a new setpoint value to an
+already-disabled session's `current_level`/`voltage_level` property does
+not re-enable output or drive current; it only changes what value would
+be presented *if* the disable mechanism doesn't behave the way this
+codebase currently assumes it does (Section 26's still-open question).
+
+### Why zeroing occurs only after battery isolation
+
+The stated rationale (unchanged from the approved design): once the
+relay is open, the battery is electrically isolated from the SMU
+circuit, so a setpoint change at that point cannot affect the battery
+either way -- whether the relay-open genuinely succeeded or not, since
+`emergency_output_off()` has already run beforehand in every path. This
+makes the new step strictly additive risk-wise: it either helps (if the
+disable mechanism does retain some image of the last commanded setpoint)
+or does nothing (if it doesn't) -- there is no path by which adding it
+makes the existing shutdown less safe than it already was.
+
+### Implementation -- centralized, not duplicated
+
+`hardware/smu.py::SMU.zero_output_setpoint_best_effort(context: str = "") -> bool`
+is the single shared implementation. It reads the session's active
+`output_function` and zeroes whichever property is actually the live
+setpoint for that mode -- `current_level` for `DC_CURRENT` (the mode
+`set_charge_mode()`/`set_discharge_mode()` configure, i.e. every real
+Charge/Discharge Battery run), `voltage_level` for `DC_VOLTAGE` (the
+mode `source_dc_voltage_point()` configures, i.e. the standalone PSU
+test) -- these are two different NI-DCPower properties and only one is
+meaningful at a time. No-op (returns `True`) if there is no open
+session. **Never raises, never retried, never blocks**: any failure
+(property write, `commit()`, or reading `output_function` itself) is
+caught, logged as a WARNING (deliberately not CRITICAL -- this step is
+cosmetic, and its failure must never be visually confused in the logs
+with an `emergency_output_off()` failure, which remains the actual
+safety-critical signal), and swallowed. Every call site additionally
+wraps the call in its own defensive `try/except` even though the method
+itself already promises not to raise -- belt-and-suspenders, matching
+this codebase's established shutdown-cleanup philosophy (mirroring how
+`relay_matrix.open_all()`'s own internal safety attempt is *also*
+wrapped in `try/except` at every call site).
+
+**Call sites (every location that can shut down an SMU, per the
+approved review scope):**
+- `test_control/charge_sequence.py::ChargeSequence.run()`'s normal
+  (EOC) completion path -- called immediately after `self.relay.open(relay_address)`.
+- `test_control/discharge_sequence.py::DischargeSequence.run()`'s
+  normal (EOD) completion path -- same position.
+- `test_control/safety_monitor.py::SafetyMonitor.emergency_stop()` --
+  called after `relay_matrix.open_all()`, unconditionally (regardless of
+  whether either preceding step succeeded), covering every exception
+  path (timeout, safety violation, relay error, generic exception) for
+  **both** `ChargeSequence` and `DischargeSequence`, since both dispatch
+  through the same `run_guarded()` -> `emergency_stop()` chain.
+- `test_control/safety_monitor.py::SafetyMonitor.safe_cancel_shutdown()`
+  -- same position, covering the operator-cancellation path for both
+  sequence classes.
+- `test_control/hardware_manager.py::HardwareManager.disconnect_all()`
+  -- called after `self._relay.open_all()`, before the device-disconnect
+  loop that might close the SMU's session (so the session is still open
+  and addressable when this runs).
+- `test.py::_functional_smu()` (the standalone PSU test) -- called
+  immediately after its own `emergency_output_off()`; there is no relay
+  in this circuit, so no isolation step needs to precede it here.
+
+**Why this counts as centralized, not duplicated:** the actual zeroing
+*logic* (property selection, error handling, logging) exists in exactly
+one place, `SMU.zero_output_setpoint_best_effort()`. The six call sites
+above are one-line additions each, positioned wherever relay-open already
+independently happens today -- relay-open itself is not centralized in
+this codebase (each sequence's normal-completion path and `SafetyMonitor`'s
+two emergency methods each call it separately), so a small number of call
+sites is unavoidable without restructuring that unrelated, already-validated
+relay-handling code, which was explicitly out of scope for this change.
+
+### Interaction with `CycleSequence` (FUTURE PLANNED ARCHITECTURE, Section 67)
+
+No new code or new call site is needed for a future `CycleSequence`.
+Per its accepted design (Section 67), it composes fresh `ChargeSequence`/
+`DischargeSequence` instances and calls their complete, self-contained
+`.run()` -- each sub-phase already inherits this zeroing behavior
+automatically, at both its own normal-completion and exception paths,
+exactly as it already inherits `run_guarded()`/`complete()`/shutdown
+behavior generally (Section 67, "What this design deliberately does not
+touch"). `CycleSequence`'s own outer `run_guarded()` (for the cycle-level
+summary row) also dispatches to the same `SafetyMonitor.emergency_stop()`/
+`safe_cancel_shutdown()`, which already includes this step.
+
+### Expected operator-visible behavior
+
+After any Charge/Discharge Battery run -- normal completion, timeout,
+safety violation, or operator cancellation -- and after the standalone
+PSU test, the SMU's own commanded setpoint (`current_level` or
+`voltage_level`, whichever was active) is driven to `0` as the final
+step, after the battery is already isolated. This does not change
+`verify_output_disabled()`'s pass/fail contract, does not add a new log
+line an operator needs to react to (a zeroing failure logs only a
+WARNING, never CRITICAL), and does not add any delay to the
+safety-critical portion of shutdown -- `emergency_output_off()` and
+`relay.open()`/`relay_matrix.open_all()` behave identically to before.
+Whether this measurably changes what a handheld meter reads at the SMU
+terminals afterward is exactly the open question this change was built
+to help answer, not something it assumes the answer to.
+
+### What this change explicitly does not do
+
+It does not reorder SMU-off relative to relay-open (evaluated and
+rejected). It does not implement `cross_validate_output_state()`
+(Section 26 remains open). It does not change
+`verify_output_disabled()`/`_check_output_disabled_detailed()`'s
+verification mechanism (Section 60 remains unchanged). It does not
+claim to explain or fix the wiring-resistance/charge-timeout
+investigation from the same hardware session -- that remains a separate,
+unresolved hardware question.

@@ -323,6 +323,18 @@ class ChargeSequence(BatteryOperationSequence):
                 level="INFO", source="charge_battery", channel=channel, relay=relay_address,
                 message=f"Relay {relay_address} deactivated -- charge complete",
             )
+            # Post-isolation defense-in-depth, not safety-critical -- the
+            # battery is already isolated by the relay.open() above, so
+            # this cannot affect it either way. Wrapped defensively even
+            # though zero_output_setpoint_best_effort() itself never
+            # raises -- this step must never prevent a completed charge
+            # from returning normally. See docs/architecture.md
+            # "Post-Isolation SMU Setpoint Zeroing".
+            try:
+                self.smu.zero_output_setpoint_best_effort(f"end of charge sequence on channel {channel}")
+            except Exception as e:
+                self.log.warning("Channel %d: post-isolation setpoint-zeroing raised "
+                                  "unexpectedly (non-critical): %s", channel, e)
             return True
 
         completed = self.run_guarded(
