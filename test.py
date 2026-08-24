@@ -3988,6 +3988,58 @@ def _confirm_operation(operation: str, battery_type: str, battery_cfg: dict,
     return answer != "C"
 
 
+def _print_presence_precheck_failure(precheck: dict) -> None:
+    """
+    Console report for a failed test_control.battery_presence_precheck::
+    battery_and_ntc_presence_precheck() result -- format fixed by explicit
+    request (see docs/architecture.md "Battery Presence + NTC Presence
+    Diagnostics"):
+
+        Battery present: YES
+        Battery voltage: 3.67 V
+        NTC present: NO
+
+        TEST ABORTED
+        Reason: NTC Missing
+
+    A REVERSED battery reading prints "Battery present: YES" here (a
+    reversed cell is still physically present -- see
+    battery_presence_precheck.py's own docstring for why this check never
+    treats REVERSED as missing); the separate, unchanged reverse-polarity
+    safety check still runs, and still logs its own event, if the run
+    proceeds far enough to reach it.
+    """
+    from test_control.battery_diagnostics import BatteryPresence
+    from hardware.temperature import NTCPresence
+
+    if not precheck["battery_readable"]:
+        battery_present = "UNKNOWN (read failed)"
+    elif precheck["battery_presence"] in (BatteryPresence.PRESENT, BatteryPresence.REVERSED):
+        battery_present = "YES"
+    else:
+        battery_present = "NO"
+
+    if precheck["ntc_presence"] is None:
+        ntc_present = "N/A"
+    elif precheck["ntc_presence"] == NTCPresence.PRESENT:
+        ntc_present = "YES"
+    else:
+        ntc_present = "NO"
+
+    print(f"\nBattery present: {battery_present}")
+    if precheck["battery_voltage_v"] is not None:
+        print(f"Battery voltage: {precheck['battery_voltage_v']:.2f} V")
+    print(f"NTC present: {ntc_present}")
+    print("\nTEST ABORTED")
+    reasons = precheck["reasons"]
+    if len(reasons) == 1:
+        print(f"Reason: {reasons[0]}")
+    else:
+        print("Reason:")
+        for reason in reasons:
+            print(f"- {reason}")
+
+
 def _print_post_run_summary(storage):
     """
     Print the generic Run Summary for the run `storage` just finished --
@@ -4027,7 +4079,7 @@ def _run_monitor_battery():
     print("MONITOR BATTERY")
 
     import signal
-    from hardware.temperature import NTCPresence
+    from test_control.battery_presence_precheck import battery_and_ntc_presence_precheck
     from test_control.hardware_manager import HardwareManager
     from test_control.monitor_battery_sequence import MonitorBatterySequence
     from test_control.safety_monitor import SafetyMonitor
@@ -4139,33 +4191,32 @@ def _run_monitor_battery():
             for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
                 storage.log_event(level="INFO", source="monitor_battery", message=message)
 
-            # Group NTC pre-check -- one-time snapshot of every position's NTC
-            # in this group, BEFORE the target relay ever closes (NTC channels
-            # are independent DAQ analog inputs, never routed through the
-            # relay matrix -- see _ntc_group_snapshot()). No-op if this group
-            # has no ntc_daq/daq assigned. Aborts (no relay activation) only if
-            # the SELECTED position was actually READ (see "readable" in
-            # _ntc_group_snapshot()'s docstring) and came back not PRESENT --
-            # a DAQ comms failure on the read itself does NOT abort, matching
-            # the active-monitoring loop's own graceful degradation on the
-            # identical DAQError. An absent/faulted NTC on some OTHER position
-            # in the group is recorded but never blocks this run either, since
-            # it isn't part of what's being monitored.
+            # Battery Presence + NTC Presence pre-check -- BEFORE the target
+            # relay closes for the real run (see
+            # test_control/battery_presence_precheck.py and
+            # docs/architecture.md "Battery Presence + NTC Presence
+            # Diagnostics"). Closes/reopens the relay itself for a passive
+            # DMM read (the SMU's output is never enabled at this point in
+            # this workflow at all), then runs the same group NTC snapshot
+            # this pre-check has always used. Aborts only on a REAL, READABLE
+            # absent/fault signal for the SELECTED position -- a DMM/DAQ
+            # comms failure degrades gracefully (not treated as "missing"),
+            # matching the active-monitoring loop's own graceful degradation
+            # on the identical DAQError. A reversed-polarity voltage reading
+            # is never treated as "missing" here -- see the module's own
+            # docstring for why.
             size = dev_cfg.group_size(group)
-            ntc_snapshot = _ntc_group_snapshot(
-                storage, hw_mgr.ntc_daq, group, size, source="monitor",
-                phase_detail="NTC_PRECHECK", log_summary=True,
+            precheck = battery_and_ntc_presence_precheck(
+                storage=storage, dmm=hw_mgr.dmm, relay=hw_mgr.relay, ntc_daq=hw_mgr.ntc_daq,
+                group=group, size=size, position=position, channel=channel,
+                relay_address=relay_address, source="monitor_battery", measurement_test_type="monitor",
             )
-            target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
-            if target_ntc is not None and target_ntc["readable"] and target_ntc["presence"] != NTCPresence.PRESENT:
-                storage.log_event(
-                    level="ERROR", source="monitor_battery", channel=channel, relay=relay_address,
-                    message=f"NTC pre-check failed for selected position -- {target_ntc['presence']}",
-                )
+            if not precheck["ok"]:
                 storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
                 storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
-                print(f"\n[FAIL] NTC pre-check failed for the selected position "
-                      f"({target_ntc['presence']}) -- aborting, no relay activated.")
+                _print_presence_precheck_failure(precheck)
+                print("\n[FAIL] Pre-check failed for the selected position -- "
+                      "aborting. Relay has been returned to open.")
                 return
 
             print("\nPress Ctrl+C to stop monitoring safely.\n")
@@ -4391,7 +4442,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     print(operation.upper())
 
     import signal
-    from hardware.temperature import NTCPresence
+    from test_control.battery_presence_precheck import battery_and_ntc_presence_precheck
     from test_control.hardware_manager import HardwareManager
     from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken, install_sigint_handler
@@ -4525,32 +4576,39 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
                 storage.log_event(level="INFO", source=source, message=message)
 
-            # Group NTC pre-check -- one-time snapshot of every position's NTC
-            # in this group, BEFORE the target relay ever closes -- see
-            # _ntc_group_snapshot()'s docstring (test.py) for why this is safe
-            # to do before any relay/SMU activity. Measurement rows use the
-            # SAME short test_type ChargeSequence/DischargeSequence's own
-            # sampling-loop rows already use ("charge"/"discharge", not
-            # "charge_battery"/"discharge_battery") so this run's measurements
-            # stay internally consistent -- see docs/architecture.md Section 46
-            # for the pre-existing run_summary-vs-measurements vocabulary split
-            # this deliberately does not add a third variant to.
+            # Battery Presence + NTC Presence pre-check -- BEFORE the target
+            # relay closes for the real run (see
+            # test_control/battery_presence_precheck.py and
+            # docs/architecture.md "Battery Presence + NTC Presence
+            # Diagnostics"). Closes/reopens the relay itself for a passive
+            # DMM read (the SMU's output is never enabled at this point --
+            # sequence_cls hasn't even been constructed yet), then runs the
+            # same group NTC snapshot this pre-check has always used.
+            # Measurement rows use the SAME short test_type
+            # ChargeSequence/DischargeSequence's own sampling-loop rows
+            # already use ("charge"/"discharge", not
+            # "charge_battery"/"discharge_battery") so this run's
+            # measurements stay internally consistent -- see
+            # docs/architecture.md Section 46 for the pre-existing
+            # run_summary-vs-measurements vocabulary split this deliberately
+            # does not add a third variant to. Aborts only on a REAL,
+            # READABLE absent/fault signal -- a DMM/DAQ comms failure
+            # degrades gracefully (not treated as "missing"). A reversed-
+            # polarity voltage reading is never treated as "missing" here --
+            # see the module's own docstring for why.
             size = dev_cfg.group_size(group)
             measurement_test_type = {"charge_battery": "charge", "discharge_battery": "discharge"}.get(source, source)
-            ntc_snapshot = _ntc_group_snapshot(
-                storage, hw_mgr.ntc_daq, group, size, source=measurement_test_type,
-                phase_detail="NTC_PRECHECK", log_summary=True,
+            precheck = battery_and_ntc_presence_precheck(
+                storage=storage, dmm=hw_mgr.dmm, relay=hw_mgr.relay, ntc_daq=hw_mgr.ntc_daq,
+                group=group, size=size, position=position, channel=channel,
+                relay_address=relay_address, source=source, measurement_test_type=measurement_test_type,
             )
-            target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
-            if target_ntc is not None and target_ntc["readable"] and target_ntc["presence"] != NTCPresence.PRESENT:
-                storage.log_event(
-                    level="ERROR", source=source, channel=channel, relay=relay_address,
-                    message=f"NTC pre-check failed for selected position -- {target_ntc['presence']}",
-                )
+            if not precheck["ok"]:
                 storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
                 storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
-                print(f"\n[FAIL] NTC pre-check failed for the selected position "
-                      f"({target_ntc['presence']}) -- aborting, no relay activated.")
+                _print_presence_precheck_failure(precheck)
+                print(f"\n[FAIL] Pre-check failed for the selected position -- aborting, "
+                      f"relay returned to open. No {operation.lower()} started.")
                 return
 
             print(f"\nPress Ctrl+C to stop {operation.lower()} safely.\n")

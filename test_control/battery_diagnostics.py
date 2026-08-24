@@ -1,30 +1,50 @@
 """
 Post-run diagnostic classification for Charge Battery / Discharge Battery
--- Test Mode informational analysis ONLY.
+-- Test Mode informational analysis ONLY -- PLUS the battery-presence
+voltage classifier used by the pre-test Battery Presence Check (see
+test_control/battery_presence_precheck.py and docs/architecture.md
+"Battery Presence + NTC Presence Diagnostics").
 
-Why this exists: in Test Mode, NTC validation and battery-presence gating
-are intentionally NOT enforced (see docs/architecture.md "Test Mode"
-sections) so an operator can validate relay routing, SMU behavior, DMM
-readings, SafetyMonitor integration, and logging infrastructure against
-partially assembled hardware -- an empty position must remain runnable,
-never blocked. But that same permissiveness means an empty position can
-look deceptively like a real result: ChargeSequence's CV compliance into
-an open circuit satisfies its own EOC condition (voltage at/above target,
-current near zero) almost immediately, indistinguishable at a glance from
-a battery that was simply already fully charged; DischargeSequence sinking
-current from an open circuit drives voltage toward the SMU's compliance
-floor almost immediately, tripping SafetyMonitor's undervoltage check.
-This module gives a human that distinction as an ADDITIVE label -- it
-never gates, never raises, never changes stop_reason/result, and is
-computed entirely from data the sampling loop already acquired (see
-test_control/battery_operation_sequence.py::_ChargeDischargeStats) -- no
-new hardware reads happen here.
+Why the post-run classification exists: before the pre-test Battery
+Presence Check was added, NTC validation was the only thing checked
+before a relay ever closed -- an operator could still validate relay
+routing, SMU behavior, DMM readings, SafetyMonitor integration, and
+logging infrastructure against partially assembled hardware, but an empty
+position could look deceptively like a real result: ChargeSequence's CV
+compliance into an open circuit satisfies its own EOC condition (voltage
+at/above target, current near zero) almost immediately, indistinguishable
+at a glance from a battery that was simply already fully charged;
+DischargeSequence sinking current from an open circuit drives voltage
+toward the SMU's compliance floor almost immediately, tripping
+SafetyMonitor's undervoltage check. classify_charge_behavior()/
+classify_discharge_behavior() below give a human that distinction as an
+ADDITIVE label -- they never gate, never raise, never change stop_reason/
+result, and are computed entirely from data the sampling loop already
+acquired (see test_control/battery_operation_sequence.py::
+_ChargeDischargeStats) -- no new hardware reads happen there. This
+remains useful even now that a real pre-test presence gate exists: the
+pre-test check only samples voltage once, before the relay closes for the
+real run; these post-run classifiers see the whole sampling loop's
+behavior and catch cases the single pre-test reading could miss (e.g. a
+connection that reads plausible at rest but never delivers real current).
+
+classify_battery_presence() (below) is a DIFFERENT kind of function from
+the two classifiers above -- a pure voltage->classification mapping with
+no gating/raising of its own either (mirrors hardware/temperature.py::
+classify_ntc_presence()'s own relationship to its caller: the caller
+decides what to do with the classification, this function only produces
+it). It is reused by test_control/battery_presence_precheck.py to
+determine whether a battery is physically present at all, BEFORE a test
+starts -- a distinct question from "is this position's charge/discharge
+behavior normal," answered independently.
 
 Thresholds below are best-effort STARTING POINTS, not calibrated against
 real battery/rig behavior -- same "unconfirmed placeholder" convention
 already used throughout config/devices.py's BATTERY_CONFIGS. Tune once
 real hardware validation data is available (see docs/TODO.md).
 """
+
+from config.settings import Settings
 
 
 class ChargeDiagnosis:
@@ -149,3 +169,54 @@ def classify_discharge_behavior(*, initial_voltage_v, final_voltage_v, avg_curre
     if small_current and short_duration and collapsed:
         return DischargeDiagnosis.POSSIBLY_EMPTY_POSITION
     return DischargeDiagnosis.NORMAL_DISCHARGE_BEHAVIOR
+
+
+class BatteryPresence:
+    """
+    Battery-presence classification for a single pre-test DMM voltage
+    reading -- see classify_battery_presence() and
+    test_control/battery_presence_precheck.py. Plain string constants,
+    same convention as hardware/temperature.py::NTCPresence.
+    """
+    PRESENT  = "present"
+    ABSENT   = "absent"
+    REVERSED = "reversed"
+
+
+def classify_battery_presence(voltage_v: float) -> str:
+    """
+    Classify a single pre-test (SMU output still disabled) DMM voltage
+    reading as PRESENT (a real, plausible cell voltage), ABSENT (reads
+    near 0 V -- an open/disconnected position, no battery there), or
+    REVERSED (reads sharply negative -- a real cell is present, but
+    installed backwards).
+
+    Reuses two thresholds ALREADY established and reasoned about
+    elsewhere in this codebase, rather than introducing a new number:
+    Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V (-0.5 V -- the existing
+    reverse-polarity boundary, see
+    BatteryOperationSequence._check_battery_polarity()) and
+    EMPTY_POSITION_VOLTAGE_V (0.5 V, above -- "at/below this ABSOLUTE
+    voltage looks like an open/disconnected circuit, not a real cell").
+    Together they partition the number line into three zones:
+
+        <= -0.5 V           -> REVERSED
+        (-0.5 V, 0.5 V]     -> ABSENT
+        > 0.5 V             -> PRESENT
+
+    Deliberately does NOT gate or raise -- mirrors
+    hardware/temperature.py::classify_ntc_presence()'s relationship to its
+    caller: this function only classifies, the caller
+    (test_control/battery_presence_precheck.py) decides what to do with
+    the result. A REVERSED classification is intentionally NOT treated as
+    "missing" by that caller -- a reversed cell is a physically present
+    battery, just backwards; the existing, unchanged
+    BatteryOperationSequence._check_battery_polarity() (raising
+    ReversePolarityError once the real sequence starts) remains the sole
+    safety-relevant handling for that condition, never duplicated here.
+    """
+    if voltage_v <= Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V:
+        return BatteryPresence.REVERSED
+    if voltage_v <= EMPTY_POSITION_VOLTAGE_V:
+        return BatteryPresence.ABSENT
+    return BatteryPresence.PRESENT

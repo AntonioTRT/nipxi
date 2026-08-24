@@ -7086,3 +7086,168 @@ against the real datasheet's reference table, described above). Full
 suite re-run clean after this change, no regressions -- no other test in
 the suite hardcoded any of the changed numeric values (confirmed by
 search before making the change).
+
+## 76. Battery Presence + NTC Presence Diagnostics (CURRENT IMPLEMENTATION)
+
+Triggered by a review request following the SenseRouter work (Section 73):
+now that direct battery voltage measurement via the DMM is a well-
+understood, established capability, is battery presence distinguished
+from NTC presence for diagnostic purposes -- so an operator can tell WHICH
+failed, not just that "something" failed?
+
+### What was implemented before this change
+
+Only ONE pre-test presence check existed: a group-wide NTC snapshot
+(`test_control/ntc_snapshot.py::ntc_group_snapshot()`, called from
+`test.py::_run_monitor_battery()`/`_run_charge_or_discharge()` BEFORE the
+target relay ever closed) that aborted the run if the SELECTED position's
+NTC channel was read and came back not `PRESENT`. Battery presence was
+**never checked pre-test at all** -- `BatteryOperationSequence.
+_check_battery_polarity()` (inside `ChargeSequence`/`DischargeSequence`,
+AFTER the relay closes) only rejects a reading at/below
+`Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V` (-0.5 V, reversed
+polarity); a near-0 V empty socket passes that check, so the SMU would be
+enabled and "charge" nothing until timeout, with the only ever record of
+this being `test_control/battery_diagnostics.py`'s POST-RUN
+`POSSIBLY_EMPTY_POSITION` classification -- informational only, computed
+after a full charge/discharge attempt had already run against nothing,
+never gating.
+
+Direct answers to the review's questions:
+
+1. **What is currently implemented?** Only an NTC-presence pre-test gate;
+   no battery-presence check before a test starts (see above).
+2. **Is the DMM battery voltage measurement executed when NTC detection
+   fails?** No -- the NTC pre-check ran and could abort BEFORE the relay
+   ever closed, and `_check_battery_polarity()`'s own DMM read only
+   happens inside `ChargeSequence`/`DischargeSequence`, which were never
+   constructed at all on an NTC-pre-check abort.
+3. **Should battery voltage still be measured for diagnostic purposes?**
+   Yes -- implemented below.
+4. **Are battery presence and NTC presence currently treated as separate
+   checks?** No -- battery presence wasn't checked pre-test at all.
+5. **Can the event log distinguish between Battery Missing / NTC Missing
+   / both?** Not before this change (there was no battery-presence
+   pre-check to log). Yes, after -- see below.
+6. **Would `Battery Presence Check -> NTC Presence Check -> Start/Abort
+   decision` be reasonable while preserving current safety behavior?**
+   Confirmed explicitly before implementing (see "Design decision
+   confirmed" below) -- yes, implemented as a NEW, additive gate; the
+   existing NTC gate is unchanged, never weakened.
+
+### Design decision confirmed before implementing
+
+Adding a battery-presence pre-test ABORT condition is a genuine new
+safety-relevant behavior change (today, nothing blocks test start over an
+absent battery at all) -- this was flagged and confirmed explicitly
+before implementing, rather than assumed, given the review's own
+"Keep test start blocked exactly as today" instruction was in tension with
+its desired-logging examples (which show "Battery Missing" independently
+causing `TEST ABORTED`). Confirmed choice: **add a new pre-test
+battery-presence gate**, parallel to the existing NTC gate, accepting one
+extra relay actuation + settle delay on every run (even a normal one) as
+the cost of a real, present-day pre-test read (the DMM shares the same
+relay-selected bus as the SMU, unlike the NTC channel, an independent DAQ
+input never routed through the relay matrix).
+
+### `classify_battery_presence()` (`test_control/battery_diagnostics.py`)
+
+A `PRESENT`/`ABSENT`/`REVERSED` classifier (mirrors `hardware/
+temperature.py::classify_ntc_presence()`'s exact idiom: pure
+classification, no gating of its own -- the caller decides). Built from
+TWO already-established thresholds, not a new invented number:
+`Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V` (-0.5 V) and this same
+module's own pre-existing `EMPTY_POSITION_VOLTAGE_V` (0.5 V, previously
+used only by the POST-RUN classifiers above):
+
+    <= -0.5 V         -> REVERSED
+    (-0.5 V, 0.5 V]   -> ABSENT
+    > 0.5 V           -> PRESENT
+
+A `REVERSED` reading is deliberately NOT treated as "missing" -- a
+reversed cell is a physically present battery, just backwards, a distinct
+diagnostic dimension (polarity, not presence) already fully and
+separately handled, unchanged, by `_check_battery_polarity()`'s own
+`ReversePolarityError` once the real sequence starts. This new check
+never duplicates or races that mechanism; it only records an informational
+note and lets the run proceed to it normally.
+
+### `battery_and_ntc_presence_precheck()` (new `test_control/battery_presence_precheck.py`)
+
+Kept OUT of `test.py` for the same reason `ntc_snapshot.py` already is
+(that module's own docstring: reusable without inheriting `test.py`'s
+`logging.disable()` import-time side effect). For the selected position:
+closes the relay, takes one passive DMM reading (SMU output is never
+enabled at this point in any caller), classifies presence, and **always**
+reopens the relay in a `finally` before returning -- regardless of
+success, failure, or an absent reading. The caller's own sequence
+(`ChargeSequence`/`DischargeSequence`/`MonitorBatterySequence`) closes the
+relay again itself if/when it proceeds, exactly as before; this function
+never leaves the relay in a different state than it found it. Then runs
+the SAME, unchanged `ntc_group_snapshot()` call the old NTC-only pre-check
+already used. A DMM (or DAQ) read failure degrades gracefully -- logged,
+but never treated as "missing," matching the identical policy
+`ntc_group_snapshot()` already applies to its own `DAQError` case ("this
+pre-check must not be stricter than the loop it precedes").
+
+Returns a structured `{"ok", "reasons", "battery_presence",
+"battery_readable", "battery_voltage_v", "ntc_presence", "ntc_readable"}`
+dict; the CALLER (`test.py`) still owns the actual abort decision
+(`record_execution_state()`/`finish_run_summary()`/the console report) --
+this module only calls `storage.log_event()`/`record_measurement()`, the
+same division of responsibility `ntc_snapshot.py` already uses.
+
+### Logging: event_log
+
+Every run now gets one INFO (or ERROR, if aborting) event: `"Presence
+check -- Battery: PRESENT (3.670 V), NTC: present"` -- recorded
+unconditionally, not only on failure, so the DB-backed event log always
+shows both dimensions' status. On abort, ALSO a distinct, greppable event:
+`"TEST ABORTED -- Reason: Battery Missing"` / `"TEST ABORTED -- Reason:
+NTC Missing"` / `"TEST ABORTED -- Reason: Battery Missing, NTC Missing"`
+-- directly answering the review's Q5. A `REVERSED` battery reading gets
+its own additional informational event (see above) rather than folding
+into either of these two.
+
+### Logging: console report (`test.py::_print_presence_precheck_failure()`)
+
+Exact format fixed by explicit request:
+
+    Battery present: YES
+    Battery voltage: 3.67 V
+    NTC present: NO
+
+    TEST ABORTED
+    Reason: NTC Missing
+
+(or a bulleted `Reason:` list when both fail). `REVERSED` prints "Battery
+present: YES" here too, for the same reason the event log treats it as
+present, not missing.
+
+### Wired into both existing pre-test gates
+
+`test.py::_run_monitor_battery()` and `_run_charge_or_discharge()` (shared
+by Charge Battery and Discharge Battery) each replaced their own,
+previously NTC-only pre-check block with one call to
+`battery_and_ntc_presence_precheck()`, before their respective sequence
+class is ever constructed. `record_execution_state(SAFETY_VIOLATION)`/
+`finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")` on
+abort are UNCHANGED from the prior NTC-only abort path (no `run_summary`
+schema migration needed -- the added detail lives in `event_log`, exactly
+where the pre-existing NTC-only abort message already put its own detail).
+Monitor Battery was included even though the original review's examples
+were charge/discharge-flavored -- it shares the identical pre-existing
+NTC-gating code, and is exactly the tool an operator would reach for to
+diagnose a "not functioning correctly" slot, so leaving it with weaker
+diagnostics than Charge/Discharge Battery would have been an inconsistent,
+confusing gap.
+
+Tests: `tests/test_battery_presence_classification.py` (new -- boundary
+tests for the three-zone classifier), `tests/test_battery_presence_precheck.py`
+(new -- all four presence/absence combinations, relay always
+closed-then-reopened including on a raising DMM read, DMM-failure grace
+degradation, reversed-polarity non-abort, NTC FAULT-vs-ABSENT wording,
+event_log content), and `tests/test_presence_precheck_testpy_wiring.py`
+(new -- source-inspection proof that both `test.py` call sites are wired
+in the correct order, mirroring the existing `test_sense_router_testpy_wiring.py`
+technique). Full suite re-run clean, no regressions.
