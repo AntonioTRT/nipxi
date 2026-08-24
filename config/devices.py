@@ -820,10 +820,11 @@ def hardware_for_group(group: str) -> dict:
         "ntc_daq_cfg":  _ALL_DAQ_CONFIGS.get(ntc_daq_key),
         # FUTURE PLANNED ARCHITECTURE -- see docs/architecture.md "Future
         # Architecture: Battery Sense Routing" and hardware/sense_router.py.
-        # None for every group today (no group declares "sense_channel");
-        # this is purely a logical channel NUMBER, never a relay-matrix
-        # name or physical relay -- that mapping lives in SENSE_ROUTING
-        # below, resolved by hardware/sense_router.py, not here.
+        # None for every group EXCEPT B1 (which declares "sense_channel": 1
+        # below -- see "SenseRouter Deployment: MATRIX_NUMATO_201"); this is
+        # purely a logical channel NUMBER, never a relay-matrix name or
+        # physical relay -- that mapping lives in SENSE_ROUTING below,
+        # resolved by hardware/sense_router.py, not here.
         "sense_channel": grp.get("sense_channel"),
     }
 

@@ -95,6 +95,18 @@ def battery_and_ntc_presence_precheck(*, storage, dmm, relay, ntc_daq, group: st
             "battery_voltage_v": float | None,
             "ntc_presence": str | None,      # NTCPresence.* for the selected position, or None (no NTC hardware)
             "ntc_readable": bool,
+            "station_fault": bool,           # True iff the SELECTED position's NTC read
+                                              # failed with a real DAQError (test_control/
+                                              # ntc_snapshot.py's daq_comm_failure) -- a
+                                              # test-station equipment problem, not a
+                                              # per-position config gap. See docs/
+                                              # architecture.md "Group -> ALL Fault
+                                              # Classification Policy". Never True merely
+                                              # because no daq_ntc_ch is configured for
+                                              # this position -- that is ntc_readable=False,
+                                              # station_fault=False (a benign config gap,
+                                              # handled as a slot-level condition, not an
+                                              # abort trigger).
         }
 
     Never raises. `source` is the workflow's own event_log source (e.g.
@@ -134,6 +146,7 @@ def battery_and_ntc_presence_precheck(*, storage, dmm, relay, ntc_daq, group: st
     target_ntc = next((r for r in ntc_snapshot if r["position"] == position), None)
     ntc_presence = target_ntc["presence"] if target_ntc is not None else None
     ntc_readable = target_ntc["readable"] if target_ntc is not None else True
+    station_fault = target_ntc["daq_comm_failure"] if target_ntc is not None else False
 
     reasons = []
     if battery_readable and battery_presence == BatteryPresence.ABSENT:
@@ -173,4 +186,5 @@ def battery_and_ntc_presence_precheck(*, storage, dmm, relay, ntc_daq, group: st
         "battery_voltage_v": battery_voltage_v,
         "ntc_presence": ntc_presence,
         "ntc_readable": ntc_readable,
+        "station_fault": station_fault,
     }

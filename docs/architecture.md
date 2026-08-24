@@ -7191,11 +7191,13 @@ but never treated as "missing," matching the identical policy
 pre-check must not be stricter than the loop it precedes").
 
 Returns a structured `{"ok", "reasons", "battery_presence",
-"battery_readable", "battery_voltage_v", "ntc_presence", "ntc_readable"}`
-dict; the CALLER (`test.py`) still owns the actual abort decision
-(`record_execution_state()`/`finish_run_summary()`/the console report) --
-this module only calls `storage.log_event()`/`record_measurement()`, the
-same division of responsibility `ntc_snapshot.py` already uses.
+"battery_readable", "battery_voltage_v", "ntc_presence", "ntc_readable",
+"station_fault"}` dict (`station_fault` added in Section 80 -- see there
+for its semantics); the CALLER (`test.py`) still owns the actual abort
+decision (`record_execution_state()`/`finish_run_summary()`/the console
+report) -- this module only calls `storage.log_event()`/
+`record_measurement()`, the same division of responsibility
+`ntc_snapshot.py` already uses.
 
 ### Logging: event_log
 
@@ -7235,6 +7237,15 @@ class is ever constructed. `record_execution_state(SAFETY_VIOLATION)`/
 abort are UNCHANGED from the prior NTC-only abort path (no `run_summary`
 schema migration needed -- the added detail lives in `event_log`, exactly
 where the pre-existing NTC-only abort message already put its own detail).
+Both gates ALSO check `precheck["station_fault"]` BEFORE `precheck["ok"]`
+(Section 80) -- this was initially wired into the Charge/Discharge path
+only when `station_fault` was first introduced, then found missing from
+Monitor Battery by a final Milestone XX code review and added to match
+(same `STATION_FAULT` classification, `GROUP_RUN_ABORTED_STATION_FAULT`
+event, and early-return-before-sequence-construction shape as the
+Charge/Discharge path -- Monitor Battery has no Group -> ALL loop to
+abort, but must not silently proceed past a station-level DAQ fault
+either).
 Monitor Battery was included even though the original review's examples
 were charge/discharge-flavored -- it shares the identical pre-existing
 NTC-gating code, and is exactly the tool an operator would reach for to
@@ -7813,3 +7824,403 @@ part of the single-position path did not move.
 
 Full suite re-run clean after all three items: 337/337 passing, no
 regressions.
+
+## 80. Group -> ALL Fault Classification Policy (CURRENT IMPLEMENTATION)
+
+Refines Section 79's Group -> ALL behavior before milestone closure.
+Section 79 shipped a two-way outcome model: `CANCELLED` (operator Ctrl+C)
+stops the whole group; every other exception is `FAIL`, and the loop
+continues to the next position regardless of WHAT failed. A code-level
+trace of that behavior (every timeout/exception path, from raise site
+through `BatteryOperationSequence.run_guarded()`'s shutdown-then-reraise
+to `_run_one_charge_or_discharge_position()`'s catch-all) found this
+matched the intended requirements for battery-under-test problems
+(absence, timeout, a real safety violation) but NOT for test-station
+hardware problems: a `RelayError`/`DMMMeasurementLostError` (shared
+relay-matrix or DMM comms failure) was being treated identically to "this
+one battery didn't behave" -- FAIL, continue to the next position --
+even though the fault is in equipment every remaining position also
+depends on. Continuing past a station-level fault risks running every
+subsequent position against unverified, possibly still-faulted shared
+hardware.
+
+**Three-way classification (replaces Section 79's two-way model):**
+
+1. **Battery-under-test failures** (Category 1) -- specific to the one
+   position under test; the DUT's own absence, electrical behavior, or
+   condition. Result: `FAIL` or `SKIPPED`, loop continues to the next
+   position. Members: battery absence, battery presence precheck failure,
+   NTC absence for the current position (a config gap, not an equipment
+   fault -- see below), charge/discharge timeout (`NIPXITimeoutError`), a
+   real `SafetyViolationError` limit violation, `ReversePolarityError`,
+   `BatteryRemovedDuringChargeError`.
+2. **Test-station hardware failures** (Category 2) -- shared equipment
+   (relay matrix, SMU, DMM, DAQ) that every remaining position in the
+   group also depends on. Result: `STATION_FAULT` (new), loop aborts
+   immediately -- no further positions are attempted. Members:
+   `RelayError`, `SMUError`, `DMMError`, `DAQError`,
+   `DMMMeasurementLostError`, and, per explicit policy, **any exception
+   matching neither category** -- "unknown system state must be treated
+   as unsafe," not silently continued past.
+3. **Operator cancellation** -- unchanged from Section 79. Result:
+   `CANCELLED`, loop aborts immediately, but for a different reason (an
+   explicit operator request, not an unsafe/unknown state).
+
+**Single source of truth:** `utils/errors.py::STATION_HARDWARE_EXCEPTIONS`
+/ `BATTERY_UNDER_TEST_EXCEPTIONS` -- two `isinstance`-checkable tuples,
+defined once, read by `test.py::_classify_position_exception()` rather
+than re-derived inline. **Critical ordering rule:**
+`DMMMeasurementLostError` is deliberately a `SafetyViolationError`
+subclass (so it reuses `run_guarded()`'s existing `SafetyViolationError`
+shutdown branch rather than needing a new one -- see Section 60), but
+must be classified STATION-level. `_classify_position_exception()`
+therefore checks `STATION_HARDWARE_EXCEPTIONS` membership FIRST, falling
+back to `BATTERY_UNDER_TEST_EXCEPTIONS`, then defaulting to
+`STATION_FAULT` for anything matching neither:
+
+```python
+def _classify_position_exception(exc: Exception) -> str:
+    if isinstance(exc, STATION_HARDWARE_EXCEPTIONS):
+        return "STATION_FAULT"
+    if isinstance(exc, BATTERY_UNDER_TEST_EXCEPTIONS):
+        return "FAIL"
+    return "STATION_FAULT"
+```
+
+Checking the broader tuple first would misclassify
+`DMMMeasurementLostError` as battery-level, since
+`isinstance(exc, SafetyViolationError)` is also true for it -- the same
+reasoning already applied to `ReversePolarityError`/
+`BatteryRemovedDuringChargeError` in `BatteryOperationSequence`'s own
+class hierarchy (Section 60).
+
+**Relay matrix comms coverage:** `hardware/relay_eth.py` already wraps
+every comms failure (socket timeout, connection refused, generic
+exceptions) into `RelayError` -- confirmed by inspection, not assumed --
+so no separate "matrix communication failure" exception type was needed;
+`RelayError` alone covers Category 2's relay-matrix requirement.
+
+**NTC/DAQ ambiguity resolved:** before this pass,
+`ntc_snapshot.py::ntc_group_snapshot()`'s `readable=False` collapsed two
+distinct causes into one signal -- "no `daq_ntc_ch` configured for this
+position" (a benign, per-position config gap) and "a real `DAQError` on
+the read" (a genuine DAQ hardware/communication problem, shared
+equipment). A new `daq_comm_failure: bool` field on each position's
+result dict distinguishes them: `True` only for the `DAQError`-on-read
+case, `False` for both "no channel configured" and a genuinely successful
+read. `test_control/battery_presence_precheck.py::
+battery_and_ntc_presence_precheck()` surfaces this for the SELECTED
+position specifically as a new `"station_fault": bool` field on its own
+return dict. `test.py::_run_one_charge_or_discharge_position()` checks
+`precheck["station_fault"]` BEFORE `precheck["ok"]` -- required ordering,
+since an unreadable NTC never contributes to `reasons` (see that
+module's `if ... and ntc_readable and ...` guard), so `ok` could
+otherwise be `True` despite a genuine DAQ comms fault, silently
+proceeding to close the relay and start the sequence against
+unverified DAQ hardware. Desired behavior confirmed: no NTC configured ->
+slot-level condition (unchanged, `ok=True` if nothing else blocks);
+DAQ communication failure -> `STATION_FAULT` -> abort group (new).
+
+**Group orchestration:** `_run_charge_or_discharge_all_positions()`'s
+loop now breaks on `result in ("CANCELLED", "STATION_FAULT")` (was:
+`result == "CANCELLED"` only) -- two `break` statements, one per branch,
+each printing a distinct operator-facing message
+("Operator cancellation..." vs "Test-station hardware fault..."). A
+new `station_fault: bool` loop-local (mirrors the existing `cancelled`)
+is threaded into `GROUP_RUN_COMPLETED`'s logged fields and into
+`_print_group_run_summary()` (new `station_fault` parameter, always
+passed by its one production call site in
+`_run_charge_or_discharge_all_positions()`; the default value exists only
+for the test suite's direct-call convenience) for a distinct
+"Station Fault: ..." console note, parallel to the existing
+"Cancelled: ..." note.
+
+**Event logging:** a new `EventType.GROUP_RUN_ABORTED_STATION_FAULT`,
+logged once, at the exact position that triggered the abort, from inside
+`_run_one_charge_or_discharge_position()` (which already has `group`/
+`channel`/the caught exception in scope -- no change to this function's
+plain-string return contract was needed to carry exception detail back
+to the caller) and, since the final code review below, from
+`_run_monitor_battery()`'s matching `station_fault` gate too. Two shapes:
+the `precheck["station_fault"]` early return (`EXCEPTION=DAQError`, a
+fixed value -- the precheck only ever detects this one cause), and the
+generic `except Exception as e:` branch after
+`_classify_position_exception(e)` returns `"STATION_FAULT"`
+(`EXCEPTION={type(e).__name__}`, `MESSAGE={e}`). Field name is
+`POSITION=`, matching the pre-existing `GROUP_SLOT_*` events' own field
+name for the identical value -- the design review that requested this
+event used the word "slot" informally to describe the required field
+(exception type, exception message, slot, group), not a literal field
+key; `POSITION=` was chosen instead of `SLOT=` for consistency with
+Section 79's already-established event vocabulary (a final code review
+caught an initial implementation that used `SLOT=` here, inconsistent
+with every sibling `GROUP_SLOT_*` event -- corrected before closure, see
+below). Format (see `utils/event_format.py`):
+
+```
+EVENT_TYPE=GROUP_RUN_ABORTED_STATION_FAULT GROUP=B1 POSITION=3 EXCEPTION=DMMMeasurementLostError MESSAGE=DMM communication lost
+```
+
+`_run_one_charge_or_discharge_position()`'s own `run_summary` row AND
+`station_state` row are both re-written on the generic-exception path
+(`record_execution_state(state=StopReason.STATION_FAULT)` +
+`finish_run_summary(stop_reason=StopReason.STATION_FAULT,
+result="STATION_FAULT")`) -- overwriting `run_guarded()`'s own earlier
+writes (every one of its exception branches already writes
+`result="FAIL"`/some `stop_reason` and its own `record_execution_state()`
+call before re-raising, per Section 60) so BOTH DB-persisted records
+match the orchestration-level classification an operator would see, not
+the pre-classification value `run_guarded()` wrote before the exception
+ever reached this policy layer. (A final code review caught that the
+initial implementation only re-wrote `run_summary` here, leaving
+`station_state` stale at `run_guarded()`'s own `FAILED`/
+`SAFETY_VIOLATION` value -- corrected before closure, see below.)
+`utils/stop_reason.py::StopReason` gained a matching
+`STATION_FAULT = "STATION_FAULT"` constant rather than a raw string
+literal at each call site.
+
+**Validation timeout methodology (300s/600s):** to exercise this policy
+end-to-end without waiting out full-length charge/discharge cycles, B1's
+`test_setpoints` override (`config/devices.py::BATTERY_GROUPS["B1"]
+["test_setpoints"]`) is the correct, existing seam for a temporary
+`charge_timeout_s`/`discharge_timeout_s` reduction -- the same mechanism
+already used for B1's real, live 28800s (8h) "VALIDATION ONLY" override
+(Section 69). `charge_sequence.py`/`discharge_sequence.py` read
+`test_setpoints.get("charge_timeout_s", Settings.CHARGE_TIMEOUT_S)` --
+never the global default directly -- so this is a per-group override,
+not a production-default change; `Settings.CHARGE_TIMEOUT_S`/
+`DISCHARGE_TIMEOUT_S` (7200s/2h) are untouched by it.
+`utils/validators.py::validate_group_test_config()`'s Stage 4 validates
+any override positive and `<= Settings.MAX_TIMEOUT_OVERRIDE_S` (86400s/
+24h) -- 300/600 both pass with wide margin. The one validator that CAN
+reject it: `Settings.SYSTEM_MODE == PRODUCTION` rejects ANY override
+outright (Section 69's "no timeout shortcuts in production" rule) --
+`DEVELOPMENT`/`VALIDATION` mode is therefore not just sufficient but
+required for this test; production mode would reject the override
+before any hardware is touched. 300s/600s are suitable to validate every
+item on the requested list (Group -> ALL orchestration, timeout handling
+triggering `NIPXITimeoutError` -> `FAIL` -> continue, independent
+per-position `run_summary` rows via `begin_new_run_id(suffix=...)`,
+`GROUP_*`/`GROUP_RUN_ABORTED_STATION_FAULT` event generation,
+PASS/FAIL/SKIPPED/STATION_FAULT paths, and emergency shutdown between
+positions via `run_guarded()`'s unchanged shutdown-then-reraise) -- none
+of those behaviors depend on the timeout's actual duration, only on it
+eventually firing, which 300s/600s does far faster than the 7200s/28800s
+production/B1-live values while remaining well inside every validator's
+accepted range.
+
+Tests: `tests/test_group_all_fault_classification.py` (new) -- direct
+unit tests for `_classify_position_exception()` against every exception
+type named above (including the `DMMMeasurementLostError` ordering
+case and an unrecognized `ValueError` defaulting to `STATION_FAULT`),
+plus an integration-style harness (scripted fake `sequence_cls`, mirrors
+`tests/test_hardware_event_logging.py`'s fake-hardware convention)
+exercising `_run_one_charge_or_discharge_position()` end to end for all 8
+required scenarios (RelayError/DMMMeasurementLostError/DAQError ->
+STATION_FAULT; charge/discharge timeout -> FAIL; Ctrl+C/
+OperationCancelledError -> CANCELLED; unknown Exception -> STATION_FAULT;
+normal completion -> PASS), plus a `run_summary.result` overwrite check.
+`tests/test_battery_presence_precheck.py` gained a
+`StationFaultVsConfigGapTests` class for the new `station_fault` field
+(DAQ comms failure sets it, no-channel-configured does not, a normal
+reading does not, and a comms failure never contributes to `reasons`).
+`tests/test_group_all_support.py`/`tests/test_presence_precheck_testpy_
+wiring.py`'s existing source-inspection tests were updated for the new
+two-break-statement loop shape and the `station_fault`-gate-precedes-
+`ok`-gate ordering (both pre-existing tests that pinned the OLD one-break/
+one-gate shape were updated, not deleted -- they now assert the new
+shape exactly, mirroring how Section 79's own extraction updated these
+same two files' prior assertions).
+
+Full suite re-run clean after this refinement: 368/368 passing, no
+regressions -- 337 pre-existing (Section 79) + 31 net-new: 22 in the new
+`tests/test_group_all_fault_classification.py`, 4 new station_fault
+cases in `tests/test_battery_presence_precheck.py`, 2 new station_fault-
+note cases in `tests/test_group_all_support.py`'s
+`PrintGroupRunSummaryTests`, and 3 new station_fault-gate cases in
+`tests/test_presence_precheck_testpy_wiring.py` (that file's and
+`test_group_all_support.py`'s existing tests were also updated in place
+for the new two-break/two-gate shape, not counted again here since they
+are not net-new test methods). Superseded by Section 81's final count
+below -- three real gaps found by that review were fixed after this
+initial 368/368 pass.
+
+## 81. Milestone XX Final Code Review: Fixes and Disclosed Residual Risks
+
+A dedicated final review of every Milestone XX change (Sections 55-80,
+everything since Milestone XIX), focused specifically on Group -> ALL,
+`STATION_FAULT`, event logging, the battery presence precheck, the DMM
+authoritative-voltage migration, and shutdown logic, run before
+formally closing Milestone XX. Six independent passes, one per area,
+each explicitly instructed to verify claims against the actual code
+rather than trust comments/docstrings, and to check for dead code,
+duplicated logic, obsolete compatibility code, temporary/validation-only
+code left switched on, and documentation drift.
+
+### Real gaps found and fixed
+
+1. **Monitor Battery never checked `precheck["station_fault"]`
+   (`test.py::_run_monitor_battery()`).** Section 80 wired the
+   `station_fault` early-return gate into
+   `_run_one_charge_or_discharge_position()` (Charge/Discharge Battery)
+   but not into `_run_monitor_battery()`, which only checked
+   `precheck["ok"]`. Since an unreadable NTC never contributes to
+   `reasons` (see Section 76), `ok` could be `True` despite a genuine
+   DAQ comms fault on the selected position -- Monitor Battery would have
+   silently closed the relay and started `MonitorBatterySequence` against
+   confirmed-faulty shared DAQ hardware, never logging `STATION_FAULT` or
+   distinguishing the fault from "no NTC configured." Fixed by adding the
+   identical `if precheck["station_fault"]:` gate (checked before `ok`,
+   same `STATION_FAULT` `record_execution_state`/`finish_run_summary`
+   write, same `GROUP_RUN_ABORTED_STATION_FAULT` event) to
+   `_run_monitor_battery()`, mirroring the Charge/Discharge path exactly.
+   New wiring tests added to `tests/test_presence_precheck_testpy_
+   wiring.py::MonitorBatteryWiringTests` (`test_station_fault_gate_
+   precedes_the_ok_gate`, `test_station_fault_gate_returns_without_
+   constructing_the_sequence`), mirroring the existing
+   `ChargeOrDischargeWiringTests` coverage for the same property.
+2. **`station_state` (via `record_execution_state()`) was never
+   re-written on the generic-exception `STATION_FAULT` reclassification
+   path (`test.py::_run_one_charge_or_discharge_position()`'s
+   `except Exception as e:` branch).** The sibling
+   `precheck["station_fault"]` early-return branch always re-wrote both
+   `run_summary` (`finish_run_summary`) AND `station_state`
+   (`record_execution_state`) to `STATION_FAULT`; the generic-exception
+   branch only re-wrote `run_summary`, leaving `station_state`
+   permanently stuck at whatever terminal state `run_guarded()`'s own
+   exception branch wrote (`FAILED` for `RelayError`/generic `Exception`,
+   `SAFETY_VIOLATION` for `SafetyViolationError`/`DMMMeasurementLostError`,
+   `TIMEOUT` for `NIPXITimeoutError`) before re-raising -- an operator
+   inspecting `station_state` after a `RelayError`-triggered
+   `STATION_FAULT` would see `FAILED`, not `STATION_FAULT`, a real
+   traceability inconsistency between the two persisted records for the
+   same run. Fixed by adding the matching `record_execution_state(state=
+   StopReason.STATION_FAULT)` call to that branch, immediately before its
+   existing `finish_run_summary()` call. New test:
+   `tests/test_group_all_fault_classification.py::
+   RunOnePositionStationFaultIntegrationTests::
+   test_station_fault_overwrites_execution_state_too`.
+3. **`GROUP_RUN_ABORTED_STATION_FAULT` used `SLOT=` while every sibling
+   `GROUP_SLOT_*` event uses `POSITION=` for the identical value** -- an
+   undocumented, unintentional naming inconsistency (the original design
+   review's brief used "slot" as an informal description of the required
+   field, not a literal field-key spec). Fixed: all three call sites
+   (`_run_one_charge_or_discharge_position()`'s two branches,
+   `_run_monitor_battery()`'s new one) now pass `position=position`,
+   matching `GROUP_SLOT_STARTED`/`_FAILED`/`_SKIPPED`/`_COMPLETED`'s own
+   field name. Updated the one test that asserted the old `SLOT=` text
+   (`tests/test_group_all_fault_classification.py`) and this document's
+   own literal example (Section 80, above).
+
+Also fixed, lower-severity documentation-only drift (no behavior
+change): three source comments/docstrings (`hardware/sense_router.py`'s
+module docstring, `config/devices.py::hardware_for_group()`'s
+`sense_channel` comment, `test_control/battery_operation_sequence.py::
+BatteryOperationSequence.__init__`'s docstring) still claimed "no group
+declares `sense_channel`" / "both None for every operation today" --
+stale since B1's live SenseRouter deployment (Section 73), which this
+review's DMM-migration pass caught by cross-referencing the claim
+against `config/devices.py`'s actual `BATTERY_GROUPS["B1"]` entry. All
+three corrected to say "every group except B1."
+
+### Findings reviewed and confirmed NOT gaps (no change made)
+
+- **`DMMMeasurementLostError` classification ordering** -- re-derived
+  from first principles (class hierarchy, tuple membership, check order),
+  confirmed correctly `STATION_FAULT`, not `FAIL`. `RelayStateVerificationError`/
+  `SMUStateVerificationError` correctly caught via their parent classes.
+- **Every `STATION_HARDWARE_EXCEPTIONS`/`BATTERY_UNDER_TEST_EXCEPTIONS`
+  member has a real, live `raise` site** -- verified by grep, not
+  assumed; none are unreachable/dead entries.
+- **`EventType.SAFETY_MONITOR_RECOVERED`** is defined but never logged --
+  confirmed deliberate (a `SafetyViolationError` is always terminal in
+  `run_guarded()`, so nothing ever "recovers" mid-run), not a gap;
+  already explicitly documented in the constant's own comment.
+- **The "safest shutdown sequence" ordering fix (Section 78: zero
+  setpoint before disable, while still enabled)** lives in exactly one
+  place (`SMU.emergency_output_off()`), called unchanged by every
+  shutdown path (`SafetyMonitor.emergency_stop()`,
+  `safe_cancel_shutdown()`, `charge_cycle.py`, `discharge_cycle.py`,
+  `hardware_manager.py`) -- confirmed NOT partially applied; the fix
+  cannot drift between call sites because there is only one
+  implementation.
+- **SenseRouter's B1-specific, `MATRIX_NUMATO_201`-bound wiring** is a
+  disclosed, reviewed tradeoff (Section 73), not an undisclosed hack --
+  confirmed the operational mitigation ("don't run `main.py` while
+  sense-routing is active") and the legacy-binding tradeoff are both
+  already documented there.
+- **`GROUP_RUN_ABORTED_STATION_FAULT`'s field order/format** in this
+  document's own literal example was independently re-verified against
+  the actual `format_event(...)` call sites and matches exactly (once
+  corrected per fix #3 above).
+
+### Disclosed residual risks (not fixed this pass -- pre-existing, out of
+this refinement's scope, tracked for a future milestone)
+
+- **`battery_and_ntc_presence_precheck()`'s "never raises" contract is
+  narrower than documented.** It wraps its own DMM read in
+  `except Exception`, but calls `ntc_group_snapshot()` with no
+  surrounding try/except, relying entirely on that function's internal
+  `except DAQError`. `hardware/daq.py` only catches
+  `nidaqmx.errors.DaqError` when wrapping into `DAQError` -- a different,
+  unanticipated exception type from the DAQ read (or from
+  `classify_ntc_presence()`/a config lookup) would propagate uncaught
+  through both modules and `test.py`'s call sites, contradicting the
+  "never raises" docstring. Pre-existing since `ntc_snapshot.py` was
+  first extracted (not introduced by Section 80's `station_fault`
+  addition) -- narrower in scope than this review, flagged for the next
+  milestone rather than widened here without a dedicated review of what
+  "catch everything" would mask.
+- **`MonitorBatterySequence`'s own DMM read has no bounded-retry
+  handling**, unlike `ChargeSequence`/`DischargeSequence`'s
+  `DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES`-bounded retry (Section 60).
+  A transient DMM comms glitch during Monitor Battery propagates as an
+  unhandled exception rather than degrading gracefully. Pre-dates this
+  review; Monitor Battery's read-only nature (no EOC/EOD decision, no
+  safety-critical action resting on a single sample) makes this lower
+  urgency than it would be for Charge/Discharge, but it is a real,
+  disclosed inconsistency.
+- **Structural duplication between `_run_charge_or_discharge()` and
+  `_run_charge_or_discharge_all_positions()`.** Both independently
+  construct `CancellationToken`/install the SIGINT handler/construct
+  `HardwareManager`/call `connect_all()`/open storage/construct the
+  sense-router gate/run an identical `finally` teardown -- roughly 55
+  lines, currently byte-identical apart from the `owner=` string. Not a
+  bug today (nothing has drifted), but a future teardown fix applied to
+  one path and missed in the other is a real risk this shape invites.
+  Recommended as a future extraction (a shared `_group_hardware_session()`
+  context manager), not undertaken this pass -- a non-trivial refactor
+  of working, tested code is out of scope for a pre-closure review that
+  found no correctness bug here.
+
+### Test suite after this review's fixes
+
+`tests/test_presence_precheck_testpy_wiring.py` gained 2 new
+`MonitorBatteryWiringTests` cases (station_fault gate precedes the ok
+gate; station_fault gate returns before sequence construction).
+`tests/test_group_all_fault_classification.py` gained 1 new case
+(`station_state` overwrite) and 1 existing assertion was updated
+(`SLOT=1` -> `POSITION=1`). Full suite: **371/371 passing**, no
+regressions (368 from Section 80 + 3 net-new).
+
+### Milestone XX final readiness assessment
+
+All three real gaps found were safety/traceability-relevant but narrow
+(a missing gate on one of two pre-test-check call sites; a stale DB row
+in an append-only trace table after an already-correct primary-record
+fix; an inconsistent log field name) -- none reflect a systemic design
+flaw, and all three are now fixed and test-covered. The disclosed
+residual risks are pre-existing, narrower in scope than this review, and
+already tracked rather than newly discovered blockers. **Milestone XX is
+recommended for formal closure at ~93% readiness** for its stated scope
+(single position B1, single battery type HUB, Charge/Discharge
+independently) -- up from Section 80's ~92%, reflecting that this
+review's gaps were found and closed BEFORE closure rather than
+discovered afterward, which is exactly what a pre-closure review is for.
+The disclosed residual risks (precheck exception-contract breadth,
+Monitor Battery's unbounded DMM read, and the two orchestration
+functions' structural duplication) do not block closure -- none is a
+regression introduced by Milestone XX, none blocks the milestone's
+stated single-position/single-battery-type scope, and all three are
+explicitly carried forward to the next milestone rather than silently
+dropped.

@@ -187,3 +187,55 @@ class HardwareConfigurationError(ValidationError):
     not the hardware's) -- always raised before any hardware
     communication is attempted.
     """
+
+
+# -----------------------------------------------------------------------
+# Group -> ALL Fault Classification (see docs/architecture.md "Group ->
+# ALL Fault Classification Policy") -- which exception types indicate a
+# TEST-STATION HARDWARE problem (shared equipment -- relay matrix, SMU,
+# DMM, DAQ -- comms/verification failures affecting every position in the
+# group) vs a BATTERY-UNDER-TEST problem (the DUT's own electrical
+# behavior/condition, specific to the one position under test). This is
+# the single source of truth for that classification -- test.py's Group
+# -> ALL orchestration (test.py::_classify_position_exception()) checks
+# membership here rather than re-deriving the policy inline, so the
+# policy can never drift out of sync with where these exceptions are
+# actually defined.
+#
+# Order matters when USING these tuples (not when defining them):
+# DMMMeasurementLostError is deliberately a SafetyViolationError subclass
+# (so it reuses BatteryOperationSequence.run_guarded()'s existing
+# SafetyViolationError shutdown branch, rather than needing a new one),
+# but it must be classified STATION-level here. A caller MUST check
+# STATION_HARDWARE_EXCEPTIONS membership BEFORE falling back to a
+# broader SafetyViolationError/BATTERY_UNDER_TEST_EXCEPTIONS check, or
+# DMMMeasurementLostError would be misclassified as battery-level
+# (isinstance(exc, SafetyViolationError) is also True for it). See
+# test_control/battery_operation_sequence.py's own class hierarchy note
+# for the identical reasoning already applied to
+# ReversePolarityError/BatteryRemovedDuringChargeError there.
+STATION_HARDWARE_EXCEPTIONS = (
+    RelayError,               # relay matrix -- shared switching hardware
+                              # (covers both a verification mismatch and a
+                              # raw TCP/comms failure -- hardware/relay_eth.py
+                              # wraps every comms failure into RelayError,
+                              # there is no separate "matrix communication
+                              # failure" exception type to also list here)
+    SMUError,                 # SMU -- shared source/measure hardware
+    DMMError,                 # DMM -- shared, authoritative voltage source
+    DAQError,                 # DAQ -- shared NTC/telemetry hardware
+    DMMMeasurementLostError,  # DMM comms permanently lost (bounded retry
+                              # exhausted) -- a SafetyViolationError
+                              # subclass, listed here explicitly; see the
+                              # ordering note above
+)
+
+BATTERY_UNDER_TEST_EXCEPTIONS = (
+    BatteryRemovedDuringChargeError,
+    ReversePolarityError,
+    SafetyViolationError,   # catch-all for a real safety.check() limit
+                              # violation (over/under-voltage, over-current,
+                              # over-temperature) -- the DUT's own measured
+                              # electrical behavior, not an equipment fault
+    NIPXITimeoutError,
+)

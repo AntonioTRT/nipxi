@@ -41,19 +41,33 @@ def ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
     pre-operation group NTC pre-check, opt in explicitly).
 
     Returns a list of {"position", "channel", "presence", "temp_c",
-    "readable"} dicts in position order. `readable` is True only when a
-    real ADC value was obtained and classified -- False for both "no
-    daq_ntc_ch configured" (a config gap) and a DAQError on the read
-    itself (a DAQ connectivity problem). Both still record `presence` as
-    FAULT (informative -- "no reliable reading available") but callers
-    that gate an operation on presence must check `readable` too: a DAQ
-    comms hiccup is an infrastructure problem, not a signal that the
-    battery/sensor at that position is actually faulted, and must not be
-    treated the same as a real, successfully-read ABSENT/FAULT signal --
-    the active-monitoring loops (Monitor Battery/Charge/Discharge's own
-    sampling loops) already degrade gracefully on the identical DAQError,
-    never aborting the run over it; this pre-check must not be stricter
-    than the loop it precedes.
+    "readable", "daq_comm_failure"} dicts in position order. `readable`
+    is True only when a real ADC value was obtained and classified --
+    False for both "no daq_ntc_ch configured" (a config gap) and a
+    DAQError on the read itself (a DAQ connectivity problem). Both still
+    record `presence` as FAULT (informative -- "no reliable reading
+    available") but callers that gate an operation on presence must check
+    `readable` too: a DAQ comms hiccup is an infrastructure problem, not a
+    signal that the battery/sensor at that position is actually faulted,
+    and must not be treated the same as a real, successfully-read ABSENT/
+    FAULT signal -- the active-monitoring loops (Monitor Battery/Charge/
+    Discharge's own sampling loops) already degrade gracefully on the
+    identical DAQError, never aborting the run over it; this pre-check
+    must not be stricter than the loop it precedes.
+
+    `daq_comm_failure` (see docs/architecture.md "Group -> ALL Fault
+    Classification Policy") distinguishes WHICH of the two `readable`=
+    False causes applies: True only for the DAQError-on-read case (a real
+    DAQ hardware/communication problem -- test-station equipment, shared
+    across every position); False for "no daq_ntc_ch configured" (a
+    per-position config gap, not an equipment fault) AND for a genuinely
+    successful read (readable=True). Before this field existed, both
+    `readable`=False causes were indistinguishable from each other,
+    meaning a real DAQ comms failure could not be told apart from a
+    position simply never having been wired for NTC -- callers that need
+    to escalate a genuine equipment fault differently from a benign
+    config gap (see test_control/battery_presence_precheck.py) must check
+    this field, not just `readable`.
 
     No-op (returns []) if `daq` is None -- a group with no NTC hardware
     assigned behaves exactly as if this were never called.
@@ -74,6 +88,7 @@ def ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
         voltage_v = None
         temp_c = None
         readable = True
+        daq_comm_failure = False
         if ntc_ch is None:
             presence = NTCPresence.FAULT
             readable = False
@@ -88,6 +103,7 @@ def ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
             except DAQError as e:
                 presence = NTCPresence.FAULT
                 readable = False
+                daq_comm_failure = True
                 storage.log_event(level="WARNING", source=source, channel=channel,
                                    message=f"Position {position}: DAQ read failed -- {e}")
 
@@ -106,6 +122,6 @@ def ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
             )
         results.append({
             "position": position, "channel": channel, "presence": presence,
-            "temp_c": temp_c, "readable": readable,
+            "temp_c": temp_c, "readable": readable, "daq_comm_failure": daq_comm_failure,
         })
     return results

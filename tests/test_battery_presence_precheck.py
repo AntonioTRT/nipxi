@@ -60,10 +60,14 @@ class _FakeDmm:
 
 
 class _FakeNtcDaq:
-    def __init__(self, voltages_by_channel):
+    def __init__(self, voltages_by_channel, raises_channels=None):
         self._voltages = voltages_by_channel
+        self._raises_channels = raises_channels or set()
 
     def read_channel(self, channel):
+        if channel in self._raises_channels:
+            from utils.errors import DAQError
+            raise DAQError("simulated DAQ comms failure")
         return self._voltages[channel]
 
 
@@ -76,7 +80,8 @@ def _group_config(size, ntc_channels):
     }
 
 
-def _run(*, battery_voltage_v=None, battery_raises=False, ntc_voltage_v=None, ntc_channels=None):
+def _run(*, battery_voltage_v=None, battery_raises=False, ntc_voltage_v=None, ntc_channels=None,
+         ntc_daq_raises=False):
     import config.devices as dev_cfg
     orig_groups = dev_cfg.BATTERY_GROUPS
     size = 1
@@ -87,7 +92,10 @@ def _run(*, battery_voltage_v=None, battery_raises=False, ntc_voltage_v=None, nt
         storage = _FakeStorage()
         relay = _FakeRelay()
         dmm = _FakeDmm(voltage_v=battery_voltage_v, raises=battery_raises)
-        ntc_daq = _FakeNtcDaq({"Dev1/ai0": ntc_voltage_v} if ntc_voltage_v is not None else {})
+        ntc_daq = _FakeNtcDaq(
+            {"Dev1/ai0": ntc_voltage_v} if ntc_voltage_v is not None else {},
+            raises_channels={"Dev1/ai0"} if ntc_daq_raises else None,
+        )
         result = battery_and_ntc_presence_precheck(
             storage=storage, dmm=dmm, relay=relay, ntc_daq=ntc_daq,
             group="B1", size=size, position=1, channel=1, relay_address=1,
@@ -160,6 +168,41 @@ class ReversedPolarityIsNotTreatedAsMissingTests(unittest.TestCase):
     def test_reversed_voltage_still_logs_an_informational_note(self):
         _, storage, _, _ = _run(battery_voltage_v=-3.7, ntc_voltage_v=_NTC_PRESENT_V)
         self.assertTrue(any("REVERSED polarity" in m for m in storage.event_messages()))
+
+
+class StationFaultVsConfigGapTests(unittest.TestCase):
+    """Group -> ALL Fault Classification Policy (see docs/architecture.md)
+    -- a real DAQ communication failure on the selected position's NTC
+    read must be distinguishable from "no daq_ntc_ch configured", so
+    test.py can escalate the former to STATION_FAULT (abort the group)
+    while treating the latter as a benign, slot-level condition."""
+
+    def test_daq_comm_failure_sets_station_fault_true(self):
+        result, _, _, _ = _run(
+            battery_voltage_v=3.67, ntc_daq_raises=True,
+        )
+        self.assertTrue(result["station_fault"])
+        self.assertFalse(result["ntc_readable"])
+
+    def test_no_ntc_configured_does_not_set_station_fault(self):
+        result, _, _, _ = _run(
+            battery_voltage_v=3.67, ntc_channels={},  # no daq_ntc_ch for position 1
+        )
+        self.assertFalse(result["station_fault"])
+        self.assertFalse(result["ntc_readable"])
+
+    def test_normal_present_reading_does_not_set_station_fault(self):
+        result, _, _, _ = _run(battery_voltage_v=3.67, ntc_voltage_v=_NTC_PRESENT_V)
+        self.assertFalse(result["station_fault"])
+
+    def test_daq_comm_failure_does_not_add_an_ntc_reason(self):
+        # station_fault is checked/handled by the CALLER before ever
+        # looking at `reasons`/`ok` -- but `reasons` itself must not
+        # conflate a DAQ comms failure with a real NTC Missing/Fault
+        # reading (an unreadable NTC never contributes to `reasons`).
+        result, _, _, _ = _run(battery_voltage_v=3.67, ntc_daq_raises=True)
+        self.assertEqual(result["reasons"], [])
+        self.assertTrue(result["ok"])
 
 
 class NtcFaultVsAbsentWordingTests(unittest.TestCase):

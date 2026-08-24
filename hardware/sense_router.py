@@ -1,11 +1,13 @@
 """
 Battery Sense Routing -- FUTURE PLANNED ARCHITECTURE, with a CURRENT
-IMPLEMENTATION of the abstraction layer only (see docs/architecture.md
-"Future Architecture: Battery Sense Routing"). Nothing here is called
-from any real execution path today: no group in config/devices.py
-declares a "sense_channel", so `read_battery_voltage_via_sense()` below
-always takes its pure-passthrough branch in practice, identical to
-calling `dmm.measure_dc_voltage()` directly (today's actual behavior).
+IMPLEMENTATION of the abstraction layer (see docs/architecture.md
+"Future Architecture: Battery Sense Routing") that is now also LIVE for
+one group: B1 declares `"sense_channel": 1` (config/devices.py) and is
+routed through a real `ConfigDrivenSenseRouter` -- see docs/
+architecture.md "SenseRouter Deployment: MATRIX_NUMATO_201". Every OTHER
+group still declares no "sense_channel", so `read_battery_voltage_via_
+sense()` below still takes its pure-passthrough branch for them,
+identical to calling `dmm.measure_dc_voltage()` directly.
 
 Design principle: a battery group declares ONLY a logical sense_channel
 number (config/devices.py::BATTERY_GROUPS[group]["sense_channel"]) -- it

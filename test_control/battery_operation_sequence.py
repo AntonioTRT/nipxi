@@ -90,8 +90,10 @@ class BatteryOperationSequence:
         self.log = logging.getLogger(f"nipxi.{source}")
         # FUTURE PLANNED ARCHITECTURE -- see docs/architecture.md "Future
         # Architecture: Battery Sense Routing". Both None for every
-        # operation today -- _safe_final_voltage_reading() below is the
-        # only base-class DMM read, and its use of
+        # operation EXCEPT Charge/Discharge Battery on B1 (see "SenseRouter
+        # Deployment: MATRIX_NUMATO_201"), which construct and pass a real
+        # ConfigDrivenSenseRouter/sense_channel=1. _safe_final_voltage_
+        # reading() below is the only base-class DMM read, and its use of
         # read_battery_voltage_via_sense() is a pure passthrough when
         # sense_channel is None, identical to calling
         # dmm.measure_dc_voltage() directly.

@@ -63,10 +63,12 @@ class PrintGroupRunSummaryTests(unittest.TestCase):
     guarantee, covered by test_storage_measurement_scoping.py-style
     tests and the begin_new_run_id() docstring/contract itself)."""
 
-    def _run(self, results, cancelled=False):
+    def _run(self, results, cancelled=False, station_fault=False):
         buf = io.StringIO()
         with redirect_stdout(buf):
-            test_module._print_group_run_summary("B1", "Charge Battery", [1, 2, 3, 4], results, cancelled)
+            test_module._print_group_run_summary(
+                "B1", "Charge Battery", [1, 2, 3, 4], results, cancelled, station_fault
+            )
         return buf.getvalue()
 
     def test_counts_are_correct(self):
@@ -94,6 +96,16 @@ class PrintGroupRunSummaryTests(unittest.TestCase):
     def test_no_cancelled_note_on_a_normal_completion(self):
         output = self._run({1: "PASS"}, cancelled=False)
         self.assertNotIn("Cancelled:", output)
+
+    def test_station_fault_note_shown_when_the_run_was_aborted_by_a_station_fault(self):
+        output = self._run({1: "PASS", 2: "STATION_FAULT"}, station_fault=True)
+        self.assertIn("Position 3: NOT ATTEMPTED", output)
+        self.assertIn("Station Fault:", output)
+        self.assertNotIn("Cancelled:", output)
+
+    def test_no_station_fault_note_on_a_normal_completion(self):
+        output = self._run({1: "PASS"}, station_fault=False)
+        self.assertNotIn("Station Fault:", output)
 
 
 class RunChargeOrDischargeAllPositionsWiringTests(unittest.TestCase):
@@ -136,12 +148,17 @@ class RunChargeOrDischargeAllPositionsWiringTests(unittest.TestCase):
         self.assertLess(cancelled_idx, break_idx)
 
     def test_the_loop_has_no_unconditional_break_for_fail_or_skipped(self):
-        # The only "break" in this function must be inside the CANCELLED
-        # branch -- a FAIL/SKIPPED result must never stop the loop.
+        # Exactly two "break"s in this function -- one inside the
+        # CANCELLED branch, one inside the STATION_FAULT branch (see
+        # docs/architecture.md "Group -> ALL Fault Classification
+        # Policy"). A FAIL/SKIPPED result must never stop the loop.
         break_indices = [i for i, line in enumerate(self.lines) if line.strip() == "break"]
-        self.assertEqual(len(break_indices), 1)
+        self.assertEqual(len(break_indices), 2)
         cancelled_idx = self._first_index('if result == "CANCELLED":')
+        station_fault_idx = self._first_index('if result == "STATION_FAULT":')
+        self.assertIsNotNone(station_fault_idx)
         self.assertGreater(break_indices[0], cancelled_idx)
+        self.assertGreater(break_indices[1], station_fault_idx)
 
     def test_group_run_started_and_completed_are_both_logged(self):
         self.assertIsNotNone(self._first_index("EventType.GROUP_RUN_STARTED"))
@@ -158,7 +175,9 @@ class RunChargeOrDischargeAllPositionsWiringTests(unittest.TestCase):
         loop_idx = self._first_index("for position in positions:")
         # The real call site, not the docstring's prose mention of the
         # same function name (which appears earlier, before the loop).
-        summary_idx = self._first_index("_print_group_run_summary(group, operation, positions, results, cancelled)")
+        summary_idx = self._first_index(
+            "_print_group_run_summary(group, operation, positions, results, cancelled, station_fault)"
+        )
         self.assertIsNotNone(loop_idx)
         self.assertIsNotNone(summary_idx)
         self.assertLess(loop_idx, summary_idx)

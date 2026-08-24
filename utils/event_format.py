@@ -59,6 +59,12 @@ class EventType:
     GROUP_SLOT_FAILED = "GROUP_SLOT_FAILED"
     GROUP_SLOT_COMPLETED = "GROUP_SLOT_COMPLETED"
     GROUP_RUN_COMPLETED = "GROUP_RUN_COMPLETED"
+    # Group -> ALL Fault Classification Policy (see
+    # docs/architecture.md and utils/errors.py::STATION_HARDWARE_EXCEPTIONS)
+    # -- logged once, at the exact position that triggered the abort, when
+    # a test-station hardware fault (not a battery-under-test fault) stops
+    # the whole group run early rather than just failing that one slot.
+    GROUP_RUN_ABORTED_STATION_FAULT = "GROUP_RUN_ABORTED_STATION_FAULT"
 
 
 def format_event(event_type: str, **fields) -> str:

@@ -2085,7 +2085,7 @@ CycleSequence, Runtime/Cycle Controller.
 
 ## Milestone XX: Real-Hardware Charge/Discharge Validation, Safety Hardening, Diagnostics, and Milestone Closure
 
-Full technical detail in `docs/architecture.md` Sections 55-79. This
+Full technical detail in `docs/architecture.md` Sections 55-81. This
 entry closes the substantial body of work that shipped after Milestone
 XIX without a milestone record -- confirmed against `docs/architecture.md`'s
 own section numbering and git history before writing this entry, not
@@ -2172,26 +2172,100 @@ assumed. Summary:
   selection, looping only at the `test.py` orchestration level with
   `ChargeSequence`/`DischargeSequence` completely unmodified, each
   position recording its own independent `run_summary` row).
+- **Group -> ALL Fault Classification Policy (Section 80):** a
+  code-level review of Section 79's Group -> ALL behavior, done before
+  this closure, found a real gap: a test-station hardware fault (a
+  shared `RelayError`/`DMMMeasurementLostError`) was being treated
+  identically to a battery-under-test failure -- `FAIL`, continue to the
+  next position -- even though every remaining position also depends on
+  that same shared equipment. Refined to a three-way classification:
+  Category 1 (battery-under-test -- absence, timeout, a real safety
+  violation) still yields `FAIL`/`SKIPPED` and continues the group;
+  Category 2 (test-station hardware -- `RelayError`/`SMUError`/
+  `DMMError`/`DAQError`/`DMMMeasurementLostError`, plus any truly
+  unclassified exception, per "unknown state = unsafe state") now yields
+  a new `STATION_FAULT` result and aborts the whole group run, exactly
+  like operator cancellation already did. A related ambiguity was also
+  closed: `ntc_snapshot.py` previously could not distinguish "no NTC
+  configured for this position" (a benign config gap) from "a real DAQ
+  communication failure" (shared equipment) -- both collapsed into the
+  same `readable=False` signal. A new `daq_comm_failure`/`station_fault`
+  field pair now lets the pre-test presence check escalate the latter to
+  `STATION_FAULT` before ever closing a relay, while leaving the former
+  as the unchanged, benign slot-level condition it always was. New
+  `EventType.GROUP_RUN_ABORTED_STATION_FAULT` event, logged with the
+  exception type/message/group/position, at the exact position that
+  triggered the abort. 31 new/updated tests; full suite 368/368 passing.
+- **Final Milestone XX Code Review (Section 81):** a dedicated,
+  six-area review (Group -> ALL, `STATION_FAULT`, event logging, the
+  battery presence precheck, the DMM authoritative-voltage migration,
+  shutdown logic) run before formal closure, specifically hunting for
+  dead code, duplicated logic, obsolete compatibility code, leftover
+  validation-only code, and documentation drift across every change made
+  since Milestone XIX. Found and fixed three real, narrow gaps: (1)
+  Monitor Battery never checked the new `station_fault` signal from its
+  own presence precheck, unlike Charge/Discharge Battery -- a real DAQ
+  comms failure on the selected position could have silently proceeded
+  rather than aborting; (2) `STATION_FAULT`'s generic-exception
+  reclassification path re-wrote `run_summary` but not the
+  `station_state` table, leaving it stuck at `run_guarded()`'s original
+  `FAILED`/`SAFETY_VIOLATION` value -- a real traceability inconsistency
+  between two DB records for the same run; (3) the new
+  `GROUP_RUN_ABORTED_STATION_FAULT` event used `SLOT=` while every
+  sibling `GROUP_SLOT_*` event uses `POSITION=` for the identical value --
+  an undocumented, unintentional naming inconsistency. All three fixed
+  and test-covered; three additional stale "no group uses sense_channel"
+  doc comments (predating B1's live SenseRouter deployment) also
+  corrected. No dead code, no duplicated classification logic, and no
+  leftover validation-only code were found anywhere in the six areas
+  reviewed. Three narrower, pre-existing residual risks were identified
+  and explicitly disclosed rather than fixed in this pass (the presence
+  precheck's "never raises" contract is narrower than documented for an
+  unanticipated non-`DAQError` exception type; Monitor Battery's DMM read
+  has no bounded-retry handling unlike Charge/Discharge's; the
+  single-position and Group -> ALL orchestration functions duplicate
+  ~55 lines of hardware-session setup/teardown that could drift in a
+  future change) -- none block this milestone's stated scope. Full suite
+  371/371 passing after this review's fixes.
 
 ### Milestone readiness decision
 
 **Charge and Discharge Battery are validated for this milestone's scope:
 single position (B1), single battery type (HUB), independently (not as a
-combined charge-then-discharge cycle).** ~90% readiness for that scope --
-the core safety/shutdown/diagnostic architecture has been repeatedly
-hardened through multiple real-hardware feedback cycles within this one
-milestone. **Full charge-then-discharge cycle testing is intentionally
-deferred**, per explicit direction, and is additionally blocked on
-`CycleSequence`, which does not exist yet (design-only, Section 67) --
-Group -> ALL support was therefore scoped to Charge/Discharge only, not
-Cycle. Known, disclosed, not-yet-closed gaps carried forward (unchanged
-from the pre-completion review, still real): NTC-degraded monitoring has
-no *live* execution-screen indicator (event log only); no startup
-reconciliation for a `run_summary` row orphaned by a hard process crash;
-sampling-loop storage-write failures are unguarded (safety-conservative,
-but would abort a real run over a transient DB issue); diagnostic
-classification thresholds remain uncalibrated against real bench data;
-validation breadth is still one position/one battery type. The PXI Relay
+combined charge-then-discharge cycle).** ~93% readiness for that scope --
+up from ~90% before Section 80, ~92% after it, now ~93% after Section
+81's final code review closed three more narrow gaps before formal
+closure rather than after -- the core safety/shutdown/diagnostic
+architecture has been repeatedly hardened through multiple real-hardware
+feedback cycles within this one milestone, and the Group -> ALL Fault
+Classification Policy refinement (Section 80) closed a real gap found by
+review BEFORE closure rather than discovered afterward: Group -> ALL
+previously could continue attempting the remaining positions in a group
+after a test-station hardware fault (shared relay/DMM/etc.), rather than
+stopping to protect them from unverified shared equipment -- now closed
+by the new `STATION_FAULT` classification, and Section 81 confirmed the
+same protection now also applies uniformly to Monitor Battery. Remaining
+risk in this area:
+the 300s/600s validation-timeout methodology (Section 80) has been
+reviewed and confirmed workable but not yet actually RUN against real
+hardware -- the 8 required scenarios (RelayError/DMMMeasurementLostError/
+DAQError -> STATION_FAULT -> abort; charge/discharge timeout -> FAIL ->
+continue; battery absence -> SKIPPED -> continue; Ctrl+C -> CANCELLED ->
+stop; unknown exception -> STATION_FAULT -> stop) are covered by the new
+test suite against scripted fakes, not yet by a live bench run with a
+temporary B1 `test_setpoints` override. **Full charge-then-discharge
+cycle testing is intentionally deferred**, per explicit direction, and is
+additionally blocked on `CycleSequence`, which does not exist yet
+(design-only, Section 67) -- Group -> ALL support was therefore scoped
+to Charge/Discharge only, not Cycle. Known, disclosed, not-yet-closed
+gaps carried forward (unchanged from the pre-completion review, still
+real): NTC-degraded monitoring has no *live* execution-screen indicator
+(event log only); no startup reconciliation for a `run_summary` row
+orphaned by a hard process crash; sampling-loop storage-write failures
+are unguarded (safety-conservative, but would abort a real run over a
+transient DB issue); diagnostic classification thresholds remain
+uncalibrated against real bench data; validation breadth is still one
+position/one battery type. The PXI Relay
 Matrix migration (item 3 of the closure review) is **not started** by
 design -- the existing `RelayBase`/`RelayFactory` abstraction was
 confirmed already migration-ready (no business-logic coupling to the
@@ -2199,12 +2273,31 @@ concrete Numato class found anywhere), so no code changes were needed or
 made this milestone; only a real niswitch-based driver, a config dict,
 and bench validation of the PXI card's interlock semantics remain,
 deferred to whenever that hardware migration is actually scheduled.
+Section 81's final code review (Group -> ALL, `STATION_FAULT`, event
+logging, battery presence precheck, DMM migration, shutdown logic) found
+no dead code, no duplicated classification logic, and no leftover
+validation-only code switched on anywhere in those six areas; the three
+real gaps it did find were fixed and test-covered before this closure,
+and its three disclosed residual risks are pre-existing, narrower in
+scope than this review, and explicitly carried forward rather than
+silently dropped.
+
+**Milestone XX is formally closed as of this entry.** All items required
+for closure (Sections 79-81) are implemented, tested (371/371 passing),
+and documented; the readiness gaps that remain are the disclosed,
+narrower-scope items above and in Section 81, not open correctness or
+safety issues within this milestone's stated scope.
 
 ### Recommended next milestone
 
 Real-hardware validation of Group -> ALL on B1 (today's only fully wired
-group); calibrate the diagnostic classification thresholds against that
-data; close the disclosed gaps above (live NTC-degraded indicator,
+group), including a live run of the 8 Section 80 fault-classification
+scenarios against a temporary B1 `test_setpoints` override
+(`charge_timeout_s=300`/`discharge_timeout_s=600`, `DEVELOPMENT`/
+`VALIDATION` mode only, never touching `Settings.CHARGE_TIMEOUT_S`/
+`DISCHARGE_TIMEOUT_S`) to confirm `STATION_FAULT` group-abort/`FAIL`
+group-continue behavior against real hardware, not just scripted fakes;
+calibrate the diagnostic classification thresholds against that data; close the disclosed gaps above (live NTC-degraded indicator,
 crash-reconciliation, WAL mode for the storage-write-failure risk) as
 time allows; then CycleSequence (unblocks both full-cycle validation and
 Group -> ALL for Cycle), `main.py` legacy path retirement, and the

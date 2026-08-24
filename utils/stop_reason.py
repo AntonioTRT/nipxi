@@ -22,3 +22,8 @@ class StopReason:
     SAFETY_VIOLATION = "SAFETY_VIOLATION"
     TIMEOUT          = "TIMEOUT"
     CANCELLED        = "CANCELLED"
+    # Group -> ALL Fault Classification Policy (see docs/architecture.md
+    # and utils/errors.py::STATION_HARDWARE_EXCEPTIONS) -- a test-station
+    # hardware fault (shared equipment, or any truly unclassified
+    # exception), distinct from FAILED (a battery-under-test failure).
+    STATION_FAULT    = "STATION_FAULT"

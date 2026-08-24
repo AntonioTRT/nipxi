@@ -4105,6 +4105,7 @@ def _run_monitor_battery():
     from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken, install_sigint_handler
     from utils.errors import HardwareInitError, OperationCancelledError
+    from utils.stop_reason import StopReason
 
     selection = _select_group_with_hardware_summary()
     if selection is None:
@@ -4231,6 +4232,30 @@ def _run_monitor_battery():
                 group=group, size=size, position=position, channel=channel,
                 relay_address=relay_address, source="monitor_battery", measurement_test_type="monitor",
             )
+            # Group -> ALL Fault Classification Policy (see docs/architecture.md
+            # and test_control/battery_presence_precheck.py) -- checked BEFORE
+            # precheck["ok"] for the identical reason
+            # _run_one_charge_or_discharge_position() checks it first: an
+            # unreadable NTC never contributes to `reasons`, so `ok` could
+            # otherwise be True despite a genuine DAQ comms fault. Monitor
+            # Battery has no Group -> ALL orchestration to abort, but a
+            # station-level DAQ fault must not be silently treated as "no
+            # NTC configured" here either -- see this module's own docstring.
+            if precheck["station_fault"]:
+                storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.STATION_FAULT)
+                storage.finish_run_summary(stop_reason=StopReason.STATION_FAULT, result="STATION_FAULT")
+                storage.log_event(
+                    level="ERROR", source="monitor_battery", channel=channel, relay=relay_address,
+                    message=format_event(
+                        EventType.GROUP_RUN_ABORTED_STATION_FAULT, group=group, position=position,
+                        exception="DAQError", message="DAQ communication failure during NTC pre-check",
+                    ),
+                )
+                _print_presence_precheck_failure(precheck)
+                print("\n[STATION FAULT] DAQ communication failure during pre-check for position "
+                      f"{position} -- aborting. Relay has been returned to open.")
+                return
+
             if not precheck["ok"]:
                 storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
                 storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
@@ -4432,6 +4457,33 @@ def _run_monitor_battery_scan():
         signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
+def _classify_position_exception(exc: Exception) -> str:
+    """
+    Classifies an exception caught from sequence.run() into "STATION_FAULT"
+    (test-station hardware -- shared equipment; abort the whole Group ->
+    ALL run) or "FAIL" (battery-under-test -- fail only this position,
+    continue to the next) -- see docs/architecture.md "Group -> ALL Fault
+    Classification Policy" and utils/errors.py::STATION_HARDWARE_EXCEPTIONS/
+    BATTERY_UNDER_TEST_EXCEPTIONS, the single source of truth this reads
+    from rather than re-deriving the policy here.
+
+    STATION_HARDWARE_EXCEPTIONS is checked BEFORE BATTERY_UNDER_TEST_EXCEPTIONS
+    -- required ordering, see utils/errors.py's own comment (DMMMeasurementLostError
+    is a SafetyViolationError subclass and would be misclassified as
+    battery-level if the broader tuple were checked first). Any exception
+    matching neither tuple (unclassified/unexpected) defaults to
+    "STATION_FAULT" -- unknown system state must be treated as unsafe, never
+    silently continued past.
+    """
+    from utils.errors import BATTERY_UNDER_TEST_EXCEPTIONS, STATION_HARDWARE_EXCEPTIONS
+
+    if isinstance(exc, STATION_HARDWARE_EXCEPTIONS):
+        return "STATION_FAULT"
+    if isinstance(exc, BATTERY_UNDER_TEST_EXCEPTIONS):
+        return "FAIL"
+    return "STATION_FAULT"
+
+
 def _run_one_charge_or_discharge_position(*, operation, sequence_cls, source, group, hw,
                                            battery_type, battery_cfg, test_setpoints,
                                            position, channel, relay_address, ch_cfg,
@@ -4458,19 +4510,25 @@ def _run_one_charge_or_discharge_position(*, operation, sequence_cls, source, gr
     and reconnecting the sense-routing matrix per position would be
     wasteful) -- this function never constructs them itself.
 
-    Returns one of "PASS"/"FAIL"/"SKIPPED"/"CANCELLED" -- never raises
-    OperationCancelledError/KeyboardInterrupt/any other exception itself;
-    this function's own try/except (unchanged in shape from the
-    pre-Group-ALL single-position code) classifies every outcome into one
-    of these four strings instead, so a caller looping over positions
-    never needs its own try/except around this call. "CANCELLED" is
-    reserved for an operator-requested stop (Ctrl+C) -- see
-    _run_charge_or_discharge_all_positions()'s docstring for why that
+    Returns one of "PASS"/"FAIL"/"SKIPPED"/"CANCELLED"/"STATION_FAULT" --
+    never raises OperationCancelledError/KeyboardInterrupt/any other
+    exception itself; this function's own try/except classifies every
+    outcome into one of these five strings instead, so a caller looping
+    over positions never needs its own try/except around this call.
+    "CANCELLED" is reserved for an operator-requested stop (Ctrl+C) --
+    see _run_charge_or_discharge_all_positions()'s docstring for why that
     result specifically stops the whole group run rather than advancing
-    to the next position.
+    to the next position. "STATION_FAULT" (see docs/architecture.md
+    "Group -> ALL Fault Classification Policy" and
+    _classify_position_exception()) is reserved for a test-station
+    hardware fault (shared equipment -- relay/SMU/DMM/DAQ comms, or any
+    truly unclassified exception) and, like "CANCELLED", also stops the
+    whole group run rather than advancing -- unlike "CANCELLED", it is
+    never operator-requested; it reflects an unsafe/unknown station state.
     """
     from test_control.battery_presence_precheck import battery_and_ntc_presence_precheck
     from utils.errors import OperationCancelledError
+    from utils.stop_reason import StopReason
 
     smu_name, smu_cfg = hw["smu_name"], hw["smu_cfg"]
     dmm_name, dmm_cfg = hw["dmm_name"], hw["dmm_cfg"]
@@ -4544,6 +4602,28 @@ def _run_one_charge_or_discharge_position(*, operation, sequence_cls, source, gr
         group=group, size=size, position=position, channel=channel,
         relay_address=relay_address, source=source, measurement_test_type=measurement_test_type,
     )
+    # Group -> ALL Fault Classification Policy: a real DAQ communication
+    # failure on the SELECTED position's NTC read (precheck["station_fault"],
+    # see test_control/battery_presence_precheck.py) is test-station
+    # equipment trouble, not a slot-level condition -- checked BEFORE
+    # precheck["ok"] because an unreadable NTC never contributes to
+    # `reasons` (see that module), so `ok` could otherwise be True despite
+    # a genuine DAQ comms fault.
+    if precheck["station_fault"]:
+        storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.STATION_FAULT)
+        storage.finish_run_summary(stop_reason=StopReason.STATION_FAULT, result="STATION_FAULT")
+        storage.log_event(
+            level="ERROR", source=source, channel=channel, relay=relay_address,
+            message=format_event(
+                EventType.GROUP_RUN_ABORTED_STATION_FAULT, group=group, position=position,
+                exception="DAQError", message="DAQ communication failure during NTC pre-check",
+            ),
+        )
+        _print_presence_precheck_failure(precheck)
+        print(f"\n[STATION FAULT] DAQ communication failure during pre-check for position {position} -- "
+              f"aborting group run, relay returned to open. No {operation.lower()} started.")
+        return "STATION_FAULT"
+
     if not precheck["ok"]:
         storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
         storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
@@ -4579,8 +4659,27 @@ def _run_one_charge_or_discharge_position(*, operation, sequence_cls, source, gr
         print(f"\n{operation} interrupted by user (Ctrl+C).")
         result = "CANCELLED"
     except Exception as e:
-        print(f"\n[FAIL] {operation} aborted: {e}")
-        result = "FAIL"
+        result = _classify_position_exception(e)
+        if result == "STATION_FAULT":
+            print(f"\n[STATION FAULT] {operation} aborted -- test-station hardware fault: {e}")
+            # Overwrites run_guarded()'s own earlier station_state/run_summary
+            # write (every one of its exception branches records its own
+            # terminal state -- e.g. StopReason.FAILED for RelayError/generic
+            # Exception -- before re-raising, see battery_operation_sequence.py)
+            # so BOTH persisted records match this policy layer's
+            # STATION_FAULT classification, not the pre-classification value
+            # written before the exception ever reached here.
+            storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.STATION_FAULT)
+            storage.finish_run_summary(stop_reason=StopReason.STATION_FAULT, result="STATION_FAULT")
+            storage.log_event(
+                level="ERROR", source=source, channel=channel, relay=relay_address,
+                message=format_event(
+                    EventType.GROUP_RUN_ABORTED_STATION_FAULT, group=group, position=position,
+                    exception=type(e).__name__, message=str(e),
+                ),
+            )
+        else:
+            print(f"\n[FAIL] {operation} aborted: {e}")
 
     _print_post_run_summary(storage)
     return result
@@ -4754,7 +4853,8 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
-def _print_group_run_summary(group: str, operation: str, positions: list, results: dict, cancelled: bool):
+def _print_group_run_summary(group: str, operation: str, positions: list, results: dict,
+                              cancelled: bool, station_fault: bool = False):
     """
     Informational aggregate summary for a Group -> ALL run -- see
     docs/architecture.md "Group -> ALL Support". The AUTHORITATIVE record
@@ -4762,6 +4862,13 @@ def _print_group_run_summary(group: str, operation: str, positions: list, result
     _run_charge_or_discharge_all_positions()); this is a console-only
     rollup, never persisted as a substitute for those rows -- there is no
     new DB table/row for "the group run as a whole".
+
+    `station_fault` (see docs/architecture.md "Group -> ALL Fault
+    Classification Policy") mirrors `cancelled`'s existing role: True
+    when the run was aborted early by a test-station hardware fault
+    rather than every enabled position being attempted. Distinct from
+    `cancelled` -- an operator-requested stop vs. an unsafe/unknown
+    station state -- so the note printed is worded differently.
     """
     processed = len(results)
     passed = sum(1 for r in results.values() if r == "PASS")
@@ -4779,6 +4886,9 @@ def _print_group_run_summary(group: str, operation: str, positions: list, result
     print(f"Skipped:   {skipped}")
     if cancelled:
         print("Cancelled: operator stopped the run before all positions were attempted")
+    if station_fault:
+        print("Station Fault: a test-station hardware fault aborted the run before all "
+              "positions were attempted -- hardware is in a verified safe state")
     print("=" * 60)
 
 
@@ -4811,14 +4921,21 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
     is logged and the loop continues to the next position, never failing
     the whole group run over one empty slot.
 
-    Failures: a FAIL result (any exception other than an operator
-    cancellation) does NOT stop the loop -- the position's own safety
+    Failures (see docs/architecture.md "Group -> ALL Fault Classification
+    Policy" and _classify_position_exception()): a FAIL/SKIPPED result
+    (a battery-under-test problem specific to this one position -- e.g.
+    battery/NTC absence, a charge/discharge timeout, a real safety.check()
+    violation) does NOT stop the loop -- the position's own safety
     shutdown has already run (inside run_guarded(), unchanged) by the
     time _run_one_charge_or_discharge_position() returns, so the hardware
     is already back in a verified-safe state before the next position's
-    relay ever closes. A CANCELLED result (operator Ctrl+C) DOES stop the
-    loop -- an operator pressing Ctrl+C during a group run is asking to
-    stop the whole run, not skip to the next battery.
+    relay ever closes. A CANCELLED result (operator Ctrl+C) or a
+    STATION_FAULT result (a test-station hardware fault -- shared relay/
+    SMU/DMM/DAQ equipment, or any truly unclassified exception, since
+    unknown system state must be treated as unsafe) DOES stop the loop --
+    an operator pressing Ctrl+C is asking to stop the whole run, and a
+    station fault means the shared equipment itself may be in an
+    unverified state that must not be trusted for the remaining positions.
 
     `positions` (the loop scope) is every position in
     config/devices.py::BATTERY_GROUPS[group]["positions"] whose own
@@ -4892,6 +5009,7 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
 
             results = {}
             cancelled = False
+            station_fault = False
             for position in positions:
                 ch_cfg = dev_cfg.BATTERY_GROUPS[group]["positions"].get(position)
                 if ch_cfg is None:
@@ -4920,6 +5038,7 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
                 slot_event_type = {
                     "PASS": EventType.GROUP_SLOT_COMPLETED, "FAIL": EventType.GROUP_SLOT_FAILED,
                     "SKIPPED": EventType.GROUP_SLOT_SKIPPED, "CANCELLED": EventType.GROUP_SLOT_FAILED,
+                    "STATION_FAULT": EventType.GROUP_SLOT_FAILED,
                 }[result]
                 storage.log_event(
                     level="INFO" if result in ("PASS", "SKIPPED") else "ERROR",
@@ -4933,6 +5052,12 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
                           f"(remaining positions not attempted).")
                     break
 
+                if result == "STATION_FAULT":
+                    station_fault = True
+                    print(f"\nTest-station hardware fault -- aborting Group {group} ALL-positions run "
+                          f"(remaining positions not attempted). Hardware is in a verified safe state.")
+                    break
+
             storage.log_event(
                 level="INFO", source=source,
                 message=format_event(
@@ -4940,10 +5065,10 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
                     processed=len(results), passed=sum(1 for r in results.values() if r == "PASS"),
                     failed=sum(1 for r in results.values() if r == "FAIL"),
                     skipped=sum(1 for r in results.values() if r == "SKIPPED"),
-                    cancelled=cancelled,
+                    cancelled=cancelled, station_fault=station_fault,
                 ),
             )
-            _print_group_run_summary(group, operation, positions, results, cancelled)
+            _print_group_run_summary(group, operation, positions, results, cancelled, station_fault)
 
         finally:
             if sense_router is not None:
