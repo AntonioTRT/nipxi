@@ -611,6 +611,15 @@ BATTERY_GROUPS = {
         # validation setpoint below -- see docs/architecture.md "B1
         # Validation Update: 1.0 A / 4.0 V".
         "battery_type":   "HUB",
+        # TEMPORARY -- battery sense-routing deployment, first physical
+        # instance (see docs/architecture.md "SenseRouter Deployment:
+        # MATRIX_NUMATO_201" and SENSE_ROUTING above). Purely a logical
+        # channel number -- never a relay-matrix name or physical relay
+        # directly; that mapping lives entirely in SENSE_ROUTING. The DMM
+        # itself is still MAIN_DMM (unchanged, "dmm" above); this only
+        # controls whether ChargeSequence/DischargeSequence route B1's
+        # sense signal through MATRIX_NUMATO_201 before reading it.
+        "sense_channel":  1,
         # NTC acquisition migrated off the temporary NI USB-6210 dev DAQ
         # (NTC_DAQ_USB6210, resource "Dev2") to the rack DAQ -- bench
         # validation confirmed Dev1 (MAIN_DAQ) exists, is operational, and
@@ -765,27 +774,28 @@ def hardware_for_group(group: str) -> dict:
     }
 
 
-# FUTURE PLANNED ARCHITECTURE -- see docs/architecture.md "Future
-# Architecture: Battery Sense Routing" and hardware/sense_router.py::
-# ConfigDrivenSenseRouter. Maps a logical, group-declared sense_channel
-# number to the physical relay matrix + relay number that will eventually
-# route it to the DMM once a real sense-routing relay module is deployed.
-# Empty today -- no group declares "sense_channel" and no physical
-# sense-routing hardware exists yet, so this table has nothing to
-# describe. Populate it, and the relevant group's
-# BATTERY_GROUPS[group]["sense_channel"], once real hardware is deployed;
-# nothing else needs to change for a Numato-backed channel, since
+# TEMPORARY -- battery sense-routing deployment, first physical instance
+# (see docs/architecture.md "Future Architecture: Battery Sense Routing"
+# and "SenseRouter Deployment: MATRIX_NUMATO_201" for the full review).
+# Maps B1's logical sense_channel (BATTERY_GROUPS["B1"]["sense_channel"]
+# below) to relay 1 on MATRIX_NUMATO_201 -- deliberately NOT
+# MATRIX_NUMATO_202 (B1's own battery-position relay matrix), to keep
+# sense routing and battery-position control on physically separate
+# relay modules with zero shared state. MATRIX_NUMATO_201 was confirmed
+# unused for battery-position control by any enabled group before this
+# assignment (A1-A4 reference it but are all disabled with no positions)
+# -- see the architecture section above for the one known, accepted
+# residual risk (it is main.py's legacy-path default relay matrix; do not
+# run main.py while a sense-routing session is active).
+#
 # ConfigDrivenSenseRouter resolves "relay_matrix" through the SAME
 # ETHERNET_DEVICES registry (and hardware/relay_factory.py::RelayFactory)
-# every other relay-matrix role already uses.
-#
-# Shape once populated:
-#   SENSE_ROUTING = {
-#       1: {"relay_matrix": "MATRIX_NUMATO_201", "relay": 1},
-#       2: {"relay_matrix": "MATRIX_NUMATO_201", "relay": 2},
-#       3: {"relay_matrix": "MATRIX_NUMATO_202", "relay": 1},
-#   }
-SENSE_ROUTING = {}
+# every other relay-matrix role already uses -- adding a second Numato
+# module, a rack-integrated matrix, or a different controller later is a
+# config change here, never a code change.
+SENSE_ROUTING = {
+    1: {"relay_matrix": "MATRIX_NUMATO_201", "relay": 1},
+}
 
 
 def group_test_config(group: str) -> dict:

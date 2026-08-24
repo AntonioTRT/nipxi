@@ -4473,6 +4473,13 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         if storage is None:
             return
 
+        # FUTURE PLANNED ARCHITECTURE -- see docs/architecture.md "Future
+        # Architecture: Battery Sense Routing". None for every group today
+        # (hw["sense_channel"] is None whenever config/devices.py::
+        # BATTERY_GROUPS[group] declares no "sense_channel") -- no
+        # ConfigDrivenSenseRouter is even constructed in that case, so
+        # nothing changes for any group without one.
+        sense_router = None
         try:
             # CRITICAL traceability requirement: every selected-configuration
             # fact is recorded via event_log BEFORE relay activation/PSU
@@ -4545,6 +4552,17 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             print(f"\nPress Ctrl+C to stop {operation.lower()} safely.\n")
 
             safety = SafetyMonitor(Settings)
+            # Battery sense routing -- FUTURE PLANNED ARCHITECTURE, see
+            # docs/architecture.md "Future Architecture: Battery Sense
+            # Routing". hw["sense_channel"] is None for every group today
+            # (no group declares "sense_channel"), so sense_router stays
+            # None and ChargeSequence/DischargeSequence's DMM reads are
+            # byte-for-byte unchanged from before this existed.
+            sense_channel = hw.get("sense_channel")
+            if sense_channel is not None:
+                from hardware.sense_router import ConfigDrivenSenseRouter
+                sense_router = ConfigDrivenSenseRouter()
+
             # daq=hw_mgr.ntc_daq -- this group's NTC/temperature DAQ (see
             # docs/architecture.md "Dual DAQ Ownership Model"), NOT the
             # group's general daq_cfg -- ChargeSequence/DischargeSequence
@@ -4553,6 +4571,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
                 smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.ntc_daq, relay=hw_mgr.relay,
                 safety=safety, storage=storage, settings=Settings, group_name=group,
                 ntc_daq_name=hw["ntc_daq_name"],
+                sense_router=sense_router, sense_channel=sense_channel,
             )
             try:
                 sequence.run(
@@ -4571,6 +4590,11 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             _print_post_run_summary(storage)
 
         finally:
+            if sense_router is not None:
+                try:
+                    sense_router.shutdown()
+                except Exception as e:
+                    print(f"[WARNING] Sense router shutdown failed: {e}")
             try:
                 storage.close()
             except Exception as e:

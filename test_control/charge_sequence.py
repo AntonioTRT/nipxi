@@ -109,7 +109,7 @@ from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, Reve
 
 class ChargeSequence(BatteryOperationSequence):
     def __init__(self, smu, dmm, relay, safety: SafetyMonitor, storage, settings: Settings, daq=None,
-                 group_name=None, ntc_daq_name=None):
+                 group_name=None, ntc_daq_name=None, sense_router=None, sense_channel=None):
         # `daq` -- this group's NTC/temperature DAQ (see docs/architecture.md
         # "Dual DAQ Ownership Model"); DMM + SMU.measure() remain the active
         # voltage/current telemetry source (see module docstring), `daq` is
@@ -120,8 +120,18 @@ class ChargeSequence(BatteryOperationSequence):
         # needs the device's own nickname, which `daq` (the connected driver
         # instance) does not carry itself -- only its `resource` attribute
         # does.
+        # `sense_router`/`sense_channel` -- FUTURE PLANNED ARCHITECTURE, see
+        # docs/architecture.md "Future Architecture: Battery Sense Routing".
+        # Both default to None, exactly reproducing today's direct-DMM-wiring
+        # behavior for every group that does not configure a sense_channel
+        # (every group today). `sense_channel` is
+        # config/devices.py::hardware_for_group()'s resolved
+        # "sense_channel" (an int or None); `sense_router` is a
+        # hardware/sense_router.py::SenseRouter instance, required only when
+        # `sense_channel` is not None.
         super().__init__(smu=smu, relay=relay, safety=safety, storage=storage, settings=settings,
-                          source="charge_battery", dmm=dmm, daq=daq, group_name=group_name)
+                          source="charge_battery", dmm=dmm, daq=daq, group_name=group_name,
+                          sense_router=sense_router, sense_channel=sense_channel)
         self.ntc_daq_name = ntc_daq_name
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
@@ -180,174 +190,198 @@ class ChargeSequence(BatteryOperationSequence):
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state="ACTIVE")
 
-            # Pre-output-enable reverse-polarity sanity check -- Relay
-            # Selection -> Battery Voltage Measurement (DMM) -> Sanity
-            # Validation -> SMU Enable. The SMU output is still disabled at
-            # this point (HardwareManager.connect_all() leaves it OFF, and
-            # set_charge_mode()/output_enable() have not been called yet) --
-            # see BatteryOperationSequence._check_battery_polarity() and
-            # docs/architecture.md "Reverse Polarity Protection".
-            # No separate relay-settle sleep here -- self.relay.close() above
-            # already blocked for Settings.RELAY_SETTLE_TIME_S (the single
-            # global relay settling/dead-time constant, enforced in
-            # RelayBase.open()/close(), hardware/relay.py) before returning.
-            pre_enable_v = self.dmm.measure_dc_voltage()
-
-            # Captured BEFORE _check_battery_polarity() below, deliberately --
-            # this value must always be persisted (see REQUIREMENT 1 in
-            # docs/architecture.md's Start/End Voltage Persistence section),
-            # including on a ReversePolarityError raised by that very check.
-            # Capturing it only afterward (the previous ordering) meant a
-            # rejected polarity reading was silently lost -- the one
-            # measurement that would have explained the rejection never made
-            # it into run_summary/analysis_result. Taken with the SMU output
-            # still disabled, so it reflects whatever is actually connected
-            # (a real cell's resting voltage, or an empty position's near-0V
-            # open circuit). The sampling loop's own first sample is NOT
-            # used for this: by then the SMU has already been sourcing
-            # current for STABILIZATION_S, so an empty position would
-            # already read near the CV compliance target too --
-            # indistinguishable from a genuinely full battery at that point.
-            # Reuses pre_enable_v itself, no new read.
-            stats.initial_voltage_v = pre_enable_v
-
-            self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
-
-            self.smu.set_charge_mode(current_a=current_a, voltage_limit_v=voltage_limit_v)
-            self.smu.output_enable()
-
-            # try/finally starts immediately after output_enable(), covering
-            # the stabilization wait AND the sampling loop -- see
-            # docs/architecture.md Section 27 "Interruptible Wait Mechanism"
-            # (the exact latent-bug shape ChargeCycle's own fix avoided,
-            # preserved here unchanged).
-            nonlocal last_ntc_state
+            # Sense-channel connect: FUTURE PLANNED ARCHITECTURE, see docs/
+            # architecture.md "Future Architecture: Battery Sense Routing".
+            # None for every group today -- a pure no-op, unchanged from
+            # before this was added. When configured, connects ONCE for the
+            # whole operation (mirroring self.relay.close()/open() above --
+            # never toggled per-sample, to avoid needless relay-cycle wear)
+            # and is guaranteed to disconnect via the try/finally below on
+            # EVERY exit path, including a ReversePolarityError raised
+            # before the SMU's own try/finally (further down) even starts.
+            # NumatoSenseRouter.connect() already includes RelayBase's own
+            # settle-time wait (hardware/relay.py) -- no additional delay
+            # needed here.
+            if self.sense_channel is not None:
+                self.sense_router.connect(self.sense_channel)
             try:
-                interruptible_sleep(self.s.STABILIZATION_S, token=token)
+                # Pre-output-enable reverse-polarity sanity check -- Relay
+                # Selection -> Battery Voltage Measurement (DMM) -> Sanity
+                # Validation -> SMU Enable. The SMU output is still disabled at
+                # this point (HardwareManager.connect_all() leaves it OFF, and
+                # set_charge_mode()/output_enable() have not been called yet) --
+                # see BatteryOperationSequence._check_battery_polarity() and
+                # docs/architecture.md "Reverse Polarity Protection".
+                # No separate relay-settle sleep here -- self.relay.close() above
+                # already blocked for Settings.RELAY_SETTLE_TIME_S (the single
+                # global relay settling/dead-time constant, enforced in
+                # RelayBase.open()/close(), hardware/relay.py) before returning.
+                pre_enable_v = self.dmm.measure_dc_voltage()
 
-                t_start = time.monotonic()
-                dt = 1.0 / self.s.SAMPLE_RATE_HZ
-                # Per-group validation override (see docs/architecture.md
-                # "Configurable Validation Timeout") -- defaults to the
-                # unchanged global Settings.CHARGE_TIMEOUT_S when absent, so
-                # every group not explicitly opting in behaves exactly as
-                # before. Read once here, not re-read every iteration:
-                # test_setpoints is caller-owned and must not change mid-run.
-                # Already validated (positive, <= MAX_TIMEOUT_OVERRIDE_S, and
-                # refused outright in PRODUCTION mode) by
-                # utils/validators.py::validate_group_test_config() before
-                # this sequence was ever constructed -- trusted here exactly
-                # like every other test_setpoints value already is.
-                charge_timeout_s = test_setpoints.get("charge_timeout_s", self.s.CHARGE_TIMEOUT_S)
+                # Captured BEFORE _check_battery_polarity() below, deliberately --
+                # this value must always be persisted (see REQUIREMENT 1 in
+                # docs/architecture.md's Start/End Voltage Persistence section),
+                # including on a ReversePolarityError raised by that very check.
+                # Capturing it only afterward (the previous ordering) meant a
+                # rejected polarity reading was silently lost -- the one
+                # measurement that would have explained the rejection never made
+                # it into run_summary/analysis_result. Taken with the SMU output
+                # still disabled, so it reflects whatever is actually connected
+                # (a real cell's resting voltage, or an empty position's near-0V
+                # open circuit). The sampling loop's own first sample is NOT
+                # used for this: by then the SMU has already been sourcing
+                # current for STABILIZATION_S, so an empty position would
+                # already read near the CV compliance target too --
+                # indistinguishable from a genuinely full battery at that point.
+                # Reuses pre_enable_v itself, no new read.
+                stats.initial_voltage_v = pre_enable_v
 
-                while True:
-                    check_cancellation(token)
+                self._check_battery_polarity(pre_enable_v, channel=channel, relay_address=relay_address)
 
-                    elapsed = time.monotonic() - t_start
-                    if elapsed > charge_timeout_s:
-                        raise NIPXITimeoutError(
-                            f"Channel {channel}: charge timeout after {elapsed:.0f}s (EOC not reached)"
+                self.smu.set_charge_mode(current_a=current_a, voltage_limit_v=voltage_limit_v)
+                self.smu.output_enable()
+
+                # try/finally starts immediately after output_enable(), covering
+                # the stabilization wait AND the sampling loop -- see
+                # docs/architecture.md Section 27 "Interruptible Wait Mechanism"
+                # (the exact latent-bug shape ChargeCycle's own fix avoided,
+                # preserved here unchanged).
+                nonlocal last_ntc_state
+                try:
+                    interruptible_sleep(self.s.STABILIZATION_S, token=token)
+
+                    t_start = time.monotonic()
+                    dt = 1.0 / self.s.SAMPLE_RATE_HZ
+                    # Per-group validation override (see docs/architecture.md
+                    # "Configurable Validation Timeout") -- defaults to the
+                    # unchanged global Settings.CHARGE_TIMEOUT_S when absent, so
+                    # every group not explicitly opting in behaves exactly as
+                    # before. Read once here, not re-read every iteration:
+                    # test_setpoints is caller-owned and must not change mid-run.
+                    # Already validated (positive, <= MAX_TIMEOUT_OVERRIDE_S, and
+                    # refused outright in PRODUCTION mode) by
+                    # utils/validators.py::validate_group_test_config() before
+                    # this sequence was ever constructed -- trusted here exactly
+                    # like every other test_setpoints value already is.
+                    charge_timeout_s = test_setpoints.get("charge_timeout_s", self.s.CHARGE_TIMEOUT_S)
+
+                    while True:
+                        check_cancellation(token)
+
+                        elapsed = time.monotonic() - t_start
+                        if elapsed > charge_timeout_s:
+                            raise NIPXITimeoutError(
+                                f"Channel {channel}: charge timeout after {elapsed:.0f}s (EOC not reached)"
+                            )
+
+                        # Telemetry: DMM for voltage (independent, already-
+                        # validated -- mirrors Monitor Battery), SMU's own ADC
+                        # readback for current (the only real current signal
+                        # available without DAQ). See module docstring
+                        # "Telemetry Source Strategy".
+                        smu_reading = self.smu.measure()
+                        dmm_v = self.dmm.measure_dc_voltage()
+                        v = dmm_v
+                        i = smu_reading["current_a"]
+                        stats.add(v, i)
+
+                        t_c = None
+                        presence = None
+                        if self.daq is not None and ntc_channel is not None:
+                            try:
+                                ntc_v = self.daq.read_channel(ntc_channel)
+                                presence = classify_ntc_presence(ntc_v)
+                                if presence == NTCPresence.PRESENT:
+                                    t_c = ntc_voltage_to_celsius(ntc_v)
+                                elif presence != last_ntc_state:
+                                    self.storage.log_event(
+                                        level="WARNING", source="charge_battery",
+                                        channel=channel, relay=relay_address,
+                                        message=f"NTC reading {presence} -- temperature monitoring degraded",
+                                    )
+                                last_ntc_state = presence
+                            except DAQError as e:
+                                if last_ntc_state != "fault":
+                                    self.storage.log_event(
+                                        level="WARNING", source="charge_battery",
+                                        channel=channel, relay=relay_address,
+                                        message=f"NTC read failed -- {e}",
+                                    )
+                                last_ntc_state = "fault"
+
+                        status = self.safety.check(v, i, t_c, mode="charge")
+                        if not status.safe:
+                            raise SafetyViolationError(f"Channel {channel}: {status.reason}")
+
+                        self._record_measurement(
+                            position_in_group=channel,
+                            test_type="charge", channel=channel, relay=relay_address,
+                            phase_detail="CC_CV", voltage_v=v, current_a=i, temp_c=t_c,
+                            smu_measured_v=smu_reading["voltage_v"], smu_measured_i=i,
+                            dmm_measured_v=dmm_v,
+                        )
+                        self._render_frame(
+                            test_type="charge", channel=channel, relay_address=relay_address,
+                            run_number=run_number, state="ACTIVE", phase_detail="CC_CV",
+                            elapsed_s=time.monotonic() - run_start_time,
+                            smu_voltage=smu_reading["voltage_v"], smu_current=i, dmm_voltage=dmm_v,
+                            battery_voltage=v, battery_current=i, battery_temp=t_c,
+                            ntc_device=self.ntc_daq_name, ntc_resource=getattr(self.daq, "resource", None),
+                            ntc_channel=ntc_channel, ntc_status=presence,
                         )
 
-                    # Telemetry: DMM for voltage (independent, already-
-                    # validated -- mirrors Monitor Battery), SMU's own ADC
-                    # readback for current (the only real current signal
-                    # available without DAQ). See module docstring
-                    # "Telemetry Source Strategy".
-                    smu_reading = self.smu.measure()
-                    dmm_v = self.dmm.measure_dc_voltage()
-                    v = dmm_v
-                    i = smu_reading["current_a"]
-                    stats.add(v, i)
+                        # End of charge: CV taper -- voltage at/above the CV
+                        # target and current tapered at/below the cutoff.
+                        # Harvested unchanged from ChargeCycle.run() (see
+                        # docs/architecture.md Section 33).
+                        if v >= voltage_limit_v and abs(i) <= self.s.CHARGE_CUTOFF_A:
+                            self.log.info("Charge complete on channel %d (V=%.3f, I=%.4f)", channel, v, i)
+                            break
 
-                    t_c = None
-                    presence = None
-                    if self.daq is not None and ntc_channel is not None:
-                        try:
-                            ntc_v = self.daq.read_channel(ntc_channel)
-                            presence = classify_ntc_presence(ntc_v)
-                            if presence == NTCPresence.PRESENT:
-                                t_c = ntc_voltage_to_celsius(ntc_v)
-                            elif presence != last_ntc_state:
-                                self.storage.log_event(
-                                    level="WARNING", source="charge_battery",
-                                    channel=channel, relay=relay_address,
-                                    message=f"NTC reading {presence} -- temperature monitoring degraded",
-                                )
-                            last_ntc_state = presence
-                        except DAQError as e:
-                            if last_ntc_state != "fault":
-                                self.storage.log_event(
-                                    level="WARNING", source="charge_battery",
-                                    channel=channel, relay=relay_address,
-                                    message=f"NTC read failed -- {e}",
-                                )
-                            last_ntc_state = "fault"
+                        interruptible_sleep(dt, token=token)
+                finally:
+                    if not self.smu.emergency_output_off(f"end of charge sequence on channel {channel}"):
+                        self.log.critical(
+                            "Channel %d: PMU output could not be verified OFF after charge sequence.",
+                            channel,
+                        )
 
-                    status = self.safety.check(v, i, t_c, mode="charge")
-                    if not status.safe:
-                        raise SafetyViolationError(f"Channel {channel}: {status.reason}")
-
-                    self._record_measurement(
-                        position_in_group=channel,
-                        test_type="charge", channel=channel, relay=relay_address,
-                        phase_detail="CC_CV", voltage_v=v, current_a=i, temp_c=t_c,
-                        smu_measured_v=smu_reading["voltage_v"], smu_measured_i=i,
-                        dmm_measured_v=dmm_v,
-                    )
-                    self._render_frame(
-                        test_type="charge", channel=channel, relay_address=relay_address,
-                        run_number=run_number, state="ACTIVE", phase_detail="CC_CV",
-                        elapsed_s=time.monotonic() - run_start_time,
-                        smu_voltage=smu_reading["voltage_v"], smu_current=i, dmm_voltage=dmm_v,
-                        battery_voltage=v, battery_current=i, battery_temp=t_c,
-                        ntc_device=self.ntc_daq_name, ntc_resource=getattr(self.daq, "resource", None),
-                        ntc_channel=ntc_channel, ntc_status=presence,
-                    )
-
-                    # End of charge: CV taper -- voltage at/above the CV
-                    # target and current tapered at/below the cutoff.
-                    # Harvested unchanged from ChargeCycle.run() (see
-                    # docs/architecture.md Section 33).
-                    if v >= voltage_limit_v and abs(i) <= self.s.CHARGE_CUTOFF_A:
-                        self.log.info("Charge complete on channel %d (V=%.3f, I=%.4f)", channel, v, i)
-                        break
-
-                    interruptible_sleep(dt, token=token)
+                # Relay open only AFTER the PMU output is confirmed off (the
+                # finally above) -- never switch a relay while current might
+                # still be flowing. The only way execution reaches here without
+                # having raised is EOC (the `break` above) -- every other exit
+                # raises and is handled by run_guarded()'s safety shutdown,
+                # which already force-opens every relay. Without this, a
+                # successfully completed charge would leave the relay closed
+                # indefinitely -- found during review, see docs/architecture.md
+                # Section 37.
+                self.relay.open(relay_address)
+                self.storage.log_event(
+                    level="INFO", source="charge_battery", channel=channel, relay=relay_address,
+                    message=f"Relay {relay_address} deactivated -- charge complete",
+                )
+                # Post-isolation defense-in-depth, not safety-critical -- the
+                # battery is already isolated by the relay.open() above, so
+                # this cannot affect it either way. Wrapped defensively even
+                # though zero_output_setpoint_best_effort() itself never
+                # raises -- this step must never prevent a completed charge
+                # from returning normally. See docs/architecture.md
+                # "Post-Isolation SMU Setpoint Zeroing".
+                try:
+                    self.smu.zero_output_setpoint_best_effort(f"end of charge sequence on channel {channel}")
+                except Exception as e:
+                    self.log.warning("Channel %d: post-isolation setpoint-zeroing raised "
+                                      "unexpectedly (non-critical): %s", channel, e)
+                return True
             finally:
-                if not self.smu.emergency_output_off(f"end of charge sequence on channel {channel}"):
-                    self.log.critical(
-                        "Channel %d: PMU output could not be verified OFF after charge sequence.",
-                        channel,
-                    )
-
-            # Relay open only AFTER the PMU output is confirmed off (the
-            # finally above) -- never switch a relay while current might
-            # still be flowing. The only way execution reaches here without
-            # having raised is EOC (the `break` above) -- every other exit
-            # raises and is handled by run_guarded()'s safety shutdown,
-            # which already force-opens every relay. Without this, a
-            # successfully completed charge would leave the relay closed
-            # indefinitely -- found during review, see docs/architecture.md
-            # Section 37.
-            self.relay.open(relay_address)
-            self.storage.log_event(
-                level="INFO", source="charge_battery", channel=channel, relay=relay_address,
-                message=f"Relay {relay_address} deactivated -- charge complete",
-            )
-            # Post-isolation defense-in-depth, not safety-critical -- the
-            # battery is already isolated by the relay.open() above, so
-            # this cannot affect it either way. Wrapped defensively even
-            # though zero_output_setpoint_best_effort() itself never
-            # raises -- this step must never prevent a completed charge
-            # from returning normally. See docs/architecture.md
-            # "Post-Isolation SMU Setpoint Zeroing".
-            try:
-                self.smu.zero_output_setpoint_best_effort(f"end of charge sequence on channel {channel}")
-            except Exception as e:
-                self.log.warning("Channel %d: post-isolation setpoint-zeroing raised "
-                                  "unexpectedly (non-critical): %s", channel, e)
-            return True
+                if self.sense_channel is not None:
+                    try:
+                        self.sense_router.disconnect(self.sense_channel)
+                    except Exception as e:
+                        self.log.warning(
+                            "Channel %d: sense-channel disconnect raised unexpectedly "
+                            "(non-critical): %s", channel, e,
+                        )
 
         completed = self.run_guarded(
             _run_charge, channel=channel, relay_address=relay_address,

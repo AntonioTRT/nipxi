@@ -75,7 +75,8 @@ class BatteryOperationSequence:
     """
 
     def __init__(self, smu, relay, safety: SafetyMonitor, storage, settings,
-                 source: str, dmm=None, daq=None, group_name=None):
+                 source: str, dmm=None, daq=None, group_name=None,
+                 sense_router=None, sense_channel=None):
         self.smu = smu
         self.dmm = dmm
         self.daq = daq
@@ -86,6 +87,15 @@ class BatteryOperationSequence:
         self.source = source
         self.group_name = group_name
         self.log = logging.getLogger(f"nipxi.{source}")
+        # FUTURE PLANNED ARCHITECTURE -- see docs/architecture.md "Future
+        # Architecture: Battery Sense Routing". Both None for every
+        # operation today -- _safe_final_voltage_reading() below is the
+        # only base-class DMM read, and its use of
+        # read_battery_voltage_via_sense() is a pure passthrough when
+        # sense_channel is None, identical to calling
+        # dmm.measure_dc_voltage() directly.
+        self.sense_router = sense_router
+        self.sense_channel = sense_channel
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -276,11 +286,24 @@ class BatteryOperationSequence:
         "last known voltage" is a traceability gap, not a safety-relevant
         one; safety.check()'s own limits are the authoritative abort path,
         not this best-effort reading).
+
+        Uses read_battery_voltage_via_sense() (see docs/architecture.md
+        "Future Architecture: Battery Sense Routing"), not
+        self.dmm.measure_dc_voltage() directly -- a pure passthrough when
+        self.sense_channel is None (every operation today). When a sense
+        channel IS configured, this deliberately reconnects/reads/
+        disconnects fresh here even though the caller's own run() may have
+        already disconnected it on the way out: this reading happens AFTER
+        that disconnect (run_guarded() calls this from its exception
+        branches, once the sequence's own try/finally has already
+        unwound), so it must re-establish the sense path itself rather
+        than assume it is still connected.
         """
         if self.dmm is None:
             return None
         try:
-            return self.dmm.measure_dc_voltage()
+            from hardware.sense_router import read_battery_voltage_via_sense
+            return read_battery_voltage_via_sense(self.dmm, self.sense_router, self.sense_channel)
         except Exception as e:
             self.log.warning("%s: final voltage reading failed -- %s", context, e)
             return None

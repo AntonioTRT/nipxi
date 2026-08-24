@@ -60,12 +60,46 @@ class _FakeDmm:
 
 
 class HardwareForGroupSenseChannelTests(unittest.TestCase):
-    def test_b1_real_config_has_no_sense_channel(self):
-        hw = dev_cfg.hardware_for_group("B1")
-        self.assertIsNone(hw["sense_channel"])
+    """
+    B1 is now the first real sense-routing deployment (see
+    docs/architecture.md "SenseRouter Deployment: MATRIX_NUMATO_201") --
+    these assert against that live config directly, the same pattern
+    already used for B1's charge_current_a/charge_mode/timeout-override
+    tests elsewhere in this suite: document what is true today, fail
+    loudly if it changes without an accompanying test update.
+    """
 
-    def test_sense_routing_is_empty_by_default(self):
-        self.assertEqual(dev_cfg.SENSE_ROUTING, {})
+    def test_b1_real_config_declares_sense_channel_1(self):
+        hw = dev_cfg.hardware_for_group("B1")
+        self.assertEqual(hw["sense_channel"], 1)
+
+    def test_sense_routing_maps_b1s_channel_to_matrix_numato_201(self):
+        self.assertEqual(
+            dev_cfg.SENSE_ROUTING,
+            {1: {"relay_matrix": "MATRIX_NUMATO_201", "relay": 1}},
+        )
+
+    def test_sense_channel_and_battery_relay_matrix_are_physically_separate(self):
+        """
+        Safety-relevant: B1's sense-routing matrix must never be the same
+        physical module as its own battery-position relay matrix -- see
+        the SenseRouter deployment review's explicit "keep them on
+        separate physical modules" decision.
+        """
+        hw = dev_cfg.hardware_for_group("B1")
+        sense_matrix = dev_cfg.SENSE_ROUTING[hw["sense_channel"]]["relay_matrix"]
+        self.assertNotEqual(sense_matrix, hw["relay_matrix_name"])
+
+    def test_no_group_other_than_b1_declares_a_sense_channel(self):
+        """No other group (enabled or disabled) was touched by this
+        deployment -- confirms the change stayed scoped to B1 alone."""
+        for group_name, grp in dev_cfg.BATTERY_GROUPS.items():
+            if group_name == "B1":
+                continue
+            self.assertIsNone(
+                grp.get("sense_channel"),
+                f"unexpected sense_channel on group {group_name!r}",
+            )
 
 
 class NumatoSenseRouterTests(unittest.TestCase):

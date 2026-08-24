@@ -6486,22 +6486,21 @@ message, and unrecognized/wrong-type values rejected. Full suite:
 
 ## 72. Future Architecture: Battery Sense Routing
 
-**FUTURE PLANNED ARCHITECTURE, with a CURRENT IMPLEMENTATION of the
-abstraction layer only.** Today, every group's DMM is physically
-connected directly to its sense path. This will change: a relay module
-will multiplex battery sense signals to the DMM, starting with a
-temporary Numato module and later possibly a rack-integrated matrix, a
-different relay controller, additional Numato modules, or a combination.
-This section prepares the software for that transition without changing
-any current behavior -- no group in `config/devices.py` declares a
-`sense_channel`, so nothing described here is exercised by any real
-workflow today, and **no file in the active real-hardware-validation
-path was touched** (`test_control/charge_sequence.py`,
-`discharge_sequence.py`, `battery_operation_sequence.py`,
-`hardware_manager.py`, `hardware/dmm.py` -- all confirmed unchanged via
-`git diff --stat`). Real battery validation was in progress when this
-work was done; the explicit goal, as with Sections 69-71, was
-infrastructure preparation with zero behavioral risk to it.
+**FUTURE PLANNED ARCHITECTURE, now with a CURRENT IMPLEMENTATION that
+includes real live wiring for B1.** Today, B1's DMM is routed through a
+temporary Numato relay module (`MATRIX_NUMATO_201`) before being read --
+see Section 73 for the deployment review and Numato-allocation safety
+analysis that preceded this. Every other group is still wired directly
+(no `sense_channel` declared), and remains provably byte-for-byte
+unaffected (see "Tests" below).
+
+This section originally documented an abstraction-only phase (matching
+Sections 69-71's "zero behavioral risk during active validation"
+posture) that deliberately did not touch `charge_sequence.py`/
+`discharge_sequence.py`/`battery_operation_sequence.py`. That phase is
+now superseded: the live-wiring phase below **does** touch those files,
+following an explicit request and a dedicated Numato-conflict review --
+see Section 73 for exactly what was confirmed safe before that happened.
 
 ### Design questions
 
@@ -6585,25 +6584,34 @@ class registry -- `RelayFactory` (dispatching on the named matrix's own
 physical sense-routing hardware exists yet, so there is nothing to
 describe.
 
-**Q6 -- where should routing occur?** A new module-level function,
-`hardware/sense_router.py::read_battery_voltage_via_sense(dmm,
-sense_router, sense_channel)` -- **not** inside `BatteryGroup`
-initialization, `HardwareManager`, or the DMM class itself. Rationale:
-- Not `HardwareManager` -- connect/disconnect here is a per-measurement
-  action (happens around every single voltage read), not a one-time
-  session-lifecycle action like everything else `HardwareManager` owns.
+**Q6 -- where should routing occur?** Originally sketched (in this
+section's first draft) as "wrap `dmm.measure_dc_voltage()` at every
+individual call site" via `read_battery_voltage_via_sense()`. **This was
+refined once live wiring was actually implemented** (see "Live Wiring"
+below) -- toggling a relay on every single sample (once per second for a
+multi-hour run) is real, avoidable mechanical relay-cycle wear, for no
+benefit, since nothing else needs the DMM during a Charge/Discharge run.
+The connect/disconnect calls instead bracket the *whole operation* --
+mirroring exactly how `self.relay.close(relay_address)`/`self.relay.open(relay_address)`
+(the battery-position relay) already bracket the whole run, not each
+sample. `read_battery_voltage_via_sense()` itself is unchanged and still
+useful -- it is the right primitive for a genuinely single-shot read
+(see `_safe_final_voltage_reading()`'s use of it below), just not for
+the main sampling loop's repeated reads.
+- Not `HardwareManager` -- sense routing is scoped to one operation's
+  lifetime (a Charge/Discharge run), not the whole hardware session
+  `HardwareManager` owns end to end.
 - Not the DMM class -- `hardware/dmm.py::DMM` has no concept of a
   battery group or a sense channel; keeping it a passive, sense-agnostic
   measurement instrument (already its role today) means it never needs
   to know sense routing exists.
-- Not `BatteryGroup` init -- routing must happen around *every*
-  individual read (each sample in a multi-hour sampling loop), not once
-  at setup.
-- A dedicated function, called from wherever `BatteryOperationSequence`
-  subclasses currently call `self.dmm.measure_dc_voltage()` directly, is
-  the cleanest fit -- and per its own docstring, is deliberately a pure
-  passthrough when `sense_channel is None`, so wiring it in later is a
-  call-site substitution, not a redesign.
+- The actual landing points (see "Live Wiring" below): `ChargeSequence`/
+  `DischargeSequence`'s own `run()` (connect once, right after the
+  battery relay closes; disconnect once, guaranteed on every exit path)
+  and `BatteryOperationSequence._safe_final_voltage_reading()` (one
+  single-shot reconnect-read-disconnect via
+  `read_battery_voltage_via_sense()`, for the one best-effort reading
+  that happens *after* the main operation has already disconnected).
 
 **Q7 -- cleanest approach preserving the existing modular architecture?**
 Exactly the shape implemented: one new, standalone module
@@ -6613,68 +6621,180 @@ centralization point, and one new empty config table
 (`SENSE_ROUTING`) -- no existing class's behavior, signature, or call
 sites change.
 
-### What was added
+### What was added (abstraction phase)
 
 - **`hardware/sense_router.py`** (new) -- `SenseRouter` (abstract),
   `NumatoSenseRouter` (concrete, one matrix), `ConfigDrivenSenseRouter`
   (composite, reads `SENSE_ROUTING`, caches per-matrix connections,
-  `shutdown()` for future cleanup-path integration), and
-  `read_battery_voltage_via_sense()` (the future integration point,
-  a pure passthrough when unconfigured).
-- **`config/devices.py`** -- `hardware_for_group()` now resolves an
-  optional `"sense_channel"` (`None` for every group today, confirmed by
-  test); new `SENSE_ROUTING = {}` table, documented with its intended
-  future shape inline.
+  `shutdown()`), and `read_battery_voltage_via_sense()`.
+- **`config/devices.py`** -- `hardware_for_group()` resolves an optional
+  `"sense_channel"`.
 
-### Where the future `BatteryOperationSequence` integration would land
+### Live Wiring (CURRENT IMPLEMENTATION -- now deployed for B1)
 
-Per the current DMM-voltage-read call sites (confirmed by direct
-inspection, none modified by this phase):
-- `charge_sequence.py`'s pre-enable reverse-polarity check and its main
-  sampling-loop per-iteration read.
-- `discharge_sequence.py`'s identical pair of call sites.
-- `battery_operation_sequence.py::_safe_final_voltage_reading()` (the
-  best-effort final-voltage capture on abnormal termination).
+Following a Numato-allocation safety review (see Section 73,
+"SenseRouter Deployment: MATRIX_NUMATO_201"), this was wired into the
+real execution path -- the first time this codebase's sense-routing
+groundwork was actually connected to `ChargeSequence`/
+`DischargeSequence`, not merely designed alongside them.
 
-Each would change from `self.dmm.measure_dc_voltage()` to
+**Constructor changes (all new parameters default to `None`, so every
+group without a `sense_channel` is provably unaffected -- see "Tests"
+below):**
+- `BatteryOperationSequence.__init__` gains `sense_router=None,
+  sense_channel=None`, stored as `self.sense_router`/`self.sense_channel`.
+- `ChargeSequence.__init__`/`DischargeSequence.__init__` gain the same
+  two parameters, passed straight through to `super().__init__()`.
+
+**`ChargeSequence.run()`/`DischargeSequence.run()` -- connect once,
+disconnect once, guaranteed on every exit path:**
+```
+self.relay.close(relay_address)          # battery relay closes (unchanged)
+if self.sense_channel is not None:
+    self.sense_router.connect(self.sense_channel)
+try:
+    pre_enable_v = self.dmm.measure_dc_voltage()     # UNCHANGED call
+    self._check_battery_polarity(...)                # may raise here
+    ...
+    <existing SMU try/finally, sampling loop, EOC/EOD, relay.open(), zeroing>
+    return True
+finally:
+    if self.sense_channel is not None:
+        self.sense_router.disconnect(self.sense_channel)   # wrapped, never raises
+```
+The interior pre-enable polarity read and every sampling-loop
+`self.dmm.measure_dc_voltage()` call are **byte-for-byte unchanged** --
+zero lines touched inside the hot loop. The sense channel is held
+connected for the operation's *entire* duration once opened, exactly
+mirroring the battery relay's own open-once/close-once pattern -- not
+re-toggled per sample.
+
+**The subtlety that required getting the nesting right:** a
+`ReversePolarityError` (a `SafetyViolationError` subclass) can be raised
+by `_check_battery_polarity()` *before* the SMU's own existing
+try/finally even begins. The new sense-disconnect `finally` had to wrap
+that too, not just the SMU's inner block -- confirmed by a real
+(non-source-inspection) test that deliberately drives a
+`ReversePolarityError` and asserts the sense channel still gets
+disconnected (`tests/test_sense_routing_live_wiring.py::
+test_reverse_polarity_failure_still_disconnects`).
+
+**`_safe_final_voltage_reading()`** (called from `run_guarded()`'s
+exception branches, *after* the sequence's own `finally` above has
+already disconnected the sense channel on the way out) now calls
 `read_battery_voltage_via_sense(self.dmm, self.sense_router,
-self.sense_channel)` -- a small, mechanical, well-contained substitution
-once undertaken, deliberately deferred to a later phase (see "Remaining
-work" below) rather than done now, given active real-hardware
-validation was underway when this groundwork was built.
+self.sense_channel)` instead of `self.dmm.measure_dc_voltage()` directly
+-- this **deliberately reconnects a second time** to take its own fresh
+best-effort reading, then disconnects again. Two connect/disconnect
+pairs on an exception path is correct, designed behavior, not a bug --
+verified explicitly by the same test file (it initially looked like a
+bug in this work's own test until traced back to this exact, intended
+reason).
 
-### Remaining work for a real sense-routing deployment
-
-1. Populate `SENSE_ROUTING` and the relevant group's `sense_channel`
-   once physical sense-routing hardware (the temporary Numato module) is
-   deployed.
-2. Wire `read_battery_voltage_via_sense()` into the call sites listed
-   above -- pass `sense_router`/`sense_channel` into
-   `BatteryOperationSequence.__init__`/`ChargeSequence`/
-   `DischargeSequence`'s constructors (both default to `None`, preserving
-   today's behavior for every group without a configured channel).
-3. Decide where a `ConfigDrivenSenseRouter` instance is constructed and
-   owned per real run (likely alongside `HardwareManager`'s own
-   construction in `test.py`'s workflow functions) and whether/how its
-   `shutdown()` integrates into `HardwareManager.disconnect_all()`'s
-   existing shutdown sequence -- deliberately not decided in this phase.
-4. Real-hardware validation of the connect -> read -> disconnect timing
-   once physical hardware exists -- in particular, whether an additional
-   settle delay is needed after `connect()` before the DMM reading is
-   trustworthy (mirroring the same electrical-settling caution already
-   applied to relay switching elsewhere in this codebase).
+**`test.py::_run_charge_or_discharge()`** constructs a
+`ConfigDrivenSenseRouter()` only when `hw["sense_channel"]` is not
+`None` (so no router is even instantiated for a group without one),
+passes `sense_router=`/`sense_channel=` into `sequence_cls(...)`, and
+calls `sense_router.shutdown()` in its own `finally`, before
+`storage.close()`/`hw_mgr.disconnect_all()`.
 
 ### Tests
 
-`tests/test_sense_router.py` -- `NumatoSenseRouter` connect/disconnect
-delegation and unknown-channel rejection; `ConfigDrivenSenseRouter`
-dispatch across synthetic multi-matrix configs (connection sharing on
-one matrix, separate connections across matrices, missing-config/
-unconfigured-channel rejection, `shutdown()`); and
-`read_battery_voltage_via_sense()`'s pure-passthrough guarantee when
-unconfigured (the core backward-compatibility property), its
-connect-read-disconnect ordering when configured, and that disconnect
-still happens if the DMM read itself raises. Plus
-`hardware_for_group()`'s new `sense_channel` resolution against B1's
-real config (`None`, confirmed). Full suite: 195/195 passing (179 prior
-+ 16 new).
+`tests/test_sense_router.py` -- `NumatoSenseRouter`/`ConfigDrivenSenseRouter`
+unit tests (updated to assert B1's *live* deployed values, including a
+dedicated check that B1's sense-routing matrix and its own
+battery-position relay matrix are never the same physical module) and
+`read_battery_voltage_via_sense()`'s passthrough/ordering guarantees.
+`tests/test_sense_routing_live_wiring.py` (new) -- a real, executing
+fake-hardware harness against `ChargeSequence` (not source inspection):
+proves `sense_channel=None` never touches a "poison" sense_router that
+raises on any use; proves connect-once/disconnect-once on normal EOC
+completion; proves the `ReversePolarityError` early-exit still
+disconnects (with the two-pair reconnect explained above); proves
+`sense_router.connect()` happens before the first DMM read.
+`tests/test_sense_router_testpy_wiring.py` (new) -- source-inspection
+confirming `test.py`'s construction/gating/teardown call sites are
+correctly ordered. Full suite: 207/207 passing.
+
+### Remaining work
+
+1. Real-hardware validation of the connect -> read -> disconnect timing
+   once MATRIX_NUMATO_201 is physically wired for this purpose -- in
+   particular, whether `RelayBase.close()`'s existing settle delay
+   (already reused automatically -- no new timing code was added) proves
+   sufficient in practice, or whether an additional explicit delay is
+   needed before the first post-connect DMM reading is trustworthy.
+2. Decide whether/how `ConfigDrivenSenseRouter`'s lifecycle should ever
+   integrate with `HardwareManager.disconnect_all()`'s shutdown sequence
+   directly, rather than `test.py` owning it as a sibling -- not needed
+   today (a single caller, a single group), revisit if a second group
+   ever adopts sense routing.
+
+## 73. SenseRouter Deployment: MATRIX_NUMATO_201
+
+**Numato allocation analysis, performed before any implementation, per
+an explicit request to verify no relay conflicts could occur.**
+
+### Battery-position control today
+
+Verified directly from `config/devices.py::BATTERY_GROUPS` (not from
+memory): only `MATRIX_NUMATO_202` drives an enabled group (B1, 8 real
+positions). `MATRIX_NUMATO_201` is assigned to A1-A4 and
+`MATRIX_NUMATO_203` to C1-C4, but every one of those 8 groups is
+`enabled: False` with empty `positions` -- neither is performing any
+battery-position control today. `utils/device_validator.py` confirmed:
+an relay-matrix config entry unreferenced by any enabled group is a
+completely normal, untested-for state in this codebase, not an error
+condition.
+
+### The conflict risk that required a decision, not just a config check
+
+`MATRIX_NUMATO_201` is bound to two legacy aliases --
+`MAIN_MATRIX_ETH`/`NUMATO_RELAY_MATRIX_CONFIG`
+(`config/devices.py:949,953`) -- and `main.py:112` constructs its
+`HardwareManager` with `relay_cfg=dev_cfg.NUMATO_RELAY_MATRIX_CONFIG`,
+i.e. **`.201` is `main.py`'s legacy-path default relay matrix.** Even
+though no real validation in this project has gone through `main.py`
+(exclusively `test.py`'s menu), `.201` is one `python main.py`
+invocation away from a second, independent connection attempt to the
+same physical module a `SenseRouter` would hold open for the duration of
+a Charge/Discharge run.
+
+`MATRIX_NUMATO_203` has no such binding -- lower conflict surface, but
+no hardware-validation record exists for it (`docs/MILESTONES.md`
+records a PASS for `.201`/`.202`, not `.203`), so its physical presence
+on the bench could not be confirmed from config alone.
+
+### Decision
+
+Presented both options, with the trade-off stated plainly, to the
+operator directly (this could not be resolved from code/config alone --
+it required knowledge of physical bench reality and operational habits
+outside this repository's visibility). **`MATRIX_NUMATO_201` was chosen**,
+accepting the legacy-binding risk in exchange for known-good,
+already-validated hardware. Operational mitigation (documentation only,
+not code -- no cross-process locking was added, which would be
+disproportionate to a risk this codebase's own usage pattern already
+makes unlikely): **do not run `main.py` while a sense-routing session
+against `MATRIX_NUMATO_201` is active.**
+
+### No relay-address conflict on the chosen module
+
+`SENSE_ROUTING` assigns B1's `sense_channel` to relay `1` on
+`MATRIX_NUMATO_201`. Since no enabled group uses any relay on `.201`
+today (A1-A4 are disabled, empty `positions`), there is no possibility
+of two different logical purposes contending for the same physical relay
+number on this module.
+
+### Why sense routing and battery-position control were kept on
+### physically separate modules
+
+B1's own battery-position relay matrix (`MATRIX_NUMATO_202`) was
+deliberately **not** reused for sense routing, even though it would also
+technically satisfy "channel 1 is free" -- keeping sense routing on a
+different physical module than battery-position control means the two
+concerns can never share connection state, never contend for the same
+TCP session, and a fault in one relay module's connection can never
+directly affect the other. `tests/test_sense_router.py::
+test_sense_channel_and_battery_relay_matrix_are_physically_separate`
+makes this an enforced, tested invariant, not just a design intention.
