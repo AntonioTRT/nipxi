@@ -644,6 +644,38 @@ class SMU(HardwareBase):
         swallowed here -- a failure to record a trace event must never be
         confused with, or interfere with, the actual output-disable
         sequence this method exists to guarantee.
+
+        Safest Shutdown Sequence (see docs/architecture.md "Safest
+        Shutdown Sequence" -- added after a real post-Ctrl+C ~4 V terminal
+        reading persisted even after `zero_output_setpoint_best_effort()`
+        was made to also zero `voltage_limit`): this method now actively
+        zeros the commanded setpoint FIRST, WHILE OUTPUT IS STILL ENABLED,
+        before ever attempting `output_disable()`. Writing to
+        `current_level`/`voltage_limit` AFTER output is already disabled
+        (which is all the earlier fix did, and all
+        `zero_output_setpoint_best_effort()` -- called by every caller
+        AFTER this method already returned -- still does) has NO physical
+        effect on the output terminals: once `output_enabled` is False,
+        the active regulation loop has already stopped, so those
+        properties only update a stored register for the next time output
+        is enabled, not anything currently present at the terminals. That
+        is explicitly acknowledged in `zero_output_setpoint_best_effort()`'s
+        own docstring ("the battery is already electrically isolated, so
+        driving the SMU's own commanded setpoint to zero cannot affect it
+        either way") -- which is accurate for THAT call site, but means
+        the earlier voltage_limit fix could never have addressed a
+        physical residual-voltage symptom, only a technician's later
+        register readback. Zeroing the setpoint HERE, before disabling,
+        lets the SMU's own active regulation loop pull the output down
+        from whatever it was actively holding (e.g. a CV compliance
+        ceiling) to a low, controlled state BEFORE the output stage goes
+        inert -- this is what can actually discharge output-side
+        capacitance/residual charge, rather than leaving it electrically
+        frozen at its value the instant output goes high-impedance.
+        Best-effort, non-blocking, like every other defense-in-depth step
+        in this method -- a failure here never prevents proceeding
+        immediately to the actually-critical `output_disable()` retry loop
+        below.
         """
         def _emit(message):
             if on_event is not None:
@@ -658,6 +690,11 @@ class SMU(HardwareBase):
         )
         self.log.warning("SMU %s: emergency output off -- %s", self.resource, reason)
         _emit(f"emergency_output_off requested ({reason})")
+
+        # Actively drive the setpoint to zero WHILE STILL ENABLED -- see
+        # "Safest Shutdown Sequence" above. Must run before output_disable()
+        # is ever attempted, not after.
+        self._apply_zero_setpoint(reason, on_event=on_event, stage="pre-disable")
 
         max_attempts = Settings.EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS
         last_result = OutputVerificationResult.VERIFICATION_COMM_FAILURE
@@ -734,27 +771,29 @@ class SMU(HardwareBase):
         AFTER the relay isolating this channel from its battery has
         already been opened (or at least attempted) -- see docs/
         architecture.md "Post-Isolation SMU Setpoint Zeroing". At that
-        point the battery is already electrically isolated, so driving
-        the SMU's own commanded setpoint to zero cannot affect it either
-        way; this exists purely to leave the SMU's own internal state
-        unambiguous should a technician probe its output terminals after
-        a run, regardless of root cause of any residual reading.
+        point the battery is already electrically isolated, and output is
+        already disabled, so driving the SMU's own commanded setpoint to
+        zero HERE cannot affect the output terminals either way (the
+        active regulation loop already stopped the moment output was
+        disabled) -- this call exists purely to leave the SMU's own
+        internal register state unambiguous should a technician probe its
+        output terminals or query the session after a run, regardless of
+        root cause of any residual reading.
+
+        This is the SAME underlying zeroing logic
+        emergency_output_off() now ALSO applies internally, but EARLIER --
+        see that method's "Safest Shutdown Sequence" docstring section for
+        why zeroing the setpoint before output is disabled (not just
+        after, as this method alone always has) is what actually matters
+        for the physical terminal voltage. This method's own post-
+        isolation call remains valuable as a second, independent
+        confirmation of the SMU's final internal state, not as the
+        primary fix for a residual-voltage symptom -- that fix lives in
+        emergency_output_off() itself now.
 
         For DC_CURRENT sessions (ChargeSequence/DischargeSequence's CC-CV
         mode), zeros BOTH `current_level` AND `voltage_limit` -- not just
         `current_level` alone (the original, incomplete implementation).
-        Rationale (see docs/architecture.md "Shutdown State Determinism",
-        added after a real post-Ctrl+C ~4.0 V terminal reading was traced
-        to this exact gap): B1's charge behavior has consistently shown
-        CV-limited/compliance operation (SMU voltage pinned at
-        voltage_limit, not a true constant-current region), meaning
-        `voltage_limit` -- not `current_level` -- is the value actually
-        governing terminal voltage while the output remains configured
-        that way. Zeroing only `current_level` left `voltage_limit` at its
-        last commanded ceiling (e.g. 4.0 V), so a technician probing the
-        output terminals after output_disable() could still see that
-        ceiling reflected depending on instrument/output state, even
-        though the disable command itself had already been verified.
         `voltage_limit_range` (the setting's resolution scale) is
         deliberately left untouched -- it does not itself present a
         voltage, so zeroing it would add a new, unnecessary failure mode
@@ -782,6 +821,28 @@ class SMU(HardwareBase):
         event-log observability hook this driver has no direct knowledge
         of; exceptions from `on_event` are swallowed here too).
         """
+        return self._apply_zero_setpoint(context, on_event=on_event, stage="post-isolation")
+
+    def _apply_zero_setpoint(self, context: str, on_event, *, stage: str) -> bool:
+        """
+        Shared core for zero_output_setpoint_best_effort() and
+        emergency_output_off()'s new pre-disable call -- see both methods'
+        docstrings for WHEN each is called and why that timing matters
+        (physically meaningful pre-disable vs. cosmetic post-isolation).
+        Only ONE place implements the actual register read/write/commit
+        logic, so both call sites can never drift out of sync with each
+        other.
+
+        `stage` ("pre-disable"/"post-isolation") is folded into every
+        `on_event` message so a reader of the event log (which will show
+        BOTH calls for a typical shutdown -- this one via
+        emergency_output_off(), then the public method's own call again
+        afterward) can tell which stage produced which entry, rather than
+        seeing the same message text twice with no way to distinguish them.
+
+        Same never-raises/never-blocks/never-retried contract as
+        zero_output_setpoint_best_effort() -- see that method's docstring.
+        """
         if self._session is None:
             return True
         prefix = f"{context}: " if context else ""
@@ -789,7 +850,7 @@ class SMU(HardwareBase):
         def _emit(message):
             if on_event is not None:
                 try:
-                    on_event(message)
+                    on_event(f"{stage}: {message}")
                 except Exception:
                     pass
 
@@ -811,8 +872,8 @@ class SMU(HardwareBase):
             return True
         except Exception as e:
             self.log.warning(
-                "%sSMU %s: post-isolation setpoint-zeroing failed (non-critical, "
-                "shutdown already complete): %s", prefix, self.resource, e,
+                "%sSMU %s: setpoint-zeroing failed (non-critical, %s stage): %s",
+                prefix, self.resource, stage, e,
             )
             return False
 

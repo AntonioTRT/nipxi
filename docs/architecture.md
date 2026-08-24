@@ -7419,3 +7419,145 @@ every such transition now raises `BatteryRemovedDuringChargeError` before
 `break` is reachable.** The residual gap is narrower and explicitly
 disclosed (very-early and very-late removal windows), not silent or
 unbounded.
+
+## 78. Post-3d1433c Regression Investigation: First-Sample N/A + Safest Shutdown Sequence
+
+Two issues reported after commit `3d1433c` (Battery Removal During Charge
+Detection). Investigated by tracing the exact code, not by assumption --
+one is a real regression, correctly identified as such but from a
+DIFFERENT commit than reported; the other is a genuine, previously-
+unidentified gap in the shutdown sequence itself.
+
+### Issue 1: first-sample N/A -- root cause identified, NOT `3d1433c`
+
+**`3d1433c` does not touch this.** Re-verified via `git show 3d1433c --
+test_control/charge_sequence.py`: `_record_measurement()` is called
+unconditionally on every sampling-loop iteration, unchanged, BEFORE any
+of the new battery-removal-detection code runs; `stats.initial_voltage_v`
+(the run_summary `start_voltage` source) is set from `pre_enable_v`,
+captured before the sampling loop even starts -- also untouched.
+
+**The real cause: `battery_and_ntc_presence_precheck()`** (commit
+`4b1a1b9`, "Add separate Battery Presence + NTC Presence pre-test
+diagnostics" -- Section 76), TWO commits before the reported one. It
+records a `measurements` row for the selected channel, before the relay
+ever closes: `phase_detail="BATTERY_PRECHECK"`, `voltage_v` populated,
+`dmm_measured_v`/`smu_measured_v`/`current_a` all left `NULL`.
+`DataStorage.get_first_measurement()` already had a filter for exactly
+this SHAPE of row -- added earlier for `_ntc_group_snapshot()`'s own
+`phase_detail="NTC_PRECHECK"` row, which has the identical problem (a
+real, non-NULL `voltage_v` -- the raw NTC divider voltage -- but no
+DMM/SMU/current data) -- but that filter named `'NTC_PRECHECK'`
+specifically, by string, and was never updated when `BATTERY_PRECHECK`
+was introduced. The new row silently became "row one" again, reproducing
+the exact N/A symptom the `NTC_PRECHECK` filter was built to prevent, for
+a second, different reason. The user's report attributed this to the
+most recent commit (a reasonable inference, since testing happened after
+it), but the regression was latent since `4b1a1b9`.
+
+**Fix:** `data/storage.py::get_first_measurement()`'s SQL filter changed
+from excluding `phase_detail != 'NTC_PRECHECK'` to `phase_detail NOT IN
+('NTC_PRECHECK', 'BATTERY_PRECHECK')`. Both known precheck row shapes are
+now named explicitly -- a comment flags that a third precheck-style
+measurement, if ever added, must be added here too, or this will regress
+a third time.
+
+Tests: `tests/test_storage_measurement_scoping.py` gained
+`test_battery_precheck_row_with_real_voltage_is_skipped` and
+`test_first_real_sample_is_found_after_both_precheck_row_kinds` (a run
+writing BOTH precheck row shapes before the genuine first CC_CV sample,
+confirming both are skipped and the real sample is still found).
+
+### Issue 2: ~4 V measurable after Ctrl+C -- Safest Shutdown Sequence
+
+**Traced every Ctrl+C/abort/exception/SafetyViolationError/
+emergency_stop path** (`run_guarded()`'s five exception branches ->
+`SafetyMonitor.emergency_stop()`/`safe_cancel_shutdown()` ->
+`SMU.emergency_output_off()` -> `relay_matrix.open_all()` ->
+`SMU.zero_output_setpoint_best_effort()`) -- unchanged by this
+investigation; the ORDERING of SMU-disable vs. relay-open was already
+correct (SMU output disabled and VERIFIED before the relay ever opens --
+"never switch a relay while current might still be flowing" -- confirmed
+still intact, matches `tests/test_safety_monitor_shutdown.py`'s existing
+`test_call_order_is_smu_off_then_relay_open_then_zero`).
+
+**Is the SMU explicitly forced to 0 V and 0 A before output disable?**
+Before this fix: **no.** `zero_output_setpoint_best_effort()` was always
+called AFTER `emergency_output_off()` had already disabled and verified
+output OFF -- and its own docstring said so explicitly: "the battery is
+already electrically isolated, so driving the SMU's own commanded
+setpoint to zero cannot affect it either way." That sentence is the bug:
+writing `current_level`/`voltage_limit` to 0 AFTER `output_enabled` is
+already `False` has **no physical effect** on the output terminals --
+the active regulation loop has already stopped; those properties only
+update a stored register for the next time output is enabled. The
+earlier fix in commit `983fc64` (making this method also zero
+`voltage_limit`, not just `current_level`) was well-reasoned about WHICH
+register mattered, but applied at a point in the sequence where zeroing
+ANY register could no longer have a physical effect -- it could only
+ever fix a technician's later register readback, never the terminal
+voltage itself. This explains why ~4 V (matching the commanded CV target)
+remained measurable after Ctrl+C even after that fix.
+
+**Why 4 V specifically:** at the instant Ctrl+C lands, if the run was in
+its CV phase, the SMU's active regulation loop is holding the output AT
+the commanded `voltage_limit_v` compliance ceiling. Disabling output
+without first commanding the setpoint down leaves whatever the output
+stage (and any output-side capacitance) was actively holding at that
+instant electrically "frozen" the moment the output goes inert/high-
+impedance -- consistent with a residual reading that matches the CV
+target, not 0 V.
+
+**The fix -- safest shutdown sequence:**
+`SMU.emergency_output_off()` now actively zeros the commanded setpoint
+FIRST, WHILE OUTPUT IS STILL ENABLED, before ever attempting
+`output_disable()`:
+
+    emergency_output_off(reason):
+        1. [NEW] actively zero current_level+voltage_limit (or
+           voltage_level in DC_VOLTAGE mode) -- WHILE STILL ENABLED
+        2. output_disable() -> verify OFF, bounded retry (unchanged)
+    -- then, unchanged, at the SafetyMonitor level:
+        3. relay_matrix.open_all()
+        4. zero_output_setpoint_best_effort() -- post-isolation, cosmetic
+           second confirmation of the SMU's internal register state
+
+Step 1 is what actually matters physically: the SMU's own active
+regulation loop pulls the output down from whatever it was holding to a
+low, controlled state BEFORE the output stage goes inert -- this is what
+can discharge output-side capacitance/residual charge, unlike a register
+write made after disable (step 4, unchanged, kept only as a second,
+independent confirmation of final internal state, not a physical fix).
+Implemented via a new shared private helper, `SMU._apply_zero_setpoint()`
+-- the exact same read/write/commit logic `zero_output_setpoint_best_effort()`
+already had, now called from TWO places (`stage="pre-disable"` inside
+`emergency_output_off()`, `stage="post-isolation"` from the existing
+public method), each stage folded into `on_event` messages so the two
+calls a typical shutdown now produces are distinguishable in the event
+log rather than showing identical text twice.
+
+Best-effort and non-blocking, like every other defense-in-depth step in
+this shutdown chain -- a failure to zero the setpoint never delays or
+blocks the immediately-following, actually-critical `output_disable()`
+retry loop.
+
+No changes were needed to `safety_monitor.py`,
+`battery_operation_sequence.py`, or any caller -- `emergency_output_off()`
+is the single, canonical PMU fail-safe reflex called from every shutdown
+path (charge/discharge sequences' own inner `finally`, `SafetyMonitor.
+emergency_stop()`/`safe_cancel_shutdown()`, `HardwareManager.connect_all()`/
+`disconnect_all()`), so fixing it once there automatically covers every
+caller -- the same "fix centrally" principle already used elsewhere in
+this driver.
+
+Tests: `tests/test_smu_shutdown_sequence_ordering.py` (new) -- a fake
+NI-DCPower session that records the exact order of every property write
+AND whether output was still enabled at the moment of each write, proving
+`current_level`/`voltage_limit` (or `voltage_level` in DC_VOLTAGE mode)
+are zeroed strictly before the first `output_enabled = False` write, that
+a failing pre-disable zero never blocks `output_disable()`, and that the
+pre-disable/post-isolation `on_event` messages are distinguishable. Full
+suite re-run clean, no regressions -- `safety_monitor.py`'s own existing
+call-order tests (SMU off -> relay open -> zero) pass unchanged, since
+this fix is entirely internal to `emergency_output_off()` and does not
+change its external call contract.

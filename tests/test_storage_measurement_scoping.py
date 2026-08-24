@@ -128,6 +128,52 @@ class GetFirstMeasurementTests(MeasurementScopingTestCase):
         self.assertIsNotNone(initial)
         self.assertEqual(initial["phase_detail"], "OPEN_BEFORE")
 
+    def test_battery_precheck_row_with_real_voltage_is_skipped(self):
+        """
+        The SAME class of bug the NTC_PRECHECK test above covers, but for
+        test_control/battery_presence_precheck.py::
+        battery_and_ntc_presence_precheck()'s own pre-relay-close row
+        (phase_detail="BATTERY_PRECHECK", voltage_v populated,
+        dmm_measured_v/smu_measured_v/current_a left NULL) -- this
+        regressed the exact same "Initial Measurement shows N/A" symptom
+        under a different phase_detail string the filter didn't yet know
+        about when that feature was added. See this method's own
+        docstring "REGRESSED, then re-fixed here".
+        """
+        self.storage.record_measurement(
+            test_type="charge", channel=1, phase_detail="BATTERY_PRECHECK",
+            voltage_v=3.67, group_name="B1", position_in_group=1,
+        )
+        self.assertIsNone(
+            self.storage.get_first_measurement(run_id=self.storage.run_id, channel=1),
+            "a BATTERY_PRECHECK-only row must never be reported as the Initial Measurement",
+        )
+
+    def test_first_real_sample_is_found_after_both_precheck_row_kinds(self):
+        """
+        A real run writes BOTH an NTC_PRECHECK row (from the group NTC
+        snapshot) AND a BATTERY_PRECHECK row (from the battery presence
+        check) before the relay ever closes -- both must be skipped, and
+        the genuine first CC_CV sample must still be found.
+        """
+        self.storage.record_measurement(
+            test_type="charge", channel=1, phase_detail="BATTERY_PRECHECK",
+            voltage_v=3.67, group_name="B1", position_in_group=1,
+        )
+        self.storage.record_measurement(
+            test_type="charge", channel=1, phase_detail="NTC_PRECHECK",
+            voltage_v=2.13847, temp_c=27.0, group_name="B1", position_in_group=1,
+        )
+        self.storage.record_measurement(
+            test_type="charge", channel=1, phase_detail="CC_CV",
+            voltage_v=3.568383, current_a=0.139728, temp_c=27.1,
+            smu_measured_v=3.699169, smu_measured_i=0.139728, dmm_measured_v=3.568383,
+        )
+        initial = self.storage.get_first_measurement(run_id=self.storage.run_id, channel=1)
+        self.assertIsNotNone(initial)
+        self.assertEqual(initial["phase_detail"], "CC_CV")
+        self.assertEqual(initial["dmm_measured_v"], 3.568383)
+
 
 class GetMeasurementsRecentLimitTests(MeasurementScopingTestCase):
     def test_recent_limit_returns_last_n_in_chronological_order(self):

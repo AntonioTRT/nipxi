@@ -662,23 +662,40 @@ class DataStorage(StorageBackend):
         execution_screen.py's "Initial" panel), without fetching the whole
         table to find it.
 
-        Excludes rows tagged `phase_detail = 'NTC_PRECHECK'` explicitly --
-        NOT just "voltage_v is NULL". A first attempt at this filter (see
-        git history) checked only for at least one non-NULL electrical
-        column, on the wrong assumption that test.py::_ntc_group_snapshot()
-        ever's pre-check row leaves `voltage_v` NULL. It does not:
-        _ntc_group_snapshot() stores the RAW NTC DIVIDER VOLTAGE in that
-        same `voltage_v` column (see its own docstring/_run_ntc_group_scan()'s
-        "voltage_v=<raw divider volts>") -- a real, non-NULL float that
-        satisfied the old filter's OR-condition despite `dmm_measured_v`/
-        `smu_measured_v`/`current_a` (the columns the "Initial" panel
-        actually displays) staying NULL on that row. The pre-check row is
-        written for the selected position BEFORE the relay ever closes and
-        would otherwise still be "row one" for that channel every time --
-        showing the operator an Initial Measurement of DMM/SMU/Current
-        all N/A even though the battery plainly had a real, valid voltage
-        reading (the pre-enable polarity check) before charging was ever
-        allowed to start.
+        Excludes rows tagged `phase_detail IN ('NTC_PRECHECK',
+        'BATTERY_PRECHECK')` explicitly -- NOT just "voltage_v is NULL". A
+        first attempt at this filter (see git history) checked only for at
+        least one non-NULL electrical column, on the wrong assumption that
+        test.py::_ntc_group_snapshot()'s pre-check row leaves `voltage_v`
+        NULL. It does not: _ntc_group_snapshot() stores the RAW NTC
+        DIVIDER VOLTAGE in that same `voltage_v` column (see its own
+        docstring/_run_ntc_group_scan()'s "voltage_v=<raw divider volts>")
+        -- a real, non-NULL float that satisfied the old filter's
+        OR-condition despite `dmm_measured_v`/`smu_measured_v`/`current_a`
+        (the columns the "Initial" panel actually displays) staying NULL
+        on that row. The pre-check row is written for the selected
+        position BEFORE the relay ever closes and would otherwise still be
+        "row one" for that channel every time -- showing the operator an
+        Initial Measurement of DMM/SMU/Current all N/A even though the
+        battery plainly had a real, valid voltage reading (the pre-enable
+        polarity check) before charging was ever allowed to start.
+
+        REGRESSED, then re-fixed here (see docs/architecture.md "Battery
+        Removal During Charge Detection" review): when
+        test_control/battery_presence_precheck.py::
+        battery_and_ntc_presence_precheck() was added, it recorded its own
+        pre-relay-close measurement row for the selected channel --
+        `phase_detail="BATTERY_PRECHECK"`, `voltage_v` populated,
+        `dmm_measured_v`/`smu_measured_v`/`current_a` left NULL -- the
+        exact same shape as the NTC_PRECHECK row this filter was
+        originally built to exclude, under a DIFFERENT phase_detail string
+        this filter didn't yet know about. Since the filter only excluded
+        `'NTC_PRECHECK'` by name, the new BATTERY_PRECHECK row silently
+        became "row one" again, reintroducing the identical N/A symptom
+        for a second, different reason. Fixed by excluding both known
+        precheck phase_detail values explicitly, by name -- if a THIRD
+        precheck-style measurement is ever added, its phase_detail string
+        must be added here too, or this will regress a third time.
 
         The non-NULL-electrical-column check is kept as a second, general
         guard (any future phase_detail that also writes an all-NULL row
@@ -698,7 +715,7 @@ class DataStorage(StorageBackend):
         if self._db is None:
             return None
         conditions, params = [
-            "(phase_detail IS NULL OR phase_detail != 'NTC_PRECHECK')",
+            "(phase_detail IS NULL OR phase_detail NOT IN ('NTC_PRECHECK', 'BATTERY_PRECHECK'))",
             "(voltage_v IS NOT NULL OR current_a IS NOT NULL "
             "OR smu_measured_v IS NOT NULL OR dmm_measured_v IS NOT NULL)",
         ], []
