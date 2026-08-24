@@ -143,6 +143,47 @@ but is currently rejected outright rather than silently ignored):
 },
 ```
 
+### Battery sense routing (future architecture, not yet active)
+
+**Illustrative only -- not applied to any real group today.** See
+`docs/architecture.md` "Future Architecture: Battery Sense Routing" for
+the full design. A group may optionally declare a logical
+`sense_channel` (a top-level group field, not a `test_setpoints` entry --
+it is a hardware-wiring fact, not a test parameter):
+
+```python
+"B1": {
+    "relay_matrix": "MATRIX_NUMATO_202",
+    "smu": "AUX_SMU_1",
+    "dmm": "MAIN_DMM",
+    "daq": "MAIN_DAQ",
+    "battery_type": "HUB",
+    # Omitted today on every real group -- DMM is wired directly to the
+    # sense path. Once a sense-routing relay module is deployed, adding
+    # this number is the only group-side change needed.
+    # "sense_channel": 1,
+    "test_setpoints": {...},
+    "positions": {...},
+},
+```
+
+The channel number is mapped to a physical relay matrix + relay via
+`config/devices.py::SENSE_ROUTING`, empty today:
+
+```python
+SENSE_ROUTING = {
+    1: {"relay_matrix": "MATRIX_NUMATO_201", "relay": 1},
+    2: {"relay_matrix": "MATRIX_NUMATO_201", "relay": 2},
+    3: {"relay_matrix": "MATRIX_NUMATO_202", "relay": 1},
+}
+```
+
+A group never names a relay module, IP, or physical relay number
+directly -- only the logical channel. `relay_matrix` above reuses the
+same `ETHERNET_DEVICES` nickname namespace every other `relay_matrix`
+role already uses -- no separate backend registry is needed to add a
+second Numato module or a future rack-integrated matrix.
+
 ### Stabilization and sampling
 
 | Parameter | Default | Type | Description |

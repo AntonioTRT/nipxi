@@ -6483,3 +6483,198 @@ compatibility (including the no-mutation-of-the-live-config-dict check),
 explicit `CC_CV` accepted, `CV` rejected with the "not yet implemented"
 message, and unrecognized/wrong-type values rejected. Full suite:
 179/179 passing (170 prior + 9 new).
+
+## 72. Future Architecture: Battery Sense Routing
+
+**FUTURE PLANNED ARCHITECTURE, with a CURRENT IMPLEMENTATION of the
+abstraction layer only.** Today, every group's DMM is physically
+connected directly to its sense path. This will change: a relay module
+will multiplex battery sense signals to the DMM, starting with a
+temporary Numato module and later possibly a rack-integrated matrix, a
+different relay controller, additional Numato modules, or a combination.
+This section prepares the software for that transition without changing
+any current behavior -- no group in `config/devices.py` declares a
+`sense_channel`, so nothing described here is exercised by any real
+workflow today, and **no file in the active real-hardware-validation
+path was touched** (`test_control/charge_sequence.py`,
+`discharge_sequence.py`, `battery_operation_sequence.py`,
+`hardware_manager.py`, `hardware/dmm.py` -- all confirmed unchanged via
+`git diff --stat`). Real battery validation was in progress when this
+work was done; the explicit goal, as with Sections 69-71, was
+infrastructure preparation with zero behavioral risk to it.
+
+### Design questions
+
+**Q1 -- what should a group's config look like?** `sense_channel: <int>`,
+an optional **top-level** field on `BATTERY_GROUPS[group]` (sibling to
+`relay_matrix`/`smu`/`dmm`/`daq`), not a `test_setpoints` entry --
+`sense_channel` is a hardware-wiring fact (which physical sense path
+this group uses), not a per-test parameter that varies between
+validation runs. Resolved by `hardware_for_group()` alongside every
+other role, defaulting to `None` when absent (every group today):
+```python
+"B1": {
+    "relay_matrix": "MATRIX_NUMATO_202",
+    "smu": "AUX_SMU_1",
+    "dmm": "MAIN_DMM",
+    "daq": "MAIN_DAQ",
+    "sense_channel": 1,   # optional; omitted today on every real group
+    ...
+},
+```
+A group never names a relay module, IP address, or physical relay number
+directly -- only this logical channel number. It describes intent
+("route my sense signal"), never implementation.
+
+**Q2 -- how is Numato-today/matrix-tomorrow abstracted with minimal
+change?** By reusing `hardware/relay_factory.py::RelayFactory` --
+already generic across relay transport types (`"ethernet"` ->
+`NumatoRelayMatrix`, `"serial"` -> `SerialRelay`, extensible per its own
+documented "Adding a new relay type" recipe) -- instead of inventing a
+second, parallel backend-name registry. A future routing device that
+needs a transport `RelayFactory` doesn't already support means adding
+one `hardware/relay_<type>.py` driver (an already-established,
+documented extension point); it never means touching sense-routing
+callers.
+
+**Q3 -- is a dedicated `SenseRouter` interface appropriate?** Yes,
+implemented in the new `hardware/sense_router.py`:
+```python
+class SenseRouter:
+    def connect(self, channel: int) -> None: ...
+    def disconnect(self, channel: int) -> None: ...
+```
+mirroring `orchestration/arbiter.py::Arbiter`'s interface-now/
+implementation-later pattern. `NumatoSenseRouter` is the reference
+implementation -- a thin wrapper over one already-constructed
+`RelayBase`-shaped driver's own `close()`/`open()` (connect = close the
+relay, routing the sense path to the DMM; disconnect = open it). It does
+not import or assume `NumatoRelayMatrix` specifically -- any
+`RelayBase` subclass works.
+
+**Q4 -- how are multiple routing backends supported?**
+`ConfigDrivenSenseRouter` is the composite a future caller would hold
+exactly one instance of. It reads `config/devices.py::SENSE_ROUTING`
+to decide which physical relay matrix and relay number serves a given
+logical channel, lazily constructing (via `RelayFactory`) and **caching
+one `NumatoSenseRouter` per distinct relay matrix actually referenced**
+-- so several sense channels on the same physical module share one
+relay connection rather than opening redundant ones, and channels on
+different matrices are dispatched to different connections
+automatically. This is the one place that knows `SENSE_ROUTING`'s
+shape; adding a second Numato module, a rack matrix, or a mix of several
+is a config change here, never a change to a caller.
+
+**Q5 -- should channels be mapped through `config/devices.py`?** Yes --
+`SENSE_ROUTING`, keyed by logical channel number, naming an **existing**
+relay-matrix nickname (the same `ETHERNET_DEVICES` namespace
+`relay_matrix` roles already use) plus a physical relay number on that
+matrix:
+```python
+SENSE_ROUTING = {
+    1: {"relay_matrix": "MATRIX_NUMATO_201", "relay": 1},
+    2: {"relay_matrix": "MATRIX_NUMATO_201", "relay": 2},
+    3: {"relay_matrix": "MATRIX_NUMATO_202", "relay": 1},
+}
+```
+This is a deliberate refinement over a generic `{"backend": "numato201"}`
+string field: reusing the existing relay-matrix nickname namespace means
+`ConfigDrivenSenseRouter` never needs its own separate backend-name-to-
+class registry -- `RelayFactory` (dispatching on the named matrix's own
+`"type"`) already is that registry. `SENSE_ROUTING` is `{}` today -- no
+physical sense-routing hardware exists yet, so there is nothing to
+describe.
+
+**Q6 -- where should routing occur?** A new module-level function,
+`hardware/sense_router.py::read_battery_voltage_via_sense(dmm,
+sense_router, sense_channel)` -- **not** inside `BatteryGroup`
+initialization, `HardwareManager`, or the DMM class itself. Rationale:
+- Not `HardwareManager` -- connect/disconnect here is a per-measurement
+  action (happens around every single voltage read), not a one-time
+  session-lifecycle action like everything else `HardwareManager` owns.
+- Not the DMM class -- `hardware/dmm.py::DMM` has no concept of a
+  battery group or a sense channel; keeping it a passive, sense-agnostic
+  measurement instrument (already its role today) means it never needs
+  to know sense routing exists.
+- Not `BatteryGroup` init -- routing must happen around *every*
+  individual read (each sample in a multi-hour sampling loop), not once
+  at setup.
+- A dedicated function, called from wherever `BatteryOperationSequence`
+  subclasses currently call `self.dmm.measure_dc_voltage()` directly, is
+  the cleanest fit -- and per its own docstring, is deliberately a pure
+  passthrough when `sense_channel is None`, so wiring it in later is a
+  call-site substitution, not a redesign.
+
+**Q7 -- cleanest approach preserving the existing modular architecture?**
+Exactly the shape implemented: one new, standalone module
+(`hardware/sense_router.py`) that no existing file imports, one new
+optional group field resolved by the existing `hardware_for_group()`
+centralization point, and one new empty config table
+(`SENSE_ROUTING`) -- no existing class's behavior, signature, or call
+sites change.
+
+### What was added
+
+- **`hardware/sense_router.py`** (new) -- `SenseRouter` (abstract),
+  `NumatoSenseRouter` (concrete, one matrix), `ConfigDrivenSenseRouter`
+  (composite, reads `SENSE_ROUTING`, caches per-matrix connections,
+  `shutdown()` for future cleanup-path integration), and
+  `read_battery_voltage_via_sense()` (the future integration point,
+  a pure passthrough when unconfigured).
+- **`config/devices.py`** -- `hardware_for_group()` now resolves an
+  optional `"sense_channel"` (`None` for every group today, confirmed by
+  test); new `SENSE_ROUTING = {}` table, documented with its intended
+  future shape inline.
+
+### Where the future `BatteryOperationSequence` integration would land
+
+Per the current DMM-voltage-read call sites (confirmed by direct
+inspection, none modified by this phase):
+- `charge_sequence.py`'s pre-enable reverse-polarity check and its main
+  sampling-loop per-iteration read.
+- `discharge_sequence.py`'s identical pair of call sites.
+- `battery_operation_sequence.py::_safe_final_voltage_reading()` (the
+  best-effort final-voltage capture on abnormal termination).
+
+Each would change from `self.dmm.measure_dc_voltage()` to
+`read_battery_voltage_via_sense(self.dmm, self.sense_router,
+self.sense_channel)` -- a small, mechanical, well-contained substitution
+once undertaken, deliberately deferred to a later phase (see "Remaining
+work" below) rather than done now, given active real-hardware
+validation was underway when this groundwork was built.
+
+### Remaining work for a real sense-routing deployment
+
+1. Populate `SENSE_ROUTING` and the relevant group's `sense_channel`
+   once physical sense-routing hardware (the temporary Numato module) is
+   deployed.
+2. Wire `read_battery_voltage_via_sense()` into the call sites listed
+   above -- pass `sense_router`/`sense_channel` into
+   `BatteryOperationSequence.__init__`/`ChargeSequence`/
+   `DischargeSequence`'s constructors (both default to `None`, preserving
+   today's behavior for every group without a configured channel).
+3. Decide where a `ConfigDrivenSenseRouter` instance is constructed and
+   owned per real run (likely alongside `HardwareManager`'s own
+   construction in `test.py`'s workflow functions) and whether/how its
+   `shutdown()` integrates into `HardwareManager.disconnect_all()`'s
+   existing shutdown sequence -- deliberately not decided in this phase.
+4. Real-hardware validation of the connect -> read -> disconnect timing
+   once physical hardware exists -- in particular, whether an additional
+   settle delay is needed after `connect()` before the DMM reading is
+   trustworthy (mirroring the same electrical-settling caution already
+   applied to relay switching elsewhere in this codebase).
+
+### Tests
+
+`tests/test_sense_router.py` -- `NumatoSenseRouter` connect/disconnect
+delegation and unknown-channel rejection; `ConfigDrivenSenseRouter`
+dispatch across synthetic multi-matrix configs (connection sharing on
+one matrix, separate connections across matrices, missing-config/
+unconfigured-channel rejection, `shutdown()`); and
+`read_battery_voltage_via_sense()`'s pure-passthrough guarantee when
+unconfigured (the core backward-compatibility property), its
+connect-read-disconnect ordering when configured, and that disconnect
+still happens if the DMM read itself raises. Plus
+`hardware_for_group()`'s new `sense_channel` resolution against B1's
+real config (`None`, confirmed). Full suite: 195/195 passing (179 prior
++ 16 new).
