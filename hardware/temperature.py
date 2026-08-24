@@ -22,9 +22,28 @@ formula from a generic NTC-divider reference.
 import math
 
 
-# NTC parameters (Li-ion battery thermistor, per BLOSS Hub spec)
+# NTC parameters (Li-ion battery thermistor, per BLOSS Hub spec).
+# Confirmed 2026-08-24 against the real part datasheet: 103JT, R25 = 10 kOhm,
+# B25/85 = 3435 K (see docs/architecture.md "HUB Battery Configuration
+# Update: Real Datasheet Values"). NTC_BETA was previously an unverified
+# 3950 K placeholder ("TODO: verify from datasheet") -- the Beta-
+# approximation formula below (1/T = 1/T0 + (1/B)*ln(R/R0), referenced to
+# R25/298.15 K) is exactly the standard usage for a "B25/85"-rated
+# thermistor, so only the numeric value needed correcting, not the
+# formula. Cross-checked against the datasheet's own resistance-vs-
+# temperature reference table: with the corrected Beta, this formula
+# reproduces the datasheet's reference points within ~1% near the 25-85 C
+# calibration range, widening to ~3-4% at the table's extremes (0 C,
+# 125 C) -- the expected, inherent accuracy limit of a single-Beta (two-
+# point) approximation this far from its calibration window, not a defect
+# in this implementation. This is well within the classification
+# thresholds' own tolerance (see ABSENT_VOLTAGE_THRESHOLD/
+# NTC_PLAUSIBLE_TEMP_MIN_C/MAX_C below) and does not affect PRESENT/
+# ABSENT/FAULT classification or the safety-relevant temperature range
+# (BAT_TEMP_MAX_C = 45 C, well inside the most accurate part of this
+# curve).
 NTC_R25_OHM      = 10000.0   # resistance at 25 deg C
-NTC_BETA         = 3950.0    # Beta coefficient (K) - TODO: verify from datasheet
+NTC_BETA         = 3435.0    # Beta coefficient (K), B25/85 -- confirmed from the 103JT datasheet
 NTC_PULLDOWN_R   = 10000.0   # pull-down resistor in the voltage divider (GND side)
 NTC_EXCITATION_V = 5.0       # divider excitation supply (NTC side) -- was named
                              # NTC_VCC (3.3 V) in a prior revision; renamed because

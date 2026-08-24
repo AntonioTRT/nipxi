@@ -74,7 +74,22 @@ class Settings:
     # -------------------------------------------------------------------------
     CHARGE_CURRENT_A   = 0.5    # A  - constant current during CC phase
     CHARGE_VOLTAGE_V   = 4.2    # V  - target CV voltage
-    CHARGE_CUTOFF_A    = 0.05   # A  - end-of-charge current threshold (CV taper)
+    # end-of-charge current threshold (CV taper) -- confirmed 2026-08-24
+    # against the real HUB cell datasheet's stated "Termination threshold:
+    # 150 mA" (see docs/architecture.md "HUB Battery Configuration Update:
+    # Real Datasheet Values"). Was 0.05 A (50 mA), an unconfirmed
+    # placeholder. This is a single GLOBAL constant with no per-
+    # battery-type equivalent (see test_control/charge_cycle.py/
+    # charge_sequence.py's own comments) -- HUB is the only real battery
+    # type in active use today, so this value is effectively HUB's own
+    # termination threshold applied globally. Revisit if/when a second
+    # real battery type with a materially different termination spec goes
+    # into active use. Raising this (0.05 -> 0.15 A) means EOC is now
+    # detected at a higher tapering current than before -- charge
+    # terminates slightly earlier/less fully than the old placeholder
+    # would have allowed, matching the manufacturer's own specified
+    # termination point rather than an arbitrary lower placeholder.
+    CHARGE_CUTOFF_A    = 0.15   # A  - end-of-charge current threshold (CV taper)
     CHARGE_TIMEOUT_S   = 7200   # s  - max charge time (2 h)
 
     # -------------------------------------------------------------------------

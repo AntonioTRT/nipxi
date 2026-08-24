@@ -2243,9 +2243,6 @@ def test_sensors():
     appended -- built entirely from data the scan loop already acquired
     (see _ntc_summary_table_result()), never a second read of any channel.
     """
-    config_ref = "hardware/temperature.py  Beta=3950 K  R25=10 kOhm  V_exc=5.0 V"
-    results    = []
-
     # -- Module import + function test ----------------------------------------
     try:
         from hardware.temperature import (
@@ -2253,7 +2250,14 @@ def test_sensors():
             NTC_BETA, NTC_R25_OHM, NTC_EXCITATION_V
         )
     except ImportError as e:
-        return [_fail("Sensors", "NTC", config_ref, f"Import error: {e}")]
+        # config_ref built from a hardcoded literal here (the only place
+        # NTC_BETA/NTC_R25_OHM aren't importable yet) -- every result below
+        # this point instead builds it from the real imported constants, so
+        # it can never drift out of sync with hardware/temperature.py again
+        # (a hardcoded "Beta=3950 K" string previously did exactly that).
+        return [_fail("Sensors", "NTC", "hardware/temperature.py", f"Import error: {e}")]
+    config_ref = f"hardware/temperature.py  Beta={NTC_BETA:.0f} K  R25={NTC_R25_OHM/1000:.0f} kOhm  V_exc={NTC_EXCITATION_V:.1f} V"
+    results    = []
 
     # Test 1: Reference point 25 degC at the matched-divider midpoint (2.5 V
     # for a 5 V excitation rail) -- R_ntc == R_pulldown at balance, so this

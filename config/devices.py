@@ -432,50 +432,96 @@ DMM_CONFIG = DMM_CONFIGS["MAIN_DMM"]
 # wiring information only.
 #
 # CONFIRMED vs ASSUMED -- read before relying on these for safety enforcement:
-#   CONFIRMED (from the source spec):
-#     - nominal_voltage_v (3.7 V, both types)
-#     - capacity_ah (HUB = 1.05 Ah / 1050 mAh, SB = 0.16 Ah / 160 mAh)
-#   ASSUMED / NOT YET CONFIRMED against a real datasheet (marked inline
-#   "unconfirmed placeholder"/"unconfirmed"):
-#     - chemistry, form_factor
-#     - voltage_max_v, voltage_min_v -- assumed standard Li-ion window
-#     - max_charge_current_a, max_discharge_current_a -- assumed 0.5C/1C
-#       ratios applied to capacity_ah, not measured/specified
-#     - max_temp_c -- assumed standard Li-ion ceiling
-#   These assumed values are placeholders derived from the two confirmed
-#   values above using the same standard Li-ion voltage window and 0.5C/1C
-#   charge/discharge ratios the previous generic entry used. They must be
-#   confirmed against the real BLOSS Hub/SB datasheet before being treated
-#   as production limits -- until then, the global Settings.BAT_* limits
-#   (config/settings.py) remain the enforced safety ceiling regardless of
-#   what's listed here (see docs/architecture.md "Operational Limit
-#   Resolution"). Do not silently treat any "unconfirmed" value as verified.
+#   HUB -- CONFIRMED from a real cell datasheet (2026-08-24 config review;
+#   see docs/architecture.md "HUB Battery Configuration Update: Real
+#   Datasheet Values" for the full rationale): nominal_voltage_v,
+#   voltage_max_v, voltage_min_v, capacity_ah, max_charge_current_a,
+#   max_discharge_current_a. Still ASSUMED / NOT CONFIRMED for HUB:
+#   chemistry, form_factor (not stated in the given spec), max_temp_c (no
+#   temperature rating was given).
+#   SB -- entirely ASSUMED / NOT YET CONFIRMED against a real datasheet
+#   (marked inline "unconfirmed placeholder"/"unconfirmed"), unchanged by
+#   the HUB review above:
+#     - nominal_voltage_v, capacity_ah are the only CONFIRMED SB fields
+#       (from the original source spec, before HUB's own real datasheet
+#       existed)
+#     - chemistry, form_factor, voltage_max_v, voltage_min_v,
+#       max_charge_current_a, max_discharge_current_a, max_temp_c remain
+#       assumed placeholders (0.5C/1C ratios applied to capacity_ah, a
+#       standard Li-ion voltage window, a standard Li-ion temperature
+#       ceiling) -- not measured/specified. Must be confirmed against a
+#       real SB datasheet before being treated as production limits --
+#       until then, the global Settings.BAT_* limits (config/settings.py)
+#       remain the enforced safety ceiling regardless of what's listed
+#       here for SB (see docs/architecture.md "Operational Limit
+#       Resolution"). Do not silently treat any "unconfirmed" value as
+#       verified.
 BATTERY_CONFIGS = {
+    # HUB -- updated from the real cell datasheet (2026-08-24 config
+    # review). Every "unconfirmed placeholder"/"TEMPORARY" note this dict
+    # previously carried for HUB is now resolved to a real, confirmed
+    # datasheet figure -- see docs/architecture.md "HUB Battery
+    # Configuration Update: Real Datasheet Values" for the full field-by-
+    # field rationale, including the specific values NOT used and why.
+    #
+    # Policy applied throughout (per explicit direction): for every
+    # SAFETY-RELATED limit, prefer the datasheet's nominal/recommended
+    # operating figure over its absolute-maximum/marketing figure --
+    # preferred safe operating value > absolute maximum. Where the
+    # datasheet gives a range instead of a single typical value (discharge
+    # current), the LOWER (more conservative) bound of that range is used
+    # as the enforced ceiling.
     "HUB": {
-        "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
-        "form_factor":             None,       # unconfirmed
-        "nominal_voltage_v":       3.7,        # confirmed
-        "voltage_max_v":           4.2,        # unconfirmed placeholder -- assumed standard Li-ion window
-        "voltage_min_v":           3.0,        # unconfirmed placeholder -- assumed standard Li-ion window
-        "capacity_ah":             1.05,       # confirmed -- 1050 mAh
-        # TEMPORARY -- raised 0.525 -> 1.5 (~0.5C -> ~1.43C) at explicit
-        # operator request for the B1 1.0 A charge-current validation run
-        # (see docs/architecture.md "B1 Validation Update: 1.0 A / 4.0 V").
-        # Both the old and new values are UNCONFIRMED placeholders, not a
-        # manufacturer datasheet figure being overridden -- 0.525 A was
-        # itself only an assumed 0.5C default, never a verified limit. This
-        # is a real RUNTIME safety-ceiling change, not just a config-
-        # validation-time number: SafetyMonitor.check() reads
-        # max_charge_current_a directly from this dict once
-        # set_battery_limits(battery_cfg) is called (which every Charge/
-        # Discharge Battery run does) -- it does NOT fall back to the
-        # global Settings.BAT_CURRENT_MAX (1.0 A) once a battery_cfg is
-        # set. Global HUB-typed scope: every group with battery_type="HUB"
-        # inherits this raised ceiling, not just B1. Revisit once the real
-        # cell's datasheet charge-rate rating is confirmed.
-        "max_charge_current_a":    1.5,
-        "max_discharge_current_a": 1.05,       # unconfirmed placeholder -- assumed 1C
-        "max_temp_c":              45.0,       # unconfirmed placeholder -- assumed standard Li-ion ceiling
+        "chemistry":               "Li-ion",   # still unconfirmed -- not stated in the given spec;
+                                                #    inferred from nominal_voltage_v/operating range as before
+        "form_factor":             None,       # still unconfirmed -- not stated in the given spec
+        "nominal_voltage_v":       3.6,        # confirmed -- datasheet "Nominal voltage: 3.600 V"
+                                                #    (was 3.7, an unconfirmed placeholder)
+        "voltage_max_v":           4.2,        # confirmed -- datasheet operating-range ceiling (2.750-4.200 V)
+                                                #    AND the datasheet's own recommended charge voltage
+                                                #    (4.200 V, 10-45 C) -- a single stated value, not a
+                                                #    typical-vs-max pair, so used directly (value unchanged
+                                                #    from the prior placeholder, now confirmed not assumed)
+        "voltage_min_v":           2.75,       # confirmed -- datasheet operating-range floor (2.750 V).
+                                                #    This is the manufacturer's own stated safe minimum
+                                                #    (an over-discharge protection boundary), not a stretched
+                                                #    "absolute max" figure -- used directly as the safety
+                                                #    floor. (was 3.0, an unconfirmed placeholder)
+        # confirmed -- datasheet gives "Rated capacity: 3050 mAh" and
+        # "Nominal capacity: 3120-3220 mAh" (the typical/average figure,
+        # higher than the guaranteed-minimum rated figure). The LOWER,
+        # rated figure is used here (was 1.05 Ah/1050 mAh, an unconfirmed
+        # placeholder) -- capacity_ah is not read by any current-limit
+        # calculation in this codebase today (confirmed by search), so
+        # this is a display/record-keeping value, not a live safety
+        # ceiling; the conservative figure is still preferred for
+        # consistency with every other field in this dict.
+        "capacity_ah":             3.05,
+        # confirmed -- datasheet "Charge current: 2000 mA typical / 2233 mA
+        # maximum". The TYPICAL/recommended figure (2.0 A) is used, NOT the
+        # 2233 mA maximum -- this replaces both the original unconfirmed
+        # placeholder (0.525 A, an assumed 0.5C default) AND the later
+        # TEMPORARY validation-only override (1.5 A, raised specifically to
+        # accommodate B1's 1.0 A validation setpoint before this real
+        # figure was available -- see docs/architecture.md "B1 Validation
+        # Update: 1.0 A / 4.0 V"). B1's current 1.0 A commanded setpoint
+        # (BATTERY_GROUPS["B1"]["test_setpoints"]) remains comfortably
+        # within this real, confirmed ceiling with no exception needed.
+        # Global HUB-typed scope: every group with battery_type="HUB"
+        # inherits this ceiling.
+        "max_charge_current_a":    2.0,
+        # confirmed -- datasheet "Nominal discharge current: 2000-2700 mA",
+        # a range, not a single typical value. The LOWER bound (2.0 A) is
+        # used as the enforced ceiling, per the "prefer the conservative
+        # end" policy above (was 1.05 A, an unconfirmed placeholder assumed
+        # at 1C of the old, incorrect capacity_ah).
+        "max_discharge_current_a": 2.0,
+        # STILL an unconfirmed placeholder -- the provided battery spec
+        # does not include a temperature rating. Left unchanged rather than
+        # guessed; see docs/architecture.md for this open item. The global
+        # Settings.BAT_TEMP_MAX_C (45.0 C) matches this by coincidence, not
+        # because it was derived from a confirmed HUB rating.
+        "max_temp_c":              45.0,
     },
     "SB": {
         "chemistry":               "Li-ion",   # unconfirmed -- inferred from nominal_voltage_v
@@ -657,10 +703,18 @@ BATTERY_GROUPS = {
             "charge_voltage_v":    4.0,    # VALIDATION ONLY -- was 3.7. Still <= HUB voltage_max_v (4.2)
                                             #    with margin. More realistic full-charge target for a
                                             #    nominal 3.7 V Li-ion cell than 3.7 V was.
-            "discharge_current_a": 0.08,   # unchanged -- <= HUB max_discharge_current_a (1.05) and
-                                            #    <= AUX_SMU_1 max_current_a (1.0)
-            "discharge_cutoff_v":  3.0,    # unchanged -- == HUB voltage_min_v (the safety floor --
-                                            #    see "Discharge Cutoff Policy")
+            "discharge_current_a": 0.08,   # unchanged -- <= HUB max_discharge_current_a (2.0, updated to
+                                            #    the real datasheet figure -- see BATTERY_CONFIGS["HUB"]
+                                            #    above) and <= AUX_SMU_1 max_current_a (1.0)
+            "discharge_cutoff_v":  3.0,    # unchanged -- previously exactly == HUB voltage_min_v (3.0,
+                                            #    when that was an unconfirmed placeholder). voltage_min_v
+                                            #    is now the real, confirmed 2.75 V floor (see
+                                            #    BATTERY_CONFIGS["HUB"] above), so this target is now a
+                                            #    deliberately conservative 0.25 V ABOVE the real safety
+                                            #    floor, not exactly at it -- left unchanged (a more
+                                            #    conservative discharge target than strictly required is
+                                            #    not a concern; only a target BELOW the real floor would
+                                            #    be). See "Discharge Cutoff Policy".
             "charge_timeout_s":    28800,  # VALIDATION ONLY -- 8h, vs. the 2h global default. See
                                             #    docs/architecture.md "Configurable Validation Timeout".
             "discharge_timeout_s": 28800,  # VALIDATION ONLY -- 8h, symmetric with charge_timeout_s.

@@ -6940,3 +6940,149 @@ proof for all five exception branches), plus updated fakes/assertions in
 `tests/test_safety_monitor_shutdown.py`, `tests/test_smu_post_isolation_zeroing.py`,
 and `tests/test_sense_routing_live_wiring.py` to accept and, where
 relevant, exercise the new `on_event` parameter.
+
+## 75. HUB Battery Configuration Update: Real Datasheet Values (CURRENT IMPLEMENTATION)
+
+Real cell + NTC datasheet figures supplied for the first time (2026-08-24
+config review). Every field in `BATTERY_CONFIGS["HUB"]` that was
+previously an "unconfirmed placeholder" (see the "CONFIRMED vs ASSUMED"
+comment block above that dict) or a "TEMPORARY" validation-only override
+is now either resolved to a real, confirmed figure, or explicitly left
+flagged as still-unconfirmed (never silently guessed). `SB` was not
+touched -- no SB datasheet was supplied, so it remains entirely assumed.
+
+Policy applied throughout, per explicit direction: for every SAFETY-
+RELATED limit, use the datasheet's nominal/recommended operating figure,
+never its absolute-maximum figure -- "preferred safe operating value >
+absolute maximum marketing limit." Where the datasheet gives a range
+instead of a single typical value, the lower (more conservative) bound of
+that range is used as the enforced ceiling.
+
+### Field-by-field rationale
+
+| Field | Old (placeholder) | New | Datasheet source | Note |
+|---|---|---|---|---|
+| `nominal_voltage_v` | 3.7 | **3.6** | "Nominal voltage: 3.600 V" | single stated value, used directly |
+| `voltage_max_v` | 4.2 (unconfirmed) | **4.2** (confirmed) | operating range ceiling + charge voltage (4.200 V) | value unchanged, now confirmed not assumed |
+| `voltage_min_v` | 3.0 | **2.75** | operating range floor "2.750 V to 4.200 V" | the manufacturer's own stated safe minimum, not a stretched figure |
+| `capacity_ah` | 1.05 (1050 mAh) | **3.05** (3050 mAh) | "Rated capacity: 3050 mAh" | LOWER of rated (3050) vs nominal (3120-3220); not read by any current-limit calculation today (confirmed by search) -- display/record-keeping only |
+| `max_charge_current_a` | 1.5 (TEMPORARY) | **2.0** (2000 mA) | "2000 mA typical / 2233 mA maximum" | typical figure used; 2233 mA maximum explicitly rejected |
+| `max_discharge_current_a` | 1.05 | **2.0** (2000 mA) | "Nominal discharge current: 2000-2700 mA" | lower bound of the given nominal range used as the ceiling |
+| `max_temp_c` | 45.0 (unconfirmed) | **45.0** (still unconfirmed) | not provided | no temperature rating was given -- left unchanged rather than guessed |
+
+`max_charge_current_a` rising from 1.5 A to 2.0 A resolves the entire
+"TEMPORARY -- raised 0.525 -> 1.5" saga documented in Section 59/the B1
+Validation Update section: that was always an unconfirmed placeholder
+being stretched to accommodate B1's 1.0 A validation setpoint before a
+real number existed. B1's current 1.0 A commanded setpoint
+(`BATTERY_GROUPS["B1"]["test_setpoints"]`) was NOT changed by this review
+-- it remains comfortably within the new, real 2.0 A ceiling with no
+exception needed, and is left as the operator's deliberately chosen
+validation operating point.
+
+`discharge_cutoff_v` (B1's test_setpoints, 3.0 V) was also left unchanged,
+but its comment was corrected: it previously read "== HUB voltage_min_v"
+(true when voltage_min_v was also 3.0, an unconfirmed placeholder). Now
+that `voltage_min_v` is the real 2.75 V floor, 3.0 V is a deliberately
+conservative 0.25 V margin above the real floor, not an exact match --
+this is a comment-accuracy fix only, not a behavior change (a discharge
+target above the safety floor is more conservative, never less safe).
+
+### EOC termination threshold (`Settings.CHARGE_CUTOFF_A`)
+
+Updated 0.05 A (50 mA, unconfirmed placeholder) -> **0.15 A (150 mA)**,
+matching the datasheet's stated "Termination threshold: 150 mA". This is
+a single GLOBAL constant with no per-battery-type equivalent (`hardware/
+smu.py`, `test_control/charge_cycle.py`, and `test_control/
+charge_sequence.py` all document this explicitly) -- HUB is the only real
+battery type in active use, so this value is effectively HUB's own
+termination threshold applied globally. Real behavioral effect: EOC
+(`v >= voltage_limit_v and abs(i) <= CHARGE_CUTOFF_A`) now trips at a
+higher tapering current than before, so a real charge will terminate
+slightly earlier than the old placeholder would have allowed -- matching
+the manufacturer's own specified termination point rather than an
+arbitrary lower number.
+
+### NTC: Beta correction (software WAS calculating temperature incorrectly)
+
+`hardware/temperature.py`'s Beta-approximation formula
+(`1/T = 1/T0 + (1/B)*ln(R/R0)`, referenced to R25/298.15 K) is exactly the
+standard usage for a thermistor rated with a single "B25/85" Beta value --
+the FORMULA was already correct. `NTC_R25_OHM` (10000.0) already matched
+the real 103JT part. The one actual defect: `NTC_BETA` was `3950.0`, an
+unverified placeholder explicitly marked "TODO: verify from datasheet" --
+the real 103JT datasheet specifies `B25/85 = 3435 K`. **Fixed: `NTC_BETA`
+3950.0 -> 3435.0.**
+
+Verified against the datasheet's own resistance-vs-temperature reference
+table (0/25/50/60/85/100/125 C) by converting each reference resistance to
+the divider voltage this circuit would produce and running it through the
+real `ntc_voltage_to_celsius()`: with the corrected Beta, computed
+temperatures land within about 2 C of the datasheet's stated values across
+the entire table, and within a few tenths of a degree near the 25-85 C
+calibration window the part's B25/85 rating is centered on -- the small,
+increasing spread at the table's extremes (0 C, 125 C) is the expected,
+inherent behavior of a single-Beta (two-point) approximation this far
+from its calibration range, not a defect in this implementation. This
+does not affect PRESENT/ABSENT/FAULT classification thresholds or the
+safety-relevant temperature range (`BAT_TEMP_MAX_C` = 45 C sits well
+inside the most accurate part of this curve). See
+`tests/test_ntc_beta_calibration.py`.
+
+`test.py`'s Sensors/NTC bench-test tool had its own, separate copy of this
+bug: a hardcoded display string, `"hardware/temperature.py  Beta=3950 K
+R25=10 kOhm  V_exc=5.0 V"`, that would have stayed silently stale even
+after this fix (it was a literal, not built from the real constants).
+Changed to build `config_ref` from `NTC_BETA`/`NTC_R25_OHM`/
+`NTC_EXCITATION_V` directly, so it can never drift out of sync with
+`hardware/temperature.py` again.
+
+### Items reviewed but deliberately NOT changed (safety concerns to flag, not silently implement)
+
+- **Precharge current (150-310 mA, datasheet)**: this codebase's
+  `ChargeSequence` has no precharge phase -- every charge goes straight to
+  CC-CV at the configured `charge_current_a` regardless of the cell's
+  starting voltage. For a genuinely deeply-discharged cell, commanding the
+  full CC-CV current immediately (rather than a reduced precharge current
+  first) is outside the manufacturer's specified charge algorithm. This is
+  a pre-existing architectural gap, not something a config-value update
+  can fix -- flagged here as a real safety consideration for a future,
+  explicitly-scoped precharge-phase feature, not implemented in this
+  change.
+- **Charge-voltage temperature qualification (10-45 C, datasheet)**: the
+  datasheet's 4.200 V charge voltage is only specified valid across
+  10-45 C. `SafetyMonitor.check()` enforces only an upper temperature
+  bound (`max_temp_c`) -- `Settings.BAT_TEMP_MIN_C` (20.0) is DEFINED but
+  is never read anywhere else in this codebase (confirmed by search),
+  i.e. there is no enforced low-temperature charge inhibit today. Charging
+  a genuinely cold cell would not be stopped by any existing safety check.
+  Flagged as a real, currently-unenforced gap -- not fixed here, since
+  adding a low-temperature charge inhibit is a new safety feature (a
+  behavior change to when/whether output_enable() may proceed), not a
+  configuration value, and should be scoped and confirmed as its own
+  change rather than folded silently into a config-value update.
+- **AC impedance (122 mOhm @ 1 kHz, datasheet)**: informational only --
+  no field in `BATTERY_CONFIGS` or any calculation in this codebase
+  consumes an internal-resistance figure today (confirmed by search, no
+  `impedance`/`internal_resistance` reference anywhere). Not added as a
+  new, unused config field. Noted here as a candidate input for a future
+  IR-compensation or cross-validation feature (see
+  `hardware/smu.py::cross_validate_output_state()`'s own "FUTURE
+  EXTENSION POINT" for a related, already-marked future hook), not
+  something to add speculatively now.
+- **Global `Settings.BAT_*` fallbacks** (`BAT_VOLTAGE_MAX`/`_MIN`,
+  `BAT_CURRENT_MAX`, `BAT_TEMP_MAX_C`): intentionally untouched -- these
+  are generic defaults used only when no `battery_cfg` is supplied at all
+  (every real HUB run always supplies one via
+  `SafetyMonitor.set_battery_limits()`), not HUB-specific, and out of this
+  review's scope.
+
+Tests: `tests/test_hub_battery_spec_update.py` (new -- pins every updated
+`BATTERY_CONFIGS["HUB"]` field and `Settings.CHARGE_CUTOFF_A` to its real
+datasheet-derived value, and proves B1's existing test_setpoints still
+pass full validation against the updated limits) and
+`tests/test_ntc_beta_calibration.py` (new -- verifies the corrected Beta
+against the real datasheet's reference table, described above). Full
+suite re-run clean after this change, no regressions -- no other test in
+the suite hardcoded any of the changed numeric values (confirmed by
+search before making the change).
