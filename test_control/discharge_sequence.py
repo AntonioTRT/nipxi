@@ -77,6 +77,20 @@ compliance floor almost immediately, tripping the undervoltage safety
 check -- `analysis_result` (NORMAL_DISCHARGE_BEHAVIOR/
 POSSIBLY_EMPTY_POSITION) distinguishes that from a genuine discharge,
 purely additively, never touching stop_reason/result.
+
+Battery Removal During Discharge -- deliberately has NO equivalent to
+ChargeSequence's real-time "Battery Removal During Charge Detection" (see
+that module's docstring and docs/architecture.md "Battery Removal During
+Charge Detection"). A battery removed mid-discharge leaves the SMU
+sinking commanded current from an open circuit, which drives voltage
+sharply NEGATIVE toward the SMU's own compliance floor (symmetric
+compliance around `compliance_voltage_v` above) -- far below
+`battery_cfg["voltage_min_v"]`. `self.safety.check(v, i, t_c,
+mode="discharge")`'s undervoltage branch, which runs BEFORE the `v <=
+cutoff_v` EOD check on every sample (see the loop below), already catches
+this as a SafetyViolationError before EOD ever has a chance to evaluate
+-- discharge was already safe against this exact scenario, confirmed by
+code review, before any new detection was added for charge.
 """
 
 import time

@@ -127,6 +127,78 @@ MIN_MEANINGFUL_CURRENT_FRACTION = 0.05
 # ever fires on a near-instant EOC/EOD, never a genuinely slow real run.
 SHORT_DURATION_S = 15.0
 
+# Real-time (not post-run) battery-removal-during-charge detection -- see
+# charge_transition_suggests_battery_removed() and docs/architecture.md
+# "Battery Removal During Charge Detection". A sample is still considered
+# "clearly in the CC phase, not yet tapering" if |current| is at/above
+# this fraction of the commanded charge current. Chosen well above
+# MIN_MEANINGFUL_CURRENT_FRACTION above (a much looser "any current at
+# all" bar for the unrelated post-run classifier) -- this constant instead
+# has to reliably separate "still sourcing near the full commanded
+# current" from "already partway through a genuine CV taper", which for
+# every real battery type configured today (commanded current comfortably
+# above Settings.CHARGE_CUTOFF_A) sits well clear of the termination
+# threshold on either side of the 0.5 boundary.
+CC_PHASE_CURRENT_FRACTION = 0.5
+
+
+def charge_transition_suggests_battery_removed(*, prev_v, prev_i, v: float, i: float,
+                                                current_a: float, voltage_limit_v: float,
+                                                cutoff_a: float) -> bool:
+    """
+    Real-time detector, called once per sample from ChargeSequence's own
+    loop, BEFORE a sample satisfying the EOC condition is accepted as a
+    genuine, passing end-of-charge. Returns True if the transition from
+    the PREVIOUS sample (`prev_v`/`prev_i`) to the CURRENT one (`v`/`i`)
+    looks like the battery was physically removed while the SMU was still
+    actively sourcing, rather than a genuine CV taper reaching its natural
+    termination point.
+
+    Physical reasoning: a real cell's CC->CV transition and its
+    subsequent current taper both take many sample intervals (an RC-like
+    decay governed by the cell's own internal resistance/capacity) -- by
+    the time current has genuinely decayed down to `cutoff_a`, the
+    PRECEDING sample was already close to that same low value, not still
+    near the full commanded current. If the immediately preceding sample
+    was still clearly in the CC phase (see CC_PHASE_CURRENT_FRACTION) and
+    THIS sample already satisfies the EOC condition, that one-sample jump
+    is not achievable by a real, connected cell -- consistent instead with
+    the SMU suddenly driving an open circuit (nothing left to charge),
+    which reaches its own voltage compliance ceiling with near-zero
+    delivered current almost instantly.
+
+    `prev_v`/`prev_i` are None for the very first sample of a run (nothing
+    to compare against yet) -- always returns False in that case, exactly
+    like the existing ALREADY_CHARGED classification already accepts a
+    battery that starts at/near the CV target as legitimate, not
+    anomalous. This is a real, disclosed scope boundary, not an oversight:
+    a removal happening in the brief window between output_enable() and
+    the very first sample (a few seconds, see Settings.STABILIZATION_S) is
+    inherently indistinguishable from a battery that was already
+    essentially fully charged from the start -- both present as "first
+    sample already at/near the CV target, low current." Likewise, a
+    removal during the LATE stage of a genuine CV taper (current already
+    well below CC_PHASE_CURRENT_FRACTION * current_a, close to the
+    termination threshold) is not caught either -- at that point a real
+    cell's own natural completion and a just-removed cell's compliance
+    settling look too similar to reliably distinguish from voltage/current
+    alone. Both are accepted, narrower scope than "catch every possible
+    removal instant" -- this still closes the large majority of a real
+    charge's duration (the CC phase and the early-to-mid CV taper), which
+    is the residual gap this function exists to close.
+
+    Never raises. Pure function -- no hardware access, no logging; the
+    caller (ChargeSequence) decides what to do with a True result (raises
+    utils.errors.BatteryRemovedDuringChargeError) and owns all logging.
+    """
+    if prev_v is None or prev_i is None:
+        return False
+    eoc_now = v >= voltage_limit_v and abs(i) <= cutoff_a
+    if not eoc_now:
+        return False
+    was_still_in_cc_phase = abs(prev_i) >= abs(current_a) * CC_PHASE_CURRENT_FRACTION
+    return was_still_in_cc_phase
+
 
 def classify_charge_behavior(*, initial_voltage_v, avg_current_a, duration_s,
                               commanded_current_a, battery_cfg) -> str:

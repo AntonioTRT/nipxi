@@ -85,26 +85,56 @@ that threshold raises ReversePolarityError -- a SafetyViolationError
 subclass -- before the SMU is ever enabled.
 
 Post-Run Diagnostic Classification (Test Mode only, informational --
-see test_control/battery_diagnostics.py): this workflow deliberately does
-NOT gate or block on battery presence/NTC validation, so an empty
-position can look deceptively like "already charged" (SMU hits CV
-compliance, current near zero, EOC trips almost instantly). A
-BatteryOperationSequence._ChargeDischargeStats accumulator (fed the exact
-voltage_v/current_a this loop already computes -- no new read) is
-classified into `analysis_result` (ALREADY_CHARGED/POSSIBLY_EMPTY_POSITION/
-NORMAL_CHARGE_BEHAVIOR) and folded into run_summary via the existing
-`extra_run_summary_fields_fn`/`complete()` mechanism -- purely additive,
-never touches stop_reason/result.
+see test_control/battery_diagnostics.py): a pre-test Battery Presence +
+NTC Presence check (test_control/battery_presence_precheck.py, called by
+test.py before this sequence is ever constructed) now blocks a run from
+starting at all against an empty/absent position -- but an empty position
+that passes that check (e.g. a battery removed AFTER the pre-check, or a
+position with no NTC hardware assigned to it) can still look deceptively
+like "already charged" once running (SMU hits CV compliance, current near
+zero, EOC trips almost instantly). A BatteryOperationSequence.
+_ChargeDischargeStats accumulator (fed the exact voltage_v/current_a this
+loop already computes -- no new read) is classified into `analysis_result`
+(ALREADY_CHARGED/POSSIBLY_EMPTY_POSITION/NORMAL_CHARGE_BEHAVIOR) and
+folded into run_summary via the existing `extra_run_summary_fields_fn`/
+`complete()` mechanism -- purely additive, never touches stop_reason/
+result. This classifier only catches an empty position from the very
+START of the run (see its own SHORT_DURATION_S-gated logic) -- it does
+NOT catch a battery that charged normally for some time and was then
+physically removed partway through. That distinct case is what Battery
+Removal During Charge Detection (below) exists to catch instead.
+
+Battery Removal During Charge Detection (see test_control/
+battery_diagnostics.py::charge_transition_suggests_battery_removed() and
+docs/architecture.md "Battery Removal During Charge Detection"): unlike
+the post-run classifier above, this runs INSIDE the sampling loop, on
+every sample, and DOES gate -- it is what prevents a battery removed
+mid-charge from ever being reported as a clean, passing EOC. A genuine
+cell's CC->CV transition and current taper both take many sample
+intervals; if the sample immediately before an EOC-satisfying sample was
+still clearly in the CC phase (current near the full commanded value),
+that one-sample jump is not physically achievable by a real, connected
+cell. When detected, raises utils.errors.BatteryRemovedDuringChargeError
+(a SafetyViolationError subclass) instead of accepting the sample as EOC
+-- routed through the existing run_guarded()/SafetyMonitor.
+emergency_stop() shutdown path unchanged, reported as
+StopReason.SAFETY_VIOLATION/result="FAIL", never "PASS". Discharge does
+not need an equivalent -- see discharge_sequence.py's module docstring for
+why DischargeSequence was already safe against this scenario.
 """
 
 import time
 
 from config.settings import Settings
 from hardware.temperature import NTCPresence, classify_ntc_presence, ntc_voltage_to_celsius
+from test_control.battery_diagnostics import charge_transition_suggests_battery_removed
 from test_control.battery_operation_sequence import BatteryOperationSequence, _ChargeDischargeStats
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
-from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, ReversePolarityError
+from utils.errors import (
+    BatteryRemovedDuringChargeError, DAQError, NIPXITimeoutError, SafetyViolationError,
+    ReversePolarityError,
+)
 
 
 class ChargeSequence(BatteryOperationSequence):
@@ -265,6 +295,20 @@ class ChargeSequence(BatteryOperationSequence):
                     # like every other test_setpoints value already is.
                     charge_timeout_s = test_setpoints.get("charge_timeout_s", self.s.CHARGE_TIMEOUT_S)
 
+                    # Battery Removal During Charge Detection (see
+                    # test_control/battery_diagnostics.py::
+                    # charge_transition_suggests_battery_removed() and
+                    # docs/architecture.md "Battery Removal During Charge
+                    # Detection") -- tracks the immediately preceding
+                    # sample so an abrupt CC->EOC transition (physically
+                    # impossible for a real cell's gradual CV taper) can be
+                    # distinguished from a genuine, passing end-of-charge.
+                    # None on the first iteration -- see that function's
+                    # docstring for why this is a deliberate, disclosed
+                    # scope boundary, not an oversight.
+                    prev_v = None
+                    prev_i = None
+
                     while True:
                         check_cancellation(token)
 
@@ -333,11 +377,37 @@ class ChargeSequence(BatteryOperationSequence):
                         # End of charge: CV taper -- voltage at/above the CV
                         # target and current tapered at/below the cutoff.
                         # Harvested unchanged from ChargeCycle.run() (see
-                        # docs/architecture.md Section 33).
+                        # docs/architecture.md Section 33) -- EXCEPT this
+                        # sample is no longer accepted at face value: see
+                        # "Battery Removal During Charge Detection" above.
+                        # A genuine CV taper reaching this point gradually,
+                        # over many prior samples, is accepted normally; an
+                        # abrupt one-sample jump from still-CC-phase current
+                        # is treated as a safety violation instead of a pass.
                         if v >= voltage_limit_v and abs(i) <= self.s.CHARGE_CUTOFF_A:
+                            if charge_transition_suggests_battery_removed(
+                                prev_v=prev_v, prev_i=prev_i, v=v, i=i,
+                                current_a=current_a, voltage_limit_v=voltage_limit_v,
+                                cutoff_a=self.s.CHARGE_CUTOFF_A,
+                            ):
+                                message = (
+                                    f"Channel {channel}: abrupt CC->EOC transition detected "
+                                    f"(previous sample {prev_i:+.4f} A / {prev_v:.3f} V -> "
+                                    f"current sample {i:+.4f} A / {v:.3f} V) -- consistent with "
+                                    f"the battery being physically removed while charging, not a "
+                                    f"genuine CV taper reaching completion. Treating as a safety "
+                                    f"violation, not end-of-charge."
+                                )
+                                self.log.error(message)
+                                self.storage.log_event(
+                                    level="ERROR", source="charge_battery", channel=channel,
+                                    relay=relay_address, message=message,
+                                )
+                                raise BatteryRemovedDuringChargeError(message)
                             self.log.info("Charge complete on channel %d (V=%.3f, I=%.4f)", channel, v, i)
                             break
 
+                        prev_v, prev_i = v, i
                         interruptible_sleep(dt, token=token)
                 finally:
                     on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)

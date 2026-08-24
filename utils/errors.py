@@ -48,6 +48,39 @@ class ReversePolarityError(SafetyViolationError):
     """
 
 
+class BatteryRemovedDuringChargeError(SafetyViolationError):
+    """
+    Raised by ChargeSequence's sampling loop (see test_control/
+    battery_diagnostics.py::charge_transition_suggests_battery_removed()
+    and docs/architecture.md "Battery Removal During Charge Detection")
+    when the CC->EOC transition happens abruptly -- the immediately
+    preceding sample was still clearly in the CC phase (current close to
+    the full commanded value), then the very next sample already
+    satisfies the EOC condition (voltage at the CV target, current at/
+    below the termination threshold). A genuine cell's CV taper takes many
+    sample intervals to decay from commanded current down to the
+    termination threshold; an instantaneous one-sample jump is not
+    physically achievable by a real, connected cell and is the signature
+    of the load having vanished (the battery physically removed) while
+    the SMU was still actively sourcing.
+
+    Deliberately a SafetyViolationError subclass -- caught by
+    BatteryOperationSequence.run_guarded()'s existing SafetyViolationError
+    branch, triggering the identical SafetyMonitor.emergency_stop()
+    shutdown and StopReason.SAFETY_VIOLATION/result="FAIL" reporting; no
+    separate shutdown path was introduced for this. This is what prevents
+    a battery removed mid-charge from ever being reported as a clean,
+    passing EOC -- see ReversePolarityError's identical rationale for why
+    this is deliberately NOT a generic Overvoltage/Undervoltage message.
+
+    Discharge does not need an equivalent: sinking current into an open
+    circuit (a removed battery) drives voltage sharply negative, which
+    SafetyMonitor's own undervoltage check already catches BEFORE the EOD
+    voltage-cutoff check ever runs in DischargeSequence's loop -- discharge
+    was already safe against this scenario before this class existed.
+    """
+
+
 class OperationCancelledError(NIPXIError):
     """
     Raised when a cancellation checkpoint (see utils/cancellation.py) finds

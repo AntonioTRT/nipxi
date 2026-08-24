@@ -7251,3 +7251,171 @@ event_log content), and `tests/test_presence_precheck_testpy_wiring.py`
 (new -- source-inspection proof that both `test.py` call sites are wired
 in the correct order, mirroring the existing `test_sense_router_testpy_wiring.py`
 technique). Full suite re-run clean, no regressions.
+
+## 77. Battery Removal During Charge Detection (CURRENT IMPLEMENTATION)
+
+Implements "Issue A" from the pre-completion review (Section 76's sibling
+review): a battery physically removed mid-charge (after the pre-test
+Battery Presence Check already passed) was reported as a clean, passing
+end-of-charge, with no flag at all -- a false PASS. Confirmed by code
+trace, not assumption: removing the battery leaves the SMU (CC-CV,
+sourcing `current_a`) driving an open circuit, which rises to its own
+`voltage_limit_v` compliance ceiling with delivered current collapsing
+toward zero -- this exactly satisfies the existing EOC condition (`v >=
+voltage_limit_v and abs(i) <= CHARGE_CUTOFF_A`). The post-run diagnostic
+classifier (`battery_diagnostics.py::classify_charge_behavior()`) does
+NOT catch this either: it requires `duration_s <= SHORT_DURATION_S`
+(15 s), so a battery removed after any meaningful charging time reports
+`NORMAL_CHARGE_BEHAVIOR`.
+
+**Discharge needed no equivalent change** -- confirmed by the same code
+trace: sinking current into an open circuit drives voltage sharply
+NEGATIVE toward the SMU's own (symmetric) compliance floor, which
+`SafetyMonitor.check(mode="discharge")`'s undervoltage branch already
+catches, as a `SafetyViolationError`, BEFORE the `v <= cutoff_v` EOD
+check ever runs in `DischargeSequence`'s loop. `discharge_sequence.py` is
+otherwise unmodified by this work -- only a documentation note was added
+explaining why, so a future reader doesn't wonder whether the asymmetry
+between charge and discharge is an oversight.
+
+### Detection approach
+
+`test_control/battery_diagnostics.py::charge_transition_suggests_battery_removed()`
+-- a new pure function, called once per sample from `ChargeSequence`'s
+own loop, immediately before a sample satisfying the EOC condition is
+accepted as genuine. Physical reasoning: a real cell's CC->CV transition
+and its subsequent current taper both take many sample intervals (an
+RC-like decay governed by the cell's own internal resistance/capacity) --
+by the time current has genuinely decayed to `CHARGE_CUTOFF_A`, the
+PRECEDING sample was already close to that same low value, not still near
+the full commanded current. If the immediately preceding sample was still
+clearly in the CC phase (current at/above `CC_PHASE_CURRENT_FRACTION`
+(0.5) of the commanded current) and THIS sample already satisfies EOC,
+that one-sample jump is not achievable by a real, connected cell.
+
+Two thresholds only, both new and both documented as best-effort
+starting points (same "unconfirmed placeholder" discipline as
+`EMPTY_POSITION_VOLTAGE_V`/`NEAR_FULL_MARGIN_V` elsewhere in the same
+module) -- `CC_PHASE_CURRENT_FRACTION = 0.5`. No new hardware read: the
+detector only compares the sample the loop already just took against the
+one immediately before it.
+
+### Scope boundaries (disclosed, not oversights)
+
+- **A removal in the first few seconds of a run** (between
+  `output_enable()` and the very first sample -- the
+  `Settings.STABILIZATION_S` window) cannot be distinguished from a
+  battery that was already essentially fully charged from the start
+  (`prev_v`/`prev_i` are `None` on the first sample, so the detector
+  always returns `False` there -- matching the existing `ALREADY_CHARGED`
+  classification's own acceptance of that same signature).
+- **A removal during the LATE stage of a genuine CV taper** (current
+  already well below the CC-phase fraction, close to the termination
+  threshold) is not caught -- at that point a real cell's natural
+  completion and a just-removed cell's compliance settling look too
+  similar to distinguish from voltage/current alone.
+- Both boundaries are accepted, narrower scope than "catch every possible
+  removal instant" -- this still closes the large majority of a real
+  charge's duration (the CC phase and the early-to-mid CV taper), which is
+  the gap this feature exists to close. See the focused post-implementation
+  review below for why these residual gaps do not reopen the false-PASS
+  risk this feature was built to close.
+
+### What happens when detected
+
+`utils/errors.py::BatteryRemovedDuringChargeError` (new, a
+`SafetyViolationError` subclass, mirroring `ReversePolarityError`'s exact
+pattern) is raised instead of accepting the sample as EOC. This reuses
+the EXISTING `BatteryOperationSequence.run_guarded()` `SafetyViolationError`
+branch unchanged -- full `SafetyMonitor.emergency_stop()` shutdown (PMU
+off + all relays forced open, the same shutdown-trace-logged path as
+every other safety violation -- see Section 74), `StopReason.
+SAFETY_VIOLATION`/`result="FAIL"` recorded, **never** `"PASS"`. Two
+event_log entries are recorded, matching the existing `ReversePolarityError`
+convention exactly: a detailed message at the raise site (previous and
+current sample's voltage/current, explicitly naming "battery being
+physically removed"), plus `run_guarded()`'s own generic `"Safety
+violation -- {e}"` line afterward -- not a replacement for it.
+
+### Files modified
+
+- `utils/errors.py` -- new `BatteryRemovedDuringChargeError(SafetyViolationError)`.
+- `test_control/battery_diagnostics.py` -- new `CC_PHASE_CURRENT_FRACTION`
+  constant and `charge_transition_suggests_battery_removed()` function.
+- `test_control/charge_sequence.py` -- tracks `prev_v`/`prev_i` across
+  loop iterations; calls the detector immediately before accepting an
+  EOC-satisfying sample; raises with a detailed log message if flagged.
+  Module docstring updated (also corrected a stale claim that this
+  workflow "does not gate on battery presence/NTC" -- no longer true as
+  of Section 76).
+- `test_control/discharge_sequence.py` -- documentation only (module
+  docstring explains why no equivalent change was needed); no logic
+  change.
+
+Tests: `tests/test_battery_removal_during_charge.py` (new) -- direct
+boundary tests for the pure detector (first-sample exemption, genuine
+taper not flagged, abrupt jump flagged, exact-boundary inclusive, sign-
+independence), plus full `ChargeSequence.run()` integration tests using
+scripted fake hardware (a multi-sample gradual taper completing as a
+genuine PASS; an already-charged-from-sample-one run still completing as
+PASS; an abrupt mid-charge removal raising
+`BatteryRemovedDuringChargeError`, routed to `emergency_stop()` and
+`result="FAIL"`/`stop_reason="SAFETY_VIOLATION"`, confirmed never
+`"PASS"`, with both the detailed and generic event_log messages present).
+Full suite re-run clean, no regressions (discharge's own existing tests
+are unaffected, confirming the "discharge unchanged" requirement).
+
+### Focused post-implementation review: can a false PASS still occur on charge-side battery removal?
+
+Performed by re-tracing every path that can reach `self.complete(...)`
+(the only call that records `result="PASS"`) for a Charge Battery run,
+after this change:
+
+1. **The only way `_run_charge()` returns normally (without raising) is
+   the `break` at the EOC check.** Every other exit (`NIPXITimeoutError`,
+   `SafetyViolationError` from `safety.check()`, `OperationCancelledError`,
+   `ReversePolarityError`, any unexpected exception, and now
+   `BatteryRemovedDuringChargeError`) propagates out of `_run_charge()` to
+   `run_guarded()`, which never calls `complete()` on any exception path --
+   confirmed by re-reading `battery_operation_sequence.py::run_guarded()`
+   in full: every `except` branch ends in `raise`, and `complete()` is only
+   ever called from `_run_charge_battery()`'s own success path in
+   `charge_sequence.py::run()`, after `run_guarded()` has already returned
+   normally.
+2. **The `break` is now unconditionally preceded by the removal check.**
+   Re-read the final code: `if v >= voltage_limit_v and abs(i) <=
+   CHARGE_CUTOFF_A:` is the ONLY place `break` is reachable in the loop,
+   and `charge_transition_suggests_battery_removed(...)` is evaluated
+   first, inside that same `if` block, before `break` -- there is no code
+   path that reaches `break` without first passing through this check.
+3. **The detector cannot silently fail closed.** It is a pure function
+   with no hardware access, no exception-raising branch of its own (no
+   I/O, no division -- `abs()`/comparisons only) -- it cannot itself throw
+   and be swallowed. `prev_v`/`prev_i` are always plain `None` or a float
+   already validated by `safety.check()` a few lines earlier in the same
+   iteration (a `NaN`/non-finite reading would already have been rejected
+   by `SafetyMonitor.check()`'s voltage-range comparisons before reaching
+   this point, or by `hardware/dmm.py`'s own `math.isfinite()` guard on
+   the read itself).
+4. **The two disclosed scope boundaries (first-sample, late-CV-taper) do
+   not create a NEW false-PASS beyond what already existed.** The first-
+   sample boundary is identical in shape to the pre-existing, accepted
+   `ALREADY_CHARGED` signature -- not a regression, a pre-existing,
+   deliberate design choice this feature does not attempt to re-open. The
+   late-CV-taper boundary means a removal in that narrow window is not
+   *flagged*, but it is also not any WORSE than before this change (the
+   pre-existing behavior for that window was also an unflagged PASS) --
+   this feature strictly reduces the false-PASS window, it does not
+   introduce any new one.
+5. **Discharge is unaffected and was independently re-confirmed safe**
+   (see "Discharge needed no equivalent change" above) -- no risk of this
+   change's scope creeping into discharge, since `discharge_sequence.py`
+   received no logic changes at all (only a docstring note), confirmed by
+   `git diff`.
+
+**Conclusion: no code path can report `result="PASS"` for a Charge
+Battery run in which an abrupt CC-phase-to-EOC transition occurred --
+every such transition now raises `BatteryRemovedDuringChargeError` before
+`break` is reachable.** The residual gap is narrower and explicitly
+disclosed (very-early and very-late removal windows), not silent or
+unbounded.
