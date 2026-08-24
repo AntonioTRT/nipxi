@@ -6348,3 +6348,138 @@ then-current state -- the fix is to the test's fixture assumption, not
 the feature. A new test,
 `test_production_mode_currently_rejects_b1s_real_config`, documents the
 real, current consequence above. Full suite: 170/170 passing.
+
+## 71. Future Architecture: Configurable Charge Modes
+
+**FUTURE PLANNED ARCHITECTURE, with a CURRENT IMPLEMENTATION of its
+validation-layer groundwork only.** This section follows a design review
+(triggered by a real-hardware observation that B1's CC-CV charge was
+running voltage-clamped rather than true-CC -- see the charging-behavior
+review earlier in this validation cycle) that recommended a phased path
+toward per-group charge-mode selection: `CC_CV` (today's only strategy)
+and `CV` (a real, scoped future addition), with a third mode (`CC`-only)
+explicitly deferred pending its own termination-condition design.
+
+**Nothing in this section changes current behavior.** `ChargeSequence`
+does not read `charge_mode` and is not modified by this work.
+`test_control/charge_sequence.py`, `discharge_sequence.py`,
+`hardware/smu.py`, `safety_monitor.py`, and `hardware_manager.py` --
+every file in the active real-hardware-validation path -- are untouched.
+All groundwork lives in `utils/validators.py`'s pre-flight validation
+stage, which runs before any hardware is constructed or touched, and in
+documentation/tests. This was a deliberate scoping decision: real
+battery validation was actively in progress when this work was done, and
+the explicit goal was infrastructure preparation with zero behavioral
+risk to that validation.
+
+### What was added -- Stage 5 of `validate_group_test_config()`
+
+A group's `test_setpoints` may declare an optional `charge_mode`:
+
+```python
+"test_setpoints": {
+    "charge_current_a": 0.5,
+    "charge_voltage_v": 3.7,
+    "discharge_current_a": 0.08,
+    "discharge_cutoff_v": 3.0,
+    "charge_mode": "CC_CV",   # optional -- this is also the default when absent
+},
+```
+
+- **Absent (every group today, including B1):** defaults to `"CC_CV"` --
+  the only strategy that has ever existed in `ChargeSequence`. Zero
+  behavior change, by construction.
+- **`"CC_CV"`, explicit:** accepted, behaves identically to the default.
+- **`"CV"`:** a *recognized* name -- the vocabulary is reserved and will
+  validate as "a real, spellable mode" -- but is **rejected outright**,
+  not silently accepted-and-ignored. `ChargeSequence` has no CV dispatch
+  logic yet; letting a group configure `charge_mode: "CV"` today would
+  mean the config claims one behavior while the software silently runs
+  another (`CC_CV` regardless) -- exactly the class of "unknown state"
+  this codebase's safety philosophy already refuses elsewhere (compare
+  Section 60's "never silently proceed without recording the exact
+  condition"). The rejection message names this explicitly ("recognized
+  but not yet implemented") rather than reading like a generic typo
+  error.
+- **Anything else:** rejected as an unrecognized value.
+
+Implementation detail worth calling out: `validate_group_test_config()`
+now returns a **shallow copy** of `test_setpoints` with `charge_mode`
+normalized in, rather than the original dict reference it returned
+before. `config/devices.py::BATTERY_GROUPS[group]["test_setpoints"]`
+itself is never mutated by validation -- confirmed by a dedicated test.
+Every current caller (`test.py::_run_charge_or_discharge()`) only reads
+from the returned dict and passes it straight into `sequence.run()`, so
+this is not an observable change for anything today; it exists so a
+future `ChargeSequence` can rely on `test_setpoints["charge_mode"]`
+always being present, without needing its own `.get(..., "CC_CV")`
+fallback scattered around.
+
+The vocabulary itself is a small, explicit two-constant design:
+```python
+_RECOGNIZED_CHARGE_MODES = ("CC_CV", "CV")
+_IMPLEMENTED_CHARGE_MODES = ("CC_CV",)
+```
+Enabling `CV` later is meant to be "move it from `_RECOGNIZED`-only into
+`_IMPLEMENTED`" once `ChargeSequence` actually supports it -- a small,
+additive change to this validator, not a redesign.
+
+### Design questions
+
+**Q1 -- is it possible to prepare this infrastructure with zero behavior
+change?** Yes, demonstrated, not just claimed: every file in the
+hardware-active path is untouched, B1's real config is untouched, and
+the full existing regression suite (170 tests before this work) passes
+unmodified alongside 9 new tests, none of which needed to change any
+prior assertion.
+
+**Q2 -- can `CycleSequence` automatically inherit `charge_mode`?** Yes,
+by the same mechanism as the timeout override (Section 69): per its
+accepted design (Section 67), `CycleSequence` passes the *same*
+`test_setpoints` dict through to its composed `ChargeSequence` phases,
+unchanged, every repetition. The moment `ChargeSequence` itself reads
+`test_setpoints["charge_mode"]`, `CycleSequence` inherits that behavior
+with zero new code and zero new config surface -- exactly the same
+"extend the shared dict, let it propagate for free" shape already
+proven twice (timeout override, and now this).
+
+**Q3 -- what remains for full CV support?**
+- Design and implement a `ChargeSequence` mode dispatch: which SMU
+  configuration call to make (`DC_VOLTAGE`/`voltage_level` sourcing,
+  mirroring `source_dc_voltage_point()`'s pattern, vs. today's
+  `DC_CURRENT`/`current_level` via `set_charge_mode()`) and which EOC
+  condition applies (CV-only's natural EOC is current-taper-only, since
+  voltage is already at target from the first sample by definition of
+  CV mode -- there is no CC lead-in to wait through).
+- A new, analogous `hardware/smu.py` method (e.g.
+  `set_charge_mode_cv(voltage_v, current_limit_a)`) -- not added yet, to
+  keep this phase's footprint to the validation layer only.
+- Real-hardware validation of the new mode specifically -- per the
+  design review's own conclusion, a new sourcing strategy needs its own
+  hardware validation pass, not just unit tests, before it can be
+  trusted the way `CC_CV` now is.
+- Move `"CV"` from `_RECOGNIZED_CHARGE_MODES`-only into
+  `_IMPLEMENTED_CHARGE_MODES` once the above is done and validated.
+- Decide (separately, later) whether/how a `CC`-only mode's termination
+  condition (time-based? Ah-based?) should be designed -- explicitly not
+  part of this or the next phase.
+
+**Q4 -- any reason not to merge this now?** None identified. It is
+additive, isolated to the pre-flight validation layer, provably
+behavior-preserving for every existing group, and directly reduces the
+size of the future CV-enablement change (per Q3) without touching
+anything currently under real-hardware validation.
+
+### Documentation and example configuration
+
+See `docs/CONFIGURATION.md` "Charge mode (future architecture, not yet
+active)" for the illustrative `CC_CV`/`CV` example snippets referenced
+above -- documentation-only, not applied to any real group.
+
+### Tests
+
+`tests/test_charge_mode_validation.py` -- default-is-`CC_CV`/backward-
+compatibility (including the no-mutation-of-the-live-config-dict check),
+explicit `CC_CV` accepted, `CV` rejected with the "not yet implemented"
+message, and unrecognized/wrong-type values rejected. Full suite:
+179/179 passing (170 prior + 9 new).

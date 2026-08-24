@@ -111,6 +111,38 @@ that group in production, rather than the software silently protecting
 them from a leftover validation setting.
 > Verify these two values match your battery chemistry and update as needed.
 
+### Charge mode (future architecture, not yet active)
+
+**Illustrative only -- not applied to any real group today.** A group's
+`test_setpoints` may optionally declare `charge_mode` (see
+`docs/architecture.md` "Future Architecture: Configurable Charge Modes"
+for the full design, including why `CV` validates as a recognized name
+but is currently rejected outright rather than silently ignored):
+
+```python
+# Omitted, or explicit -- both mean exactly today's behavior:
+"test_setpoints": {
+    "charge_current_a": 0.5,
+    "charge_voltage_v": 3.7,
+    "discharge_current_a": 0.08,
+    "discharge_cutoff_v": 3.0,
+    "charge_mode": "CC_CV",   # optional; this is also the default
+},
+```
+
+```python
+# NOT YET USABLE -- ChargeSequence has no CV dispatch logic yet.
+# validate_group_test_config() rejects this today with an explicit
+# "recognized but not yet implemented" error, on purpose.
+"test_setpoints": {
+    "charge_current_a": 0.5,
+    "charge_voltage_v": 3.7,
+    "discharge_current_a": 0.08,
+    "discharge_cutoff_v": 3.0,
+    "charge_mode": "CV",
+},
+```
+
 ### Stabilization and sampling
 
 | Parameter | Default | Type | Description |

@@ -59,16 +59,25 @@ _REQUIRED_TEST_SETPOINTS = (
     "charge_current_a", "charge_voltage_v", "discharge_current_a", "discharge_cutoff_v",
 )
 
+# See Stage 5 below and docs/architecture.md "Future Architecture:
+# Configurable Charge Modes". _RECOGNIZED names the full vocabulary this
+# validator will accept as a well-formed value; _IMPLEMENTED is the subset
+# ChargeSequence actually knows how to run today. Enabling a new mode later
+# is meant to be "move it from _RECOGNIZED-only into _IMPLEMENTED", not a
+# rewrite of this validator.
+_RECOGNIZED_CHARGE_MODES = ("CC_CV", "CV")
+_IMPLEMENTED_CHARGE_MODES = ("CC_CV",)
+
 
 def validate_group_test_config(group: str) -> dict:
     """
-    Four-stage validation pipeline for a Charge/Discharge Battery request,
+    Five-stage validation pipeline for a Charge/Discharge Battery request,
     run BEFORE any hardware is touched (no HardwareManager constructed, no
     relay closed, no PSU output enabled on any failure):
 
         Group Configuration -> Battery Limits Validation ->
         Hardware Capability Validation -> Timeout Override Validation ->
-        (caller proceeds to) Execution
+        Charge Mode Validation -> (caller proceeds to) Execution
 
     Battery type is NEVER an operator choice and never a second source of
     truth -- it is read here directly from config/devices.py
@@ -104,10 +113,20 @@ def validate_group_test_config(group: str) -> dict:
         ConfigurationError         -- (Stage 4) a declared timeout override
                                        is not a positive number, or exceeds
                                        Settings.MAX_TIMEOUT_OVERRIDE_S.
+        GroupConfigurationError    -- (Stage 5) test_setpoints["charge_mode"]
+                                       is not a recognized value, or names a
+                                       recognized-but-not-yet-implemented
+                                       charging strategy (e.g. "CV" today).
+
+    The returned `test_setpoints` is a shallow copy with `charge_mode`
+    normalized to its default ("CC_CV") when absent -- the original
+    config/devices.py::BATTERY_GROUPS[group]["test_setpoints"] dict is
+    never mutated.
 
     See docs/architecture.md "Battery Group Test Configuration
-    Architecture" and "Configurable Validation Timeout" for the full
-    design rationale.
+    Architecture", "Configurable Validation Timeout", and "Future
+    Architecture: Configurable Charge Modes" for the full design
+    rationale.
     """
     # -- Stage 1: Group Configuration --------------------------------------
     if group not in dev_cfg.BATTERY_GROUPS:
@@ -243,4 +262,41 @@ def validate_group_test_config(group: str) -> dict:
                 f"override may be large, but must never be effectively unbounded."
             )
 
-    return {"battery_type": battery_type, "test_setpoints": test_setpoints}
+    # -- Stage 5: Charge Mode Validation (FUTURE ARCHITECTURE, inert today) -
+    # Recognizes (but does not yet act on) an optional test_setpoints
+    # "charge_mode" -- see docs/architecture.md "Future Architecture:
+    # Configurable Charge Modes". "CC_CV" is the only currently-IMPLEMENTED
+    # mode (ChargeSequence never reads this key -- it is the only strategy
+    # that exists), and is the default when the key is absent, so every
+    # group not explicitly opting in (i.e. every group today) is completely
+    # unaffected. "CV" is a RECOGNIZED name (the vocabulary is reserved) but
+    # deliberately rejected outright rather than silently accepted-and-
+    # ignored: ChargeSequence has no CV-mode dispatch logic yet, so letting
+    # a group configure charge_mode="CV" today would mean the config claims
+    # one behavior while the software silently does another -- exactly the
+    # kind of "unknown state" this codebase's safety philosophy already
+    # refuses elsewhere. Enabling CV later is meant to be a small, additive
+    # change (add "CV" to _IMPLEMENTED_CHARGE_MODES once ChargeSequence
+    # actually supports it), not a redesign of this validator.
+    #
+    # Returns a SHALLOW COPY of test_setpoints with charge_mode normalized
+    # in (defaulted if absent) -- the original config/devices.py::
+    # BATTERY_GROUPS[group]["test_setpoints"] dict is never mutated by
+    # validation. Every current caller only reads from the returned dict,
+    # so this is not an observable behavior change for anything today.
+    resolved_test_setpoints = dict(test_setpoints)
+    charge_mode = resolved_test_setpoints.setdefault("charge_mode", "CC_CV")
+    if charge_mode not in _RECOGNIZED_CHARGE_MODES:
+        raise GroupConfigurationError(
+            f"Group {group!r}: test_setpoints['charge_mode'] must be one of "
+            f"{_RECOGNIZED_CHARGE_MODES}, got {charge_mode!r}."
+        )
+    if charge_mode not in _IMPLEMENTED_CHARGE_MODES:
+        raise GroupConfigurationError(
+            f"Group {group!r}: charge_mode {charge_mode!r} is a recognized future "
+            f"charging strategy but is not yet implemented in ChargeSequence -- only "
+            f"{_IMPLEMENTED_CHARGE_MODES} can be used today. See docs/architecture.md "
+            f"'Future Architecture: Configurable Charge Modes'."
+        )
+
+    return {"battery_type": battery_type, "test_setpoints": resolved_test_setpoints}
