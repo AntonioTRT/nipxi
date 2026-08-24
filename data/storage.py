@@ -92,7 +92,11 @@ CREATE TABLE IF NOT EXISTS measurements (
     voltage_min_v                 REAL,
     voltage_max_v                 REAL,
     group_name                    TEXT,
-    position_in_group             INTEGER
+    position_in_group             INTEGER,
+    matrix_card                   TEXT,
+    matrix_channel                TEXT,
+    source                        TEXT,
+    unit                          TEXT
 );
 """
 
@@ -136,6 +140,25 @@ _MEASUREMENT_EXTRA_COLUMNS = [
     # position number exists) -- group_name is what disambiguates rows
     # from two different groups that happen to share a channel number.
     "group_name", "position_in_group",
+    # Matrix routing + engineering-unit provenance (Measurement Schema
+    # Improvement -- see docs/architecture.md "Measurement Schema
+    # Improvement"). Distinct from group_name/position_in_group/relay
+    # above, which describe WHICH BATTERY POSITION a row belongs to --
+    # these instead describe WHICH PHYSICAL SENSOR HARDWARE PATH produced
+    # the raw reading (e.g. "matrix_card='MATRIX_NUMATO_201',
+    # matrix_channel='1', source='BATTERY_VOLTAGE', unit='V'" for a
+    # sense-routed DMM read; "matrix_card=None, matrix_channel=None,
+    # source='NTC', unit='V'" for a direct-DAQ NTC channel, which is never
+    # matrix-routed today -- see test_control/ntc_snapshot.py). All four
+    # nullable and independent: a row may have `source`/`unit` populated
+    # with `matrix_card`/`matrix_channel` left NULL when the signal simply
+    # isn't matrix-routed, never a forced/fabricated value. `source` is a
+    # short label (see utils/event_format.py-style plain string constants
+    # in the callers that populate it, e.g. "NTC"/"BATTERY_VOLTAGE"), NOT
+    # a foreign key into any other table -- config/devices.py remains the
+    # single source of truth for the actual routing topology; these
+    # columns only record what applied to THIS specific row.
+    "matrix_card", "matrix_channel", "source", "unit",
 ]
 
 _MEASUREMENT_ALL_COLUMNS = _COLUMNS + _MEASUREMENT_EXTRA_COLUMNS
@@ -311,6 +334,10 @@ _MEASUREMENT_MIGRATION_COLUMNS = [
     ("voltage_max_v", "REAL"),
     ("group_name", "TEXT"),
     ("position_in_group", "INTEGER"),
+    ("matrix_card", "TEXT"),
+    ("matrix_channel", "TEXT"),
+    ("source", "TEXT"),
+    ("unit", "TEXT"),
 ]
 
 _STATION_STATE_MIGRATION_COLUMNS = [
@@ -372,6 +399,36 @@ class DataStorage(StorageBackend):
         self._db: sqlite3.Connection | None = None
         self._csv_writers: dict = {}
         self._csv_files: dict = {}
+
+    def begin_new_run_id(self, suffix: str = None) -> str:
+        """
+        Reassign self.run_id to a fresh value, WITHOUT closing/reopening
+        the underlying DB connection -- see docs/architecture.md "Group
+        -> ALL Support". Every subsequent start_run_summary()/
+        record_measurement()/log_event()/record_execution_state() call
+        scopes to this NEW run_id, exactly as if a fresh DataStorage had
+        been opened, but sharing ONE connection across an entire
+        "Group -> ALL" operation: each position gets its own independent
+        run_summary row (run_summary.run_id is UNIQUE NOT NULL -- see
+        CREATE_RUN_SUMMARY_SQL), while every position's event_log/
+        measurements rows remain queryable from the same open connection
+        and the same on-disk database file.
+
+        `suffix` (e.g. a position number), if given, is appended to
+        disambiguate two calls whose wall-clock second collides -- this
+        class's run_id resolution is 1 second (see __init__), and
+        positions processed in a tight loop can easily start within the
+        same second. Callers iterating multiple positions MUST pass a
+        distinct suffix per position, or risk a run_summary UNIQUE
+        constraint violation. Single-position callers (the pre-existing,
+        unchanged behavior for every workflow before Group -> ALL
+        support) never call this at all -- the run_id generated at
+        construction time continues to be used for the whole process
+        lifetime, exactly as before.
+        """
+        base = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = f"{base}_{suffix}" if suffix is not None else base
+        return self.run_id
 
     # ------------------------------------------------------------------
     # StorageBackend interface
@@ -569,11 +626,24 @@ class DataStorage(StorageBackend):
         current_a, temp_c, commanded_v, commanded_current_limit_a,
         smu_readback_v, smu_readback_current_limit_a, smu_measured_v,
         smu_measured_i, dmm_measured_v, output_enabled_readback,
-        in_compliance, daq_channel_0_raw, voltage_min_v, voltage_max_v --
-        any field omitted is stored NULL (rendered as
+        in_compliance, daq_channel_0_raw, voltage_min_v, voltage_max_v,
+        group_name, position_in_group, matrix_card, matrix_channel,
+        source, unit -- any field omitted is stored NULL (rendered as
         "N/A" by the UI layer, never by this method). Unknown keys are
         ignored rather than raising, same policy as
         record_execution_state().
+
+        matrix_card/matrix_channel/source/unit (Measurement Schema
+        Improvement) describe WHICH PHYSICAL SENSOR HARDWARE PATH
+        produced this row's raw reading -- e.g. matrix_card=
+        "MATRIX_NUMATO_201", matrix_channel="1", source="BATTERY_VOLTAGE",
+        unit="V" for a sense-routed DMM read, or matrix_card=None,
+        source="NTC", unit="V" for a direct-DAQ NTC channel (never
+        matrix-routed today). Distinct from group_name/position_in_group/
+        relay, which describe WHICH BATTERY the row belongs to -- a
+        different, already-solved concern. All four independently
+        nullable; a caller populates only what it actually knows, never a
+        fabricated placeholder.
 
         Raises if the storage backend is not open -- this is historical
         result data, a caller must know immediately if it silently failed

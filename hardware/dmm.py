@@ -41,6 +41,13 @@ class DMM(HardwareBase):
         self._simulate  = bool(cfg.get("simulate", False))
         self._session   = None
 
+    @property
+    def model(self) -> str:
+        """Read-only -- config/devices.py's declared model string, for
+        event-log/traceability provenance (see docs/architecture.md
+        "Standardized Hardware Event Logging")."""
+        return self._model
+
     def connect(self):
         self.log.info("Opening DMM session: %s", self.resource)
         try:

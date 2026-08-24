@@ -2083,9 +2083,144 @@ CycleSequence, Runtime/Cycle Controller.
 
 ---
 
+## Milestone XX: Real-Hardware Charge/Discharge Validation, Safety Hardening, Diagnostics, and Milestone Closure
+
+Full technical detail in `docs/architecture.md` Sections 55-79. This
+entry closes the substantial body of work that shipped after Milestone
+XIX without a milestone record -- confirmed against `docs/architecture.md`'s
+own section numbering and git history before writing this entry, not
+assumed. Summary:
+
+- **DMM Authoritative Voltage Migration (Sections 72/73):** the
+  documented "planned migration of battery voltage measurements from the
+  SMU to the DMM" is **complete**, not still planned -- confirmed by code
+  trace, not assumption. `ChargeSequence`/`DischargeSequence`/
+  `MonitorBatterySequence` all use `dmm.measure_dc_voltage()` as the sole
+  authoritative voltage for EOC/EOD detection and every `safety.check()`
+  call; the SMU's own voltage readback is recorded only as a diagnostic
+  display field, never used in a decision. A new `hardware/sense_router.py`
+  abstraction (`SenseRouter`/`ConfigDrivenSenseRouter`) was designed
+  abstraction-only, then live-deployed for B1 via `MATRIX_NUMATO_201`
+  (relay 1) -- resolving the ground-reference ambiguity behind an earlier
+  real -4 V/+4 V measurement investigation, with an explicit,
+  operator-confirmed choice of physical relay module (accepting a
+  documented legacy-binding tradeoff over an unvalidated alternative) and
+  a tested, enforced invariant that the sense-routing matrix and B1's own
+  battery-position relay matrix are never the same physical module.
+- **Battery Presence + NTC Presence Diagnostics (Section 76):** a new
+  pre-test gate (`test_control/battery_presence_precheck.py`) closes a
+  real gap -- battery presence was never checked before a test started at
+  all (only NTC was); an absent battery on an NTC-present position sailed
+  through every existing check, enabled the SMU, and was only ever
+  flagged retroactively (if at all) by the post-run diagnostic
+  classifier. `classify_battery_presence()` (PRESENT/ABSENT/REVERSED)
+  reuses two already-established thresholds, not a new invented number.
+  Confirmed as a genuine new safety-relevant behavior change (battery
+  absence now blocks test start, parallel to the pre-existing NTC gate)
+  before implementing, not assumed. Event log now distinguishes Battery
+  Missing / NTC Missing / both via one combined, greppable reason line.
+- **Shutdown Hardening (Sections 60/68/74/78):** bounded-retry emergency
+  shutdown with distinct STILL_ENABLED/VERIFICATION_COMM_FAILURE failure
+  modes; post-isolation SMU setpoint-zeroing; DB-backed "SHUTDOWN: ..."
+  shutdown-trace event logging (previously Python-logger-only, invisible
+  to the same DB-backed event log operators actually inspect); and the
+  **Safest Shutdown Sequence fix**, a real root-cause correction: the SMU
+  setpoint is now actively zeroed FIRST, while output is still enabled,
+  before `output_disable()` is ever attempted -- zeroing it only AFTER
+  disable (all the previous fix ever did) has no physical effect on the
+  output terminals once the active regulation loop has already stopped,
+  which is why a real post-Ctrl+C ~4 V terminal reading persisted even
+  after that earlier fix. Relay-open-after-SMU-disable ordering was
+  independently re-confirmed already correct and is unchanged.
+- **Battery Removal During Charge Detection (Section 77):** closes a
+  false-PASS gap found during a pre-completion review -- a battery
+  physically removed mid-charge drove the SMU to its own voltage
+  compliance ceiling with current collapsing toward zero, exactly
+  satisfying the pre-existing EOC condition, previously reported as a
+  clean pass. `charge_transition_suggests_battery_removed()` detects the
+  physically-impossible one-sample jump from still-CC-phase current to
+  EOC and raises a new `BatteryRemovedDuringChargeError` instead.
+  Discharge was independently confirmed already safe against the
+  identical scenario (undervoltage safety check fires first) and
+  required no code change.
+- **HUB Battery Configuration Update (Section 75):** every previously
+  "unconfirmed placeholder"/"TEMPORARY" value in `BATTERY_CONFIGS["HUB"]`
+  replaced with real cell-datasheet figures, consistently preferring the
+  nominal/recommended operating value over the absolute-maximum rating
+  (e.g. 2000 mA typical charge current used, not the 2233 mA maximum).
+  The NTC Beta constant was corrected from an unverified 3950 K
+  placeholder to the real 103JT part's 3435 K rating, verified against
+  the datasheet's own resistance-vs-temperature table.
+- **Regression fixes (Section 78):** the first-sample-N/A symptom
+  reported after a later commit was traced to its REAL cause two commits
+  earlier (a new pre-check measurement row's `phase_detail` not yet known
+  to `get_first_measurement()`'s exclusion filter) -- corrected, and the
+  investigation is recorded as a reminder that attributing a regression
+  to "the most recent change" is a reasonable first guess, not a
+  substitute for tracing the actual diff.
+- **Milestone Closure Implementation (Section 79):** the three items this
+  closure review required before Milestone XX could be recorded --
+  Measurement Schema Improvement (four new nullable `measurements`
+  columns describing sensor-hardware provenance, via the existing
+  additive migration mechanism), Event Log Completeness (a new
+  standardized `EVENT_TYPE=... KEY=value` event vocabulary closing three
+  confirmed gaps -- SMU output enable, matrix routing changes, and DMM
+  measurement failures as a distinct, bounded-tolerance category -- found
+  by reviewing every hardware call site against the required list, not
+  assumed complete), and Group -> ALL Support (Charge/Discharge Battery
+  can now run every enabled position in a group from one operator
+  selection, looping only at the `test.py` orchestration level with
+  `ChargeSequence`/`DischargeSequence` completely unmodified, each
+  position recording its own independent `run_summary` row).
+
+### Milestone readiness decision
+
+**Charge and Discharge Battery are validated for this milestone's scope:
+single position (B1), single battery type (HUB), independently (not as a
+combined charge-then-discharge cycle).** ~90% readiness for that scope --
+the core safety/shutdown/diagnostic architecture has been repeatedly
+hardened through multiple real-hardware feedback cycles within this one
+milestone. **Full charge-then-discharge cycle testing is intentionally
+deferred**, per explicit direction, and is additionally blocked on
+`CycleSequence`, which does not exist yet (design-only, Section 67) --
+Group -> ALL support was therefore scoped to Charge/Discharge only, not
+Cycle. Known, disclosed, not-yet-closed gaps carried forward (unchanged
+from the pre-completion review, still real): NTC-degraded monitoring has
+no *live* execution-screen indicator (event log only); no startup
+reconciliation for a `run_summary` row orphaned by a hard process crash;
+sampling-loop storage-write failures are unguarded (safety-conservative,
+but would abort a real run over a transient DB issue); diagnostic
+classification thresholds remain uncalibrated against real bench data;
+validation breadth is still one position/one battery type. The PXI Relay
+Matrix migration (item 3 of the closure review) is **not started** by
+design -- the existing `RelayBase`/`RelayFactory` abstraction was
+confirmed already migration-ready (no business-logic coupling to the
+concrete Numato class found anywhere), so no code changes were needed or
+made this milestone; only a real niswitch-based driver, a config dict,
+and bench validation of the PXI card's interlock semantics remain,
+deferred to whenever that hardware migration is actually scheduled.
+
+### Recommended next milestone
+
+Real-hardware validation of Group -> ALL on B1 (today's only fully wired
+group); calibrate the diagnostic classification thresholds against that
+data; close the disclosed gaps above (live NTC-degraded indicator,
+crash-reconciliation, WAL mode for the storage-write-failure risk) as
+time allows; then CycleSequence (unblocks both full-cycle validation and
+Group -> ALL for Cycle), `main.py` legacy path retirement, and the
+Runtime/Cycle Controller -- the same "recommended next milestone" chain
+Milestone XIX already pointed at, now with the `run_summary` granularity
+question it flagged resolved in practice (each position's own row,
+confirmed workable end-to-end by this milestone's own Group -> ALL
+implementation).
+
+---
+
 *Record created after Hardware Bring-Up Milestone 1 was confirmed on the
 physical PXIe rack, and updated for Milestone 2 (Proto Test Execution)'s
-implementation, Milestone II's Monitor Battery implementation, and the
-Menu Restructuring Review above. See `docs/TODO.md` for the live
-remaining-work checklist and `docs/architecture.md`/`docs/CONFIGURATION.md`
-for full technical detail on every item referenced above.*
+implementation, Milestone II's Monitor Battery implementation, the Menu
+Restructuring Review, and Milestone XX's closure of the real-hardware
+Charge/Discharge validation, safety-hardening, and diagnostics work above.
+See `docs/TODO.md` for the live remaining-work checklist and
+`docs/architecture.md`/`docs/CONFIGURATION.md` for full technical detail
+on every item referenced above.*

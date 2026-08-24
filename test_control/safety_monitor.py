@@ -20,6 +20,7 @@ default) preserves the exact prior global-Settings-only behavior.
 import logging
 from dataclasses import dataclass
 from config.settings import Settings
+from utils.event_format import EventType, format_event
 
 
 @dataclass
@@ -167,6 +168,7 @@ class SafetyMonitor:
 
         self.log.warning("[SHUTDOWN-TRACE] emergency_stop() entered (reason=%s)", reason)
         self.log.error("EMERGENCY STOP: %s", reason)
+        _emit(format_event(EventType.EMERGENCY_STOP_STARTED, reason=reason))
         if not smu.emergency_output_off(reason, on_event=on_event):
             self.log.critical(
                 "PMU output could not be verified OFF during e-stop. PMU may still be "
@@ -178,6 +180,7 @@ class SafetyMonitor:
             relay_matrix.open_all()
             self.log.warning("[SHUTDOWN-TRACE] Relay open command sent -- open_all() returned normally")
             _emit("relay_matrix.open_all executed")
+            _emit(format_event(EventType.RELAY_OPEN_ALL, relay_matrix_name=getattr(relay_matrix, "name", None)))
         except Exception as e:
             self.log.critical(
                 "Relay open-all FAILED during e-stop: %s. Hardware may still be "
@@ -200,6 +203,7 @@ class SafetyMonitor:
                               "(non-critical, shutdown already complete): %s", e)
         self.log.warning("Emergency stop complete.")
         _emit("shutdown completed")
+        _emit(format_event(EventType.EMERGENCY_STOP_COMPLETED, reason=reason))
 
     def safe_cancel_shutdown(self, smu, relay_matrix, reason: str, on_event=None):
         """
@@ -222,6 +226,7 @@ class SafetyMonitor:
 
         self.log.warning("[SHUTDOWN-TRACE] safe_cancel_shutdown() entered (reason=%s)", reason)
         self.log.warning("SAFE CANCELLATION: %s -- entering safe shutdown", reason)
+        _emit(format_event(EventType.EMERGENCY_STOP_STARTED, reason=reason))
         if not smu.emergency_output_off(reason, on_event=on_event):
             self.log.critical(
                 "PMU output could not be verified OFF during cancellation shutdown. "
@@ -233,6 +238,7 @@ class SafetyMonitor:
             relay_matrix.open_all()
             self.log.warning("[SHUTDOWN-TRACE] Relay open command sent -- open_all() returned normally")
             _emit("relay_matrix.open_all executed")
+            _emit(format_event(EventType.RELAY_OPEN_ALL, relay_matrix_name=getattr(relay_matrix, "name", None)))
         except Exception as e:
             self.log.critical(
                 "Relay open-all FAILED during cancellation shutdown: %s. Hardware may "
@@ -249,3 +255,4 @@ class SafetyMonitor:
                               "(non-critical, shutdown already complete): %s", e)
         self.log.info("Safe cancellation shutdown complete.")
         _emit("shutdown completed")
+        _emit(format_event(EventType.EMERGENCY_STOP_COMPLETED, reason=reason))

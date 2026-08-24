@@ -143,6 +143,15 @@ class SMU(HardwareBase):
         # nothing in this driver's own logic depends on this being fresh.
         self.last_known_output_state: bool | None = None
 
+    @property
+    def model(self) -> str:
+        """Read-only -- config/devices.py's declared model string (e.g.
+        "PXI-4130"), for event-log/traceability provenance (see
+        docs/architecture.md "Standardized Hardware Event Logging"). Not
+        a live instrument query -- identify() remains the real, verified
+        model read via self_test()."""
+        return self._model
+
     def connect(self):
         self.log.info("Opening SMU session: %s (channel %s)", self.resource, self._channel)
         try:

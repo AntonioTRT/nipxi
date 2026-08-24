@@ -43,11 +43,6 @@ class RunChargeOrDischargeSenseRouterWiringTests(unittest.TestCase):
         self.assertIsNotNone(construct_idx)
         self.assertLess(gate_idx, construct_idx)
 
-    def test_sequence_construction_passes_sense_router_and_sense_channel(self):
-        src_after_construct = self.src[self.src.index("sequence = sequence_cls("):]
-        self.assertIn("sense_router=sense_router", src_after_construct[:600])
-        self.assertIn("sense_channel=sense_channel", src_after_construct[:600])
-
     def test_sense_router_shutdown_happens_in_finally_before_storage_close(self):
         shutdown_idx = self._first_index("sense_router.shutdown()")
         storage_close_idx = self._first_index("storage.close()")
@@ -60,6 +55,27 @@ class RunChargeOrDischargeSenseRouterWiringTests(unittest.TestCase):
         # The nearest preceding "if sense_router is not None:" guards it.
         preceding = "\n".join(self.lines[max(0, idx - 3):idx])
         self.assertIn("if sense_router is not None:", preceding)
+
+
+class RunOnePositionSenseRouterWiringTests(unittest.TestCase):
+    """
+    sequence_cls(...) construction itself now lives in
+    _run_one_charge_or_discharge_position() -- the per-position workflow
+    body extracted so Group -> ALL orchestration
+    (_run_charge_or_discharge_all_positions()) can call it once per
+    position -- see docs/architecture.md "Group -> ALL Support". Both
+    the single-position path and the Group -> ALL loop pass their own
+    (shared, constructed-once) sense_router/sense_channel into this same
+    function, so this one test covers both callers.
+    """
+
+    def setUp(self):
+        self.src = inspect.getsource(test_module._run_one_charge_or_discharge_position)
+
+    def test_sequence_construction_passes_sense_router_and_sense_channel(self):
+        src_after_construct = self.src[self.src.index("sequence = sequence_cls("):]
+        self.assertIn("sense_router=sense_router", src_after_construct[:600])
+        self.assertIn("sense_channel=sense_channel", src_after_construct[:600])
 
 
 if __name__ == "__main__":

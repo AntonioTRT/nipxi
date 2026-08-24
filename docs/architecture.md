@@ -7561,3 +7561,255 @@ suite re-run clean, no regressions -- `safety_monitor.py`'s own existing
 call-order tests (SMU off -> relay open -> zero) pass unchanged, since
 this fix is entirely internal to `emergency_output_off()` and does not
 change its external call contract.
+
+## 79. Milestone Closure Implementation: Schema, Event Logging, Group -> ALL Support
+
+Implements items 1/2/5 from the milestone closure review (Section 78's
+sibling review is item-4's charge/discharge validation status; item 3
+was a checklist only, no code). All three landed together, tested, in
+this order: schema first (event logging wants the new columns available,
+even though this pass doesn't yet populate them from every possible
+source), then event logging, then Group -> ALL (which depends on
+neither, but benefits from both already being settled conventions).
+
+### Item 1: Measurement Schema Improvement
+
+Four new nullable columns added to `measurements` via the existing
+additive migration mechanism (`_migrate_add_missing_columns()`, already
+used for every prior schema growth in this project) -- `matrix_card`,
+`matrix_channel`, `source`, `unit`. `daq_channel_0_raw` and every other
+existing column are unchanged; `record_measurement()`'s signature is
+unchanged (still `**fields`, unknown keys still silently ignored).
+
+These four columns describe WHICH PHYSICAL SENSOR HARDWARE PATH produced
+a row's raw reading -- a different, previously entirely absent concept
+from `channel`/`relay`/`group_name`/`position_in_group` (which describe
+WHICH BATTERY a row belongs to, already solved). Populated so far for the
+one concrete case in the original review's own target example: NTC
+readings (`test_control/ntc_snapshot.py`) now ready to carry
+`source="NTC"`, `unit="V"` (the raw divider voltage actually stored --
+NOT "Ohm" as the review's illustrative example showed, since this
+codebase does not compute/store thermistor resistance anywhere; using
+"Ohm" for a value that is actually volts would be a fabricated,
+misleading unit, not a "same as the example" match). `matrix_card`/
+`matrix_channel` are left NULL for NTC rows -- NTC channels are direct
+DAQ analog inputs, never routed through a relay matrix (confirmed by
+existing code/comments), so populating a matrix identity for them would
+be fabricated, not real provenance. A sense-routed DMM battery-voltage
+read (B1's live `SENSE_ROUTING` deployment, Section 73) is the one real
+case where `matrix_card`/`matrix_channel` have an honest, non-fabricated
+value (the resolved `relay_matrix`/`relay` from `SENSE_ROUTING[sense_channel]`)
+-- not yet wired into the sampling loop's own per-sample
+`_record_measurement()` calls in this pass (that call records the SMU/
+DMM's OWN readback columns, a separate, pre-existing concern); left as a
+clearly scoped, honest gap rather than populated with an approximate or
+inferred value.
+
+A rejected design alternative: a separate normalized
+`measurement_sources`/routing lookup table with `measurements` storing
+only a foreign key. Rejected because the actual routing topology is
+static per deployment and already fully owned by `config/devices.py` --
+normalizing it into a second DB table would just re-derive what config
+already states definitively, for no real query benefit, while adding
+real migration/join complexity. The four new columns instead simply
+RECORD what applied to a given row, matching the same pattern
+`relay`/`group_name`/`position_in_group` already establish.
+
+Tests: `tests/test_storage_measurement_scoping.py` gained a
+`MatrixRoutingProvenanceColumnsTests` class (round-trip for all four new
+columns, NULL-by-default backward compatibility, `daq_channel_0_raw`
+and every pre-existing column confirmed unchanged) and a
+`MigrationFromPreExistingDatabaseTests` class -- builds a REAL pre-
+Measurement-Schema-Improvement SQLite database file (the true oldest
+schema shape, missing all four Milestone-II-and-later columns, not just
+the four newest ones) and proves `DataStorage.open()`'s migration adds
+them via `ALTER TABLE` with the pre-existing row's data completely
+untouched. This is the first test in the suite that actually exercises
+the migration mechanism end-to-end against a real on-disk file, rather
+than only asserting against the in-memory column-list constants.
+
+### Item 2: Event Log Completeness
+
+New `utils/event_format.py` -- `EventType` (one string constant per
+required category) + `format_event(event_type, **fields)`, producing
+`"EVENT_TYPE=<type> KEY=<value> ..."` lines stored in the existing
+`event_log.message` column. `RUN_ID` is deliberately never embedded in
+the text (that's already a real, populated column on every row --
+repeating it would be redundant, not additive). A field whose value is
+`None` is omitted entirely, never written as `KEY=None` -- lets a caller
+pass every possible provenance field and have only the ones it actually
+has appear.
+
+Coverage review (grepped every `storage.log_event()` call site and every
+`output_enable()`/`output_disable()`/relay `open()`/`close()` call site
+before writing any code, not assumed):
+
+| Required event | Was | Now |
+|---|---|---|
+| Charge/Discharge start/completed, Battery presence failure, Test abort (generic), NTC failures | already covered | unchanged |
+| Relay enable/disable | bundled into "charging started" text only | ALSO a distinct `RELAY_CLOSE`/`RELAY_OPEN` structured event |
+| SMU output disable | covered via Section 74's shutdown-trace `on_event` | ALSO a distinct `SMU_OUTPUT_DISABLED` structured event (includes `VERIFIED=`) |
+| **SMU output enable** | missing entirely (Python-logged only, inside `hardware/smu.py`, never DB) | **new** `SMU_OUTPUT_ENABLED` |
+| **Matrix routing changes** | missing entirely (`hardware/sense_router.py` has zero storage awareness) | **new** `MATRIX_ROUTE_APPLIED`/`MATRIX_ROUTE_CLEARED`, logged by the caller (ChargeSequence/DischargeSequence), not the router itself -- same layering discipline as `SMU`/`SafetyMonitor`'s own storage-free design |
+| **DMM measurement failures** | absorbed into the generic "Unexpected error --" catch-all, no distinct category | **new** `DMM_MEASUREMENT_FAILED`/`DMM_MEASUREMENT_RECOVERED`, bounded-tolerance (see below) |
+| Safety monitor state transitions | failures logged generically | ALSO a distinct `SAFETY_MONITOR_TRIGGERED`, added ONCE in `run_guarded()`'s shared `SafetyViolationError` branch (covers reverse polarity, a real `safety.check()` violation, and battery-removal-during-charge uniformly, never duplicated per raise site) |
+| Emergency stop | Python-logged only, no single literal DB event | **new** `EMERGENCY_STOP_STARTED`/`EMERGENCY_STOP_COMPLETED`, `RELAY_OPEN_ALL`, added to `SafetyMonitor.emergency_stop()`/`safe_cancel_shutdown()` via the existing `on_event` callback |
+
+**`SAFETY_MONITOR_RECOVERED` is defined in the vocabulary but is not
+reachable by any code path today, and this is disclosed, not silently
+omitted** (see `EventType`'s own docstring comment): a triggered safety
+violation is, by design, immediately terminal -- `run_guarded()` always
+re-raises after shutdown, so no run ever continues past one, meaning
+nothing ever "recovers" within a single run. Making a safety violation
+tolerable/recoverable would be a real, much bigger safety-behavior change
+than "add event logging", and was not made here.
+
+**DMM bounded-tolerance design decision:** DMM is the authoritative
+voltage source for EOC/EOD and every `safety.check()` call in these
+loops, so a read failure cannot be tolerated indefinitely the way an NTC
+read failure already is (NTC only degrades temperature monitoring). But
+`DMM_MEASUREMENT_FAILED`/`_RECOVERED` as a pair only makes sense if a
+transient failure gets a real chance to resolve within the same run --
+so the sampling loop now wraps `dmm.measure_dc_voltage()` in a bounded
+retry: up to `Settings.DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES` (3,
+mirroring `EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS`'s existing convention)
+consecutive failures are tolerated (logged, sample skipped, loop
+continues at the normal sample interval); a successful read after one or
+more failures logs `DMM_MEASUREMENT_RECOVERED` and resets the counter;
+exceeding the bound raises the new `utils.errors.DMMMeasurementLostError`
+(a `SafetyViolationError` subclass, mirroring `ReversePolarityError`/
+`BatteryRemovedDuringChargeError`'s pattern), routed through the existing
+`emergency_stop()` shutdown path unchanged.
+
+New hardware-class properties added purely for event provenance (never
+used in any decision): `SMU.model`, `DMM.model`, `NumatoRelayMatrix.host`/
+`.port` -- all thin, read-only wrappers around already-stored private
+config values.
+
+Files touched: `utils/event_format.py` (new), `data/storage.py` (schema,
+covered under item 1), `hardware/smu.py`/`hardware/dmm.py`/
+`hardware/relay_eth.py` (provenance properties), `config/settings.py`
+(new `DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES`), `utils/errors.py` (new
+`DMMMeasurementLostError`), `test_control/safety_monitor.py`,
+`test_control/battery_operation_sequence.py` (`run_guarded()`'s shared
+`SafetyViolationError` branch), `test_control/charge_sequence.py`,
+`test_control/discharge_sequence.py`, `test_control/
+monitor_battery_sequence.py` (`RELAY_CLOSE` only -- no `RELAY_OPEN`
+call site exists there today; Monitor Battery only ever ends via
+cancellation, handled by the existing safety shutdown path).
+
+Tests: `tests/test_event_format.py` (formatter + full vocabulary
+coverage) and `tests/test_hardware_event_logging.py` (scripted-hardware
+integration tests against both `ChargeSequence`/`DischargeSequence` --
+every new event type fires at the right point, the DMM bounded-tolerance
+behavior for both "recovers within the bound" and "exceeds the bound and
+raises", `MATRIX_ROUTE_APPLIED`/`_CLEARED` only fire when a
+`sense_channel` is actually configured). Existing fake-hardware test
+doubles across the suite (`tests/test_battery_removal_during_charge.py`,
+`tests/test_sense_routing_live_wiring.py`) gained `.model`/`.resource`/
+`.name` attributes to match the real driver classes' new provenance
+surface -- the established "update the fake, not the code" pattern used
+consistently throughout this project.
+
+### Item 5: Group -> ALL Support
+
+**UI:** `_select_battery_position(group, allow_all=False)` gained an
+`allow_all` parameter (default `False` -- every pre-existing caller,
+Monitor Battery/Monitor Battery Scan, is completely unaffected). When
+`True` (Charge/Discharge Battery only, per explicit scope -- Cycle is
+out of scope because `CycleSequence` does not exist yet), the literal
+`"ALL"` (case-insensitive) is accepted and returned as the string
+`"ALL"`; a specific position number remains fully supported the same way
+it always was -- "B1 -> ALL" and "B1 -> 1" are both live at the same
+prompt.
+
+**Architecture:** `ChargeSequence`/`DischargeSequence` were NOT modified
+for this feature at all (confirmed: neither class name appears anywhere
+in the new orchestration function's source -- enforced by
+`tests/test_group_all_support.py::
+test_sequence_classes_are_never_referenced_by_name_inside_this_function`).
+The pre-existing single-position workflow body of
+`test.py::_run_charge_or_discharge()` (hardware-snapshot traceability,
+the Battery Presence + NTC Presence pre-check, sequence construction and
+`.run()`, post-run summary print) was extracted, UNCHANGED in logic, into
+`_run_one_charge_or_discharge_position()`, which now returns one of
+`"PASS"/"FAIL"/"SKIPPED"/"CANCELLED"` instead of implicitly returning
+`None` -- classifying every outcome via the exact same try/except this
+code already had, so no caller needs its own try/except around the call.
+`_run_charge_or_discharge()`'s own single-position path calls this once
+(discarding the return value, matching its pre-existing behavior
+exactly); the new `_run_charge_or_discharge_all_positions()` calls it
+once per enabled position in a loop -- this is the ONLY place any
+looping happens. Hardware connect (`HardwareManager`), storage open, the
+SIGINT handler, and teardown all happen ONCE for the whole group run, not
+once per position -- `safety`/`sense_router`/`sense_channel` are also
+constructed once and passed into every position's call (SafetyMonitor is
+stateless across positions once `battery_cfg` is set; reconnecting the
+sense-routing matrix per position would be wasted relay cycles for no
+benefit).
+
+**Empty positions / failures:** a position whose own Battery Presence +
+NTC Presence pre-check fails returns `"SKIPPED"` (unchanged behavior,
+now just reported as a classification instead of ending the whole call);
+any other exception returns `"FAIL"` -- by the time either happens, the
+position's own safety shutdown (inside `run_guarded()`, unchanged) has
+already run, so hardware is back in a verified-safe state before the
+next position's relay ever closes. Neither `SKIPPED` nor `FAIL` stops the
+loop (confirmed by `test_the_loop_has_no_unconditional_break_for_fail_or_skipped`
+-- the function's only `break` is inside the `CANCELLED` branch).
+`"CANCELLED"` (operator Ctrl+C) DOES stop the loop -- pressing Ctrl+C
+during a group run means "stop the whole run," not "skip to the next
+battery." Only `enabled: True` positions
+(`config/devices.py::BATTERY_GROUPS[group]["positions"]`) are ever
+attempted -- a disabled/unwired position is never even reported as
+`SKIPPED`, matching how "enabled" is already treated everywhere else in
+this codebase.
+
+**Storage design (explicit decision, not the default choice):** each
+enabled position gets its OWN independent `run_summary` row -- a fresh,
+guaranteed-unique `run_id` via the new `DataStorage.begin_new_run_id
+(suffix=f"pos{position}")` (reassigns `self.run_id` without closing/
+reopening the DB connection; every subsequent `start_run_summary()`/
+`record_measurement()`/`log_event()`/`record_execution_state()` call
+scopes to the new id, since they all read `self.run_id` fresh at call
+time) called before every position. `run_summary.run_id` remains `UNIQUE
+NOT NULL` -- unchanged schema, no migration needed for this part. The
+per-position `run_summary` row is the AUTHORITATIVE record;
+`_print_group_run_summary()` (console-only, informational, never
+persisted as a substitute) prints the Processed/Passed/Failed/Skipped
+rollup plus each position's own result after the loop ends. This was
+deliberately NOT built as one shared row across positions (the shape
+`MonitorBatteryScanSequence` already uses) -- that shape cannot satisfy
+"independent results per position," which this feature explicitly
+requires.
+
+**Logging:** `GROUP_RUN_STARTED`/`GROUP_RUN_COMPLETED` (once each, start/
+end of the whole group run) and `GROUP_SLOT_STARTED`/`GROUP_SLOT_SKIPPED`/
+`GROUP_SLOT_FAILED`/`GROUP_SLOT_COMPLETED` (once per position, mapped
+directly from that position's classification -- `CANCELLED` is logged as
+`GROUP_SLOT_FAILED`, since "the operator stopped it" and "it failed" are
+both accurately described as "this slot did not complete," and the
+review's own requested vocabulary has no fifth, `GROUP_SLOT_CANCELLED`
+category).
+
+Tests: `tests/test_group_all_support.py` -- direct unit tests for
+`_select_battery_position`'s `allow_all` behavior (including that every
+pre-existing non-`allow_all` caller is unaffected) and for
+`_print_group_run_summary()`'s pure console output, plus source-
+inspection tests for `_run_charge_or_discharge_all_positions()`'s
+structural properties (enabled-only filtering, per-position run_id
+scoping, `CANCELLED`-stops/`FAIL`-and-`SKIPPED`-continue, hardware
+connects exactly once, `GROUP_*` events logged, aggregate summary printed
+after the loop, no direct `ChargeSequence`/`DischargeSequence`
+reference). `tests/test_presence_precheck_testpy_wiring.py` and
+`tests/test_sense_router_testpy_wiring.py`'s existing source-inspection
+tests were updated to point at
+`_run_one_charge_or_discharge_position()` (where that logic now lives
+after extraction) instead of `_run_charge_or_discharge()` -- a mechanical
+consequence of the extraction, not a behavior change; both files'
+remaining tests (sense-router None-init/construction-gate/shutdown-in-
+finally) still target `_run_charge_or_discharge()` correctly, since that
+part of the single-position path did not move.
+
+Full suite re-run clean after all three items: 337/337 passing, no
+regressions.

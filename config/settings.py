@@ -150,6 +150,19 @@ class Settings:
     EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS = 3     # attempts before giving up
     EMERGENCY_OUTPUT_OFF_RETRY_DELAY_S = 0.3  # s - delay between retry attempts
 
+    # ChargeSequence/DischargeSequence sampling-loop DMM-read bounded
+    # tolerance (see docs/architecture.md "Standardized Hardware Event
+    # Logging" -- DMM_MEASUREMENT_FAILED/_RECOVERED). DMM is the
+    # authoritative voltage source for EOC/EOD and safety.check(), so a
+    # read failure cannot be tolerated indefinitely (unlike an NTC read
+    # failure, which only degrades temperature monitoring) -- but a single
+    # transient comms glitch should get a bounded chance to resolve before
+    # the run aborts, mirroring EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS's own
+    # bounded-retry philosophy above. Consecutive (not cumulative) count:
+    # any successful read resets it to zero and logs
+    # DMM_MEASUREMENT_RECOVERED if it had previously failed at least once.
+    DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES = 3
+
     # Pre-output-enable reverse-polarity sanity check (ChargeSequence/
     # DischargeSequence -- see docs/architecture.md "Reverse Polarity
     # Protection"). A correctly-connected, intact Li-ion cell never reads

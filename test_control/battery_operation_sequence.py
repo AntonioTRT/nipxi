@@ -32,6 +32,7 @@ from utils.errors import (
     SafetyViolationError, RelayError, OperationCancelledError, ReversePolarityError,
     NIPXITimeoutError,
 )
+from utils.event_format import EventType, format_event
 from utils.stop_reason import StopReason
 
 
@@ -400,6 +401,15 @@ class BatteryOperationSequence:
             self.storage.log_event(
                 level="ERROR", source=self.source, channel=channel, relay=relay_address,
                 message=f"Safety violation -- {e}",
+            )
+            # Standardized Hardware Event Logging (see docs/architecture.md)
+            # -- covers every SafetyViolationError source uniformly
+            # (reverse polarity, a real safety.check() limit violation,
+            # battery-removal-during-charge) via this one shared branch,
+            # rather than duplicating the same event at each raise site.
+            self.storage.log_event(
+                level="ERROR", source=self.source, channel=channel, relay=relay_address,
+                message=format_event(EventType.SAFETY_MONITOR_TRIGGERED, reason=str(e)),
             )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.SAFETY_VIOLATION)
             fields = extra_run_summary_fields_fn()

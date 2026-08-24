@@ -81,6 +81,9 @@ class DetectorBoundaryTests(unittest.TestCase):
 class _ScriptedDmm:
     """Returns one voltage per call, in order -- StopIteration if the
     script runs out (a test bug, not a production concern)."""
+    model = "NI-4065"
+    resource = "DMM1"
+
     def __init__(self, voltages):
         self._voltages = list(voltages)
         self._idx = 0
@@ -95,6 +98,9 @@ class _ScriptedSmu:
     """Returns one current per call, in order. voltage_v in the returned
     dict is display-only (see charge_sequence.py) -- never used for a
     decision, so a fixed placeholder is fine here."""
+    model = "PXI-4130"
+    resource = "SMU1"
+
     def __init__(self, currents):
         self._currents = list(currents)
         self._idx = 0
@@ -120,6 +126,8 @@ class _ScriptedSmu:
 
 
 class _FakeRelay:
+    name = "TEST_RELAY_MATRIX"
+
     def close(self, channel):
         pass
 

@@ -67,8 +67,18 @@ class MonitorBatteryWiringTests(_SourceInspectionMixin, unittest.TestCase):
 
 
 class ChargeOrDischargeWiringTests(_SourceInspectionMixin, unittest.TestCase):
+    """
+    The precheck/sequence-construction wiring this class inspects lives in
+    _run_one_charge_or_discharge_position() -- the per-position workflow
+    body extracted from _run_charge_or_discharge() so Group -> ALL
+    orchestration (_run_charge_or_discharge_all_positions()) can call it
+    once per position, without any multi-position logic inside
+    ChargeSequence/DischargeSequence themselves. See docs/architecture.md
+    "Group -> ALL Support".
+    """
+
     def setUp(self):
-        self.src = inspect.getsource(test_module._run_charge_or_discharge)
+        self.src = inspect.getsource(test_module._run_one_charge_or_discharge_position)
         self.lines = self.src.splitlines()
 
     def test_precheck_is_called(self):
@@ -86,8 +96,12 @@ class ChargeOrDischargeWiringTests(_SourceInspectionMixin, unittest.TestCase):
         construct_idx = self._first_index("sequence = sequence_cls(")
         self.assertIsNotNone(gate_idx)
         self.assertIsNotNone(construct_idx)
-        # The nearest "return" after the gate must precede construction.
-        return_idx = next(i for i in range(gate_idx, len(self.lines)) if self.lines[i].strip() == "return")
+        # The nearest "return" after the gate must precede construction --
+        # now returns a classification string ("SKIPPED"), not a bare
+        # return, since this function reports outcomes to its caller.
+        return_idx = next(
+            i for i in range(gate_idx, len(self.lines)) if self.lines[i].strip() == 'return "SKIPPED"'
+        )
         self.assertLess(return_idx, construct_idx)
 
     def test_failure_path_prints_the_presence_precheck_report(self):
@@ -98,6 +112,20 @@ class ChargeOrDischargeWiringTests(_SourceInspectionMixin, unittest.TestCase):
 
     def test_no_longer_calls_the_old_ntc_only_precheck_directly(self):
         self.assertIsNone(self._first_index("ntc_snapshot = _ntc_group_snapshot("))
+
+    def test_returns_every_classification_string_group_all_depends_on(self):
+        # Group -> ALL orchestration depends on this exact vocabulary --
+        # no try/except needed at the loop level. "PASS" is the initial
+        # `result` value (returned via "return result" at the very end,
+        # if nothing overwrites it); the rest appear as either a direct
+        # "return ..." or a "result = ..." assignment later returned the
+        # same way.
+        self.assertIn('result = "PASS"', self.src)
+        self.assertIn('return "FAIL"', self.src)
+        self.assertIn('return "SKIPPED"', self.src)
+        self.assertIn('result = "CANCELLED"', self.src)
+        self.assertIn('result = "FAIL"', self.src)
+        self.assertIn("return result", self.src)
 
 
 if __name__ == "__main__":

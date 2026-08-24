@@ -19,6 +19,7 @@ data_output/ database.
 
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 
@@ -173,6 +174,146 @@ class GetFirstMeasurementTests(MeasurementScopingTestCase):
         self.assertIsNotNone(initial)
         self.assertEqual(initial["phase_detail"], "CC_CV")
         self.assertEqual(initial["dmm_measured_v"], 3.568383)
+
+
+class MatrixRoutingProvenanceColumnsTests(MeasurementScopingTestCase):
+    """
+    Measurement Schema Improvement -- see docs/architecture.md. New,
+    nullable matrix_card/matrix_channel/source/unit columns, added via the
+    existing additive migration mechanism. daq_channel_0_raw must remain
+    untouched (backward compatibility is mandatory, per explicit
+    requirement).
+    """
+
+    def test_new_columns_round_trip(self):
+        row_id = self.storage.record_measurement(
+            test_type="charge", channel=1, phase_detail="NTC_PRECHECK",
+            voltage_v=2.13847, source="NTC", unit="V",
+        )
+        self.assertIsInstance(row_id, int)
+        rows = self.storage.get_measurements(run_id=self.storage.run_id, channel=1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "NTC")
+        self.assertEqual(rows[0]["unit"], "V")
+        self.assertIsNone(rows[0]["matrix_card"])
+        self.assertIsNone(rows[0]["matrix_channel"])
+
+    def test_matrix_card_and_channel_round_trip(self):
+        self.storage.record_measurement(
+            test_type="charge", channel=1, phase_detail="CC_CV",
+            voltage_v=3.7, matrix_card="MATRIX_NUMATO_201", matrix_channel="1",
+            source="BATTERY_VOLTAGE", unit="V",
+        )
+        rows = self.storage.get_measurements(run_id=self.storage.run_id, channel=1)
+        self.assertEqual(rows[0]["matrix_card"], "MATRIX_NUMATO_201")
+        self.assertEqual(rows[0]["matrix_channel"], "1")
+
+    def test_new_columns_default_to_null_when_omitted(self):
+        # Every pre-existing caller that never mentions these fields must
+        # keep working unchanged -- backward compatibility is mandatory.
+        self.storage.record_measurement(
+            test_type="charge", channel=1, phase_detail="CC_CV",
+            voltage_v=3.7, current_a=0.1,
+        )
+        rows = self.storage.get_measurements(run_id=self.storage.run_id, channel=1)
+        self.assertIsNone(rows[0]["matrix_card"])
+        self.assertIsNone(rows[0]["matrix_channel"])
+        self.assertIsNone(rows[0]["source"])
+        self.assertIsNone(rows[0]["unit"])
+
+    def test_daq_channel_0_raw_is_unchanged_and_still_writable(self):
+        self.storage.record_measurement(
+            test_type="monitor_scan", channel=1, phase_detail="CLOSED",
+            daq_channel_0_raw=1.234,
+        )
+        rows = self.storage.get_measurements(run_id=self.storage.run_id, channel=1)
+        self.assertEqual(rows[0]["daq_channel_0_raw"], 1.234)
+
+    def test_existing_measurement_columns_are_not_removed_or_renamed(self):
+        # A representative sample of pre-existing columns must still exist
+        # and be writable, unaffected by this additive migration.
+        self.storage.record_measurement(
+            test_type="charge", channel=1, voltage_v=3.7, current_a=0.1,
+            relay=1, group_name="B1", position_in_group=1,
+            smu_measured_v=3.71, dmm_measured_v=3.70,
+        )
+        rows = self.storage.get_measurements(run_id=self.storage.run_id, channel=1)
+        row = rows[0]
+        for column in ("voltage_v", "current_a", "relay", "group_name",
+                        "position_in_group", "smu_measured_v", "dmm_measured_v"):
+            self.assertIn(column, row)
+
+
+class MigrationFromPreExistingDatabaseTests(unittest.TestCase):
+    """
+    Simulates a real pre-Measurement-Schema-Improvement database (a
+    `measurements` table missing matrix_card/matrix_channel/source/unit)
+    to prove DataStorage.open()'s existing additive-migration mechanism
+    actually adds them -- via ALTER TABLE, never a DROP/rebuild -- and
+    that a pre-existing row's data is completely untouched.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db_path = os.path.join(self._tmpdir, "test.db")
+        settings = type("_TempSettings", (Settings,), {
+            "DATA_DIR": self._tmpdir,
+            "CSV_DIR": os.path.join(self._tmpdir, "csv"),
+            "DATABASE_FILE": self._db_path,
+        })
+        self.settings = settings
+
+        # Build an OLD-shape measurements table (deliberately omits the
+        # four new columns) and insert one pre-existing row, exactly as
+        # if this database predated the Measurement Schema Improvement.
+        conn = sqlite3.connect(self._db_path)
+        conn.execute("""
+            CREATE TABLE measurements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                channel INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                elapsed_s REAL,
+                phase TEXT,
+                voltage_v REAL,
+                current_a REAL,
+                temp_c REAL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO measurements (run_id, channel, timestamp, voltage_v, current_a) "
+            "VALUES ('old-run', 1, '2026-01-01T00:00:00', 3.65, 0.1)"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_open_migrates_old_database_and_preserves_existing_row(self):
+        storage = DataStorage(settings=self.settings)
+        storage.open()
+        try:
+            rows = storage.get_measurements(run_id="old-run", channel=1)
+            self.assertEqual(len(rows), 1)
+            # Pre-existing data is completely untouched.
+            self.assertEqual(rows[0]["voltage_v"], 3.65)
+            self.assertEqual(rows[0]["current_a"], 0.1)
+            # New columns exist and are NULL for this pre-migration row,
+            # never a fabricated default.
+            self.assertIsNone(rows[0]["matrix_card"])
+            self.assertIsNone(rows[0]["matrix_channel"])
+            self.assertIsNone(rows[0]["source"])
+            self.assertIsNone(rows[0]["unit"])
+            # And are now genuinely writable for a NEW row.
+            storage.record_measurement(
+                test_type="charge", channel=1, voltage_v=3.7,
+                matrix_card="MATRIX_NUMATO_201", matrix_channel="1", source="BATTERY_VOLTAGE", unit="V",
+            )
+            new_rows = storage.get_measurements(run_id=storage.run_id, channel=1)
+            self.assertEqual(new_rows[-1]["matrix_card"], "MATRIX_NUMATO_201")
+        finally:
+            storage.close()
 
 
 class GetMeasurementsRecentLimitTests(MeasurementScopingTestCase):

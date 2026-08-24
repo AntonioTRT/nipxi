@@ -81,6 +81,27 @@ class BatteryRemovedDuringChargeError(SafetyViolationError):
     """
 
 
+class DMMMeasurementLostError(SafetyViolationError):
+    """
+    Raised by ChargeSequence's/DischargeSequence's sampling loop when
+    `dmm.measure_dc_voltage()` fails on
+    Settings.DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES consecutive samples
+    -- see docs/architecture.md "Standardized Hardware Event Logging".
+    DMM is the authoritative voltage source for EOC/EOD detection and
+    every safety.check() call in these loops -- unlike an NTC read
+    failure (which only degrades temperature monitoring and is tolerated
+    indefinitely), a DMM that cannot be read at all means voltage safety
+    cannot be verified, which is unsafe per "unknown state = unsafe
+    state". A single transient comms glitch is still given a bounded
+    number of consecutive attempts to resolve (mirroring
+    emergency_output_off()'s own bounded-retry philosophy) before this is
+    raised. Deliberately a SafetyViolationError subclass -- caught by
+    BatteryOperationSequence.run_guarded()'s existing SafetyViolationError
+    branch, triggering the identical SafetyMonitor.emergency_stop()
+    shutdown; no separate shutdown path was introduced for this.
+    """
+
+
 class OperationCancelledError(NIPXIError):
     """
     Raised when a cancellation checkpoint (see utils/cancellation.py) finds

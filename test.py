@@ -34,6 +34,7 @@ from test_control.storage_session import (
     start_run_summary_guarded as _shared_start_run_summary_guarded,
 )
 from test_control.ntc_snapshot import ntc_group_snapshot as _shared_ntc_group_snapshot
+from utils.event_format import EventType, format_event
 
 # Suppress NI driver / serial noise during tests
 logging.disable(logging.CRITICAL)
@@ -3785,13 +3786,32 @@ def _select_battery_group():
     return choice
 
 
-def _select_battery_position(group: str):
+def _select_battery_position(group: str, allow_all: bool = False):
     """Position selection is always relative to the selected group (e.g.
     "Group A Position 3"), never a raw global position number. Bounds-
     checking itself is shared with any future non-interactive caller --
-    see utils/group_hardware.py::validate_position_in_group()."""
+    see utils/group_hardware.py::validate_position_in_group().
+
+    `allow_all` (default False, preserving every existing caller's exact
+    prior behavior unchanged -- Monitor Battery/Monitor Battery Scan
+    still accept only a single explicit position number) -- when True
+    (Charge/Discharge Battery -- see docs/architecture.md "Group -> ALL
+    Support"), the literal string "ALL" (case-insensitive) is also
+    accepted and returned as-is (the string "ALL", never lowercased --
+    callers branch on `position == "ALL"`), instead of only an int.
+    Returns None (same "invalid, no further retry" contract as before)
+    for anything that is neither a valid int in range nor, when allowed,
+    "ALL".
+    """
     size = dev_cfg.group_size(group)
-    choice = input(f"\nPosition within Group {group} (1-{size}): ").strip()
+    prompt = (
+        f"\nPosition within Group {group} (1-{size}, or ALL): "
+        if allow_all else
+        f"\nPosition within Group {group} (1-{size}): "
+    )
+    choice = input(prompt).strip()
+    if allow_all and choice.upper() == "ALL":
+        return "ALL"
     try:
         pos = int(choice)
     except ValueError:
@@ -4412,18 +4432,175 @@ def _run_monitor_battery_scan():
         signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
+def _run_one_charge_or_discharge_position(*, operation, sequence_cls, source, group, hw,
+                                           battery_type, battery_cfg, test_setpoints,
+                                           position, channel, relay_address, ch_cfg,
+                                           hw_mgr, storage, safety, sense_router, sense_channel, token) -> str:
+    """
+    Runs ONE complete Charge/Discharge Battery attempt against a single,
+    already-resolved position -- the shared per-position workflow body
+    used by BOTH the single-position path (_run_charge_or_discharge(),
+    calling this once) and Group -> ALL orchestration
+    (_run_charge_or_discharge_all_positions(), calling this once per
+    enabled position) -- see docs/architecture.md "Group -> ALL Support".
+    Every hardware-connect/storage-open/teardown/confirmation-screen
+    concern stays with the CALLER; this function only does the
+    per-position work: traceability logging, the Battery Presence + NTC
+    Presence pre-check, ChargeSequence/DischargeSequence construction and
+    .run(), and the post-run summary print -- byte-for-byte the same
+    logic this file always had for a single position, just extracted so
+    Group -> ALL can reuse it without any multi-position logic inside
+    ChargeSequence/DischargeSequence themselves (they are never modified).
+
+    `safety`/`sense_router`/`sense_channel` are constructed once by the
+    caller (shared across every position in a Group -> ALL run, since
+    SafetyMonitor is stateless across positions once battery_cfg is set,
+    and reconnecting the sense-routing matrix per position would be
+    wasteful) -- this function never constructs them itself.
+
+    Returns one of "PASS"/"FAIL"/"SKIPPED"/"CANCELLED" -- never raises
+    OperationCancelledError/KeyboardInterrupt/any other exception itself;
+    this function's own try/except (unchanged in shape from the
+    pre-Group-ALL single-position code) classifies every outcome into one
+    of these four strings instead, so a caller looping over positions
+    never needs its own try/except around this call. "CANCELLED" is
+    reserved for an operator-requested stop (Ctrl+C) -- see
+    _run_charge_or_discharge_all_positions()'s docstring for why that
+    result specifically stops the whole group run rather than advancing
+    to the next position.
+    """
+    from test_control.battery_presence_precheck import battery_and_ntc_presence_precheck
+    from utils.errors import OperationCancelledError
+
+    smu_name, smu_cfg = hw["smu_name"], hw["smu_cfg"]
+    dmm_name, dmm_cfg = hw["dmm_name"], hw["dmm_cfg"]
+    daq_name, daq_cfg = hw["daq_name"], hw["daq_cfg"]
+    relay_cfg = hw["relay_matrix_cfg"]
+
+    # CRITICAL traceability requirement: every selected-configuration
+    # fact is recorded via event_log BEFORE relay activation/PSU
+    # output -- same requirement as _run_monitor_battery().
+    hardware_snapshot = _hardware_snapshot_fields(
+        smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
+    )
+    if not _start_run_summary_guarded(
+        storage, test_type=source,
+        battery_type=battery_type,
+        battery_voltage_max_v=battery_cfg["voltage_max_v"],
+        battery_voltage_min_v=battery_cfg["voltage_min_v"],
+        battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
+        battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
+        capacity_ah=battery_cfg["capacity_ah"],
+        group_name=group, position_in_group=position,
+        **hardware_snapshot,
+    ):
+        return "FAIL"
+    storage.log_event(level="INFO", source=source, message="Run started")
+    storage.log_event(level="INFO", source=source, message=f"Operation selected: {operation}")
+    storage.log_event(level="INFO", source=source, message=f"Battery selected: {battery_type}")
+    storage.log_event(level="INFO", source=source,
+                       message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
+    storage.log_event(level="INFO", source=source, message=f"Group selected: {group}")
+    storage.log_event(level="INFO", source=source,
+                       channel=channel, relay=relay_address,
+                       message=f"Position selected: {position} (Group {group} Position {position})")
+    storage.log_event(level="INFO", source=source, message="Configuration snapshot recorded")
+    storage.log_event(level="INFO", source=source, message="Hardware assignment resolved")
+    storage.log_event(level="INFO", source=source, message=f"Relay matrix selected: {hw['relay_matrix_name']}")
+    storage.log_event(level="INFO", source=source, message=f"SMU selected: {smu_name}")
+    storage.log_event(level="INFO", source=source, message=f"DMM selected: {dmm_name}")
+    storage.log_event(level="INFO", source=source, message=f"DAQ selected: {daq_name}")
+    if hw.get("ntc_daq_name"):
+        storage.log_event(level="INFO", source=source,
+                           message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
+    storage.log_event(level="INFO", source=source, message="Operator confirmed execution")
+    for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
+        storage.log_event(level="INFO", source=source, message=message)
+
+    # Battery Presence + NTC Presence pre-check -- BEFORE the target
+    # relay closes for the real run (see
+    # test_control/battery_presence_precheck.py and
+    # docs/architecture.md "Battery Presence + NTC Presence
+    # Diagnostics"). Closes/reopens the relay itself for a passive
+    # DMM read (the SMU's output is never enabled at this point --
+    # sequence_cls hasn't even been constructed yet), then runs the
+    # same group NTC snapshot this pre-check has always used.
+    # Measurement rows use the SAME short test_type
+    # ChargeSequence/DischargeSequence's own sampling-loop rows
+    # already use ("charge"/"discharge", not
+    # "charge_battery"/"discharge_battery") so this run's
+    # measurements stay internally consistent -- see
+    # docs/architecture.md Section 46 for the pre-existing
+    # run_summary-vs-measurements vocabulary split this deliberately
+    # does not add a third variant to. Aborts only on a REAL,
+    # READABLE absent/fault signal -- a DMM/DAQ comms failure
+    # degrades gracefully (not treated as "missing"). A reversed-
+    # polarity voltage reading is never treated as "missing" here --
+    # see the module's own docstring for why.
+    size = dev_cfg.group_size(group)
+    measurement_test_type = {"charge_battery": "charge", "discharge_battery": "discharge"}.get(source, source)
+    precheck = battery_and_ntc_presence_precheck(
+        storage=storage, dmm=hw_mgr.dmm, relay=hw_mgr.relay, ntc_daq=hw_mgr.ntc_daq,
+        group=group, size=size, position=position, channel=channel,
+        relay_address=relay_address, source=source, measurement_test_type=measurement_test_type,
+    )
+    if not precheck["ok"]:
+        storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
+        storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
+        _print_presence_precheck_failure(precheck)
+        print(f"\n[FAIL] Pre-check failed for the selected position -- aborting, "
+              f"relay returned to open. No {operation.lower()} started.")
+        return "SKIPPED"
+
+    print(f"\nPress Ctrl+C to stop {operation.lower()} safely.\n")
+
+    # daq=hw_mgr.ntc_daq -- this group's NTC/temperature DAQ (see
+    # docs/architecture.md "Dual DAQ Ownership Model"), NOT the
+    # group's general daq_cfg -- ChargeSequence/DischargeSequence
+    # still use the DMM/SMU for voltage/current telemetry.
+    sequence = sequence_cls(
+        smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.ntc_daq, relay=hw_mgr.relay,
+        safety=safety, storage=storage, settings=Settings, group_name=group,
+        ntc_daq_name=hw["ntc_daq_name"],
+        sense_router=sense_router, sense_channel=sense_channel,
+    )
+    result = "PASS"
+    try:
+        sequence.run(
+            channel=channel, relay_address=relay_address,
+            battery_cfg=battery_cfg, test_setpoints=test_setpoints,
+            ntc_channel=ch_cfg.get("daq_ntc_ch"), token=token,
+        )
+        print(f"\n{operation} complete.")
+    except OperationCancelledError:
+        print(f"\n{operation} stopped by operator -- hardware is in a verified safe state.")
+        result = "CANCELLED"
+    except KeyboardInterrupt:
+        print(f"\n{operation} interrupted by user (Ctrl+C).")
+        result = "CANCELLED"
+    except Exception as e:
+        print(f"\n[FAIL] {operation} aborted: {e}")
+        result = "FAIL"
+
+    _print_post_run_summary(storage)
+    return result
+
+
 def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_line_fn):
     """
     Shared workflow for Charge Battery / Discharge Battery -- both are the
     same skeleton as _run_monitor_battery() (select group + hardware
     summary via _select_group_with_hardware_summary() -> select position
-    -> validate group test configuration (derives battery type from the
-    group -- see docs/architecture.md "Battery Group Test Configuration
-    Architecture") -> confirmation screen -> traceability -> ChargeSequence/
-    DischargeSequence.run()) with only the sequence class, event-log
-    source name, and confirmation-screen setpoint line differing --
-    factored here once rather than duplicating the whole workflow twice.
-    Built on BatteryOperationSequence (test_control/
+    (a single position, or ALL -- see docs/architecture.md "Group -> ALL
+    Support", which delegates to _run_charge_or_discharge_all_positions()
+    and returns) -> validate group test configuration (derives battery
+    type from the group -- see docs/architecture.md "Battery Group Test
+    Configuration Architecture") -> confirmation screen -> traceability ->
+    ChargeSequence/DischargeSequence.run(), via
+    _run_one_charge_or_discharge_position()) with only the sequence
+    class, event-log source name, and confirmation-screen setpoint line
+    differing -- factored here once rather than duplicating the whole
+    workflow twice. Built on BatteryOperationSequence (test_control/
     battery_operation_sequence.py) via `sequence_cls` -- never
     TestExecutor/BatteryTestSequence, and never a second workflow
     architecture (see docs/architecture.md Section 35).
@@ -4442,13 +4619,12 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
     print(operation.upper())
 
     import signal
-    from test_control.battery_presence_precheck import battery_and_ntc_presence_precheck
     from test_control.hardware_manager import HardwareManager
     from test_control.safety_monitor import SafetyMonitor
     from utils.cancellation import CancellationToken, install_sigint_handler
     from utils.errors import (
         ConfigurationError, GroupConfigurationError, HardwareConfigurationError,
-        HardwareInitError, OperationCancelledError,
+        HardwareInitError,
     )
     from utils.validators import validate_group_test_config
 
@@ -4457,7 +4633,7 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         return
     group, hw, battery_type, battery_cfg = selection
 
-    position = _select_battery_position(group)
+    position = _select_battery_position(group, allow_all=True)
     if position is None:
         return
 
@@ -4477,6 +4653,14 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         print(f"\n[FAIL] {type(e).__name__}: {e}\nAborting, no hardware activated.")
         return
     test_setpoints = validated["test_setpoints"]
+
+    if position == "ALL":
+        _run_charge_or_discharge_all_positions(
+            operation=operation, sequence_cls=sequence_cls, source=source, limit_line_fn=limit_line_fn,
+            group=group, hw=hw, battery_type=battery_type, battery_cfg=battery_cfg,
+            test_setpoints=test_setpoints,
+        )
+        return
 
     ch_cfg = dev_cfg.BATTERY_GROUPS[group]["positions"].get(position)
     if ch_cfg is None:
@@ -4499,9 +4683,9 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         return
 
     relay_cfg = hw["relay_matrix_cfg"]
-    smu_name, smu_cfg = hw["smu_name"], hw["smu_cfg"]
-    dmm_name, dmm_cfg = hw["dmm_name"], hw["dmm_cfg"]
-    daq_name, daq_cfg = hw["daq_name"], hw["daq_cfg"]
+    smu_cfg = hw["smu_cfg"]
+    dmm_cfg = hw["dmm_cfg"]
+    daq_cfg = hw["daq_cfg"]
     print("\nSelected Hardware\n")
     print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
     print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}\n  {smu_cfg.get('resource', '')}\n")
@@ -4536,120 +4720,230 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         # nothing changes for any group without one.
         sense_router = None
         try:
-            # CRITICAL traceability requirement: every selected-configuration
-            # fact is recorded via event_log BEFORE relay activation/PSU
-            # output -- same requirement as _run_monitor_battery().
-            hardware_snapshot = _hardware_snapshot_fields(
-                smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq_cfg, relay_cfg,
-            )
-            if not _start_run_summary_guarded(
-                storage, test_type=source,
-                battery_type=battery_type,
-                battery_voltage_max_v=battery_cfg["voltage_max_v"],
-                battery_voltage_min_v=battery_cfg["voltage_min_v"],
-                battery_charge_current_limit_a=battery_cfg["max_charge_current_a"],
-                battery_discharge_current_limit_a=battery_cfg["max_discharge_current_a"],
-                capacity_ah=battery_cfg["capacity_ah"],
-                group_name=group, position_in_group=position,
-                **hardware_snapshot,
-            ):
-                return
-            storage.log_event(level="INFO", source=source, message="Run started")
-            storage.log_event(level="INFO", source=source, message=f"Operation selected: {operation}")
-            storage.log_event(level="INFO", source=source, message=f"Battery selected: {battery_type}")
-            storage.log_event(level="INFO", source=source,
-                               message=f"Battery capacity: {battery_cfg['capacity_ah'] * 1000:.0f} mAh")
-            storage.log_event(level="INFO", source=source, message=f"Group selected: {group}")
-            storage.log_event(level="INFO", source=source,
-                               channel=channel, relay=relay_address,
-                               message=f"Position selected: {position} (Group {group} Position {position})")
-            storage.log_event(level="INFO", source=source, message="Configuration snapshot recorded")
-            storage.log_event(level="INFO", source=source, message="Hardware assignment resolved")
-            storage.log_event(level="INFO", source=source, message=f"Relay matrix selected: {hw['relay_matrix_name']}")
-            storage.log_event(level="INFO", source=source, message=f"SMU selected: {smu_name}")
-            storage.log_event(level="INFO", source=source, message=f"DMM selected: {dmm_name}")
-            storage.log_event(level="INFO", source=source, message=f"DAQ selected: {daq_name}")
-            if hw.get("ntc_daq_name"):
-                storage.log_event(level="INFO", source=source,
-                                   message=f"NTC DAQ selected: {hw['ntc_daq_name']}")
-            storage.log_event(level="INFO", source=source, message="Operator confirmed execution")
-            for message in dev_cfg.hardware_traceability_messages(hardware_snapshot):
-                storage.log_event(level="INFO", source=source, message=message)
-
-            # Battery Presence + NTC Presence pre-check -- BEFORE the target
-            # relay closes for the real run (see
-            # test_control/battery_presence_precheck.py and
-            # docs/architecture.md "Battery Presence + NTC Presence
-            # Diagnostics"). Closes/reopens the relay itself for a passive
-            # DMM read (the SMU's output is never enabled at this point --
-            # sequence_cls hasn't even been constructed yet), then runs the
-            # same group NTC snapshot this pre-check has always used.
-            # Measurement rows use the SAME short test_type
-            # ChargeSequence/DischargeSequence's own sampling-loop rows
-            # already use ("charge"/"discharge", not
-            # "charge_battery"/"discharge_battery") so this run's
-            # measurements stay internally consistent -- see
-            # docs/architecture.md Section 46 for the pre-existing
-            # run_summary-vs-measurements vocabulary split this deliberately
-            # does not add a third variant to. Aborts only on a REAL,
-            # READABLE absent/fault signal -- a DMM/DAQ comms failure
-            # degrades gracefully (not treated as "missing"). A reversed-
-            # polarity voltage reading is never treated as "missing" here --
-            # see the module's own docstring for why.
-            size = dev_cfg.group_size(group)
-            measurement_test_type = {"charge_battery": "charge", "discharge_battery": "discharge"}.get(source, source)
-            precheck = battery_and_ntc_presence_precheck(
-                storage=storage, dmm=hw_mgr.dmm, relay=hw_mgr.relay, ntc_daq=hw_mgr.ntc_daq,
-                group=group, size=size, position=position, channel=channel,
-                relay_address=relay_address, source=source, measurement_test_type=measurement_test_type,
-            )
-            if not precheck["ok"]:
-                storage.record_execution_state(channel=channel, relay=relay_address, state="SAFETY_VIOLATION")
-                storage.finish_run_summary(stop_reason="SAFETY_VIOLATION", result="FAIL")
-                _print_presence_precheck_failure(precheck)
-                print(f"\n[FAIL] Pre-check failed for the selected position -- aborting, "
-                      f"relay returned to open. No {operation.lower()} started.")
-                return
-
-            print(f"\nPress Ctrl+C to stop {operation.lower()} safely.\n")
-
             safety = SafetyMonitor(Settings)
-            # Battery sense routing -- FUTURE PLANNED ARCHITECTURE, see
-            # docs/architecture.md "Future Architecture: Battery Sense
-            # Routing". hw["sense_channel"] is None for every group today
-            # (no group declares "sense_channel"), so sense_router stays
-            # None and ChargeSequence/DischargeSequence's DMM reads are
-            # byte-for-byte unchanged from before this existed.
             sense_channel = hw.get("sense_channel")
             if sense_channel is not None:
                 from hardware.sense_router import ConfigDrivenSenseRouter
                 sense_router = ConfigDrivenSenseRouter()
 
-            # daq=hw_mgr.ntc_daq -- this group's NTC/temperature DAQ (see
-            # docs/architecture.md "Dual DAQ Ownership Model"), NOT the
-            # group's general daq_cfg -- ChargeSequence/DischargeSequence
-            # still use the DMM/SMU for voltage/current telemetry.
-            sequence = sequence_cls(
-                smu=hw_mgr.smu, dmm=hw_mgr.dmm, daq=hw_mgr.ntc_daq, relay=hw_mgr.relay,
-                safety=safety, storage=storage, settings=Settings, group_name=group,
-                ntc_daq_name=hw["ntc_daq_name"],
-                sense_router=sense_router, sense_channel=sense_channel,
+            _run_one_charge_or_discharge_position(
+                operation=operation, sequence_cls=sequence_cls, source=source,
+                group=group, hw=hw, battery_type=battery_type, battery_cfg=battery_cfg,
+                test_setpoints=test_setpoints, position=position, channel=channel,
+                relay_address=relay_address, ch_cfg=ch_cfg, hw_mgr=hw_mgr, storage=storage,
+                safety=safety, sense_router=sense_router, sense_channel=sense_channel, token=token,
             )
-            try:
-                sequence.run(
-                    channel=channel, relay_address=relay_address,
-                    battery_cfg=battery_cfg, test_setpoints=test_setpoints,
-                    ntc_channel=ch_cfg.get("daq_ntc_ch"), token=token,
-                )
-                print(f"\n{operation} complete.")
-            except OperationCancelledError:
-                print(f"\n{operation} stopped by operator -- hardware is in a verified safe state.")
-            except KeyboardInterrupt:
-                print(f"\n{operation} interrupted by user (Ctrl+C).")
-            except Exception as e:
-                print(f"\n[FAIL] {operation} aborted: {e}")
 
-            _print_post_run_summary(storage)
+        finally:
+            if sense_router is not None:
+                try:
+                    sense_router.shutdown()
+                except Exception as e:
+                    print(f"[WARNING] Sense router shutdown failed: {e}")
+            try:
+                storage.close()
+            except Exception as e:
+                print(f"[WARNING] Storage close failed: {e}")
+            try:
+                hw_mgr.disconnect_all()
+            except Exception as shutdown_err:
+                print(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+                print("           Hardware may still be energized -- "
+                      "physically disconnect power if this cannot be resolved immediately.")
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+
+
+def _print_group_run_summary(group: str, operation: str, positions: list, results: dict, cancelled: bool):
+    """
+    Informational aggregate summary for a Group -> ALL run -- see
+    docs/architecture.md "Group -> ALL Support". The AUTHORITATIVE record
+    remains each position's own independent run_summary row (see
+    _run_charge_or_discharge_all_positions()); this is a console-only
+    rollup, never persisted as a substitute for those rows -- there is no
+    new DB table/row for "the group run as a whole".
+    """
+    processed = len(results)
+    passed = sum(1 for r in results.values() if r == "PASS")
+    failed = sum(1 for r in results.values() if r == "FAIL")
+    skipped = sum(1 for r in results.values() if r == "SKIPPED")
+    print("\n" + "=" * 60)
+    print(f"Group {group} -- {operation} -- ALL Positions Summary")
+    print("=" * 60)
+    for position in positions:
+        print(f"  Position {position}: {results.get(position, 'NOT ATTEMPTED')}")
+    print("-" * 60)
+    print(f"Processed: {processed}")
+    print(f"Passed:    {passed}")
+    print(f"Failed:    {failed}")
+    print(f"Skipped:   {skipped}")
+    if cancelled:
+        print("Cancelled: operator stopped the run before all positions were attempted")
+    print("=" * 60)
+
+
+def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, limit_line_fn,
+                                            group, hw, battery_type, battery_cfg, test_setpoints):
+    """
+    Group -> ALL orchestration for Charge/Discharge Battery -- see
+    docs/architecture.md "Group -> ALL Support". Loops ONLY at this
+    level: ChargeSequence/DischargeSequence are never modified and are
+    constructed fresh, once per position, inside
+    _run_one_charge_or_discharge_position() -- the exact same
+    per-position workflow the single-position path
+    (_run_charge_or_discharge()) uses, unmodified. Hardware connect/
+    storage open/SIGINT handler/teardown happen ONCE for the whole group
+    run, not once per position -- mirrors the single-position path's own
+    "connect once" lifecycle, just with a loop over positions inside it.
+
+    Storage design (explicit decision): each ENABLED position gets its
+    own independent run_summary row -- a fresh run_id via
+    storage.begin_new_run_id(suffix=f"pos{position}") before every
+    position -- never collapsed into one row. The per-position
+    run_summary row is the AUTHORITATIVE record; the aggregate printed at
+    the end (_print_group_run_summary()) is informational console output
+    only.
+
+    Empty/absent positions: the existing Battery Presence + NTC Presence
+    pre-check (unchanged, called from
+    _run_one_charge_or_discharge_position()) runs for every position
+    exactly as it already does for a single position -- a SKIPPED result
+    is logged and the loop continues to the next position, never failing
+    the whole group run over one empty slot.
+
+    Failures: a FAIL result (any exception other than an operator
+    cancellation) does NOT stop the loop -- the position's own safety
+    shutdown has already run (inside run_guarded(), unchanged) by the
+    time _run_one_charge_or_discharge_position() returns, so the hardware
+    is already back in a verified-safe state before the next position's
+    relay ever closes. A CANCELLED result (operator Ctrl+C) DOES stop the
+    loop -- an operator pressing Ctrl+C during a group run is asking to
+    stop the whole run, not skip to the next battery.
+
+    `positions` (the loop scope) is every position in
+    config/devices.py::BATTERY_GROUPS[group]["positions"] whose own
+    "enabled" flag is True -- a disabled/unwired position is never
+    attempted at all (not even as a SKIPPED result), matching how the
+    rest of this codebase already treats "enabled": False.
+    """
+    import signal
+    from test_control.hardware_manager import HardwareManager
+    from test_control.safety_monitor import SafetyMonitor
+    from utils.cancellation import CancellationToken, install_sigint_handler
+    from utils.errors import HardwareInitError
+
+    positions = sorted(
+        p for p, cfg in dev_cfg.BATTERY_GROUPS[group]["positions"].items() if cfg.get("enabled")
+    )
+    if not positions:
+        print(f"\n[FAIL] Group {group} has no enabled positions -- nothing to run.")
+        return
+
+    positions_label = f"ALL ({len(positions)} enabled position(s): {', '.join(str(p) for p in positions)})"
+    extra_lines = [
+        f"\nMax Voltage:\n{battery_cfg['voltage_max_v']:.2f} V   "
+        f"Min Voltage: {battery_cfg['voltage_min_v']:.2f} V",
+        limit_line_fn(test_setpoints),
+        f"\nMax Temperature:\n{battery_cfg['max_temp_c']:.1f} C",
+    ]
+    if not _confirm_operation(f"{operation} (ALL positions)", battery_type, battery_cfg, group,
+                               positions_label, hw, extra_lines=extra_lines):
+        print("\nCancelled -- no relay activated.")
+        return
+
+    relay_cfg = hw["relay_matrix_cfg"]
+    smu_cfg = hw["smu_cfg"]
+    dmm_cfg = hw["dmm_cfg"]
+    daq_cfg = hw["daq_cfg"]
+    print("\nSelected Hardware\n")
+    print(f"Relay:\n  {dev_cfg.device_display_name(relay_cfg)}  \n  {relay_cfg.get('ip', '')}\n")
+    print(f"SMU:\n  {dev_cfg.device_display_name(smu_cfg)}\n  {smu_cfg.get('resource', '')}\n")
+    print(f"DMM (telemetry source):\n  {dev_cfg.device_display_name(dmm_cfg)}\n  {dmm_cfg.get('resource', '')}\n")
+
+    token = CancellationToken(owner=f"test.py:_run_charge_or_discharge_all_positions:{source}")
+    previous_sigint_handler = install_sigint_handler(
+        token, owner=f"test.py:_run_charge_or_discharge_all_positions:{source}"
+    )
+    try:
+        hw_mgr = HardwareManager(Settings, relay_cfg=relay_cfg, smu_cfg=smu_cfg, daq_cfg=daq_cfg,
+                                 dmm_cfg=dmm_cfg, ntc_daq_cfg=hw["ntc_daq_cfg"])
+        try:
+            hw_mgr.connect_all()
+        except HardwareInitError as e:
+            print(f"[FAIL] Hardware initialization failed: {e}")
+            return
+
+        storage = _open_storage_guarded(hw_mgr)
+        if storage is None:
+            return
+
+        sense_router = None
+        try:
+            safety = SafetyMonitor(Settings)
+            sense_channel = hw.get("sense_channel")
+            if sense_channel is not None:
+                from hardware.sense_router import ConfigDrivenSenseRouter
+                sense_router = ConfigDrivenSenseRouter()
+
+            storage.log_event(
+                level="INFO", source=source,
+                message=format_event(EventType.GROUP_RUN_STARTED, group=group, positions=len(positions)),
+            )
+
+            results = {}
+            cancelled = False
+            for position in positions:
+                ch_cfg = dev_cfg.BATTERY_GROUPS[group]["positions"].get(position)
+                if ch_cfg is None:
+                    continue
+                relay_address = ch_cfg["relay_address"]
+                channel = position
+
+                # Independent run_summary row per position -- see this
+                # function's own docstring "Storage design".
+                storage.begin_new_run_id(suffix=f"pos{position}")
+                storage.log_event(
+                    level="INFO", source=source, channel=channel, relay=relay_address,
+                    message=format_event(EventType.GROUP_SLOT_STARTED, group=group, position=position),
+                )
+                print(f"\n=== Group {group} Position {position} ({operation}) ===")
+
+                result = _run_one_charge_or_discharge_position(
+                    operation=operation, sequence_cls=sequence_cls, source=source,
+                    group=group, hw=hw, battery_type=battery_type, battery_cfg=battery_cfg,
+                    test_setpoints=test_setpoints, position=position, channel=channel,
+                    relay_address=relay_address, ch_cfg=ch_cfg, hw_mgr=hw_mgr, storage=storage,
+                    safety=safety, sense_router=sense_router, sense_channel=sense_channel, token=token,
+                )
+                results[position] = result
+
+                slot_event_type = {
+                    "PASS": EventType.GROUP_SLOT_COMPLETED, "FAIL": EventType.GROUP_SLOT_FAILED,
+                    "SKIPPED": EventType.GROUP_SLOT_SKIPPED, "CANCELLED": EventType.GROUP_SLOT_FAILED,
+                }[result]
+                storage.log_event(
+                    level="INFO" if result in ("PASS", "SKIPPED") else "ERROR",
+                    source=source, channel=channel, relay=relay_address,
+                    message=format_event(slot_event_type, group=group, position=position, result=result),
+                )
+
+                if result == "CANCELLED":
+                    cancelled = True
+                    print(f"\nOperator cancellation -- stopping Group {group} ALL-positions run "
+                          f"(remaining positions not attempted).")
+                    break
+
+            storage.log_event(
+                level="INFO", source=source,
+                message=format_event(
+                    EventType.GROUP_RUN_COMPLETED, group=group,
+                    processed=len(results), passed=sum(1 for r in results.values() if r == "PASS"),
+                    failed=sum(1 for r in results.values() if r == "FAIL"),
+                    skipped=sum(1 for r in results.values() if r == "SKIPPED"),
+                    cancelled=cancelled,
+                ),
+            )
+            _print_group_run_summary(group, operation, positions, results, cancelled)
 
         finally:
             if sense_router is not None:

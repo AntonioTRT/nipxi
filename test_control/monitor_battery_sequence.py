@@ -86,6 +86,7 @@ from test_control.battery_operation_sequence import BatteryOperationSequence
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import DAQError, SafetyViolationError
+from utils.event_format import EventType, format_event
 
 
 class _VoltageStats:
@@ -177,6 +178,12 @@ class MonitorBatterySequence(BatteryOperationSequence):
             self.storage.log_event(
                 level="INFO", source="monitor_battery", channel=channel, relay=relay_address,
                 message=f"Relay {relay_address} activated -- monitoring started",
+            )
+            self.storage.log_event(
+                level="INFO", source="monitor_battery", channel=channel, relay=relay_address,
+                message=format_event(
+                    EventType.RELAY_CLOSE, relay_matrix_name=self.relay.name, relay_address=relay_address,
+                ),
             )
             self.storage.log_event(
                 level="INFO", source="monitor_battery",

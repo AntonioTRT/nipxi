@@ -243,6 +243,19 @@ class NumatoRelayMatrix(RelayBase):
                 f"NUMATO_RELAY_MATRIX_CONFIG missing 'ip' for Numato relay matrix '{self.name}'"
             )
 
+    @property
+    def host(self) -> str:
+        """Read-only -- configured IP/hostname, for event-log/traceability
+        provenance (see docs/architecture.md "Standardized Hardware Event
+        Logging")."""
+        return self._host
+
+    @property
+    def port(self) -> int:
+        """Read-only -- configured TCP port, for the same provenance
+        purpose as `host` above."""
+        return self._port
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------

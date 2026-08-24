@@ -49,6 +49,9 @@ class _RecordingSenseRouter:
 
 
 class _FakeSmu:
+    model = "PXI-4130"
+    resource = "SMU1"
+
     def __init__(self):
         self.enabled = False
 
@@ -70,6 +73,8 @@ class _FakeSmu:
 
 
 class _FakeRelay:
+    name = "TEST_RELAY_MATRIX"
+
     def close(self, channel):
         pass
 

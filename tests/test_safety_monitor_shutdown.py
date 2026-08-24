@@ -130,7 +130,10 @@ class ShutdownTraceOnEventTests(unittest.TestCase):
         events = []
         SafetyMonitor(Settings).emergency_stop(smu, relay, "test reason", on_event=events.append)
         self.assertIn("relay_matrix.open_all executed", events)
-        self.assertEqual(events[-1], "shutdown completed")
+        self.assertIn("shutdown completed", events)
+        # The standardized EVENT_TYPE=... line is now the final event --
+        # see docs/architecture.md "Standardized Hardware Event Logging".
+        self.assertTrue(events[-1].startswith("EVENT_TYPE=EMERGENCY_STOP_COMPLETED"))
 
     def test_emergency_stop_reports_relay_open_failure(self):
         smu = _FakeSmu()
@@ -138,7 +141,8 @@ class ShutdownTraceOnEventTests(unittest.TestCase):
         events = []
         SafetyMonitor(Settings).emergency_stop(smu, relay, "test reason", on_event=events.append)
         self.assertTrue(any(e.startswith("relay_matrix.open_all FAILED") for e in events))
-        self.assertEqual(events[-1], "shutdown completed")
+        self.assertIn("shutdown completed", events)
+        self.assertTrue(events[-1].startswith("EVENT_TYPE=EMERGENCY_STOP_COMPLETED"))
 
     def test_emergency_stop_forwards_on_event_into_smu_calls(self):
         smu = _FakeSmu()
@@ -154,7 +158,8 @@ class ShutdownTraceOnEventTests(unittest.TestCase):
         events = []
         SafetyMonitor(Settings).safe_cancel_shutdown(smu, relay, "operator cancel", on_event=events.append)
         self.assertIn("relay_matrix.open_all executed", events)
-        self.assertEqual(events[-1], "shutdown completed")
+        self.assertIn("shutdown completed", events)
+        self.assertTrue(events[-1].startswith("EVENT_TYPE=EMERGENCY_STOP_COMPLETED"))
 
     def test_on_event_defaults_to_none_and_is_optional(self):
         # Existing/other callers that don't pass on_event at all must be

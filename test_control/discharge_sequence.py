@@ -95,12 +95,16 @@ code review, before any new detection was added for charge.
 
 import time
 
+import config.devices as dev_cfg
 from config.settings import Settings
 from hardware.temperature import NTCPresence, classify_ntc_presence, ntc_voltage_to_celsius
 from test_control.battery_operation_sequence import BatteryOperationSequence, _ChargeDischargeStats
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
-from utils.errors import DAQError, NIPXITimeoutError, SafetyViolationError, ReversePolarityError
+from utils.errors import (
+    DAQError, DMMMeasurementLostError, NIPXITimeoutError, SafetyViolationError, ReversePolarityError,
+)
+from utils.event_format import EventType, format_event
 
 
 class DischargeSequence(BatteryOperationSequence):
@@ -202,6 +206,12 @@ class DischargeSequence(BatteryOperationSequence):
                         f"({current_a:.3f} A sink, {compliance_voltage_v:.3f} V SMU compliance, "
                         f"{cutoff_v:.3f} V EOD cutoff)",
             )
+            self.storage.log_event(
+                level="INFO", source="discharge_battery", channel=channel, relay=relay_address,
+                message=format_event(
+                    EventType.RELAY_CLOSE, relay_matrix_name=self.relay.name, relay_address=relay_address,
+                ),
+            )
             self.storage.record_execution_state(channel=channel, relay=relay_address, state="ACTIVE")
 
             # Sense-channel connect -- see charge_sequence.py's identical
@@ -211,6 +221,15 @@ class DischargeSequence(BatteryOperationSequence):
             # disconnect via the try/finally below on every exit path.
             if self.sense_channel is not None:
                 self.sense_router.connect(self.sense_channel)
+                sense_route = dev_cfg.SENSE_ROUTING.get(self.sense_channel, {})
+                self.storage.log_event(
+                    level="INFO", source="discharge_battery", channel=channel, relay=relay_address,
+                    message=format_event(
+                        EventType.MATRIX_ROUTE_APPLIED,
+                        matrix_name=sense_route.get("relay_matrix"), matrix_channel=sense_route.get("relay"),
+                        source="DMM", destination=f"channel_{self.sense_channel}",
+                    ),
+                )
             try:
                 # Pre-output-enable reverse-polarity sanity check -- Relay
                 # Selection -> Battery Voltage Measurement (DMM) -> Sanity
@@ -234,6 +253,13 @@ class DischargeSequence(BatteryOperationSequence):
 
                 self.smu.set_discharge_mode(current_a=current_a, voltage_limit_v=compliance_voltage_v)
                 self.smu.output_enable()
+                self.storage.log_event(
+                    level="INFO", source="discharge_battery", channel=channel, relay=relay_address,
+                    message=format_event(
+                        EventType.SMU_OUTPUT_ENABLED, device=self.smu.model,
+                        resource=self.smu.resource, channel=channel,
+                    ),
+                )
 
                 nonlocal last_ntc_state
                 try:
@@ -248,6 +274,12 @@ class DischargeSequence(BatteryOperationSequence):
                     # constructed.
                     discharge_timeout_s = test_setpoints.get("discharge_timeout_s", self.s.DISCHARGE_TIMEOUT_S)
 
+                    # Standardized Hardware Event Logging -- DMM_MEASUREMENT_
+                    # FAILED/_RECOVERED -- see charge_sequence.py's identical
+                    # rationale and docs/architecture.md "Standardized
+                    # Hardware Event Logging".
+                    consecutive_dmm_failures = 0
+
                     while True:
                         check_cancellation(token)
 
@@ -260,7 +292,35 @@ class DischargeSequence(BatteryOperationSequence):
                         # Telemetry: DMM for voltage, SMU's own ADC readback for
                         # current -- see charge_sequence.py's identical rationale.
                         smu_reading = self.smu.measure()
-                        dmm_v = self.dmm.measure_dc_voltage()
+                        try:
+                            dmm_v = self.dmm.measure_dc_voltage()
+                        except Exception as e:
+                            consecutive_dmm_failures += 1
+                            self.storage.log_event(
+                                level="WARNING", source="discharge_battery", channel=channel, relay=relay_address,
+                                message=format_event(
+                                    EventType.DMM_MEASUREMENT_FAILED, device=self.dmm.model,
+                                    resource=self.dmm.resource, attempt=consecutive_dmm_failures,
+                                    max_attempts=self.s.DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES,
+                                    error=str(e),
+                                ),
+                            )
+                            if consecutive_dmm_failures >= self.s.DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES:
+                                raise DMMMeasurementLostError(
+                                    f"Channel {channel}: DMM measurement failed "
+                                    f"{consecutive_dmm_failures} consecutive times -- {e}"
+                                ) from e
+                            interruptible_sleep(dt, token=token)
+                            continue
+                        if consecutive_dmm_failures > 0:
+                            self.storage.log_event(
+                                level="INFO", source="discharge_battery", channel=channel, relay=relay_address,
+                                message=format_event(
+                                    EventType.DMM_MEASUREMENT_RECOVERED, device=self.dmm.model,
+                                    resource=self.dmm.resource, after_failures=consecutive_dmm_failures,
+                                ),
+                            )
+                            consecutive_dmm_failures = 0
                         v = dmm_v
                         i = smu_reading["current_a"]
                         stats.add(v, i)
@@ -319,13 +379,23 @@ class DischargeSequence(BatteryOperationSequence):
                         interruptible_sleep(dt, token=token)
                 finally:
                     on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
-                    if not self.smu.emergency_output_off(
+                    smu_disabled_ok = self.smu.emergency_output_off(
                         f"end of discharge sequence on channel {channel}", on_event=on_event,
-                    ):
+                    )
+                    if not smu_disabled_ok:
                         self.log.critical(
                             "Channel %d: PMU output could not be verified OFF after discharge sequence.",
                             channel,
                         )
+                    self.storage.log_event(
+                        level="INFO" if smu_disabled_ok else "CRITICAL",
+                        source="discharge_battery", channel=channel, relay=relay_address,
+                        message=format_event(
+                            EventType.SMU_OUTPUT_DISABLED, device=self.smu.model,
+                            resource=self.smu.resource, channel=channel,
+                            verified=smu_disabled_ok,
+                        ),
+                    )
 
                 # Relay open only AFTER the PMU output is confirmed off (the
                 # finally above) -- never switch a relay while current might
@@ -341,6 +411,12 @@ class DischargeSequence(BatteryOperationSequence):
                 self.storage.log_event(
                     level="INFO", source="discharge_battery", channel=channel, relay=relay_address,
                     message=f"Relay {relay_address} deactivated -- discharge complete",
+                )
+                self.storage.log_event(
+                    level="INFO", source="discharge_battery", channel=channel, relay=relay_address,
+                    message=format_event(
+                        EventType.RELAY_OPEN, relay_matrix_name=self.relay.name, relay_address=relay_address,
+                    ),
                 )
                 # Post-isolation defense-in-depth, not safety-critical -- the
                 # battery is already isolated by the relay.open() above, so
@@ -361,6 +437,15 @@ class DischargeSequence(BatteryOperationSequence):
                 if self.sense_channel is not None:
                     try:
                         self.sense_router.disconnect(self.sense_channel)
+                        sense_route = dev_cfg.SENSE_ROUTING.get(self.sense_channel, {})
+                        self.storage.log_event(
+                            level="INFO", source="discharge_battery", channel=channel, relay=relay_address,
+                            message=format_event(
+                                EventType.MATRIX_ROUTE_CLEARED,
+                                matrix_name=sense_route.get("relay_matrix"), matrix_channel=sense_route.get("relay"),
+                                source="DMM", destination=f"channel_{self.sense_channel}",
+                            ),
+                        )
                     except Exception as e:
                         self.log.warning(
                             "Channel %d: sense-channel disconnect raised unexpectedly "
