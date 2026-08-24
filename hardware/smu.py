@@ -596,7 +596,7 @@ class SMU(HardwareBase):
             "docs/architecture.md 'PSU/Relay Cross-Validation (Future)'."
         )
 
-    def emergency_output_off(self, reason: str) -> bool:
+    def emergency_output_off(self, reason: str, on_event=None) -> bool:
         """
         Single, public, non-recursive PMU fail-safe reflex. Never raises.
 
@@ -630,12 +630,34 @@ class SMU(HardwareBase):
         hardware_manager.py at startup and shutdown) must treat a False
         return as "PMU may still be sourcing/sinking current" -- unknown
         PMU state is unsafe state.
+
+        `on_event` (default None), if given, is called with a single plain
+        string message at two points: once on entry ("emergency_output_off
+        requested (<reason>)") and once with the final verification result
+        ("output disabled verification result: <DISABLED/STILL_ENABLED/
+        VERIFICATION_COMM_FAILURE>") -- see docs/architecture.md "Shutdown
+        Trace Logging". This is a DB-event-log observability hook, not a
+        second logging module -- this driver has no knowledge of `storage`
+        or the event_log schema; the caller supplies a ready-made callback
+        (see test_control/battery_operation_sequence.py::
+        _shutdown_trace_logger()). Any exception from `on_event` itself is
+        swallowed here -- a failure to record a trace event must never be
+        confused with, or interfere with, the actual output-disable
+        sequence this method exists to guarantee.
         """
+        def _emit(message):
+            if on_event is not None:
+                try:
+                    on_event(message)
+                except Exception:
+                    pass
+
         self.log.warning(
             "[SHUTDOWN-TRACE] emergency_output_off() entered -- SMU %s (%s)",
             self.resource, reason,
         )
         self.log.warning("SMU %s: emergency output off -- %s", self.resource, reason)
+        _emit(f"emergency_output_off requested ({reason})")
 
         max_attempts = Settings.EMERGENCY_OUTPUT_OFF_MAX_ATTEMPTS
         last_result = OutputVerificationResult.VERIFICATION_COMM_FAILURE
@@ -662,6 +684,7 @@ class SMU(HardwareBase):
                         self.resource, attempt, max_attempts,
                     )
                     self.log.info("SMU %s: emergency output off verified safe.", self.resource)
+                    _emit(f"output disabled verification result: {last_result}")
                     return True
                 self.log.warning(
                     "[SHUTDOWN-TRACE] PSU output disable verification result on attempt "
@@ -699,9 +722,10 @@ class SMU(HardwareBase):
                 "genuinely unknown, not assumed safe).",
                 self.resource, max_attempts, OutputVerificationResult.VERIFICATION_COMM_FAILURE,
             )
+        _emit(f"output disabled verification result: {last_result} (exhausted {max_attempts} attempt(s))")
         return False
 
-    def zero_output_setpoint_best_effort(self, context: str = "") -> bool:
+    def zero_output_setpoint_best_effort(self, context: str = "", on_event=None) -> bool:
         """
         Post-isolation defense-in-depth step -- NOT part of the safety-
         critical disable chain. Every real caller invokes this only AFTER
@@ -716,11 +740,31 @@ class SMU(HardwareBase):
         unambiguous should a technician probe its output terminals after
         a run, regardless of root cause of any residual reading.
 
-        Zeros whichever setpoint is actually active for the session's
-        current `output_function` -- `current_level` for DC_CURRENT
-        (ChargeSequence/DischargeSequence's CC mode), `voltage_level` for
-        DC_VOLTAGE (the standalone PSU test's mode) -- since those are two
-        different NI-DCPower properties and only one applies at a time.
+        For DC_CURRENT sessions (ChargeSequence/DischargeSequence's CC-CV
+        mode), zeros BOTH `current_level` AND `voltage_limit` -- not just
+        `current_level` alone (the original, incomplete implementation).
+        Rationale (see docs/architecture.md "Shutdown State Determinism",
+        added after a real post-Ctrl+C ~4.0 V terminal reading was traced
+        to this exact gap): B1's charge behavior has consistently shown
+        CV-limited/compliance operation (SMU voltage pinned at
+        voltage_limit, not a true constant-current region), meaning
+        `voltage_limit` -- not `current_level` -- is the value actually
+        governing terminal voltage while the output remains configured
+        that way. Zeroing only `current_level` left `voltage_limit` at its
+        last commanded ceiling (e.g. 4.0 V), so a technician probing the
+        output terminals after output_disable() could still see that
+        ceiling reflected depending on instrument/output state, even
+        though the disable command itself had already been verified.
+        `voltage_limit_range` (the setting's resolution scale) is
+        deliberately left untouched -- it does not itself present a
+        voltage, so zeroing it would add a new, unnecessary failure mode
+        (an invalid range/value combination) for no electrical benefit.
+
+        Zeros whichever setpoint(s) are actually active for the session's
+        current `output_function` -- `current_level` + `voltage_limit` for
+        DC_CURRENT, `voltage_level` for DC_VOLTAGE (the standalone PSU
+        test's mode) -- since those are different NI-DCPower properties
+        and only one branch applies at a time.
 
         Never raises, never blocks, and is never retried -- a single
         best-effort attempt. Any failure is logged as a WARNING (not
@@ -730,17 +774,40 @@ class SMU(HardwareBase):
         command was applied without error, False otherwise -- callers are
         not required to check this return value, and shutdown must (and
         does, at every call site) proceed identically either way.
+
+        `on_event` (default None), if given, is called once per value
+        actually zeroed (e.g. "current_level zeroed (was 1.000 A)",
+        "voltage_limit zeroed (was 4.000 V)") -- see
+        emergency_output_off()'s docstring for the same contract (a DB-
+        event-log observability hook this driver has no direct knowledge
+        of; exceptions from `on_event` are swallowed here too).
         """
         if self._session is None:
             return True
         prefix = f"{context}: " if context else ""
+
+        def _emit(message):
+            if on_event is not None:
+                try:
+                    on_event(message)
+                except Exception:
+                    pass
+
         try:
             import nidcpower
             if self._session.output_function == nidcpower.OutputFunction.DC_CURRENT:
+                prior_current = self._session.current_level
+                prior_voltage_limit = self._session.voltage_limit
                 self._session.current_level = 0.0
+                self._session.voltage_limit = 0.0
+                self._session.commit()
+                _emit(f"current_level zeroed (was {prior_current:.3f} A)")
+                _emit(f"voltage_limit zeroed (was {prior_voltage_limit:.3f} V)")
             else:
+                prior_voltage = self._session.voltage_level
                 self._session.voltage_level = 0.0
-            self._session.commit()
+                self._session.commit()
+                _emit(f"voltage_level zeroed (was {prior_voltage:.3f} V)")
             return True
         except Exception as e:
             self.log.warning(

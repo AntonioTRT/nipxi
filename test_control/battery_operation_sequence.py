@@ -308,6 +308,46 @@ class BatteryOperationSequence:
             self.log.warning("%s: final voltage reading failed -- %s", context, e)
             return None
 
+    def _shutdown_trace_logger(self, *, channel, relay_address):
+        """
+        Returns an on_event(message: str) callback that records a
+        "SHUTDOWN: <message>" event_log row via self.storage.log_event() --
+        see docs/architecture.md "Shutdown Trace Logging". This is the DB-
+        backed counterpart to the "[SHUTDOWN-TRACE]"-prefixed lines already
+        emitted via self.log.* (Python's logging module, not the database)
+        inside hardware/smu.py and test_control/safety_monitor.py -- those
+        Python-logger lines go to whatever log handlers are configured
+        (console/file), NOT to the SQLite event_log table
+        get_recent_events() reads from. Without this, an operator inspecting
+        the DB-backed event log after a Ctrl+C sees only the single, human-
+        readable cancellation line (e.g. "Charging stopped by operator")
+        and nothing about the underlying shutdown steps, even though those
+        steps did execute -- a logging/observability gap, not evidence the
+        shutdown sequence didn't run.
+
+        This is the one place with legitimate access to BOTH `self.storage`
+        and the specific channel/relay this call concerns -- hardware/smu.py
+        and safety_monitor.py deliberately have no knowledge of `storage`/
+        the event_log schema (a hardware/persistence layering boundary this
+        project maintains elsewhere too), so they accept this callback as a
+        plain string-in, nothing-out hook instead.
+
+        Never raises: a failure to record a trace event is demoted to a
+        Python-logging WARNING and swallowed here, same policy as every
+        other post-isolation/best-effort step in the shutdown path -- this
+        must never be able to interfere with the actual shutdown action it
+        is describing.
+        """
+        def _on_event(message: str) -> None:
+            try:
+                self.storage.log_event(
+                    level="INFO", source=self.source, channel=channel, relay=relay_address,
+                    message=f"SHUTDOWN: {message}",
+                )
+            except Exception as log_err:
+                self.log.warning("Failed to record shutdown-trace event %r: %s", message, log_err)
+        return _on_event
+
     def run_guarded(self, fn, *, channel, relay_address, label, verb, cancel_message,
                      extra_run_summary_fields_fn=lambda: {}):
         """
@@ -335,6 +375,8 @@ class BatteryOperationSequence:
 
         except OperationCancelledError as e:
             self.log.warning("%s cancelled: %s", label, e)
+            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+            on_event("cancellation detected")
             self.storage.log_event(
                 level="INFO", source=self.source, channel=channel, relay=relay_address,
                 message=cancel_message,
@@ -348,11 +390,13 @@ class BatteryOperationSequence:
                 stop_reason=StopReason.CANCELLED, result="STOPPED_BY_OPERATOR",
                 **fields,
             )
-            self.safety.safe_cancel_shutdown(self.smu, self.relay, str(e))
+            self.safety.safe_cancel_shutdown(self.smu, self.relay, str(e), on_event=on_event)
             raise
 
         except SafetyViolationError as e:
             self.log.error("Safety violation while %s channel %d: %s", verb, channel, e)
+            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+            on_event("safety violation detected")
             self.storage.log_event(
                 level="ERROR", source=self.source, channel=channel, relay=relay_address,
                 message=f"Safety violation -- {e}",
@@ -366,11 +410,13 @@ class BatteryOperationSequence:
                 stop_reason=StopReason.SAFETY_VIOLATION, result="FAIL",
                 **fields,
             )
-            self.safety.emergency_stop(self.smu, self.relay, str(e))
+            self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)
             raise
 
         except RelayError as e:
             self.log.error("Relay verification fault while %s channel %d: %s", verb, channel, e)
+            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+            on_event("relay fault detected")
             self.storage.log_event(
                 level="ERROR", source=self.source, channel=channel, relay=relay_address,
                 message=f"Relay verification fault -- {e}",
@@ -384,7 +430,7 @@ class BatteryOperationSequence:
                 stop_reason=StopReason.FAILED, result="FAIL",
                 **fields,
             )
-            self.safety.emergency_stop(self.smu, self.relay, str(e))
+            self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)
             raise
 
         except NIPXITimeoutError as e:
@@ -393,6 +439,8 @@ class BatteryOperationSequence:
             # sequence is identical to every other fault (emergency_stop()),
             # only the recorded stop_reason/execution_state differ.
             self.log.error("Timeout while %s channel %d: %s", verb, channel, e)
+            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+            on_event("timeout detected")
             self.storage.log_event(
                 level="ERROR", source=self.source, channel=channel, relay=relay_address,
                 message=f"Timeout -- {e}",
@@ -406,11 +454,13 @@ class BatteryOperationSequence:
                 stop_reason=StopReason.TIMEOUT, result="FAIL",
                 **fields,
             )
-            self.safety.emergency_stop(self.smu, self.relay, str(e))
+            self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)
             raise
 
         except Exception as e:
             self.log.error("Unexpected error while %s channel %d: %s", verb, channel, e, exc_info=True)
+            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+            on_event("unexpected error detected")
             self.storage.log_event(
                 level="ERROR", source=self.source, channel=channel, relay=relay_address,
                 message=f"Unexpected error -- {e}",
@@ -424,7 +474,7 @@ class BatteryOperationSequence:
                 stop_reason=StopReason.FAILED, result="FAIL",
                 **fields,
             )
-            self.safety.emergency_stop(self.smu, self.relay, str(e))
+            self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)
             raise
 
     def complete(self, *, channel, relay_address, log_message, **extra_run_summary_fields):

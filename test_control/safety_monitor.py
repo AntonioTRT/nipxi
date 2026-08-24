@@ -128,7 +128,7 @@ class SafetyMonitor:
         """True if current is low enough to switch the relay without arcing."""
         return abs(current_a) <= self.s.ZERO_CURRENT_THRESHOLD_A
 
-    def emergency_stop(self, smu, relay_matrix, reason: str):
+    def emergency_stop(self, smu, relay_matrix, reason: str, on_event=None):
         """
         Execute emergency stop sequence:
           1. PMU (SMU) output OFF, verified -- via emergency_output_off(),
@@ -144,10 +144,30 @@ class SafetyMonitor:
              failure at this point is a second failed attempt and is logged
              as CRITICAL.)
         Mirrors the 'Safe shutdown' node in the VI flowchart.
+
+        `on_event` (default None) -- see docs/architecture.md "Shutdown
+        Trace Logging": an optional callback, forwarded into
+        smu.emergency_output_off()/smu.zero_output_setpoint_best_effort()
+        unchanged, and called directly here around relay_matrix.open_all()
+        and at the very end of this method. This class has no `storage`
+        reference of its own (by design -- it is constructed independent
+        of any operation's DataStorage handle); the caller
+        (test_control/battery_operation_sequence.py::run_guarded(), which
+        DOES have `self.storage`) supplies a ready-made closure that writes
+        a "SHUTDOWN: <message>" event_log row. Wrapped in its own
+        try/except here too, on top of the callee-side guarding -- a
+        logging failure must never be able to interrupt this sequence.
         """
+        def _emit(message):
+            if on_event is not None:
+                try:
+                    on_event(message)
+                except Exception:
+                    pass
+
         self.log.warning("[SHUTDOWN-TRACE] emergency_stop() entered (reason=%s)", reason)
         self.log.error("EMERGENCY STOP: %s", reason)
-        if not smu.emergency_output_off(reason):
+        if not smu.emergency_output_off(reason, on_event=on_event):
             self.log.critical(
                 "PMU output could not be verified OFF during e-stop. PMU may still be "
                 "actively sourcing/sinking current -- physically disconnect power if "
@@ -157,12 +177,14 @@ class SafetyMonitor:
         try:
             relay_matrix.open_all()
             self.log.warning("[SHUTDOWN-TRACE] Relay open command sent -- open_all() returned normally")
+            _emit("relay_matrix.open_all executed")
         except Exception as e:
             self.log.critical(
                 "Relay open-all FAILED during e-stop: %s. Hardware may still be "
                 "energized -- physically disconnect power if this cannot be "
                 "resolved immediately.", e,
             )
+            _emit(f"relay_matrix.open_all FAILED: {e}")
         # Post-isolation defense-in-depth, not safety-critical -- attempted
         # unconditionally, regardless of the open_all() outcome above,
         # since the SMU output was already commanded off before this point
@@ -172,13 +194,14 @@ class SafetyMonitor:
         # from being reached. See docs/architecture.md "Post-Isolation
         # SMU Setpoint Zeroing".
         try:
-            smu.zero_output_setpoint_best_effort(reason)
+            smu.zero_output_setpoint_best_effort(reason, on_event=on_event)
         except Exception as e:
             self.log.warning("Post-isolation SMU setpoint-zeroing raised unexpectedly "
                               "(non-critical, shutdown already complete): %s", e)
         self.log.warning("Emergency stop complete.")
+        _emit("shutdown completed")
 
-    def safe_cancel_shutdown(self, smu, relay_matrix, reason: str):
+    def safe_cancel_shutdown(self, smu, relay_matrix, reason: str, on_event=None):
         """
         Safe shutdown sequence for an operator-requested cancellation
         (see utils/cancellation.py / OperationCancelledError). Hardware
@@ -187,10 +210,19 @@ class SafetyMonitor:
         as a deliberate, expected operator action (INFO/WARNING) rather
         than "EMERGENCY STOP", so log output does not read as a fault when
         the operator asked for exactly this. Never raises.
+
+        `on_event` -- see emergency_stop()'s identical docstring section.
         """
+        def _emit(message):
+            if on_event is not None:
+                try:
+                    on_event(message)
+                except Exception:
+                    pass
+
         self.log.warning("[SHUTDOWN-TRACE] safe_cancel_shutdown() entered (reason=%s)", reason)
         self.log.warning("SAFE CANCELLATION: %s -- entering safe shutdown", reason)
-        if not smu.emergency_output_off(reason):
+        if not smu.emergency_output_off(reason, on_event=on_event):
             self.log.critical(
                 "PMU output could not be verified OFF during cancellation shutdown. "
                 "PMU may still be actively sourcing/sinking current -- physically "
@@ -200,17 +232,20 @@ class SafetyMonitor:
         try:
             relay_matrix.open_all()
             self.log.warning("[SHUTDOWN-TRACE] Relay open command sent -- open_all() returned normally")
+            _emit("relay_matrix.open_all executed")
         except Exception as e:
             self.log.critical(
                 "Relay open-all FAILED during cancellation shutdown: %s. Hardware may "
                 "still be energized -- physically disconnect power if this cannot be "
                 "resolved immediately.", e,
             )
+            _emit(f"relay_matrix.open_all FAILED: {e}")
         # Post-isolation defense-in-depth, not safety-critical -- see
         # emergency_stop()'s identical comment above.
         try:
-            smu.zero_output_setpoint_best_effort(reason)
+            smu.zero_output_setpoint_best_effort(reason, on_event=on_event)
         except Exception as e:
             self.log.warning("Post-isolation SMU setpoint-zeroing raised unexpectedly "
                               "(non-critical, shutdown already complete): %s", e)
         self.log.info("Safe cancellation shutdown complete.")
+        _emit("shutdown completed")

@@ -61,11 +61,11 @@ class _FakeSmu:
     def measure(self):
         return {"voltage_v": 3.7, "current_a": 0.01}
 
-    def emergency_output_off(self, reason):
+    def emergency_output_off(self, reason, on_event=None):
         self.enabled = False
         return True
 
-    def zero_output_setpoint_best_effort(self, reason):
+    def zero_output_setpoint_best_effort(self, reason, on_event=None):
         return True
 
 
@@ -84,10 +84,10 @@ class _FakeSafety:
     def check(self, v, i, t_c, mode=None):
         return SafetyStatus(safe=True)
 
-    def emergency_stop(self, smu, relay, reason):
+    def emergency_stop(self, smu, relay, reason, on_event=None):
         pass
 
-    def safe_cancel_shutdown(self, smu, relay, reason):
+    def safe_cancel_shutdown(self, smu, relay, reason, on_event=None):
         pass
 
 

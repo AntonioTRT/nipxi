@@ -6798,3 +6798,145 @@ TCP session, and a fault in one relay module's connection can never
 directly affect the other. `tests/test_sense_router.py::
 test_sense_channel_and_battery_relay_matrix_are_physically_separate`
 makes this an enforced, tested invariant, not just a design intention.
+
+## 74. Shutdown Trace Logging + Shutdown State Determinism (CURRENT IMPLEMENTATION)
+
+Triggered by a real observation: after a Ctrl+C stop during a B1 charge
+run, the operator measured ~4.0 V at the PSU output terminals, and the
+DB-backed `event_log` (what `get_recent_events()`/the "Recent Events"
+panel reads) showed only one row: `INFO / charge_battery / "Charging
+stopped by operator"` -- nothing for `emergency_output_off()`, output-
+disabled verification, relay open, or post-isolation setpoint-zeroing,
+even though the prior review (Section 68) had already confirmed those
+steps do execute unconditionally on every Ctrl+C.
+
+### Root cause: two separate logging channels, not a missing execution step
+
+This codebase has always had two independent logging destinations that
+look superficially similar but are not connected:
+
+1. **Python's `logging` module** (`self.log.warning/error/critical/info`,
+   `nipxi.safety`/`nipxi.<source>` loggers) -- goes to whichever handlers
+   `data/logger.py::setup()` configures (console/file). Every
+   `"[SHUTDOWN-TRACE] ..."` line added in Section 60/68, and every
+   CRITICAL/WARNING line in `emergency_output_off()`/`emergency_stop()`/
+   `safe_cancel_shutdown()`, is one of these.
+2. **`storage.log_event()`** -- writes a row into the SQLite `event_log`
+   table, the ONLY thing `get_recent_events()` (and therefore the
+   operator-facing execution screen's "Recent Events" panel) ever reads.
+
+Before this section's change, `hardware/smu.py` and
+`test_control/safety_monitor.py` used exclusively channel 1 for every
+shutdown-related line -- neither module has ever held a `storage`
+reference (a deliberate hardware/persistence layering boundary: SMU/relay
+drivers and SafetyMonitor know nothing about the event_log schema). The
+ONE `storage.log_event()` call anywhere in the whole cancellation path was
+`BatteryOperationSequence.run_guarded()`'s own `except
+OperationCancelledError` branch, recording exactly `cancel_message`
+("Charging stopped by operator" for Charge). That is precisely, and only,
+the single row the operator observed.
+
+**Conclusion: this was a logging/observability gap, not evidence the
+shutdown sequence failed to run.** The shutdown sequence's actual
+execution was independently re-confirmed via code trace (Section 68):
+`safe_cancel_shutdown()` unconditionally calls `emergency_output_off()` ->
+`relay_matrix.open_all()` -> `zero_output_setpoint_best_effort()`, each
+independently guarded, on every Ctrl+C.
+
+### Shutdown State Determinism: the voltage_limit gap (fixed)
+
+Section 68 separately identified that `zero_output_setpoint_best_effort()`
+only zeroed `current_level`, never `voltage_limit` -- the SMU's compliance
+ceiling. B1's real charge behavior throughout this validation cycle has
+shown CV-limited/compliance operation (SMU voltage pinned at the
+commanded ceiling, not a true constant-current region), so `voltage_limit`
+-- not `current_level` -- is the value actually governing terminal
+voltage while the output remains configured that way. The measured ~4.0 V
+matched B1's `charge_voltage_v` exactly, supporting this as the specific
+explanation (rather than a generic high-impedance artifact).
+
+Fixed in `hardware/smu.py::zero_output_setpoint_best_effort()`: for a
+DC_CURRENT session, both `current_level` AND `voltage_limit` are now
+zeroed (previously only `current_level`). `voltage_limit_range` is
+deliberately left untouched -- it is a resolution/scale setting, not a
+value that itself presents a voltage; changing it would add a new
+range/value-validity failure mode for no electrical benefit. The
+DC_VOLTAGE branch (`voltage_level`) is unchanged.
+
+### Design: an injectable `on_event` callback, not a `storage` reference threaded into the hardware/safety layers
+
+Adding `storage.log_event()` calls directly inside `hardware/smu.py`/
+`safety_monitor.py` was rejected -- it would violate the existing
+hardware/persistence layering boundary those modules have always kept
+(neither has ever taken a `storage` constructor argument, and both are
+constructed and used well before/without any operation-specific
+`DataStorage` in several call sites, e.g. `HardwareManager`'s own startup/
+shutdown checks). Instead:
+
+- `hardware/smu.py::emergency_output_off()` and
+  `zero_output_setpoint_best_effort()` gained an optional `on_event=None`
+  parameter: a plain `Callable[[str], None]`, called with one short
+  message per checkpoint (`"emergency_output_off requested (...)"`,
+  `"output disabled verification result: ..."`, `"current_level zeroed
+  (was ...)"`, `"voltage_limit zeroed (was ...)"`). Any exception the
+  callback itself raises is caught and swallowed at the call site -- a
+  logging failure must never be able to interrupt or fail the real
+  hardware action it is describing.
+- `test_control/safety_monitor.py::emergency_stop()`/
+  `safe_cancel_shutdown()` gained the same optional `on_event=None`,
+  forwarded unchanged into their `smu.*` calls, and invoked directly
+  around `relay_matrix.open_all()` (`"relay_matrix.open_all executed"` or
+  `"relay_matrix.open_all FAILED: ..."`) and once more at the very end
+  (`"shutdown completed"`) -- also independently guarded here, on top of
+  the callee-side guarding.
+- `BatteryOperationSequence._shutdown_trace_logger(*, channel,
+  relay_address)` (new, in `test_control/battery_operation_sequence.py`)
+  is the one place with legitimate access to both `self.storage` and the
+  specific channel/relay a call concerns. It returns a closure that writes
+  `storage.log_event(level="INFO", source=self.source, channel=...,
+  relay=..., message=f"SHUTDOWN: {message}")` -- swallowing (and
+  demoting to a Python-logging WARNING) any failure to write that row,
+  never letting an event_log write failure affect the actual shutdown.
+- `run_guarded()`'s five exception branches
+  (`OperationCancelledError`/`SafetyViolationError`/`RelayError`/
+  `NIPXITimeoutError`/generic `Exception`) each build one
+  `_shutdown_trace_logger()` instance, emit a branch-specific
+  `"<trigger> detected"` event (`"cancellation detected"`, `"safety
+  violation detected"`, `"relay fault detected"`, `"timeout detected"`,
+  `"unexpected error detected"`) immediately, then pass it as `on_event=`
+  into `self.safety.safe_cancel_shutdown()`/`emergency_stop()`. The
+  pre-existing `cancel_message`/`f"Safety violation -- {e}"`/etc.
+  human-readable event_log lines are unchanged and additive, not replaced.
+- `ChargeSequence`/`DischargeSequence`'s own inner
+  `emergency_output_off()` call (the sampling loop's own try/finally,
+  which runs BEFORE `run_guarded()` ever sees an exception) and their own
+  normal-completion `zero_output_setpoint_best_effort()` call also build
+  and pass an `on_event` via the same `_shutdown_trace_logger()` helper,
+  so a normal EOC/EOD completion gets the identical trace, not just an
+  abnormal exit.
+
+Net effect: after a Ctrl+C, the DB-backed event_log now shows, in order,
+`SHUTDOWN: cancellation detected`, the existing cancel_message,
+`SHUTDOWN: emergency_output_off requested (...)`, `SHUTDOWN: output
+disabled verification result: ...`, `SHUTDOWN: relay_matrix.open_all
+executed`, `SHUTDOWN: current_level zeroed (...)`, `SHUTDOWN:
+voltage_limit zeroed (...)`, `SHUTDOWN: shutdown completed` -- fully
+traceable from the same panel the operator was already inspecting, with
+no step able to disappear silently (every guarded step either succeeds or
+logs its own explicit failure line, in both the Python logger and now the
+event_log).
+
+`hardware_manager.py::disconnect_all()`'s own, separate,
+already-existing `zero_output_setpoint_best_effort()` call (Section 60)
+is deliberately NOT wired to an `on_event` -- it runs in `test.py`'s
+`finally` block AFTER `storage.close()` has already been called, so no
+event_log write would be possible there regardless; this is an
+unavoidable and pre-existing property of that specific redundant,
+belt-and-suspenders call site, not a gap introduced here.
+
+Tests: `tests/test_shutdown_trace_logging.py` (new -- direct
+`_shutdown_trace_logger()` coverage plus an end-to-end `run_guarded()`
+proof for all five exception branches), plus updated fakes/assertions in
+`tests/test_safety_monitor_shutdown.py`, `tests/test_smu_post_isolation_zeroing.py`,
+and `tests/test_sense_routing_live_wiring.py` to accept and, where
+relevant, exercise the new `on_event` parameter.

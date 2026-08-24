@@ -30,6 +30,7 @@ class _FakeSessionForZeroing:
                  fail_property_set=False, fail_commit=False, fail_output_function_read=False):
         self.output_function = output_function
         self.current_level = 0.5
+        self.voltage_limit = 4.0
         self.voltage_level = 3.7
         self.commit_calls = 0
         self._fail_property_set = fail_property_set
@@ -58,14 +59,34 @@ class NoSessionTests(unittest.TestCase):
 
 
 class DcCurrentModeTests(unittest.TestCase):
-    def test_zeros_current_level_not_voltage_level(self):
+    def test_zeros_current_level_and_voltage_limit_not_voltage_level(self):
+        """
+        Zeros BOTH current_level and voltage_limit -- see
+        hardware/smu.py::zero_output_setpoint_best_effort()'s docstring
+        "Shutdown State Determinism": B1's real charge behavior has shown
+        CV-limited/compliance operation, where voltage_limit (not
+        current_level) governs terminal voltage. Zeroing current_level
+        alone (the original implementation) left voltage_limit at its last
+        commanded ceiling -- this test now asserts the fixed behavior.
+        voltage_level (DC_VOLTAGE mode's own setpoint) is still untouched,
+        since it is not the active property for a DC_CURRENT session.
+        """
         session = _FakeSessionForZeroing(output_function=nidcpower.OutputFunction.DC_CURRENT)
         smu = _make_smu(session)
         result = smu.zero_output_setpoint_best_effort("end of charge sequence on channel 1")
         self.assertTrue(result)
         self.assertEqual(session.current_level, 0.0)
+        self.assertEqual(session.voltage_limit, 0.0)
         self.assertEqual(session.voltage_level, 3.7, "voltage_level is not the active setpoint in DC_CURRENT mode")
         self.assertEqual(session.commit_calls, 1)
+
+    def test_on_event_reports_both_zeroed_values_with_prior_readings(self):
+        session = _FakeSessionForZeroing(output_function=nidcpower.OutputFunction.DC_CURRENT)
+        smu = _make_smu(session)
+        events = []
+        smu.zero_output_setpoint_best_effort("test", on_event=events.append)
+        self.assertTrue(any("current_level zeroed" in e and "0.500" in e for e in events))
+        self.assertTrue(any("voltage_limit zeroed" in e and "4.000" in e for e in events))
 
 
 class DcVoltageModeTests(unittest.TestCase):

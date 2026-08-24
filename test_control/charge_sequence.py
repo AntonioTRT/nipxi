@@ -340,7 +340,10 @@ class ChargeSequence(BatteryOperationSequence):
 
                         interruptible_sleep(dt, token=token)
                 finally:
-                    if not self.smu.emergency_output_off(f"end of charge sequence on channel {channel}"):
+                    on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+                    if not self.smu.emergency_output_off(
+                        f"end of charge sequence on channel {channel}", on_event=on_event,
+                    ):
                         self.log.critical(
                             "Channel %d: PMU output could not be verified OFF after charge sequence.",
                             channel,
@@ -368,7 +371,9 @@ class ChargeSequence(BatteryOperationSequence):
                 # from returning normally. See docs/architecture.md
                 # "Post-Isolation SMU Setpoint Zeroing".
                 try:
-                    self.smu.zero_output_setpoint_best_effort(f"end of charge sequence on channel {channel}")
+                    self.smu.zero_output_setpoint_best_effort(
+                        f"end of charge sequence on channel {channel}", on_event=on_event,
+                    )
                 except Exception as e:
                     self.log.warning("Channel %d: post-isolation setpoint-zeroing raised "
                                       "unexpectedly (non-critical): %s", channel, e)
