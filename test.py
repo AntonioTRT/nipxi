@@ -4824,6 +4824,12 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
             if sense_channel is not None:
                 from hardware.sense_router import ConfigDrivenSenseRouter
                 sense_router = ConfigDrivenSenseRouter()
+                # Hardware Audit Trail (see docs/architecture.md) -- SenseRouter
+                # is constructed here, not by HardwareManager, so it must be
+                # instrumented at its own construction site; shares hw_mgr's
+                # audit writer/run_id provider so its rows correlate with
+                # every other device's. Purely additive -- no behavior change.
+                hw_mgr.instrument_external_device(sense_router, "SENSE_ROUTER")
 
             _run_one_charge_or_discharge_position(
                 operation=operation, sequence_cls=sequence_cls, source=source,
@@ -5001,6 +5007,12 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
             if sense_channel is not None:
                 from hardware.sense_router import ConfigDrivenSenseRouter
                 sense_router = ConfigDrivenSenseRouter()
+                # Hardware Audit Trail (see docs/architecture.md) -- SenseRouter
+                # is constructed here, not by HardwareManager, so it must be
+                # instrumented at its own construction site; shares hw_mgr's
+                # audit writer/run_id provider so its rows correlate with
+                # every other device's. Purely additive -- no behavior change.
+                hw_mgr.instrument_external_device(sense_router, "SENSE_ROUTER")
 
             storage.log_event(
                 level="INFO", source=source,

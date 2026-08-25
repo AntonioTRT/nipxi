@@ -46,6 +46,16 @@ def open_storage_guarded(settings, hw_mgr=None, on_fail=None):
     storage = DataStorage(settings=settings)
     try:
         storage.open()
+        # Hardware Audit Trail (see docs/architecture.md "Hardware Audit
+        # Trail" / "Session Tracking") -- as soon as a real run_id
+        # exists, every raw_hardware_log row HardwareManager's already-
+        # instrumented devices produce should carry it. `hasattr` guards
+        # against any hw_mgr-like object that predates this feature (see
+        # tests/test_storage_session.py's _FakeHardwareManager, which has
+        # no such method) -- this call is best-effort wiring, never a
+        # hard requirement of a successful storage open.
+        if hw_mgr is not None and hasattr(hw_mgr, "attach_run_id_provider"):
+            hw_mgr.attach_run_id_provider(lambda: storage.run_id)
     except (OSError, sqlite3.Error) as e:
         if on_fail is not None:
             on_fail(f"\n[FAIL] Database unavailable -- could not open storage: {e}")

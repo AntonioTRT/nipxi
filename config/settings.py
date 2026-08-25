@@ -163,6 +163,63 @@ class Settings:
     # DMM_MEASUREMENT_RECOVERED if it had previously failed at least once.
     DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES = 3
 
+    # -------------------------------------------------------------------------
+    # Hardware Audit Trail (see docs/architecture.md "Hardware Audit Trail" --
+    # hardware/audit_proxy.py + data/raw_hardware_log.py). Fully additive and
+    # independent of event_log/measurements/EventType -- disabling this never
+    # changes ChargeSequence/DischargeSequence/MonitorBatterySequence/
+    # SafetyMonitor behavior or existing event logging in any way.
+    # -------------------------------------------------------------------------
+
+    # Master switch. False = HardwareManager returns every device
+    # completely unwrapped (zero overhead, not just "logs nothing").
+    ENABLE_RAW_HARDWARE_LOGGING = True
+
+    # Whether "repetitive measurement read" methods (SMU.measure(),
+    # DMM.measure_dc_voltage(), DAQ.read_channel() -- see
+    # hardware/audit_proxy.py::MEASUREMENT_METHOD_NAMES) are logged at
+    # all. State-changing commands (output enable/disable, setpoint
+    # commands, relay/matrix open/close, connect/disconnect) and every
+    # FAILURE are always logged regardless of this flag -- it only gates
+    # successful, routine measurement polling, which is by far the
+    # highest-frequency hardware traffic in any sampling loop. Left True
+    # (not disabled) as the production default -- the storage-growth
+    # review's finding was that FULL-RATE measurement logging is the
+    # actual cost driver, not that measurement logging itself should be
+    # dropped; RAW_HW_MEASUREMENT_SAMPLE_RATE below is the correct lever.
+    RAW_HW_LOG_MEASUREMENTS = True
+
+    # When RAW_HW_LOG_MEASUREMENTS is True, log only 1 in every N
+    # successful measurement-method calls (always including the very
+    # first). 1 = log every call (no sampling). NEVER applies to
+    # failures (always logged, every time, regardless of this value) or
+    # to state-changing commands (always logged in full) -- only
+    # successful measurement polling is sampled.
+    #
+    # Production default is 10, not 1 -- see docs/architecture.md
+    # "Hardware Audit Trail: Storage Growth Review". At the confirmed
+    # real sampling cadence (Settings.SAMPLE_RATE_HZ = 1.0, i.e. one
+    # ChargeSequence/DischargeSequence sampling-loop iteration per
+    # second, each iteration calling SMU.measure() + DMM.
+    # measure_dc_voltage() + DAQ.read_channel() -- see
+    # charge_sequence.py's sampling loop), a rate of 1 logs every one of
+    # those three measurement calls every second for the full duration
+    # of every run: ~86,400 measurement rows (~23 MB) for one position's
+    # 8-hour B1 validation-timeout run alone, before Group -> ALL
+    # multiplies that by every enabled position. A rate of 10 cuts that
+    # dominant term by ~90% (one measurement row every ~10 seconds per
+    # device instead of every second) while leaving command traceability
+    # and failure traceability at 100% fidelity, unaffected -- both are
+    # comparatively rare events (a handful of commands per run, and
+    # failures are the exceptional case this audit trail exists to
+    # catch), so neither is meaningfully improved by full-rate
+    # measurement sampling and both are completely unaffected by this
+    # value. This is the production-safe default; a shorter validation-
+    # only run can still set this to 1 (or use DEVELOPMENT/VALIDATION
+    # mode) for full-fidelity measurement capture when specifically
+    # investigating a measurement-level issue.
+    RAW_HW_MEASUREMENT_SAMPLE_RATE = 10
+
     # Pre-output-enable reverse-polarity sanity check (ChargeSequence/
     # DischargeSequence -- see docs/architecture.md "Reverse Polarity
     # Protection"). A correctly-connected, intact Li-ion cell never reads

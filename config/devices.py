@@ -715,9 +715,24 @@ BATTERY_GROUPS = {
                                             #    conservative discharge target than strictly required is
                                             #    not a concern; only a target BELOW the real floor would
                                             #    be). See "Discharge Cutoff Policy".
-            "charge_timeout_s":    28800,  # VALIDATION ONLY -- 8h, vs. the 2h global default. See
-                                            #    docs/architecture.md "Configurable Validation Timeout".
-            "discharge_timeout_s": 28800,  # VALIDATION ONLY -- 8h, symmetric with charge_timeout_s.
+            "charge_timeout_s":    300,    # VALIDATION ONLY, TEMPORARY -- 5 min, down from the prior 8h
+                                            #    (28800s) validation value, vs. the 2h (7200s) global
+                                            #    default (Settings.CHARGE_TIMEOUT_S). DEVELOPMENT/VALIDATION
+                                            #    mode only -- rejected outright in PRODUCTION mode by
+                                            #    utils/validators.py::validate_group_test_config() Stage 4,
+                                            #    exactly like the 8h value it replaces. Intended to exercise
+                                            #    Group -> ALL end-to-end on real hardware without waiting out
+                                            #    a full-length cycle: independent per-position run_id
+                                            #    creation, NIPXITimeoutError -> FAIL -> group-continues
+                                            #    handling, run_summary generation, event logging, and
+                                            #    emergency shutdown between slots. See docs/architecture.md
+                                            #    "Configurable Validation Timeout" / "Group -> ALL Fault
+                                            #    Classification Policy". Restore a production-appropriate
+                                            #    value (or remove this override entirely, falling back to
+                                            #    Settings.CHARGE_TIMEOUT_S) before any production use of B1.
+            "discharge_timeout_s": 600,    # VALIDATION ONLY, TEMPORARY -- 10 min, down from the prior 8h
+                                            #    (28800s) validation value. Same rationale/constraints as
+                                            #    charge_timeout_s above.
         },
         "positions": {
             # daq_ntc_ch is Dev1/ai0-ai7 -- bench-confirmed real wiring (see

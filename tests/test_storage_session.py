@@ -44,6 +44,20 @@ class _FakeHardwareManager:
             raise RuntimeError("simulated shutdown failure, not a real hardware error")
 
 
+class _FakeHardwareManagerWithAuditWiring(_FakeHardwareManager):
+    """Mirrors the real HardwareManager's Hardware Audit Trail surface
+    (see test_control/hardware_manager.py) without constructing any real
+    hardware -- used to verify open_storage_guarded() wires the run_id
+    provider through on success, without needing a real HardwareManager."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.attached_providers = []
+
+    def attach_run_id_provider(self, provider):
+        self.attached_providers.append(provider)
+
+
 class OpenStorageGuardedSuccessTests(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
@@ -60,6 +74,46 @@ class OpenStorageGuardedSuccessTests(unittest.TestCase):
     def test_works_with_on_fail_omitted(self):
         settings = _FakeSettings(self.tmp_dir, os.path.join(self.tmp_dir, "nipxi_test2.db"))
         storage = open_storage_guarded(settings)
+        self.addCleanup(storage.close)
+        self.assertIsNotNone(storage)
+
+    def test_hw_mgr_without_attach_run_id_provider_is_not_an_error(self):
+        # Backward compatibility: a hw_mgr-like object that predates the
+        # Hardware Audit Trail (e.g. _FakeHardwareManager, used by every
+        # other test in this file) must not break a successful open.
+        settings = _FakeSettings(self.tmp_dir, os.path.join(self.tmp_dir, "nipxi_test3.db"))
+        hw_mgr = _FakeHardwareManager()
+        storage = open_storage_guarded(settings, hw_mgr=hw_mgr)
+        self.addCleanup(storage.close)
+        self.assertIsNotNone(storage)
+
+    def test_run_id_provider_is_attached_to_hw_mgr_on_success(self):
+        settings = _FakeSettings(self.tmp_dir, os.path.join(self.tmp_dir, "nipxi_test4.db"))
+        hw_mgr = _FakeHardwareManagerWithAuditWiring()
+        storage = open_storage_guarded(settings, hw_mgr=hw_mgr)
+        self.addCleanup(storage.close)
+        self.assertEqual(len(hw_mgr.attached_providers), 1)
+        self.assertEqual(hw_mgr.attached_providers[0](), storage.run_id)
+
+    def test_attached_provider_reflects_group_all_run_id_changes(self):
+        # Group -> ALL reassigns storage.run_id per position via
+        # begin_new_run_id() on the SAME DataStorage instance -- the
+        # attached provider must reflect that live, not a value captured
+        # once at attach time.
+        settings = _FakeSettings(self.tmp_dir, os.path.join(self.tmp_dir, "nipxi_test5.db"))
+        hw_mgr = _FakeHardwareManagerWithAuditWiring()
+        storage = open_storage_guarded(settings, hw_mgr=hw_mgr)
+        self.addCleanup(storage.close)
+        provider = hw_mgr.attached_providers[0]
+        first_run_id = provider()
+        storage.begin_new_run_id(suffix="pos2")
+        second_run_id = provider()
+        self.assertNotEqual(first_run_id, second_run_id)
+        self.assertEqual(second_run_id, storage.run_id)
+
+    def test_no_hw_mgr_means_no_provider_attachment_attempted(self):
+        settings = _FakeSettings(self.tmp_dir, os.path.join(self.tmp_dir, "nipxi_test6.db"))
+        storage = open_storage_guarded(settings, hw_mgr=None)  # must not raise
         self.addCleanup(storage.close)
         self.assertIsNotNone(storage)
 

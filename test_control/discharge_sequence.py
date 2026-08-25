@@ -273,6 +273,12 @@ class DischargeSequence(BatteryOperationSequence):
                     # validate_group_test_config() before this sequence was
                     # constructed.
                     discharge_timeout_s = test_setpoints.get("discharge_timeout_s", self.s.DISCHARGE_TIMEOUT_S)
+                    # Display-only -- shown on the execution screen alongside
+                    # discharge_timeout_s above (see test_control/
+                    # execution_screen.py and charge_sequence.py's identical
+                    # rationale). Never used for any timeout/EOC/EOD decision
+                    # in this sequence.
+                    charge_timeout_s = test_setpoints.get("charge_timeout_s", self.s.CHARGE_TIMEOUT_S)
 
                     # Standardized Hardware Event Logging -- DMM_MEASUREMENT_
                     # FAILED/_RECOVERED -- see charge_sequence.py's identical
@@ -366,6 +372,7 @@ class DischargeSequence(BatteryOperationSequence):
                             elapsed_s=time.monotonic() - run_start_time,
                             smu_voltage=smu_reading["voltage_v"], smu_current=i, dmm_voltage=dmm_v,
                             battery_voltage=v, battery_current=i, battery_temp=t_c,
+                            charge_timeout_s=charge_timeout_s, discharge_timeout_s=discharge_timeout_s,
                             ntc_device=self.ntc_daq_name, ntc_resource=getattr(self.daq, "resource", None),
                             ntc_channel=ntc_channel, ntc_status=presence,
                         )

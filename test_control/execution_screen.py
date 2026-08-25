@@ -93,6 +93,20 @@ class ExecutionFrame:
     battery_current: float = None
     battery_temp: float = None
 
+    # Active charge/discharge timeout setpoints (config/devices.py::
+    # BATTERY_GROUPS[group]["test_setpoints"], falling back to
+    # Settings.CHARGE_TIMEOUT_S/DISCHARGE_TIMEOUT_S -- see
+    # ChargeSequence/DischargeSequence's own resolution of these same
+    # values). Display-only: this frame never enforces a timeout itself,
+    # it only shows whichever value the sequence is actually using, so
+    # an operator can see the effective validation-timeout override
+    # (e.g. B1's temporary 300s/600s) without checking config/devices.py.
+    # None (renders "N/A") for any test type without a timeout concept
+    # (Monitor Battery, Proto Test) -- see render_execution_frame()'s
+    # conditional gate on this pair.
+    charge_timeout_s: float = None
+    discharge_timeout_s: float = None
+
     # NTC block (Charge/Discharge/future Cycle -- see docs/architecture.md
     # Section 58) -- which physical device/channel this run's temperature
     # reading actually came from, for the active battery position only.
@@ -159,7 +173,8 @@ class ExecutionFrame:
     def from_live(cls, *, run_id, test_type, channel, run_number=None, relay=None,
                   state=None, phase_detail=None, elapsed_s=None, smu_voltage=None, smu_current=None,
                   dmm_voltage=None, battery_voltage=None, battery_current=None,
-                  battery_temp=None, ntc_device=None, ntc_resource=None, ntc_channel=None,
+                  battery_temp=None, charge_timeout_s=None, discharge_timeout_s=None,
+                  ntc_device=None, ntc_resource=None, ntc_channel=None,
                   ntc_status=None, capacity=None, energy=None, cycle_count=None,
                   battery_type=None, group=None, position_in_group=None,
                   relay_state=None, daq_channel_0_raw=None, current_step=None,
@@ -180,6 +195,7 @@ class ExecutionFrame:
             smu_voltage=smu_voltage, smu_current=smu_current, dmm_voltage=dmm_voltage,
             battery_voltage=battery_voltage, battery_current=battery_current,
             battery_temp=battery_temp,
+            charge_timeout_s=charge_timeout_s, discharge_timeout_s=discharge_timeout_s,
             ntc_device=ntc_device, ntc_resource=ntc_resource, ntc_channel=ntc_channel,
             ntc_status=ntc_status,
             capacity=capacity, energy=energy, cycle_count=cycle_count,
@@ -296,6 +312,10 @@ def _fmt_temp(value) -> str:
     return "N/A" if value is None else f"{value:.1f} C"
 
 
+def _fmt_timeout(value) -> str:
+    return "N/A" if value is None else f"{int(value)} s"
+
+
 def _fmt_elapsed(seconds) -> str:
     """"HH:MM:SS" (or "MM:SS" under an hour) -- REQUIREMENT 4's "Elapsed
     Time" line. "N/A" if the caller never threaded elapsed_s through (a
@@ -395,16 +415,20 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
     print(f"Run Number     : {_fmt(frame.run_number)}")
     print(f"Run ID         : {_fmt(frame.run_id)}")
     print(f"Test Type      : {_fmt(frame.test_type)}")
-    print()
     print(f"DUT / Channel  : {_fmt(frame.channel)}")
     print(f"Relay          : {_fmt(frame.relay)}")
-    print()
     print(f"Current Status : {_running_indicator(frame.state, frame.elapsed_s)}")
     print(f"Elapsed Time   : {_fmt_elapsed(frame.elapsed_s)}")
     print(f"Phase Detail   : {_fmt(frame.phase_detail)}")
-    print()
+    # Active charge/discharge timeout setpoints -- Charge/Discharge Battery
+    # only (see ExecutionFrame.charge_timeout_s's own docstring); omitted
+    # entirely, not shown as "N/A", for test types with no timeout concept
+    # (Monitor Battery, Proto Test) so their screens stay exactly as
+    # compact as before this feature existed.
+    if frame.charge_timeout_s is not None or frame.discharge_timeout_s is not None:
+        print(f"Charge Timeout : {_fmt_timeout(frame.charge_timeout_s)}")
+        print(f"Discharge Timeout : {_fmt_timeout(frame.discharge_timeout_s)}")
     if frame.battery_type is not None or frame.group is not None or frame.scan_progress is not None:
-        print("Scan Context")
         print("-" * 60)
         print(f"Battery Type   : {_fmt(frame.battery_type)}")
         print(f"Group          : {_fmt(frame.group)}")
@@ -414,32 +438,20 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
         print(f"Scan Progress  : {_fmt(frame.scan_progress)}")
         print(f"Dwell Progress : {_fmt(frame.dwell_progress)}")
         print(f"Remaining Time : {_fmt(frame.dwell_remaining_s)}" + ("" if frame.dwell_remaining_s is None else " s"))
-        print()
-    print("Voltage / Current / Temperature")
     print("-" * 60)
     print(f"SMU Voltage    : {_fmt_volts(frame.smu_voltage)}")
     print(f"SMU Current    : {_fmt_amps(frame.smu_current)}")
     print(f"DMM Voltage    : {_fmt_volts(frame.dmm_voltage)}")
     print(f"Battery Voltage: {_fmt_volts(frame.battery_voltage)}")
-    print(f"Battery Current: {_fmt_amps(frame.battery_current)}")
     print(f"Battery Temp   : {_fmt_temp(frame.battery_temp)}")
     print(f"DAQ Ch0 Raw    : {_fmt(frame.daq_channel_0_raw, '.6f')}" + ("" if frame.daq_channel_0_raw is None else " V (raw)"))
-    print()
+    # NTC device/resource/channel/status, compacted onto one line -- the
+    # temperature VALUE itself is Battery Temp above, never repeated here.
     if frame.ntc_device is not None or frame.ntc_channel is not None:
-        print("NTC")
-        print("-" * 60)
-        print(f"Device         : {_fmt(frame.ntc_device)}")
-        print(f"Resource       : {_fmt(frame.ntc_resource)}")
-        print(f"Channel        : {_fmt(frame.ntc_channel)}")
-        print(f"Status         : {_fmt(frame.ntc_status.upper() if frame.ntc_status else None)}")
-        print(f"Temperature    : {_fmt_temp(frame.battery_temp)}")
-        print()
-    print("Battery Metrics")
-    print("-" * 60)
-    print(f"Capacity       : {_fmt(frame.capacity)}")
-    print(f"Energy         : {_fmt(frame.energy)}")
-    print(f"Cycle Count    : {_fmt(frame.cycle_count)}")
-    print()
+        status = frame.ntc_status.upper() if frame.ntc_status else "N/A"
+        print(f"NTC            : {_fmt(frame.ntc_device)} ({_fmt(frame.ntc_resource)}) "
+              f"{_fmt(frame.ntc_channel)} -- {status}")
+    print(f"Capacity: {_fmt(frame.capacity)} | Energy: {_fmt(frame.energy)} | Cycles: {_fmt(frame.cycle_count)}")
 
     print("=" * 60)
     print("Measurement History")
@@ -452,7 +464,6 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
         print(_fmt_measurement_row(frame.initial_measurement))
     else:
         print("(none)")
-    print()
     print(f"Recent (last {RECENT_MEASUREMENTS_DISPLAY_LIMIT})")
     print(header)
     print("-" * len(header))
@@ -461,7 +472,6 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
             print(_fmt_measurement_row(m))
     else:
         print("(none)")
-    print()
 
     print("=" * 60)
     print("Recent Events")

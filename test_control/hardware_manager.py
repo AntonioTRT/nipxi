@@ -43,6 +43,8 @@ import logging
 from config.settings import Settings
 from config import devices as dev_cfg
 from config.system_mode import get_mode_policy
+from data.raw_hardware_log import RawHardwareLogWriter
+from hardware.audit_proxy import instrument_hardware_instance
 from hardware.smu import SMU
 from hardware.daq import DAQ
 from hardware.dmm import DMM
@@ -139,6 +141,30 @@ class HardwareManager:
         else:
             self._ntc_daq = DAQ(ntc_daq_cfg)
 
+        # Hardware Audit Trail (see docs/architecture.md "Hardware Audit
+        # Trail") -- wraps every device's public methods so every call is
+        # automatically recorded to raw_hardware_log, regardless of
+        # caller. Applied here, once, immediately after construction, so
+        # every subsequent use of self._smu/_daq/_relay/_dmm/_ntc_daq
+        # anywhere (including this class's OWN connect_all()/
+        # disconnect_all()/atexit methods below) is already instrumented.
+        # _run_id_provider defaults to "no run_id yet" -- correct for the
+        # real startup ordering (this class connects hardware BEFORE any
+        # DataStorage is opened in every real workflow); see
+        # attach_run_id_provider() below and test_control/storage_session.py
+        # ::open_storage_guarded(), which calls it automatically once
+        # storage actually opens.
+        self._run_id_provider = lambda: None
+        self._audit_writer = RawHardwareLogWriter(settings)
+        for dev, device_type in (
+            (self._smu, "SMU"), (self._daq, "DAQ"),
+            (self._relay, "RELAY"), (self._dmm, "DMM"),
+        ):
+            if dev is not None:
+                self._instrument(dev, device_type)
+        if self._ntc_daq is not None and self._ntc_daq is not self._daq:
+            self._instrument(self._ntc_daq, "DAQ")
+
         relay_class = self._relay.__class__.__name__
         if relay_cfg.get("type", "serial").lower() == "ethernet":
             detail = f"IP: {relay_cfg.get('ip', '')}"
@@ -158,6 +184,44 @@ class HardwareManager:
         # hard process kill -- nothing in userspace can.
         atexit.register(self._atexit_relay_shutdown)
         atexit.register(self._atexit_smu_shutdown)
+
+    # ------------------------------------------------------------------
+    # Hardware Audit Trail (see docs/architecture.md "Hardware Audit Trail")
+    # ------------------------------------------------------------------
+
+    def _instrument(self, device, device_type: str) -> None:
+        instrument_hardware_instance(
+            device, device_type=device_type, writer=self._audit_writer,
+            run_id_provider=lambda: self._run_id_provider(), settings=self.s,
+        )
+
+    def attach_run_id_provider(self, provider) -> None:
+        """
+        Attach a zero-arg callable returning the CURRENT run_id (e.g.
+        `lambda: storage.run_id`), so every raw_hardware_log row from this
+        point on carries the real run_id instead of NULL. Called
+        automatically by test_control/storage_session.py::
+        open_storage_guarded() once storage actually opens -- callers do
+        not need to call this themselves. Safe to call more than once
+        (e.g. never, if storage never opens); the provider is re-invoked
+        on every audited call, so Group -> ALL's per-position
+        DataStorage.begin_new_run_id() calls are reflected automatically
+        without re-attaching anything.
+        """
+        self._run_id_provider = provider
+
+    def instrument_external_device(self, device, device_type: str) -> None:
+        """
+        Apply the same automatic hardware-audit instrumentation used for
+        every device this class constructs directly to a device
+        constructed OUTSIDE HardwareManager -- currently only SenseRouter
+        (test.py constructs ConfigDrivenSenseRouter() itself; see
+        docs/architecture.md "Future Architecture: Battery Sense
+        Routing"). Shares this instance's own audit writer/run_id
+        provider so the external device's audit rows carry the identical
+        run_id/session_id as every device HardwareManager owns directly.
+        """
+        self._instrument(device, device_type)
 
     # ------------------------------------------------------------------
     # Public device accessors

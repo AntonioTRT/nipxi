@@ -155,6 +155,11 @@ class _FastSettings:
     SAMPLE_RATE_HZ = Settings.SAMPLE_RATE_HZ
     CHARGE_CUTOFF_A = Settings.CHARGE_CUTOFF_A
     CHARGE_TIMEOUT_S = Settings.CHARGE_TIMEOUT_S
+    # Read for the execution screen's display-only "Discharge Timeout"
+    # line (test_control/execution_screen.py) even during a CHARGE run --
+    # see charge_sequence.py's own comment. Not used for any timeout
+    # decision by ChargeSequence itself.
+    DISCHARGE_TIMEOUT_S = Settings.DISCHARGE_TIMEOUT_S
     REVERSE_POLARITY_VOLTAGE_THRESHOLD_V = Settings.REVERSE_POLARITY_VOLTAGE_THRESHOLD_V
 
 

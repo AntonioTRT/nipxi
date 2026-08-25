@@ -318,6 +318,13 @@ class ChargeSequence(BatteryOperationSequence):
                     # this sequence was ever constructed -- trusted here exactly
                     # like every other test_setpoints value already is.
                     charge_timeout_s = test_setpoints.get("charge_timeout_s", self.s.CHARGE_TIMEOUT_S)
+                    # Display-only -- shown on the execution screen alongside
+                    # charge_timeout_s above (see test_control/
+                    # execution_screen.py) so an operator can see BOTH active
+                    # timeout setpoints regardless of which operation is
+                    # running, without checking config/devices.py. Never
+                    # used for any timeout/EOC/EOD decision in this sequence.
+                    discharge_timeout_s = test_setpoints.get("discharge_timeout_s", self.s.DISCHARGE_TIMEOUT_S)
 
                     # Battery Removal During Charge Detection (see
                     # test_control/battery_diagnostics.py::
@@ -432,6 +439,7 @@ class ChargeSequence(BatteryOperationSequence):
                             elapsed_s=time.monotonic() - run_start_time,
                             smu_voltage=smu_reading["voltage_v"], smu_current=i, dmm_voltage=dmm_v,
                             battery_voltage=v, battery_current=i, battery_temp=t_c,
+                            charge_timeout_s=charge_timeout_s, discharge_timeout_s=discharge_timeout_s,
                             ntc_device=self.ntc_daq_name, ntc_resource=getattr(self.daq, "resource", None),
                             ntc_channel=ntc_channel, ntc_status=presence,
                         )

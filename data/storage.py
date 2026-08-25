@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 from config.settings import Settings
+from data.raw_hardware_log import CREATE_RAW_HARDWARE_LOG_INDEXES_SQL, CREATE_RAW_HARDWARE_LOG_SQL
 
 
 # -----------------------------------------------------------------------------
@@ -443,6 +444,16 @@ class DataStorage(StorageBackend):
             self._db.execute(CREATE_STATION_STATE_SQL)
             self._db.execute(CREATE_RUN_SUMMARY_SQL)
             self._db.execute(CREATE_EVENT_LOG_SQL)
+            # Hardware Audit Trail (see docs/architecture.md) -- schema only,
+            # created here so the table/indexes are visible via this
+            # connection immediately, even before any hardware call has
+            # happened. Actual writes go through data/raw_hardware_log.py::
+            # RawHardwareLogWriter's own, independent connection (see that
+            # module's docstring for why) -- this DataStorage instance never
+            # writes to raw_hardware_log itself.
+            self._db.execute(CREATE_RAW_HARDWARE_LOG_SQL)
+            for _stmt in CREATE_RAW_HARDWARE_LOG_INDEXES_SQL:
+                self._db.execute(_stmt)
             # Additive migration -- brings a pre-Milestone-II database (e.g.
             # an existing data_output/development/nipxi_dev.db) up to the
             # current schema without touching any existing row. No-op on a
