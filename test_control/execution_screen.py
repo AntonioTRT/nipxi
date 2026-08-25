@@ -51,6 +51,20 @@ from utils.stop_reason import StopReason
 # bounded window during a multi-hour run.
 RECENT_MEASUREMENTS_DISPLAY_LIMIT = 5
 
+# How many of the most recent event_log rows the "Recent Events" panel
+# shows -- see data/storage.py::DataStorage.get_recent_events()'s `limit`
+# param (default 20; BatteryOperationSequence._render_frame() now passes
+# this constant explicitly instead of taking that default). Matches
+# RECENT_MEASUREMENTS_DISPLAY_LIMIT's value for a consistent "last 5"
+# convention across both panels -- a separate constant since the two
+# panels are conceptually independent bounds that could diverge later,
+# not because the numbers need to differ today. Reduced from the
+# previous unbounded-in-practice 20 specifically for long validation
+# campaigns (docs/architecture.md "Current Execution Screen: Second
+# Compactness Pass") -- 20 events routinely pushed the whole screen past
+# a standard terminal height with no diagnostic benefit over the last 5.
+RECENT_EVENTS_DISPLAY_LIMIT = 5
+
 
 @dataclass
 class ExecutionFrame:
@@ -106,6 +120,19 @@ class ExecutionFrame:
     # conditional gate on this pair.
     charge_timeout_s: float = None
     discharge_timeout_s: float = None
+
+    # Active DMM measurement route -- "MATRIX_NAME CHn" when this run's
+    # sense_channel is routed through a sense-routing relay matrix (see
+    # config/devices.py::SENSE_ROUTING and hardware/sense_router.py; B1
+    # is the only group configured this way today), or None for a direct
+    # DMM read (every other group, and every test type that doesn't use
+    # BatteryOperationSequence._render_frame() at all). Computed by
+    # _render_frame() itself, not passed in by ChargeSequence/
+    # DischargeSequence/MonitorBatterySequence -- this is resolved once,
+    # in the one shared base-class method, from the sense_channel/
+    # sense_router each sequence already stores, rather than duplicated
+    # per subclass.
+    dmm_route: str = None
 
     # NTC block (Charge/Discharge/future Cycle -- see docs/architecture.md
     # Section 58) -- which physical device/channel this run's temperature
@@ -174,7 +201,7 @@ class ExecutionFrame:
                   state=None, phase_detail=None, elapsed_s=None, smu_voltage=None, smu_current=None,
                   dmm_voltage=None, battery_voltage=None, battery_current=None,
                   battery_temp=None, charge_timeout_s=None, discharge_timeout_s=None,
-                  ntc_device=None, ntc_resource=None, ntc_channel=None,
+                  dmm_route=None, ntc_device=None, ntc_resource=None, ntc_channel=None,
                   ntc_status=None, capacity=None, energy=None, cycle_count=None,
                   battery_type=None, group=None, position_in_group=None,
                   relay_state=None, daq_channel_0_raw=None, current_step=None,
@@ -196,6 +223,7 @@ class ExecutionFrame:
             battery_voltage=battery_voltage, battery_current=battery_current,
             battery_temp=battery_temp,
             charge_timeout_s=charge_timeout_s, discharge_timeout_s=discharge_timeout_s,
+            dmm_route=dmm_route,
             ntc_device=ntc_device, ntc_resource=ntc_resource, ntc_channel=ntc_channel,
             ntc_status=ntc_status,
             capacity=capacity, energy=energy, cycle_count=cycle_count,
@@ -316,6 +344,52 @@ def _fmt_timeout(value) -> str:
     return "N/A" if value is None else f"{int(value)} s"
 
 
+def _fmt_dmm_route(value) -> str:
+    """"DIRECT" (not "N/A") when no sense-routing matrix is in the DMM
+    read path -- this is a real, valid, and today the MOST COMMON state
+    (every group except B1), not a missing-data gap, so it must not read
+    like one."""
+    return "DIRECT" if value is None else value
+
+
+def _active_timeout_s(frame: "ExecutionFrame"):
+    """Which of charge_timeout_s/discharge_timeout_s applies to the
+    CURRENT operation, per frame.test_type -- both are always populated
+    together (see ExecutionFrame.charge_timeout_s's docstring: both come
+    from the same test_setpoints dict regardless of which operation is
+    active), only one is ever the countdown target."""
+    if frame.test_type == "charge":
+        return frame.charge_timeout_s
+    if frame.test_type == "discharge":
+        return frame.discharge_timeout_s
+    return None
+
+
+def _fmt_remaining(frame: "ExecutionFrame") -> str:
+    """Countdown to the active timeout -- computed here, purely from
+    fields ExecutionFrame already carries (elapsed_s, charge_timeout_s/
+    discharge_timeout_s, test_type). No new plumbing into ChargeSequence/
+    DischargeSequence was needed for this -- see docs/architecture.md
+    "Current Execution Screen: Second Compactness Pass" for the review
+    that confirmed this. Clamped at 0 rather than going negative once the
+    timeout has actually elapsed (the sequence itself, not this display,
+    is what raises NIPXITimeoutError at that point)."""
+    timeout_s = _active_timeout_s(frame)
+    if timeout_s is None or frame.elapsed_s is None:
+        return "N/A"
+    return _fmt_elapsed(max(0.0, timeout_s - frame.elapsed_s))
+
+
+def _two_col(left: str, right: str, width: int = 33) -> str:
+    """Pack two already-formatted "Label : value" strings onto one line,
+    left column padded to a fixed width -- see docs/architecture.md
+    "Current Execution Screen: Second Compactness Pass". A left value
+    that overflows `width` just pushes the right column over on that one
+    line rather than truncating anything -- no data is ever lost to
+    fit a column."""
+    return f"{left:<{width}}{right}"
+
+
 def _fmt_elapsed(seconds) -> str:
     """"HH:MM:SS" (or "MM:SS" under an hour) -- REQUIREMENT 4's "Elapsed
     Time" line. "N/A" if the caller never threaded elapsed_s through (a
@@ -415,19 +489,18 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
     print(f"Run Number     : {_fmt(frame.run_number)}")
     print(f"Run ID         : {_fmt(frame.run_id)}")
     print(f"Test Type      : {_fmt(frame.test_type)}")
-    print(f"DUT / Channel  : {_fmt(frame.channel)}")
-    print(f"Relay          : {_fmt(frame.relay)}")
     print(f"Current Status : {_running_indicator(frame.state, frame.elapsed_s)}")
-    print(f"Elapsed Time   : {_fmt_elapsed(frame.elapsed_s)}")
+    print(_two_col(f"DUT / Channel  : {_fmt(frame.channel)}", f"Relay : {_fmt(frame.relay)}"))
     print(f"Phase Detail   : {_fmt(frame.phase_detail)}")
+    print(_two_col(f"Elapsed : {_fmt_elapsed(frame.elapsed_s)}", f"Remaining : {_fmt_remaining(frame)}"))
     # Active charge/discharge timeout setpoints -- Charge/Discharge Battery
     # only (see ExecutionFrame.charge_timeout_s's own docstring); omitted
     # entirely, not shown as "N/A", for test types with no timeout concept
     # (Monitor Battery, Proto Test) so their screens stay exactly as
     # compact as before this feature existed.
     if frame.charge_timeout_s is not None or frame.discharge_timeout_s is not None:
-        print(f"Charge Timeout : {_fmt_timeout(frame.charge_timeout_s)}")
-        print(f"Discharge Timeout : {_fmt_timeout(frame.discharge_timeout_s)}")
+        print(_two_col(f"Charge Timeout : {_fmt_timeout(frame.charge_timeout_s)}",
+                        f"Discharge Timeout : {_fmt_timeout(frame.discharge_timeout_s)}"))
     if frame.battery_type is not None or frame.group is not None or frame.scan_progress is not None:
         print("-" * 60)
         print(f"Battery Type   : {_fmt(frame.battery_type)}")
@@ -439,18 +512,25 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
         print(f"Dwell Progress : {_fmt(frame.dwell_progress)}")
         print(f"Remaining Time : {_fmt(frame.dwell_remaining_s)}" + ("" if frame.dwell_remaining_s is None else " s"))
     print("-" * 60)
-    print(f"SMU Voltage    : {_fmt_volts(frame.smu_voltage)}")
-    print(f"SMU Current    : {_fmt_amps(frame.smu_current)}")
-    print(f"DMM Voltage    : {_fmt_volts(frame.dmm_voltage)}")
-    print(f"Battery Voltage: {_fmt_volts(frame.battery_voltage)}")
-    print(f"Battery Temp   : {_fmt_temp(frame.battery_temp)}")
-    print(f"DAQ Ch0 Raw    : {_fmt(frame.daq_channel_0_raw, '.6f')}" + ("" if frame.daq_channel_0_raw is None else " V (raw)"))
-    # NTC device/resource/channel/status, compacted onto one line -- the
+    print(_two_col(f"SMU Voltage : {_fmt_volts(frame.smu_voltage)}", f"SMU Current : {_fmt_amps(frame.smu_current)}"))
+    print(_two_col(f"DMM Voltage : {_fmt_volts(frame.dmm_voltage)}",
+                    f"DMM Route : {_fmt_dmm_route(frame.dmm_route)}"))
+    print(_two_col(f"Battery Voltage : {_fmt_volts(frame.battery_voltage)}",
+                    f"Battery Temp : {_fmt_temp(frame.battery_temp)}"))
+    # NTC channel/status, compacted onto one short line -- device/resource
+    # dropped (operationally redundant once the channel is shown) and the
     # temperature VALUE itself is Battery Temp above, never repeated here.
+    # Paired with DAQ Ch0 Raw (both are auxiliary/diagnostic fields) when
+    # NTC applies; DAQ Ch0 Raw alone otherwise -- see docs/architecture.md
+    # "Current Execution Screen: Second Compactness Pass".
+    daq_line = (f"DAQ Ch0 Raw : {_fmt(frame.daq_channel_0_raw, '.6f')}"
+                + ("" if frame.daq_channel_0_raw is None else " V (raw)"))
     if frame.ntc_device is not None or frame.ntc_channel is not None:
         status = frame.ntc_status.upper() if frame.ntc_status else "N/A"
-        print(f"NTC            : {_fmt(frame.ntc_device)} ({_fmt(frame.ntc_resource)}) "
-              f"{_fmt(frame.ntc_channel)} -- {status}")
+        ntc_line = f"Temp Sensor : {_fmt(frame.ntc_channel)} ({status})"
+        print(_two_col(ntc_line, daq_line))
+    else:
+        print(daq_line)
     print(f"Capacity: {_fmt(frame.capacity)} | Energy: {_fmt(frame.energy)} | Cycles: {_fmt(frame.cycle_count)}")
 
     print("=" * 60)
@@ -474,7 +554,7 @@ def render_execution_frame(frame: ExecutionFrame) -> None:
         print("(none)")
 
     print("=" * 60)
-    print("Recent Events")
+    print(f"Recent Events (last {RECENT_EVENTS_DISPLAY_LIMIT})")
     print("=" * 60)
     if frame.recent_events:
         for e in frame.recent_events:

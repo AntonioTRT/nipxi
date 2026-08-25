@@ -649,6 +649,29 @@ def _identify_switch(name: str, cfg: dict):
                  f"Not applicable -- no niswitch-based driver exists in this codebase.\n{note}")
 
 
+def _functional_switch(name: str, cfg: dict):
+    """
+    Switch/Relay (PXI) Functional Validation -- see PXI_SLOTS[11]'s
+    validation_notes and _identify_switch()'s identical rationale. No
+    niswitch-based driver exists in this codebase to functionally
+    validate against (no energize/read-back cycle is possible), so this
+    reports the same honest N/A/WARNING result Identity Validation does,
+    reached via the "[2] Functional Validation" menu path instead of
+    _run_hardware_category()'s generic "not yet implemented for this
+    hardware category" placeholder -- an operator who explicitly chose
+    Functional Validation for this card should see WHY it can't be done,
+    not a vague stub message indistinguishable from "not built yet."
+    Never touches hardware -- there is no driver class to touch.
+    """
+    resource = cfg.get("resource", "")
+    model = cfg.get("model", "")
+    display = dev_cfg.device_display_name(cfg)
+    note = cfg.get("validation_notes", "No driver class implemented for this category.")
+    ref = f"config/devices.py -> PXI_SLOTS[{name!r}] ({resource} / {model})"
+    return [_warn("Switch Functional", f"Switch/Relay (PXI): {display}", ref,
+                  f"Not applicable -- no niswitch-based driver exists in this codebase.\n{note}")]
+
+
 def _pxi_slots_by_category(category: str) -> dict:
     """
     PXI_SLOTS entries of the given category, keyed by nickname, in slot-
@@ -2101,14 +2124,15 @@ def test_pxi_relay_matrix():
     Menu entry for the PXI-resident switch/relay card (PXI_SLOTS[11],
     category="switch", nickname CHASSIS_RELAY_MATRIX -- physically present
     in the rack, but NOT the active relay driver; see PXI_SLOTS[11]'s
-    validation_notes). Routes to Identity Validation (_identify_switch --
-    always reports N/A, since no niswitch-based driver exists) via the
-    shared _run_hardware_category() workflow. No Functional Validation is
-    implemented -- there is nothing to validate functionally without a
-    driver.
+    validation_notes). Routes to Identity Validation (_identify_switch)
+    or Functional Validation (_functional_switch) via the shared
+    _run_hardware_category() workflow -- both report the identical
+    honest N/A/WARNING result, since no niswitch-based driver exists in
+    this codebase to check identity against or functionally validate;
+    neither ever touches hardware.
     """
     devices = _pxi_slots_by_category("switch")
-    return _run_hardware_category("PXI Relay Matrix", devices, _identify_switch)
+    return _run_hardware_category("PXI Relay Matrix", devices, _identify_switch, _functional_switch)
 
 
 # =============================================================================
@@ -4527,7 +4551,7 @@ def _run_one_charge_or_discharge_position(*, operation, sequence_cls, source, gr
     never operator-requested; it reflects an unsafe/unknown station state.
     """
     from test_control.battery_presence_precheck import battery_and_ntc_presence_precheck
-    from utils.errors import OperationCancelledError
+    from utils.errors import NIPXITimeoutError, OperationCancelledError
     from utils.stop_reason import StopReason
 
     smu_name, smu_cfg = hw["smu_name"], hw["smu_cfg"]
@@ -4679,7 +4703,17 @@ def _run_one_charge_or_discharge_position(*, operation, sequence_cls, source, gr
                 ),
             )
         else:
-            print(f"\n[FAIL] {operation} aborted: {e}")
+            # UI-only wording distinction -- see docs/architecture.md
+            # "Current Execution Screen: Second Compactness Pass". `result`
+            # stays "FAIL" either way (from _classify_position_exception()
+            # above, unchanged), and every DB write/event (run_summary,
+            # station_state, GROUP_SLOT_FAILED) still records "FAIL" --
+            # this only changes what the OPERATOR reads on the console for
+            # the specific, common case of "the operation ran out of its
+            # configured time" vs every other battery-under-test failure,
+            # which stays "[FAIL]" exactly as before.
+            label = "[TIMEOUT]" if isinstance(e, NIPXITimeoutError) else "[FAIL]"
+            print(f"\n{label} {operation} aborted: {e}")
 
     _print_post_run_summary(storage)
     return result

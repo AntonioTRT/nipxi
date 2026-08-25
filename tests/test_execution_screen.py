@@ -38,7 +38,7 @@ class RequiredFieldsSurviveTests(unittest.TestCase):
         )
         for label in (
             "Run Number", "Run ID", "Test Type", "DUT / Channel", "Relay",
-            "Current Status", "Elapsed Time", "Phase Detail",
+            "Current Status", "Elapsed", "Phase Detail",
             "DMM Voltage", "SMU Voltage", "SMU Current", "Battery Temp",
             "Recent Events", "Measurement History",
         ):
@@ -51,11 +51,11 @@ class RemovedElementsTests(unittest.TestCase):
     def test_standalone_ntc_header_is_gone(self):
         output = _render(ntc_device="MAIN_DAQ", ntc_channel="Dev1/ai0", ntc_status="present")
         self.assertNotIn("\nNTC\n", output)
-        # NTC info must still be present, just integrated onto one line.
-        self.assertIn("NTC", output)
-        self.assertIn("MAIN_DAQ", output)
-        self.assertIn("Dev1/ai0", output)
-        self.assertIn("PRESENT", output)
+        self.assertNotIn("NTC            :", output)
+        # Second compactness pass: relabeled "NTC" -> "Temp Sensor", device/
+        # resource dropped as operationally redundant once channel is shown.
+        self.assertIn("Temp Sensor : Dev1/ai0 (PRESENT)", output)
+        self.assertNotIn("MAIN_DAQ", output)
 
     def test_battery_current_line_is_removed(self):
         output = _render(battery_current=0.5)
@@ -129,6 +129,92 @@ class VerticalDensityTests(unittest.TestCase):
         # block/Battery Current/3-line metrics) -- see the review's own
         # line-by-line count. New layout must be well under that.
         self.assertLess(top_block_end, 25)
+
+
+class TwoColumnLayoutTests(unittest.TestCase):
+    """Second compactness pass, requirement 1 -- two-column packing for
+    the live-readings block and DUT/Channel + Relay."""
+
+    def test_dut_channel_and_relay_share_one_line(self):
+        output = _render(channel=3, relay=2)
+        self.assertIn("DUT / Channel  : 3", output)
+        line = next(l for l in output.splitlines() if l.startswith("DUT / Channel"))
+        self.assertIn("Relay : 2", line)
+
+    def test_smu_voltage_and_current_share_one_line(self):
+        output = _render(smu_voltage=3.7, smu_current=0.5)
+        line = next(l for l in output.splitlines() if l.startswith("SMU Voltage"))
+        self.assertIn("SMU Current : 0.500000 A", line)
+
+    def test_dmm_voltage_and_route_share_one_line(self):
+        output = _render(dmm_voltage=3.698)
+        line = next(l for l in output.splitlines() if l.startswith("DMM Voltage"))
+        self.assertIn("DMM Route :", line)
+
+    def test_battery_voltage_and_temp_share_one_line(self):
+        output = _render(battery_voltage=3.698, battery_temp=25.3)
+        line = next(l for l in output.splitlines() if l.startswith("Battery Voltage"))
+        self.assertIn("Battery Temp : 25.3 C", line)
+
+    def test_run_number_and_run_id_stay_on_separate_lines(self):
+        # Approved design: identity fields (Run Number/Run ID/Test Type/
+        # Current Status) are NOT two-column-packed -- only the
+        # fast-changing readings block and DUT/Channel+Relay are.
+        output = _render(run_number=12)
+        line = next(l for l in output.splitlines() if l.startswith("Run Number"))
+        self.assertNotIn("Run ID", line)
+
+
+class DmmRouteTests(unittest.TestCase):
+    """Second compactness pass -- active DMM measurement route."""
+
+    def test_direct_shown_when_no_sense_route_given(self):
+        output = _render()
+        self.assertIn("DMM Route : DIRECT", output)
+
+    def test_configured_route_is_shown_verbatim(self):
+        output = _render(dmm_route="MATRIX_NUMATO_201 CH1")
+        self.assertIn("DMM Route : MATRIX_NUMATO_201 CH1", output)
+
+
+class RemainingTimeCountdownTests(unittest.TestCase):
+    """Second compactness pass -- timeout countdown, derived purely from
+    existing fields (elapsed_s, charge_timeout_s/discharge_timeout_s,
+    test_type) with no new plumbing into ChargeSequence/DischargeSequence."""
+
+    def test_remaining_counts_down_during_a_charge_run(self):
+        output = _render(test_type="charge", elapsed_s=249, charge_timeout_s=300)
+        self.assertIn("Remaining : 00:51", output)
+
+    def test_remaining_counts_down_during_a_discharge_run(self):
+        output = _render(test_type="discharge", elapsed_s=100, discharge_timeout_s=600)
+        self.assertIn("Remaining : 08:20", output)
+
+    def test_remaining_clamped_at_zero_not_negative(self):
+        output = _render(test_type="charge", elapsed_s=305, charge_timeout_s=300)
+        self.assertIn("Remaining : 00:00", output)
+
+    def test_remaining_na_when_no_timeout_configured(self):
+        output = _render(test_type="charge", elapsed_s=10)
+        self.assertIn("Remaining : N/A", output)
+
+    def test_remaining_na_for_test_types_without_a_timeout_concept(self):
+        output = _render(test_type="monitor", elapsed_s=10, charge_timeout_s=300)
+        self.assertIn("Remaining : N/A", output)
+
+    def test_elapsed_and_remaining_share_one_line(self):
+        output = _render(elapsed_s=10, charge_timeout_s=300)
+        line = next(l for l in output.splitlines() if l.startswith("Elapsed"))
+        self.assertIn("Remaining :", line)
+
+
+class RecentEventsCountTests(unittest.TestCase):
+    """Second compactness pass, requirement 7 -- header reflects the
+    reduced (5, down from 20) event count."""
+
+    def test_header_shows_the_reduced_limit(self):
+        output = _render()
+        self.assertIn("Recent Events (last 5)", output)
 
 
 if __name__ == "__main__":

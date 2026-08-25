@@ -17,7 +17,9 @@ Two levels are tested:
      wiring end to end for each of the 8 scenarios in the design brief.
 """
 
+import io
 import unittest
+from contextlib import redirect_stdout
 
 import test as test_module  # noqa: F401 -- importing this calls logging.disable(logging.CRITICAL)
 from utils.errors import (
@@ -276,6 +278,35 @@ class RunOnePositionStationFaultIntegrationTests(unittest.TestCase):
         # row for the same run.
         _, storage = _run_position(RelayError("relay comms lost"))
         self.assertTrue(any(s.get("state") == "STATION_FAULT" for s in storage.execution_states))
+
+
+class TimeoutConsoleWordingTests(unittest.TestCase):
+    """
+    UI-only wording review (see docs/architecture.md "Current Execution
+    Screen: Second Compactness Pass") -- a timeout now prints "[TIMEOUT]"
+    instead of "[FAIL]" on the console, but `result` (the value
+    orchestration/DB logic actually acts on) is unchanged: still "FAIL",
+    exactly as ClassifyPositionExceptionTests already pins. No result
+    classification, run_summary, or event-logging behavior changes here.
+    """
+
+    def _run_and_capture(self, exc):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result, storage = _run_position(exc)
+        return result, storage, buf.getvalue()
+
+    def test_timeout_exception_prints_timeout_label(self):
+        result, _, output = self._run_and_capture(NIPXITimeoutError("charge timeout after 300s"))
+        self.assertEqual(result, "FAIL")
+        self.assertIn("[TIMEOUT] Charge Battery aborted: charge timeout after 300s", output)
+        self.assertNotIn("[FAIL]", output)
+
+    def test_non_timeout_battery_failure_still_prints_fail_label(self):
+        result, _, output = self._run_and_capture(BatteryRemovedDuringChargeError("removed mid-charge"))
+        self.assertEqual(result, "FAIL")
+        self.assertIn("[FAIL] Charge Battery aborted: removed mid-charge", output)
+        self.assertNotIn("[TIMEOUT]", output)
 
 
 if __name__ == "__main__":

@@ -24,9 +24,11 @@ by every operation, not where they are first resolved.
 
 import logging
 
+import config.devices as dev_cfg
 from test_control.safety_monitor import SafetyMonitor
 from test_control.execution_screen import (
-    RECENT_MEASUREMENTS_DISPLAY_LIMIT, ExecutionFrame, render_execution_frame,
+    RECENT_EVENTS_DISPLAY_LIMIT, RECENT_MEASUREMENTS_DISPLAY_LIMIT,
+    ExecutionFrame, render_execution_frame,
 )
 from utils.errors import (
     SafetyViolationError, RelayError, OperationCancelledError, ReversePolarityError,
@@ -159,11 +161,29 @@ class BatteryOperationSequence:
         Position 5. Run-level setup messages logged with no channel at all
         (e.g. "Run started") are naturally excluded from the events panel
         once a channel filter is given -- see get_recent_events()'s own
-        docstring.
+        docstring. recent_events is bounded to RECENT_EVENTS_DISPLAY_LIMIT
+        rows for the identical "endless scrolling"/growing-query-cost
+        reason recent_measurements already was -- see docs/architecture.md
+        "Current Execution Screen: Second Compactness Pass" (this bound
+        used to be get_recent_events()'s own default of 20).
+
+        `dmm_route` is resolved here, once, for every subclass
+        (Charge/Discharge/Monitor Battery all share this one method) from
+        `self.sense_channel`/config/devices.py::SENSE_ROUTING -- None
+        (rendered "DIRECT", not "N/A") when this operation's sense_channel
+        is None, exactly like every other DMM read in this codebase today.
         """
+        dmm_route = None
+        if self.sense_channel is not None:
+            route = dev_cfg.SENSE_ROUTING.get(self.sense_channel, {})
+            matrix_name, relay_num = route.get("relay_matrix"), route.get("relay")
+            if matrix_name is not None and relay_num is not None:
+                dmm_route = f"{matrix_name} CH{relay_num}"
+
         frame = ExecutionFrame.from_live(
             run_number=run_number, run_id=self.storage.run_id, test_type=test_type,
             channel=channel, relay=relay_address, state=state, phase_detail=phase_detail,
+            dmm_route=dmm_route,
             initial_measurement=self.storage.get_first_measurement(
                 run_id=self.storage.run_id, channel=channel,
             ),
@@ -171,7 +191,9 @@ class BatteryOperationSequence:
                 run_id=self.storage.run_id, channel=channel,
                 recent_limit=RECENT_MEASUREMENTS_DISPLAY_LIMIT,
             ),
-            recent_events=self.storage.get_recent_events(run_id=self.storage.run_id, channel=channel),
+            recent_events=self.storage.get_recent_events(
+                run_id=self.storage.run_id, channel=channel, limit=RECENT_EVENTS_DISPLAY_LIMIT,
+            ),
             **extra_fields,
         )
         render_execution_frame(frame)
