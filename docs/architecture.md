@@ -8224,3 +8224,250 @@ regression introduced by Milestone XX, none blocks the milestone's
 stated single-position/single-battery-type scope, and all three are
 explicitly carried forward to the next milestone rather than silently
 dropped.
+
+## 82. Safety Fault Lifecycle (CURRENT IMPLEMENTATION)
+
+Closes a real gap disclosed nowhere above: a failed shutdown-verification
+call (`emergency_output_off()`/`verify_output_disabled()`/
+`force_output_off_and_verify()` returning `False`, or a relay
+`open_all()`/`verify_all(0)` failure) was previously only logged
+(CRITICAL) at every one of its call sites -- the calling sequence still
+returned/continued normally, so "PMU may still be sourcing/sinking
+current" never actually stopped anything. This section documents the fix:
+every such failure is now escalated to a SAFETY FAULT, persisted, shown to
+the operator, and (where a run is in progress) turned into a
+STATION_FAULT via the *existing* Group -> ALL Fault Classification Policy
+(Section 80) -- no new fault-classification system was introduced.
+
+### Three trigger points, one shared implementation
+
+All three call into `utils/safety_fault.py` (`report_safety_fault()` /
+`display_safety_fault_screen()` / `acknowledge_safety_fault()`) -- one
+persistence/display implementation, reused rather than duplicated:
+
+1. **In-run escalation** (`test_control/charge_sequence.py::ChargeSequence.run()`,
+   `test_control/discharge_sequence.py::DischargeSequence.run()`) -- at
+   the exact point that used to just log CRITICAL and fall through to
+   `self.relay.open(relay_address)` / `return True`. Now: force all
+   relays open (`self.relay.open_all()` -- mirrors
+   `SafetyMonitor.emergency_stop()`'s "isolate regardless of SMU outcome"
+   ordering, Section 24/60), report + display + block on operator
+   acknowledgement, THEN raise `utils.errors.SMUStateVerificationError`
+   (an **existing** `SMUError` subclass, previously used only for
+   config-readback mismatches in `_verify_config_readback()`). Because
+   `SMUError` is already a member of `STATION_HARDWARE_EXCEPTIONS`
+   (Section 80), `test.py::_classify_position_exception()` classifies
+   this `STATION_FAULT` with zero changes to that policy, and Group ->
+   ALL's existing break-on-`STATION_FAULT` loop
+   (`_run_charge_or_discharge_all_positions()`) aborts remaining
+   positions unchanged.
+
+2. **Startup Safety Sweep** (`test_control/safety_sweep.py::
+   run_startup_safety_sweep()`, called once from `test.py::main()`,
+   between Configuration Validation and the Main Menu). Connects,
+   force-safes, verifies, and disconnects **every** configured SMU
+   (`config/devices.py::SMU_ASSIGNMENTS`) and **every** configured Numato
+   relay matrix (`NUMATO_RELAY_MATRIX_CONFIGS`) -- broader than
+   `HardwareManager.connect_all()`, which only ever touches the one
+   SMU/relay pair resolved for whichever group is about to run. Respects
+   `config/system_mode.py` exactly like `connect_all()` already does: a
+   device that simply fails to **connect** is tolerated per SYSTEM_MODE
+   (logged, sweep continues -- this is what keeps a hardware-free
+   DEVELOPMENT laptop able to start at all), but a device that DID
+   connect and failed its safety verification is **always** fatal,
+   raising `SafetyFaultBlocked` (after the operator acknowledges the
+   SAFETY FAULT screen), which `main()` catches and calls `sys.exit(1)`
+   on -- the Main Menu is never shown.
+
+3. **Post-Workflow Safety Sweep** -- folded directly into
+   `test_control/hardware_manager.py::HardwareManager.disconnect_all()`,
+   the universal teardown point every real hardware workflow already
+   calls before returning to the Main Menu. Deliberately does **not**
+   re-run `emergency_output_off()`/`open_all()` a second time (that would
+   double an already-bounded-retry sequence and duplicate log lines) --
+   it adds the report/display/acknowledge call at the two failure
+   branches `disconnect_all()` already had (SMU verification failed;
+   relay `open_all()` raised), using the SAME `utils/safety_fault.py`
+   primitives as the other two trigger points. `HardwareManager`
+   deliberately has no `storage` reference (same storage-free layering
+   boundary as `hardware/smu.py`/`safety_monitor.py`, Section 41) --
+   `report_safety_fault()`/`acknowledge_safety_fault()` tolerate
+   `storage=None` and still persist to `raw_hardware_log`, which never
+   depends on an open `DataStorage` session (Section 79).
+
+### Console SAFETY FAULT screen
+
+`utils/safety_fault.py::display_safety_fault_screen()` -- pure CLI (no
+GUI framework exists in this project), mirrors the existing `"=" * 60`
+rule/banner idiom already used throughout `test.py` (the app startup
+banner, `run_section()`, the existing STATION FAULT summary in
+`_print_group_run_summary()`) and the existing `input()`-then-swallow-
+`KeyboardInterrupt`/`EOFError` blocking idiom already used everywhere
+else (`_pause_before_main_menu()`) -- no new banner style or input-gating
+pattern was introduced:
+
+```
+============================================================
+                    SAFETY FAULT
+============================================================
+
+SMU state:
+    UNKNOWN
+
+Relay state:
+    VERIFIED OPEN
+
+Reason:
+    <reason text>
+
+Physically inspect the station.
+
+Press ENTER to acknowledge...
+============================================================
+```
+
+### Persistence -- no schema change
+
+Reuses the existing `EventType` vocabulary (`utils/event_format.py`) --
+two new constants, `SAFETY_FAULT_RAISED`/`SAFETY_FAULT_ACKNOWLEDGED` --
+and the existing `event_log`/`raw_hardware_log` tables/writers verbatim;
+no migration, no new table:
+
+- **`event_log`** (via `DataStorage.log_event()`, when a `storage` is
+  available) -- `source="SAFETY"`, `level="CRITICAL"` (RAISED) /
+  `"INFO"` (ACKNOWLEDGED), `message` built by the existing
+  `format_event()` helper carrying `fault_id`, `device_name`,
+  `device_type`, `position`, `source_method`, `context`,
+  `verification_result`, `reason` (RAISED) or `acknowledges_fault_id`
+  (ACKNOWLEDGED) as flat `KEY=value` text.
+- **`raw_hardware_log`** (via `RawHardwareLogWriter`, always -- see
+  Section 79's "independent of any open DataStorage session" design,
+  which is exactly why this table, not `event_log`, is the one guaranteed
+  to have a row even for a Startup Safety Sweep failure that happens
+  before any `DataStorage` is ever opened): `device_type`/`device_name`
+  set to the actual faulting device; `command="safety_fault_raised"` /
+  `"operator_acknowledged_safety_fault"`; `success=0` (RAISED) / `1`
+  (ACKNOWLEDGED); **`error_type` carries the exact
+  `OutputVerificationResult` value** (see below -- this is the
+  highest-value single field this change adds); `additional_metadata`
+  (free JSON, already existed, never required a migration) carries
+  `fault_id`, `context`, `source_method`, and `linked_event_log_id` (the
+  `event_log` row's own auto-increment id, when one was written) --
+  correlating the two tables' rows for the SAME fault without a new
+  foreign-key column. `acknowledges_fault_id` in the ACKNOWLEDGED row's
+  `additional_metadata` correlates it back to its RAISED row's
+  `fault_id`, generated once by `utils.safety_fault.new_fault_id()`
+  (a process-unique label, not a database id -- so acknowledgement never
+  needs a read-back round trip to know what to correlate against).
+
+### OutputVerificationResult -- no longer discarded
+
+`hardware/smu.py::OutputVerificationResult` (`DISABLED` / `STILL_ENABLED`
+/ `VERIFICATION_COMM_FAILURE`, Section 74) already existed inside
+`emergency_output_off()`'s retry loop, but was previously discarded after
+being folded into one CRITICAL log line -- never reaching any persisted
+record. It is now preserved end to end into `raw_hardware_log.error_type`
+via a **caller-side, zero-signature-change** technique:
+`emergency_output_off()`'s own `on_event` callback already emits the
+exact string `"output disabled verification result: <value> ..."` (see
+its docstring) -- `utils.safety_fault.extract_verification_result()`
+parses that documented, stable message format. This deliberately avoids
+adding a new keyword parameter to `emergency_output_off()` (which would
+have required updating every scripted fake SMU across ~8 existing test
+files that construct `ChargeSequence`/`DischargeSequence` with a
+narrower fake) and avoids giving `hardware/smu.py` any new persistence-
+layer knowledge (it still has zero awareness of `storage`/`raw_hardware_
+log`, per its module docstring's storage-free layering boundary).
+
+Meaning of the three values, for incident investigation:
+
+- **`DISABLED`** -- output verified OFF. No fault; nothing is persisted
+  for this call.
+- **`STILL_ENABLED`** -- the instrument's own readback confirms output is
+  still electrically enabled. A real, physical fact: the PMU may still be
+  actively sourcing/sinking current. This is the single most important
+  distinction for a battery-fire investigation -- it means the output
+  stage was genuinely still live at the moment shutdown was attempted,
+  not merely unconfirmed.
+- **`VERIFICATION_COMM_FAILURE`** -- the readback query itself failed
+  (a communication problem, unrelated to whether the preceding
+  `output_disable()` command actually succeeded). Per "unknown state =
+  unsafe state" (Section 12), this is treated identically to
+  `STILL_ENABLED` for the safety DECISION (both escalate), but the two
+  are never collapsed into one generic "verification failed" in the
+  persisted record -- a communication fault points an investigator at the
+  instrument link/driver, not at the output stage itself.
+
+### Operator acknowledgement flow
+
+1. A shutdown-verification failure is detected (any of the three trigger
+   points above).
+2. All relays are forced open (best effort -- the failure is reported
+   either way, and the actually-achieved relay state, "VERIFIED OPEN" or
+   "UNVERIFIED", is what gets displayed, never assumed).
+3. `report_safety_fault()` persists the SAFETY_FAULT_RAISED record to
+   both tables and returns a `fault_id`.
+4. `display_safety_fault_screen()` shows the SAFETY FAULT screen and
+   blocks on `input()` until the operator presses ENTER (or the process
+   receives EOF/Ctrl+C, both of which resolve the block rather than
+   hanging -- the same idiom `_pause_before_main_menu()` already uses).
+5. `acknowledge_safety_fault()` persists the correlated
+   SAFETY_FAULT_ACKNOWLEDGED record.
+6. Only THEN does the trigger point raise/exit -- for the in-run case,
+   `SMUStateVerificationError` propagates into the existing STATION_FAULT
+   machinery (Group -> ALL aborts remaining positions); for the Startup
+   Safety Sweep, `SafetyFaultBlocked` propagates into `main()`, which
+   exits before the Main Menu is ever shown.
+
+**Known, disclosed limitation** (deliberate scope decision, not an
+oversight): the Post-Workflow Safety Sweep case (`disconnect_all()`)
+blocks the OPERATOR immediately and unmissably at step 4 above, but once
+acknowledged, control still returns to the Main Menu exactly as it did
+before this change -- there is no persistent "station is in SAFETY_FAULT,
+disable the menu" flag carried forward into the next menu selection. Every
+individual workflow function's own teardown already wraps
+`disconnect_all()` in a broad `except Exception:` (to keep one device's
+shutdown failure from preventing another's), so raising out of
+`disconnect_all()` itself would only be swallowed at each of those ~5
+call sites, not actually block anything further. Implementing a durable
+"station blocked until restart" flag threaded through `test.py::main()`'s
+menu loop was judged a materially larger change than this pass's scope
+(Change 3 specifically) and is flagged here as a follow-up, not silently
+left unmentioned.
+
+### Test suite after this change
+
+New: `tests/test_safety_fault.py` (18 cases -- `extract_verification_result()`,
+`report_safety_fault()`/`acknowledge_safety_fault()` persistence to both
+tables, the `storage=None` path, the console screen), `tests/
+test_shutdown_verification_escalation.py` (9 cases -- ChargeSequence/
+DischargeSequence escalation, relay-forced-open-first ordering, fault_id
+correlation, `STILL_ENABLED` vs `VERIFICATION_COMM_FAILURE` distinction),
+`tests/test_startup_safety_sweep.py` (7 cases), `tests/
+test_post_workflow_safety_sweep.py` (3 source-presence cases, mirroring
+Section 68's established convention for this same hard-to-harness
+method), plus 3 new cases in `tests/test_hardware_audit_proxy.py`
+(SENSE_ROUTER position-attribution fix, Change 8) and 2 new cases in
+`tests/test_group_all_fault_classification.py` (`SMUStateVerificationError`
+classification + end-to-end Group -> ALL abort). Full suite: **484/484
+passing**, no regressions.
+
+### SENSE_ROUTER Position Attribution Fix (Change 8)
+
+A pre-existing, previously undisclosed traceability bug, fixed alongside
+the above: `hardware/audit_proxy.py::_extract_position()` recovers a
+battery position from any of `channel`/`relay_address`/`position`-named
+parameters (Section 79) as a best-effort convenience. `hardware/
+sense_router.py::ConfigDrivenSenseRouter.connect(channel)`/
+`disconnect(channel)` takes a **logical `SENSE_ROUTING` channel number**
+(Section 72/73) -- not a battery position -- but happens to share the
+parameter name `channel`, so every sense-routing call was being recorded
+into `raw_hardware_log.position` as if it were a battery position.
+Fixed at the one shared interception point
+(`instrument_hardware_instance()`) rather than renaming SenseRouter's
+parameter (which would not stop a FUTURE non-position `channel`-named
+parameter from being misread the same way): a `_NON_POSITION_DEVICE_TYPES
+= frozenset({"SENSE_ROUTER"})` set gates `_extract_position()`, so any
+call instrumented with `device_type="SENSE_ROUTER"` always logs
+`position=None`, while every other device type's identical
+`channel`-named argument is extracted exactly as before.

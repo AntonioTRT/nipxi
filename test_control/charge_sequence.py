@@ -134,9 +134,13 @@ from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
 from utils.errors import (
     BatteryRemovedDuringChargeError, DAQError, DMMMeasurementLostError, NIPXITimeoutError,
-    SafetyViolationError, ReversePolarityError,
+    SafetyViolationError, ReversePolarityError, SMUStateVerificationError,
 )
 from utils.event_format import EventType, format_event
+from utils.safety_fault import (
+    acknowledge_safety_fault, display_safety_fault_screen, extract_verification_result,
+    report_safety_fault,
+)
 
 
 class ChargeSequence(BatteryOperationSequence):
@@ -480,7 +484,15 @@ class ChargeSequence(BatteryOperationSequence):
                         prev_v, prev_i = v, i
                         interruptible_sleep(dt, token=token)
                 finally:
-                    on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+                    shutdown_trace_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+                    verification_result = {"value": None}
+
+                    def on_event(message, _trace=shutdown_trace_event, _result=verification_result):
+                        result = extract_verification_result(message)
+                        if result is not None:
+                            _result["value"] = result
+                        _trace(message)
+
                     smu_disabled_ok = self.smu.emergency_output_off(
                         f"end of charge sequence on channel {channel}", on_event=on_event,
                     )
@@ -498,6 +510,47 @@ class ChargeSequence(BatteryOperationSequence):
                             verified=smu_disabled_ok,
                         ),
                     )
+
+                # Escalate failed shutdown verification to STATION_FAULT --
+                # see docs/architecture.md "Safety Fault Lifecycle". Unknown
+                # SMU state = unsafe state must never be allowed to fall
+                # through as a silent PASS (run_guarded()'s `finally`-adjacent
+                # code below this method never even sees a False result
+                # otherwise). Forces all relays open FIRST (mirrors
+                # SafetyMonitor.emergency_stop()'s own "physically isolate
+                # regardless of SMU outcome" ordering), then persists +
+                # displays + blocks on operator acknowledgement, THEN raises
+                # -- SMUStateVerificationError is an existing SMUError
+                # subclass, so test.py::_classify_position_exception()
+                # classifies this STATION_FAULT via the existing
+                # STATION_HARDWARE_EXCEPTIONS policy with no new
+                # classification system, and Group -> ALL's existing
+                # break-on-STATION_FAULT loop (test.py::
+                # _run_charge_or_discharge_all_positions()) aborts remaining
+                # positions unchanged.
+                if not smu_disabled_ok:
+                    relay_state = "VERIFIED OPEN"
+                    try:
+                        self.relay.open_all()
+                    except Exception:
+                        relay_state = "UNVERIFIED -- open_all() failed"
+                    fault_reason = (
+                        f"Channel {channel}: SMU output could not be verified OFF after "
+                        f"charge sequence (verification_result="
+                        f"{verification_result['value']})."
+                    )
+                    fault_id = report_safety_fault(
+                        reason=fault_reason, source_method="emergency_output_off",
+                        context="in_run_escalation", device_name=getattr(self.smu, "name", self.smu.resource),
+                        device_type="SMU", position=channel, run_id=self.storage.run_id,
+                        verification_result=verification_result["value"], storage=self.storage,
+                        settings=self.s,
+                    )
+                    display_safety_fault_screen(smu_state="UNKNOWN", relay_state=relay_state, reason=fault_reason)
+                    acknowledge_safety_fault(
+                        fault_id=fault_id, storage=self.storage, run_id=self.storage.run_id, settings=self.s,
+                    )
+                    raise SMUStateVerificationError(fault_reason)
 
                 # Relay open only AFTER the PMU output is confirmed off (the
                 # finally above) -- never switch a relay while current might

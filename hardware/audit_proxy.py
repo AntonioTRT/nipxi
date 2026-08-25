@@ -66,8 +66,23 @@ MEASUREMENT_METHOD_NAMES = frozenset({"measure", "measure_dc_voltage", "read_cha
 # constraints this feature was built under.
 _POSITION_PARAM_NAMES = ("channel", "relay_address", "position")
 
+# Device types whose "channel"-shaped parameter is NOT a battery position --
+# see docs/architecture.md "SENSE_ROUTER Position Attribution Fix".
+# ConfigDrivenSenseRouter.connect(channel)/disconnect(channel) takes a
+# logical SENSE_ROUTING channel number (config/devices.py), not a battery
+# position -- it happens to share the parameter name "channel" with every
+# true relay/matrix position operation, which is exactly what let
+# _extract_position() below mislabel a sense-routing channel as a battery
+# position in raw_hardware_log. Excluded here, at the one shared
+# interception point, rather than renaming SenseRouter's parameter (which
+# would not stop a FUTURE non-position "channel"-named parameter from being
+# misread the same way) or special-casing every caller.
+_NON_POSITION_DEVICE_TYPES = frozenset({"SENSE_ROUTER"})
 
-def _extract_position(sig: inspect.Signature, args: tuple, kwargs: dict):
+
+def _extract_position(sig: inspect.Signature, args: tuple, kwargs: dict, device_type: str = None):
+    if device_type in _NON_POSITION_DEVICE_TYPES:
+        return None
     try:
         bound = sig.bind_partial(*args, **kwargs)
     except TypeError:
@@ -153,7 +168,7 @@ def instrument_hardware_instance(instance, *, device_type: str, writer,
                 except Exception as exc:
                     duration_ms = (time.monotonic() - start) * 1000.0
                     writer.log(
-                        run_id=run_id_provider(), position=_extract_position(sig, args, kwargs),
+                        run_id=run_id_provider(), position=_extract_position(sig, args, kwargs, device_type),
                         device_type=device_type, device_name=getattr(instance, "name", device_type),
                         resource=getattr(instance, "resource", None), command=command,
                         command_parameters={"args": args, "kwargs": kwargs}, response=None,
@@ -164,7 +179,7 @@ def instrument_hardware_instance(instance, *, device_type: str, writer,
                 duration_ms = (time.monotonic() - start) * 1000.0
                 if not is_measurement or _should_log_measurement(settings, sample_counters, command):
                     writer.log(
-                        run_id=run_id_provider(), position=_extract_position(sig, args, kwargs),
+                        run_id=run_id_provider(), position=_extract_position(sig, args, kwargs, device_type),
                         device_type=device_type, device_name=getattr(instance, "name", device_type),
                         resource=getattr(instance, "resource", None), command=command,
                         command_parameters={"args": args, "kwargs": kwargs}, response=result,

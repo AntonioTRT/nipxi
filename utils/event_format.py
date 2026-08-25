@@ -65,6 +65,19 @@ class EventType:
     # a test-station hardware fault (not a battery-under-test fault) stops
     # the whole group run early rather than just failing that one slot.
     GROUP_RUN_ABORTED_STATION_FAULT = "GROUP_RUN_ABORTED_STATION_FAULT"
+    # Safety Fault Lifecycle (see docs/architecture.md "Safety Fault
+    # Lifecycle" and utils/safety_fault.py) -- SAFETY_FAULT_RAISED fires
+    # whenever a shutdown-verification failure (emergency_output_off()/
+    # verify_output_disabled()/force_output_off_and_verify() returning
+    # False, or a relay open_all()/verify_all(0) failure) is escalated
+    # into a SAFETY FAULT: an in-run STATION_FAULT escalation, a startup
+    # safety sweep failure, or a post-workflow safety sweep failure.
+    # SAFETY_FAULT_ACKNOWLEDGED fires once the operator presses ENTER on
+    # the console SAFETY FAULT screen. Every RAISED/ACKNOWLEDGED pair
+    # shares a `fault_id` field (see utils/safety_fault.py::new_fault_id())
+    # correlating them without a database round trip.
+    SAFETY_FAULT_RAISED = "SAFETY_FAULT_RAISED"
+    SAFETY_FAULT_ACKNOWLEDGED = "SAFETY_FAULT_ACKNOWLEDGED"
 
 
 def format_event(event_type: str, **fields) -> str:

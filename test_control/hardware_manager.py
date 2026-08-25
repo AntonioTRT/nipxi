@@ -50,6 +50,7 @@ from hardware.daq import DAQ
 from hardware.dmm import DMM
 from hardware.relay_factory import RelayFactory
 from utils.errors import HardwareInitError
+from utils.safety_fault import acknowledge_safety_fault, display_safety_fault_screen, report_safety_fault
 
 
 class HardwareManager:
@@ -494,6 +495,29 @@ class HardwareManager:
                     "session. This SMU resource may remain unavailable to a subsequent "
                     "connect_all() until this process exits."
                 )
+                # Post-Workflow Safety Sweep escalation (see docs/architecture.md
+                # "Safety Fault Lifecycle") -- this is the universal teardown
+                # point every real workflow already calls before returning to
+                # the Main Menu, so persisting + displaying + blocking on
+                # operator acknowledgement HERE, rather than at each
+                # individual workflow's own call site, covers every workflow
+                # at once. HardwareManager deliberately has no `storage`
+                # reference (same layering boundary as hardware/smu.py/
+                # safety_monitor.py) -- report_safety_fault()/
+                # acknowledge_safety_fault() tolerate storage=None and still
+                # persist to raw_hardware_log, which never depends on an open
+                # DataStorage session.
+                fault_reason = (
+                    "SMU output could not be verified OFF during post-workflow "
+                    "shutdown after retries."
+                )
+                fault_id = report_safety_fault(
+                    reason=fault_reason, source_method="emergency_output_off",
+                    context="post_workflow_sweep", device_name=self._smu.name,
+                    device_type="SMU", run_id=self._run_id_provider(), settings=self.s,
+                )
+                display_safety_fault_screen(smu_state="UNKNOWN", relay_state="UNKNOWN", reason=fault_reason)
+                acknowledge_safety_fault(fault_id=fault_id, run_id=self._run_id_provider(), settings=self.s)
 
         # 2. Open all relays -- physically disconnect all batteries. By the
         #    time this raises, the driver has already made its own internal
@@ -513,6 +537,16 @@ class HardwareManager:
                     "still be energized -- physically disconnect power if this "
                     "cannot be resolved immediately.", e,
                 )
+                # Post-Workflow Safety Sweep escalation -- see the identical
+                # SMU branch above for the full rationale.
+                fault_reason = f"Relay {self._relay.name}: open_all() failed during post-workflow shutdown -- {e}"
+                fault_id = report_safety_fault(
+                    reason=fault_reason, source_method="open_all",
+                    context="post_workflow_sweep", device_name=self._relay.name,
+                    device_type="RELAY", run_id=self._run_id_provider(), settings=self.s,
+                )
+                display_safety_fault_screen(smu_state="UNKNOWN", relay_state="UNVERIFIED", reason=fault_reason)
+                acknowledge_safety_fault(fault_id=fault_id, run_id=self._run_id_provider(), settings=self.s)
 
         # 2b. Post-isolation defense-in-depth, not safety-critical --
         #     attempted unconditionally (regardless of the SMU/relay

@@ -5591,6 +5591,14 @@ def main():
         print("  Fix config/ files before running hardware tests.")
         sys.exit(1)
 
+    print("\n[Pre-flight: Startup Safety Sweep]")
+    from test_control.safety_sweep import SafetyFaultBlocked, run_startup_safety_sweep
+    try:
+        run_startup_safety_sweep()
+    except SafetyFaultBlocked as e:
+        print(f"\n  Startup blocked -- {e}")
+        sys.exit(1)
+
     while True:
         print()
         for i, (label, _) in enumerate(MENU, 1):

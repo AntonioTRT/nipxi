@@ -70,11 +70,11 @@ class _FakeDevice:
         return "internal"
 
 
-def _instrument(dev, writer=None, settings=None, run_id="run1"):
+def _instrument(dev, writer=None, settings=None, run_id="run1", device_type="FAKE"):
     writer = writer if writer is not None else _RecordingWriter()
     settings = settings if settings is not None else _FakeSettings()
     instrument_hardware_instance(
-        dev, device_type="FAKE", writer=writer, run_id_provider=lambda: run_id, settings=settings,
+        dev, device_type=device_type, writer=writer, run_id_provider=lambda: run_id, settings=settings,
     )
     return writer
 
@@ -332,6 +332,45 @@ class ProductionDefaultConfigurationTests(unittest.TestCase):
                 dev.measure()
         self.assertEqual(len(writer.calls), Settings.RAW_HW_MEASUREMENT_SAMPLE_RATE + 2)
         self.assertTrue(all(not c["success"] for c in writer.calls))
+
+
+class SenseRouterPositionAttributionTests(unittest.TestCase):
+    """
+    Change 8 -- "Fix SENSE_ROUTER Position Attribution" (see
+    docs/architecture.md "SENSE_ROUTER Position Attribution Fix"):
+    ConfigDrivenSenseRouter.connect(channel)/disconnect(channel) takes a
+    logical SENSE_ROUTING channel number, not a battery position, but
+    shares the parameter name "channel" with every true relay/matrix
+    position operation -- which is what let a sense-routing channel be
+    mislabeled as a battery position in raw_hardware_log.position. These
+    tests pin that a SENSE_ROUTER-typed call always logs position=None,
+    while every other device type's identical "channel"-named argument is
+    still extracted exactly as before (regression guard against an
+    overly-broad fix).
+    """
+
+    def test_sense_router_channel_argument_is_never_recorded_as_position(self):
+        dev = _FakeDevice()
+        writer = _instrument(dev, device_type="SENSE_ROUTER")
+        dev.close(4)  # a SENSE_ROUTING logical channel number, not a battery position
+        self.assertIsNone(writer.calls[0]["position"])
+
+    def test_other_device_types_still_get_position_extracted(self):
+        dev = _FakeDevice()
+        writer = _instrument(dev, device_type="RELAY")
+        dev.close(4)
+        self.assertEqual(writer.calls[0]["position"], 4)
+
+    def test_sense_router_failure_path_also_omits_position(self):
+        class _FailingChannelDevice(_FakeDevice):
+            def close(self, channel):
+                raise RuntimeError("simulated relay comms failure")
+
+        dev = _FailingChannelDevice()
+        writer = _instrument(dev, device_type="SENSE_ROUTER")
+        with self.assertRaises(RuntimeError):
+            dev.close(4)
+        self.assertIsNone(writer.calls[0]["position"])
 
 
 if __name__ == "__main__":

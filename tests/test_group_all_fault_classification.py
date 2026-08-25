@@ -33,6 +33,7 @@ from utils.errors import (
     ReversePolarityError,
     SafetyViolationError,
     SMUError,
+    SMUStateVerificationError,
 )
 from utils.event_format import EventType
 
@@ -51,6 +52,19 @@ class ClassifyPositionExceptionTests(unittest.TestCase):
 
     def test_smu_error_is_station_fault(self):
         self.assertEqual(self._classify(SMUError("SMU comms lost")), "STATION_FAULT")
+
+    def test_smu_state_verification_error_is_station_fault(self):
+        # Change 1 ("Escalate failed shutdown verification to
+        # STATION_FAULT") -- test_control/charge_sequence.py/
+        # discharge_sequence.py raise this existing SMUError subclass when
+        # emergency_output_off() fails at end-of-sequence; it must be
+        # classified STATION_FAULT via the existing
+        # STATION_HARDWARE_EXCEPTIONS policy, with no new classification
+        # system introduced for it.
+        self.assertEqual(
+            self._classify(SMUStateVerificationError("output could not be verified OFF")),
+            "STATION_FAULT",
+        )
 
     def test_dmm_error_is_station_fault(self):
         self.assertEqual(self._classify(DMMError("DMM comms lost")), "STATION_FAULT")
@@ -255,6 +269,16 @@ class RunOnePositionStationFaultIntegrationTests(unittest.TestCase):
         result, storage = _run_position(ValueError("never seen before"))
         self.assertEqual(result, "STATION_FAULT")
         self.assertTrue(any("EXCEPTION=ValueError" in m for m in storage.event_messages()))
+
+    def test_smu_state_verification_error_returns_station_fault_and_logs_the_event(self):
+        # End-to-end pin for Change 1 -- a shutdown-verification escalation
+        # raised from inside a sequence's run() aborts Group -> ALL exactly
+        # like every other station-hardware exception already does.
+        result, storage = _run_position(SMUStateVerificationError("output could not be verified OFF"))
+        self.assertEqual(result, "STATION_FAULT")
+        messages = storage.event_messages()
+        self.assertTrue(any("GROUP_RUN_ABORTED_STATION_FAULT" in m for m in messages))
+        self.assertTrue(any("EXCEPTION=SMUStateVerificationError" in m for m in messages))
 
     def test_normal_completion_returns_pass(self):
         result, storage = _run_position(None)
