@@ -4774,6 +4774,15 @@ def _run_charge_or_discharge(operation: str, sequence_cls, source: str, limit_li
         f"Min Voltage: {battery_cfg['voltage_min_v']:.2f} V",
         limit_line_fn(test_setpoints),
         f"\nMax Temperature:\n{battery_cfg['max_temp_c']:.1f} C",
+        # Active timeout setpoints (config/devices.py::BATTERY_GROUPS[group]
+        # ["test_setpoints"], falling back to Settings.CHARGE_TIMEOUT_S/
+        # DISCHARGE_TIMEOUT_S) -- same resolution ChargeSequence/
+        # DischargeSequence themselves use, shown here BEFORE the operator
+        # commits so a validation-only override (e.g. B1's temporary 300s/
+        # 600s) is visible up front, not just on the Current Execution
+        # screen once the run is already underway.
+        f"\nCharge Timeout:\n{test_setpoints.get('charge_timeout_s', Settings.CHARGE_TIMEOUT_S):.0f} s   "
+        f"Discharge Timeout: {test_setpoints.get('discharge_timeout_s', Settings.DISCHARGE_TIMEOUT_S):.0f} s",
     ]
     if not _confirm_operation(operation, battery_type, battery_cfg, group,
                                positions_label, hw, channel=channel, relay_address=relay_address,
@@ -4968,6 +4977,15 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
         f"Min Voltage: {battery_cfg['voltage_min_v']:.2f} V",
         limit_line_fn(test_setpoints),
         f"\nMax Temperature:\n{battery_cfg['max_temp_c']:.1f} C",
+        # Active timeout setpoints (config/devices.py::BATTERY_GROUPS[group]
+        # ["test_setpoints"], falling back to Settings.CHARGE_TIMEOUT_S/
+        # DISCHARGE_TIMEOUT_S) -- same resolution ChargeSequence/
+        # DischargeSequence themselves use, shown here BEFORE the operator
+        # commits so a validation-only override (e.g. B1's temporary 300s/
+        # 600s) is visible up front, not just on the Current Execution
+        # screen once the run is already underway.
+        f"\nCharge Timeout:\n{test_setpoints.get('charge_timeout_s', Settings.CHARGE_TIMEOUT_S):.0f} s   "
+        f"Discharge Timeout: {test_setpoints.get('discharge_timeout_s', Settings.DISCHARGE_TIMEOUT_S):.0f} s",
     ]
     if not _confirm_operation(f"{operation} (ALL positions)", battery_type, battery_cfg, group,
                                positions_label, hw, extra_lines=extra_lines):
