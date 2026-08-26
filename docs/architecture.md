@@ -8471,3 +8471,306 @@ parameter from being misread the same way): a `_NON_POSITION_DEVICE_TYPES
 call instrumented with `device_type="SENSE_ROUTER"` always logs
 `position=None`, while every other device type's identical
 `channel`-named argument is extracted exactly as before.
+
+## 83. Station Identity, Global Run Sequence, Telemetry/Index Database Split, Monthly Rotation (CURRENT IMPLEMENTATION)
+
+Implements Phases A/B/C of the multi-rack-deployment groundwork reviewed
+in the database-architecture discussion: station identity, a permanent
+global run counter, splitting the single database file into a permanent
+index database and a rotating monthly telemetry database, and the
+rotation-gate logic that decides when the telemetry file may change.
+
+### Station Identity (Phase A Item 1)
+
+`config/devices.py::STATION_INFO` -- a single flat dict identifying the
+PHYSICAL RACK this configuration describes:
+
+```python
+STATION_INFO = {
+    "station_id":   "RACK01",
+    "station_name": "FIN-RACK01",
+    "location":     "Finland - Line 1",
+}
+```
+
+**Station identity is NOT PC identity.** `hostname`/`ip_address` are
+deliberately absent from this dict and are never persisted as identity --
+a PC can be swapped without changing which rack it controls, and vice
+versa. Any future diagnostic that wants the PC's hostname/IP should
+resolve it live (`socket.gethostname()`) and log it alongside
+`STATION_INFO`, never merge it into this dict.
+
+Placed in `config/devices.py`, not a new `station_identity.py` module --
+revising the earlier review's recommendation: `devices.py` is already
+"what does this physical rack contain" (`PXI_SLOTS`, `SMU_ASSIGNMENTS`,
+`BATTERY_GROUPS`, ...); station identity ("which rack is this") is the
+same category of fact, not a different concern, and a new module would
+have added a file for one flat dict with no behavior. One line of that
+file's module docstring was updated to mention it also carries station
+identity.
+
+### Global Run Sequence (Phase A Items 2-4)
+
+`run_sequence` -- a new, permanent, single-row counter table in the index
+database (never the rotating telemetry database):
+
+```sql
+CREATE TABLE IF NOT EXISTS run_sequence (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    next_value INTEGER NOT NULL
+);
+```
+
+`DataStorage._allocate_sequence_number()` allocates transaction-safely
+(`BEGIN IMMEDIATE` / `SELECT` / `UPDATE` / `COMMIT`, rolling back on any
+`sqlite3.Error`) and is the only writer. Because `run_sequence` lives in
+the index database:
+
+- **Never resets automatically** -- an ordinary committed row, never
+  reinitialized by `DataStorage.open()` beyond `INSERT OR IGNORE ...
+  VALUES (1, 1)` (a no-op once the row exists).
+- **Survives monthly rotation** -- rotation only ever changes which
+  *telemetry* file is open; the index database, and therefore
+  `run_sequence`, is untouched.
+- **Survives application restart** -- an ordinary SQLite commit, same
+  durability guarantee every other table already relies on.
+
+`run_summary` gained four new columns (via the existing
+`_migrate_add_missing_columns()` mechanism, `_RUN_SUMMARY_MIGRATION_COLUMNS`
+-- no new migration framework):
+
+```
+sequence_number INTEGER   -- this run's allocated global sequence number
+station_id      TEXT      -- STATION_INFO["station_id"] at the time of the run
+station_name    TEXT      -- STATION_INFO["station_name"] at the time of the run
+telemetry_db    TEXT      -- exact telemetry filename this run's data lives in
+```
+
+All four are populated by `DataStorage.start_run_summary()` itself,
+unconditionally, from `self._sequence_number`/`config.devices.STATION_INFO`/
+`self._telemetry_db_name` -- **never** read from a caller's `**fields**`, so
+no caller anywhere in the codebase can accidentally (or deliberately)
+override them. This is also why zero of `start_run_summary()`'s ~5 call
+sites across `test.py`/`test_control/storage_session.py` needed to change.
+
+**Run ID format** -- `RACK01-00000001` (station_id + 8-digit
+zero-padded sequence number). Deliberately **no timestamp component** --
+`run_summary.start_time`/`end_time` already record when a run happened;
+repeating it in the id would be redundant, not additive. Uniqueness comes
+entirely from the sequence allocator, which is why `begin_new_run_id()`
+(used by Group -> ALL to give each position its own row) no longer takes
+a `suffix` parameter -- the previous timestamp-based id needed one to
+disambiguate two positions started within the same wall-clock second; a
+freshly-allocated sequence number is unique by construction on every
+call, so nothing is left to disambiguate.
+
+### Backfill (Phase A Item 4)
+
+`scripts/backfill_run_sequence.py` -- a manual, one-time script (never run
+automatically at startup or from `DataStorage.open()`):
+
+- Assigns `sequence_number` to every pre-existing `run_summary` row with
+  `sequence_number IS NULL`, in `id` order (insertion order), starting
+  from `MAX(sequence_number)` + 1 (so re-running after a partial pass, or
+  running against a database that already has some numbered rows, never
+  reassigns or collides).
+- Seeds/updates `run_sequence.next_value` to one past the highest
+  `sequence_number` now present.
+- Idempotent -- rows that already have a `sequence_number` are left
+  untouched; running it twice in a row is a safe no-op.
+- `--dry-run` reports what would change (including whether `run_sequence`
+  would be created) without writing anything.
+- `--migrate-legacy-file` renames the pre-split, per-mode single-file
+  database (`nipxi_dev.db`/`nipxi_validation.db`/`nipxi.db`) into place as
+  the new index database, if the index database doesn't exist yet and a
+  legacy file does -- without this flag, a missing index database with a
+  legacy file present is left alone and the script prints instructions
+  instead of guessing.
+- `station_id`/`station_name`/`telemetry_db` are deliberately left `NULL`
+  for backfilled rows -- that data does not exist for runs recorded before
+  this feature existed, and is never fabricated.
+
+### Telemetry / Index Database Split (Phase B)
+
+`data/storage.py::DataStorage` now manages TWO SQLite connections instead
+of one:
+
+| Connection | File | Tables |
+|---|---|---|
+| `self._db_index` | `nipxi_index.db` (permanent) | `run_summary`, `station_state`, `run_sequence` |
+| `self._db` | `nipxi_<YYYY>_<MM>.db` (rotates monthly) | `measurements`, `event_log`, `raw_hardware_log` |
+
+`event_log` was placed in the telemetry database (not explicitly listed
+as "stays permanent") -- both because it is volume-wise closer to
+telemetry (one row per meaningful transition, not one row per run) and
+because the monthly-rotation policy (below) guarantees a run's `event_log`
+rows can never span two telemetry files, eliminating the cross-boundary
+concern `docs/DATABASE_ROADMAP.md` Section 5.1 originally raised about it.
+
+Routing is entirely internal to `DataStorage` -- **every external caller
+is completely unchanged**: `record_measurement()`/`log_event()`/
+`record()`/`query()`/`get_measurements()`/`get_recent_events()`/
+`get_first_measurement()` route to `self._db`; `record_execution_state()`/
+`get_last_execution_state()`/`start_run_summary()`/`finish_run_summary()`/
+`get_run_summary()`/`get_last_run_summary()`/`list_run_summaries()` route
+to `self._db_index`. No call site anywhere in `test.py`/`test_control/*`
+needed to change -- see `tests/test_run_sequence.py::
+DualDatabaseRoutingTests::test_public_read_write_methods_are_unchanged_no_call_site_refactoring_needed`.
+
+`data/raw_hardware_log.py::RawHardwareLogWriter` connects to the SAME
+telemetry file `DataStorage` uses (via the identical
+`data/rotation.py::telemetry_database_file()` resolver) instead of a
+`Settings.DATABASE_FILE` constant, which no longer exists on real
+`Settings` -- see "Path Resolution" below.
+
+### Path Resolution (`data/rotation.py`)
+
+```python
+def telemetry_database_file(settings, dt=None) -> str:
+    override = getattr(settings, "DATABASE_FILE", None)
+    if override is not None:
+        return override
+    dt = dt or datetime.now()
+    return os.path.join(settings.DATA_DIR, f"nipxi_{dt:%Y_%m}.db")
+
+def index_database_file(settings) -> str:
+    override = getattr(settings, "INDEX_DATABASE_FILE", None)
+    if override is not None:
+        return override
+    return os.path.join(settings.DATA_DIR, "nipxi_index.db")
+```
+
+Both resolve `DATA_DIR` **live** (a plain attribute lookup at call time),
+never a value frozen at class-definition time like the old `DATABASE_FILE`
+was -- this is what lets a test monkeypatch `Settings.DATA_DIR` at runtime
+(several existing tests already do this) and have both database paths
+follow it automatically, with no separate patch needed for a second frozen
+constant. Both also honor an explicit override attribute (`DATABASE_FILE`/
+`INDEX_DATABASE_FILE`) for single-fixed-file test fakes and legacy
+overrides -- real `config.settings.Settings` defines neither, so real
+callers always get the computed path.
+
+### Monthly Rotation (Phase C)
+
+**Rotation never hot-swaps a live connection.** `DataStorage`/
+`HardwareManager`/`RawHardwareLogWriter` are already constructed fresh per
+workflow (confirmed: never a long-lived singleton anywhere in the
+codebase), and `telemetry_database_file()` is resolved exactly ONCE, at
+`DataStorage.open()`, and never re-read for that instance's life. This is
+what makes "never split a group across databases" true **by construction**,
+with no extra guard needed anywhere in the sampling/event-logging code
+paths:
+
+> Group starts Jan 31, finishes Feb 1 -> the entire group's telemetry
+> stays in `nipxi_2026_01.db`, because the `DataStorage` instance that
+> opened on Jan 31 keeps using the connection it opened, regardless of how
+> long the group runs or how many months the wall clock crosses.
+
+`data/rotation.py::should_rotate()` is the pure decision function:
+
+```python
+def should_rotate(*, current_telemetry_month, now_month,
+                   group_finished, sequence_running, scheduler_idle) -> bool:
+    if current_telemetry_month == now_month:
+        return False
+    return group_finished and not sequence_running and scheduler_idle
+```
+
+Rotation may occur only when the calendar month has actually changed
+AND a group has completely finished AND no `BatteryOperationSequence` is
+running AND the scheduler is idle. **No scheduler exists in this codebase
+yet** (confirmed: zero hits for "scheduler" anywhere in source; `test.py`'s
+`while True:` menu loop, blocking on operator `input()` every iteration,
+is the only orchestration that exists). Integrated at the one real idle
+checkpoint that exists today -- `test.py::_dispatch_menu_choice()`, right
+after a workflow completes and before `_pause_before_main_menu()` -- where
+`group_finished`/`sequence_running`/`scheduler_idle` are trivially
+true/false by construction (the workflow that just returned IS the group
+finishing; nothing else runs between menu actions). `should_rotate()` is
+written to also serve a future real scheduler's idle tick unchanged.
+
+`test.py::_check_telemetry_rotation()` tracks the last-seen telemetry
+month in a module-level variable, purely for operator-visible logging of
+the transition -- it does not, and does not need to, close or reopen
+anything: the next workflow's `DataStorage.open()` already resolves
+whatever month it is at that moment, on its own.
+
+### telemetry_db Lookup Strategy
+
+`run_summary.telemetry_db` records the exact filename (e.g.
+`"nipxi_2026_01.db"`, not a full path) a run's `measurements`/`event_log`
+rows actually live in. This is the deliberate alternative to inferring
+database location from a run's timestamp:
+
+```
+run_id = RACK01-00014572
+    -> look up run_summary.telemetry_db  ->  "nipxi_2026_01.db"
+    -> open exactly that file for telemetry
+```
+
+`test.py`'s Database Tools "Latest Event Log"/"Latest Measurements" views
+implement this directly (`_open_run_telemetry_db()`): if the requested
+run's `telemetry_db` matches the currently-open telemetry connection's own
+file, the existing `DataStorage` read methods are used unchanged;
+otherwise the specific historical file is opened read-only and queried
+directly. Verified end to end (a run recorded under a mocked January date,
+then looked up from a real "now" in a different month) -- see
+`tests/test_rotation.py::MonthBoundaryGroupTests` for the underlying
+mechanism and the ad hoc smoke test run during this implementation.
+
+### Future Multi-Rack Compatibility
+
+- `run_id`/`sequence_number` are unique **within one rack's history
+  only** -- each rack has its own index database and therefore its own
+  independent `run_sequence` counter. `(station_id, sequence_number)`
+  together, not `sequence_number` alone, is the cross-rack unique key once
+  index databases are ever merged centrally (see the prior multi-rack
+  database-architecture review) -- any future central-sync job must key on
+  the pair, never the bare sequence number.
+- Telemetry filenames (`nipxi_2026_01.db`) have no station component --
+  safe today because each rack has its own `DATA_DIR` (one machine per
+  rack). If racks ever share network storage, this needs a station
+  subdirectory or filename prefix; not needed for the current one-rack
+  deployment.
+- `STATION_INFO` being a plain `config/devices.py` dict (not a database
+  row) means every rack ships its own copy of this file with its own
+  values -- there is nothing to synchronize or migrate for this piece
+  specifically.
+
+### Migration / Compatibility with Existing Data
+
+No historical row is moved, copied, or transformed. The pre-split,
+single-file database (`nipxi_dev.db`/`nipxi_validation.db`/`nipxi.db`,
+selected by `SYSTEM_MODE`) becomes the index database going forward --
+either renamed via `scripts/backfill_run_sequence.py --migrate-legacy-file`
+or left in place if an operator prefers to rename it manually -- and simply
+stops receiving new `measurements`/`event_log`/`raw_hardware_log` rows,
+which move to the first new monthly telemetry file from the migration date
+forward. Its old telemetry rows stay exactly where they are, historically
+mixed in with the index tables in that one legacy file -- a documented,
+permanent, low-risk artifact of the migration point for a single-rack
+deployment, not something requiring cleanup. `DataStorage.open()`'s
+existing additive migration (`_migrate_add_missing_columns()`) brings any
+pre-existing `run_summary`/`station_state` table up to the current schema
+on first open, exactly as it already did for every prior schema addition --
+confirmed against a hand-built legacy-shaped table in
+`tests/test_run_sequence.py::RunSummaryExtensionTests::
+test_run_summary_migration_adds_new_columns_to_a_legacy_index_database`.
+
+### Test Suite
+
+New: `tests/test_station_info.py` (5 cases), `tests/test_run_sequence.py`
+(15 cases -- allocation, persistence across restart/rotation, run_summary
+extension, migration of a legacy schema, dual-database routing, and a
+direct proof that no external call site needed to change),
+`tests/test_rotation.py` (16 cases -- path resolution, the
+`should_rotate()` decision matrix, month-boundary group safety via a
+mocked clock, and the `test.py` dispatch-checkpoint integration),
+`tests/test_backfill_run_sequence.py` (8 cases -- ordering, idempotency,
+dry-run, legacy-file migration). Updated: `tests/test_group_all_support.py`
+and `tests/test_storage_session.py` (both had a source/call-shape
+assertion pinned to the old `begin_new_run_id(suffix=...)` signature),
+`tests/test_testpy_extraction_parity.py` (its `setUp()`/`tearDown()`
+assumed `Settings.DATABASE_FILE` always exists to save/restore -- fixed to
+use `getattr`/`delattr` since it no longer does on real `Settings`). Full
+suite: **527/527 passing**, no regressions.

@@ -3156,7 +3156,8 @@ def test_database():
     Uses a temporary directory -- does not touch data_output/.
     Also verifies StorageBackend interface is implemented.
     """
-    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    from data.rotation import index_database_file
+    config_ref = f"data/storage.py -> {index_database_file(Settings)}"
     results    = []
 
     # -- Module import + interface check --------------------------------------
@@ -3233,33 +3234,68 @@ def test_database():
 # Consolidates the previous "Test SQLite (foundation)"/"Test Database
 # Layer" top-level MENU entries into one submenu (see
 # docs/architecture.md "Database Tools"). Options 1-5 are read-only
-# inspection of the REAL project database (Settings.DATABASE_FILE -- the
-# same file Monitor Battery/Proto Test Execution write to), reusing
-# DataStorage's existing read methods (get_last_run_summary()/
-# get_measurements()/get_recent_events()/get_last_execution_state()) --
-# no new read path, no new storage mechanism. Options 6-7 are the original
-# test_database()/test_sqlite() temp-directory regression self-tests,
-# unchanged, just relocated here instead of their own top-level MENU slots.
+# inspection of the REAL project databases -- the permanent index database
+# (data/rotation.py::index_database_file(), run_summary/station_state --
+# the same file Monitor Battery/Proto Test Execution write to) plus,
+# where a run's own telemetry_db lookup is needed (see docs/
+# architecture.md "telemetry_db Lookup Strategy"), the specific monthly
+# telemetry database that run actually used, reusing DataStorage's
+# existing read methods (get_last_run_summary()/get_measurements()/
+# get_recent_events()/get_last_execution_state()) -- no new read path, no
+# new storage mechanism. Options 6-7 are the original test_database()/
+# test_sqlite() temp-directory regression self-tests, unchanged, just
+# relocated here instead of their own top-level MENU slots.
 # =============================================================================
 
 def _open_real_storage_readonly():
     """
-    Open DataStorage against the REAL, mode-specific database
-    (Settings.DATABASE_FILE) for read-only inspection. Returns None if the
-    file doesn't exist yet (no runs recorded) rather than creating one --
-    a "view" option must never create the real database as a side effect
-    of merely looking at it. (DataStorage.open()'s additive schema
-    migration on an EXISTING file is the same safe, idempotent behavior
-    every other real caller already relies on -- see data/storage.py's
-    _migrate_add_missing_columns().)
+    Open DataStorage against the REAL, mode-specific index database
+    (data/rotation.py::index_database_file()) for read-only inspection.
+    Returns None if the file doesn't exist yet (no runs recorded) rather
+    than creating one -- a "view" option must never create the real
+    database as a side effect of merely looking at it. (DataStorage.open()
+    also opens/creates the CURRENT month's telemetry database as a normal
+    part of opening -- unavoidable, since DataStorage always manages both
+    connections -- but never touches an OLDER month's telemetry file
+    unless a caller explicitly looks one up via _open_run_telemetry_db()
+    below.) DataStorage.open()'s additive schema migration on an EXISTING
+    file is the same safe, idempotent behavior every other real caller
+    already relies on -- see data/storage.py's _migrate_add_missing_columns().
     """
-    if not os.path.exists(Settings.DATABASE_FILE):
-        print(f"\n  No database found at {Settings.DATABASE_FILE} -- no runs recorded yet.")
+    from data.rotation import index_database_file
+    index_path = index_database_file(Settings)
+    if not os.path.exists(index_path):
+        print(f"\n  No database found at {index_path} -- no runs recorded yet.")
         return None
     from data.storage import DataStorage
     storage = DataStorage(settings=Settings)
     storage.open()
     return storage
+
+
+def _open_run_telemetry_db(run: dict):
+    """
+    Open a read-only sqlite3 connection to the SPECIFIC telemetry database
+    a given run_summary row actually used -- via its own telemetry_db
+    column (see docs/architecture.md "telemetry_db Lookup Strategy"),
+    never by inferring a filename from the run's timestamp. Returns None
+    (with an operator-facing message) if telemetry_db is NULL (a
+    pre-migration run, before this column existed) or the file itself is
+    missing (rotated/archived away).
+    """
+    telemetry_db_name = run.get("telemetry_db")
+    if not telemetry_db_name:
+        print("  (no telemetry_db recorded for this run -- it predates the "
+              "telemetry/index database split; its telemetry, if any, is in "
+              "the legacy combined database file.)")
+        return None
+    path = os.path.join(Settings.DATA_DIR, telemetry_db_name)
+    if not os.path.exists(path):
+        print(f"  (telemetry database {telemetry_db_name} not found at {path} -- "
+              f"it may have been archived/deleted.)")
+        return None
+    import sqlite3
+    return sqlite3.connect(path)
 
 
 def _db_view_latest_run():
@@ -3271,7 +3307,8 @@ def _db_view_latest_run():
     dumping raw columns, so every summary view in the app looks identical."""
     from test_control.run_summary_report import render_run_summary
 
-    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    from data.rotation import index_database_file
+    config_ref = f"data/storage.py -> {index_database_file(Settings)}"
     storage = _open_real_storage_readonly()
     if storage is None:
         return [_warn("Database Tools", "Latest Run", config_ref,
@@ -3294,7 +3331,8 @@ def _db_view_latest_event_log():
     """View the most recent run's event_log entries -- the full
     traceability narrative (battery selection, hardware identity, phase
     transitions) for that run."""
-    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    from data.rotation import index_database_file
+    config_ref = f"data/storage.py -> {index_database_file(Settings)}"
     storage = _open_real_storage_readonly()
     if storage is None:
         return [_warn("Database Tools", "Latest Event Log", config_ref,
@@ -3304,8 +3342,27 @@ def _db_view_latest_event_log():
         if run is None:
             return [_warn("Database Tools", "Latest Event Log", config_ref,
                           "run_summary is empty -- no runs recorded")]
-        events = storage.get_recent_events(run_id=run["run_id"], limit=50)
-        print(f"\nLatest Event Log -- run_id={run['run_id']}\n{'-' * 60}")
+        print(f"\nLatest Event Log -- run_id={run['run_id']}  telemetry_db={run.get('telemetry_db')}\n{'-' * 60}")
+        # telemetry_db Lookup Strategy (see docs/architecture.md): the
+        # latest run may belong to an OLDER month's telemetry file than
+        # the one this DataStorage instance just opened (current month) --
+        # look it up by the run's own telemetry_db column rather than
+        # assuming "current" is always right.
+        if run.get("telemetry_db") == storage._telemetry_db_name:
+            events = storage.get_recent_events(run_id=run["run_id"], limit=50)
+        else:
+            conn = _open_run_telemetry_db(run)
+            if conn is None:
+                return [_warn("Database Tools", "Latest Event Log", config_ref,
+                              f"telemetry_db for run_id={run['run_id']} not found/recorded")]
+            try:
+                cur = conn.execute(
+                    "SELECT level, timestamp, message FROM event_log WHERE run_id = ? ORDER BY id",
+                    (run["run_id"],),
+                )
+                events = [{"level": r[0], "timestamp": r[1], "message": r[2]} for r in cur.fetchall()]
+            finally:
+                conn.close()
         if not events:
             print("  (no events recorded for this run)")
             return [_warn("Database Tools", "Latest Event Log", config_ref,
@@ -3321,7 +3378,8 @@ def _db_view_latest_event_log():
 def _db_view_latest_measurements():
     """View the most recent run's measurements rows -- the authoritative
     per-sample historical result store for every test type."""
-    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    from data.rotation import index_database_file
+    config_ref = f"data/storage.py -> {index_database_file(Settings)}"
     storage = _open_real_storage_readonly()
     if storage is None:
         return [_warn("Database Tools", "Latest Measurements", config_ref,
@@ -3331,8 +3389,29 @@ def _db_view_latest_measurements():
         if run is None:
             return [_warn("Database Tools", "Latest Measurements", config_ref,
                           "run_summary is empty -- no runs recorded")]
-        rows = storage.get_measurements(run_id=run["run_id"])
-        print(f"\nLatest Measurements -- run_id={run['run_id']}\n{'-' * 60}")
+        print(f"\nLatest Measurements -- run_id={run['run_id']}  telemetry_db={run.get('telemetry_db')}\n{'-' * 60}")
+        # telemetry_db Lookup Strategy -- see _db_view_latest_event_log()'s
+        # identical rationale.
+        if run.get("telemetry_db") == storage._telemetry_db_name:
+            rows = storage.get_measurements(run_id=run["run_id"])
+        else:
+            conn = _open_run_telemetry_db(run)
+            if conn is None:
+                return [_warn("Database Tools", "Latest Measurements", config_ref,
+                              f"telemetry_db for run_id={run['run_id']} not found/recorded")]
+            try:
+                cur = conn.execute(
+                    "SELECT channel, relay, phase_detail, voltage_v, current_a, temp_c "
+                    "FROM measurements WHERE run_id = ? ORDER BY id",
+                    (run["run_id"],),
+                )
+                rows = [
+                    {"channel": r[0], "relay": r[1], "phase_detail": r[2],
+                     "voltage_v": r[3], "current_a": r[4], "temp_c": r[5]}
+                    for r in cur.fetchall()
+                ]
+            finally:
+                conn.close()
         if not rows:
             print("  (no measurements recorded for this run)")
             return [_warn("Database Tools", "Latest Measurements", config_ref,
@@ -3352,7 +3431,8 @@ def _db_view_station_state():
     """View the last recorded station_state row -- recovery/current-position
     only, as of Milestone II Phase 3 (read across all run_ids, same as the
     startup "previous execution found" display)."""
-    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    from data.rotation import index_database_file
+    config_ref = f"data/storage.py -> {index_database_file(Settings)}"
     storage = _open_real_storage_readonly()
     if storage is None:
         return [_warn("Database Tools", "Station State", config_ref,
@@ -3374,30 +3454,52 @@ def _db_view_station_state():
 
 
 def _db_view_statistics():
-    """Row counts per table + file size for the real project database."""
-    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
-    if not os.path.exists(Settings.DATABASE_FILE):
+    """
+    Row counts per table + file size, across BOTH real project databases
+    (see docs/architecture.md "Telemetry / Index Database Split"): the
+    permanent index database (run_summary/station_state/run_sequence) and
+    the CURRENT month's telemetry database (measurements/event_log) --
+    older months' telemetry files are not summed here (see telemetry_db
+    Lookup Strategy for looking up one specific run's own file instead).
+    """
+    from data.rotation import index_database_file, telemetry_database_file
+    import sqlite3
+    index_path = index_database_file(Settings)
+    telemetry_path = telemetry_database_file(Settings)
+    config_ref = f"data/storage.py -> {index_path}"
+    if not os.path.exists(index_path) and not os.path.exists(telemetry_path):
         return [_warn("Database Tools", "Database Statistics", config_ref,
                       "No database file yet -- no runs recorded")]
-    import sqlite3
-    conn = sqlite3.connect(Settings.DATABASE_FILE)
+
     results = []
-    try:
-        print(f"\nDatabase Statistics -- {Settings.DATABASE_FILE}\n{'-' * 60}")
-        for table in ("measurements", "run_summary", "event_log", "station_state"):
-            try:
-                count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                print(f"  {table:14s}: {count} row(s)")
-                results.append(_ok("Database Tools", f"{table} row count", config_ref,
-                                   f"{count} row(s)"))
-            except sqlite3.OperationalError as e:
-                print(f"  {table:14s}: table not found")
-                results.append(_warn("Database Tools", f"{table} row count", config_ref, str(e)))
-        size_kb = os.path.getsize(Settings.DATABASE_FILE) / 1024.0
-        print(f"  {'file size':14s}: {size_kb:.1f} KB")
-        return results
-    finally:
-        conn.close()
+
+    def _report(path, tables):
+        if not os.path.exists(path):
+            print(f"  ({path} does not exist yet)")
+            return
+        conn = sqlite3.connect(path)
+        try:
+            print(f"\n{path}\n{'-' * 60}")
+            for table in tables:
+                try:
+                    count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    print(f"  {table:14s}: {count} row(s)")
+                    results.append(_ok("Database Tools", f"{table} row count", config_ref,
+                                       f"{count} row(s)"))
+                except sqlite3.OperationalError as e:
+                    print(f"  {table:14s}: table not found")
+                    results.append(_warn("Database Tools", f"{table} row count", config_ref, str(e)))
+            size_kb = os.path.getsize(path) / 1024.0
+            print(f"  {'file size':14s}: {size_kb:.1f} KB")
+        finally:
+            conn.close()
+
+    print(f"\nDatabase Statistics\n{'-' * 60}")
+    print("Index database (permanent):")
+    _report(index_path, ("run_summary", "station_state", "run_sequence"))
+    print("\nTelemetry database (current month):")
+    _report(telemetry_path, ("measurements", "event_log", "raw_hardware_log"))
+    return results
 
 
 def _show_last_test_summary():
@@ -3410,7 +3512,8 @@ def _show_last_test_summary():
     """
     from test_control.run_summary_report import render_run_summary
 
-    config_ref = f"data/storage.py -> {Settings.DATABASE_FILE}"
+    from data.rotation import index_database_file
+    config_ref = f"data/storage.py -> {index_database_file(Settings)}"
     storage = _open_real_storage_readonly()
     if storage is None:
         return [_warn("Last Test Summary", "Last Test Summary", config_ref,
@@ -4956,9 +5059,9 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
     "connect once" lifecycle, just with a loop over positions inside it.
 
     Storage design (explicit decision): each ENABLED position gets its
-    own independent run_summary row -- a fresh run_id via
-    storage.begin_new_run_id(suffix=f"pos{position}") before every
-    position -- never collapsed into one row. The per-position
+    own independent run_summary row -- a fresh, freshly-sequence-numbered
+    run_id via storage.begin_new_run_id() before every position -- never
+    collapsed into one row. The per-position
     run_summary row is the AUTHORITATIVE record; the aggregate printed at
     the end (_print_group_run_summary()) is informational console output
     only.
@@ -5083,7 +5186,7 @@ def _run_charge_or_discharge_all_positions(*, operation, sequence_cls, source, l
 
                 # Independent run_summary row per position -- see this
                 # function's own docstring "Storage design".
-                storage.begin_new_run_id(suffix=f"pos{position}")
+                storage.begin_new_run_id()
                 storage.log_event(
                     level="INFO", source=source, channel=channel, relay=relay_address,
                     message=format_event(EventType.GROUP_SLOT_STARTED, group=group, position=position),
@@ -5536,6 +5639,48 @@ def _pause_before_main_menu():
         print()
 
 
+# Monthly Telemetry Rotation (see docs/architecture.md and data/rotation.py)
+# -- tracks the month of the telemetry file last seen by
+# _check_telemetry_rotation() below, purely for operator-visible logging of
+# the month-boundary transition. Seeded lazily (None means "not checked
+# yet") rather than at import time, so importing test.py (e.g. from a unit
+# test) never touches the filesystem.
+_LAST_TELEMETRY_MONTH = None
+
+
+def _check_telemetry_rotation():
+    """
+    Monthly Telemetry Rotation gate -- called from _dispatch_menu_choice()
+    below, the current idle checkpoint (no BatteryOperationSequence is
+    running, no scheduler exists yet -- see data/rotation.py::
+    should_rotate()'s own docstring for why group_finished/
+    sequence_running/scheduler_idle are trivially satisfied here today).
+
+    Does NOT close or reopen any live connection -- there is none to
+    rotate (see data/rotation.py's module docstring): the NEXT workflow's
+    DataStorage.open() already resolves whatever month it is at THAT
+    moment, on its own, with no action required here. This function exists
+    to detect and log the transition for operator visibility, and to be
+    the one real, tested hook a future scheduler's idle tick can call
+    unchanged.
+    """
+    global _LAST_TELEMETRY_MONTH
+    from datetime import datetime as _datetime
+
+    from data.rotation import should_rotate
+    now_month = _datetime.now().strftime("%Y_%m")
+    if _LAST_TELEMETRY_MONTH is None:
+        _LAST_TELEMETRY_MONTH = now_month
+        return
+    if should_rotate(
+        current_telemetry_month=_LAST_TELEMETRY_MONTH, now_month=now_month,
+        group_finished=True, sequence_running=False, scheduler_idle=True,
+    ):
+        print(f"\n[INFO] Telemetry database rotated: {_LAST_TELEMETRY_MONTH} -> {now_month} "
+              f"(new runs will use nipxi_{now_month}.db).")
+        _LAST_TELEMETRY_MONTH = now_month
+
+
 # Full-hardware-run menu entries -- each drives its own real hardware run
 # (HardwareManager/CancellationToken/etc.) and returns nothing (unlike every
 # other MENU entry, which returns a list[TestResult]). Checked by name here
@@ -5573,6 +5718,7 @@ def _dispatch_menu_choice(label: str, fn):
         print("\nCancelled by operator (Ctrl+C).")
     except Exception as e:
         print(f"\n[ERROR] {label} raised an unexpected exception: {e}")
+    _check_telemetry_rotation()
     _pause_before_main_menu()
 
 

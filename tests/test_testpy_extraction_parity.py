@@ -108,13 +108,22 @@ class OpenStorageGuardedParityTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
         self._orig_data_dir = Settings.DATA_DIR
         self._orig_csv_dir = Settings.CSV_DIR
-        self._orig_db_file = Settings.DATABASE_FILE
+        # DATABASE_FILE no longer exists on real Settings by default (see
+        # data/rotation.py -- telemetry paths are computed live from
+        # DATA_DIR/current month) -- it is set here only as a test-local
+        # override (honored by data/rotation.py::telemetry_database_file()),
+        # so it must not exist afterward either.
+        self._had_db_file = hasattr(Settings, "DATABASE_FILE")
+        self._orig_db_file = getattr(Settings, "DATABASE_FILE", None)
         self.addCleanup(self._restore_settings)
 
     def _restore_settings(self):
         Settings.DATA_DIR = self._orig_data_dir
         Settings.CSV_DIR = self._orig_csv_dir
-        Settings.DATABASE_FILE = self._orig_db_file
+        if self._had_db_file:
+            Settings.DATABASE_FILE = self._orig_db_file
+        elif hasattr(Settings, "DATABASE_FILE"):
+            del Settings.DATABASE_FILE
 
     def test_success_path_returns_opened_storage_prints_nothing(self):
         Settings.DATA_DIR = self.tmp_dir

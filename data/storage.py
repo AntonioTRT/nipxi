@@ -17,8 +17,10 @@ import sqlite3
 from abc import ABC, abstractmethod
 from datetime import datetime
 
+import config.devices as dev_cfg
 from config.settings import Settings
 from data.raw_hardware_log import CREATE_RAW_HARDWARE_LOG_INDEXES_SQL, CREATE_RAW_HARDWARE_LOG_SQL
+from data.rotation import index_database_file, telemetry_database_file
 
 
 # -----------------------------------------------------------------------------
@@ -245,9 +247,17 @@ CREATE TABLE IF NOT EXISTS run_summary (
     relay_matrix_model                 TEXT,
     group_name                         TEXT,
     position_in_group                  INTEGER,
-    analysis_result                    TEXT
+    analysis_result                    TEXT,
+    sequence_number                    INTEGER,
+    station_id                         TEXT,
+    station_name                       TEXT,
+    telemetry_db                       TEXT
 );
 """
+
+CREATE_RUN_SUMMARY_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_run_summary_sequence ON run_summary(sequence_number);",
+]
 
 _RUN_SUMMARY_COLUMNS = [
     "id", "run_id", "test_type", "start_time", "end_time", "duration_s",
@@ -287,6 +297,23 @@ _RUN_SUMMARY_COLUMNS = [
     # other test_type. Never influences stop_reason/result -- a separate,
     # additive column, not a replacement for either.
     "analysis_result",
+    # Global run numbering + station identity + telemetry-file traceability
+    # (see docs/architecture.md "Global Run Sequence" / "Station Identity" /
+    # "telemetry_db Lookup Strategy"). Populated by DataStorage itself at
+    # start_run_summary() time -- NEVER caller-suppliable via **fields (see
+    # that method) -- from whatever this DataStorage instance was actually
+    # allocated/opened with. NULL for every run_summary row written before
+    # this feature existed (see scripts/backfill_run_sequence.py for
+    # sequence_number backfill; station_id/station_name/telemetry_db have
+    # no historical value to backfill and are left NULL for those rows).
+    #
+    # telemetry_db is the exact filename (not full path) of the telemetry
+    # database this run's measurements/event_log/raw_hardware_log rows
+    # actually live in (e.g. "nipxi_2026_01.db") -- the deliberate
+    # alternative to inferring database location from a run's timestamp:
+    # look up run_summary.telemetry_db by run_id, then open exactly that
+    # file, no month-arithmetic guessing required.
+    "sequence_number", "station_id", "station_name", "telemetry_db",
 ]
 
 # Runtime event history -- Milestone II. Fine-grained, timestamped narrative
@@ -372,7 +399,25 @@ _RUN_SUMMARY_MIGRATION_COLUMNS = [
     ("group_name", "TEXT"),
     ("position_in_group", "INTEGER"),
     ("analysis_result", "TEXT"),
+    # Global run numbering + station identity + telemetry-file traceability
+    # -- additive, for a run_summary table created before these existed.
+    ("sequence_number", "INTEGER"),
+    ("station_id", "TEXT"),
+    ("station_name", "TEXT"),
+    ("telemetry_db", "TEXT"),
 ]
+
+# Permanent, non-rotating global run counter -- lives in the INDEX database
+# (see data/rotation.py::index_database_file()), never the rotating
+# telemetry database, so it survives monthly rotation by construction.
+# Single-row table (CHECK (id = 1)); DataStorage._allocate_sequence_number()
+# is the only writer. See docs/architecture.md "Global Run Sequence".
+CREATE_RUN_SEQUENCE_SQL = """
+CREATE TABLE IF NOT EXISTS run_sequence (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    next_value INTEGER NOT NULL
+);
+"""
 
 
 def _migrate_add_missing_columns(conn: sqlite3.Connection, table: str, columns: list):
@@ -396,39 +441,74 @@ class DataStorage(StorageBackend):
     def __init__(self, settings):
         self.s = settings
         self.log = logging.getLogger("nipxi.storage")
-        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._db: sqlite3.Connection | None = None
+        # Assigned in open() -- generating a real run_id requires allocating
+        # a sequence number from the (not-yet-open) index database, see
+        # _new_run_id()/_allocate_sequence_number() below.
+        self.run_id = None
+        self._sequence_number: int | None = None
+        self._telemetry_db_name: str | None = None
+        self._db: sqlite3.Connection | None = None          # telemetry (measurements/event_log/raw_hardware_log)
+        self._db_index: sqlite3.Connection | None = None    # permanent (run_summary/station_state/run_sequence)
         self._csv_writers: dict = {}
         self._csv_files: dict = {}
 
-    def begin_new_run_id(self, suffix: str = None) -> str:
+    def _allocate_sequence_number(self) -> int:
         """
-        Reassign self.run_id to a fresh value, WITHOUT closing/reopening
-        the underlying DB connection -- see docs/architecture.md "Group
-        -> ALL Support". Every subsequent start_run_summary()/
-        record_measurement()/log_event()/record_execution_state() call
-        scopes to this NEW run_id, exactly as if a fresh DataStorage had
-        been opened, but sharing ONE connection across an entire
-        "Group -> ALL" operation: each position gets its own independent
-        run_summary row (run_summary.run_id is UNIQUE NOT NULL -- see
-        CREATE_RUN_SUMMARY_SQL), while every position's event_log/
-        measurements rows remain queryable from the same open connection
-        and the same on-disk database file.
+        Transaction-safe allocation from the permanent run_sequence
+        counter (index database) -- see docs/architecture.md "Global Run
+        Sequence". Never resets, survives monthly telemetry rotation
+        (run_sequence lives in the non-rotating index database) and
+        process restart (an ordinary committed SQLite row).
+        """
+        if self._db_index is None:
+            raise RuntimeError("DataStorage._allocate_sequence_number() called before open()")
+        self._db_index.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._db_index.execute("SELECT next_value FROM run_sequence WHERE id = 1")
+            value = cur.fetchone()[0]
+            self._db_index.execute("UPDATE run_sequence SET next_value = next_value + 1 WHERE id = 1")
+        except sqlite3.Error:
+            self._db_index.rollback()
+            raise
+        self._db_index.commit()
+        return value
 
-        `suffix` (e.g. a position number), if given, is appended to
-        disambiguate two calls whose wall-clock second collides -- this
-        class's run_id resolution is 1 second (see __init__), and
-        positions processed in a tight loop can easily start within the
-        same second. Callers iterating multiple positions MUST pass a
-        distinct suffix per position, or risk a run_summary UNIQUE
-        constraint violation. Single-position callers (the pre-existing,
-        unchanged behavior for every workflow before Group -> ALL
-        support) never call this at all -- the run_id generated at
-        construction time continues to be used for the whole process
-        lifetime, exactly as before.
+    def _new_run_id(self) -> str:
         """
-        base = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_id = f"{base}_{suffix}" if suffix is not None else base
+        Allocate a fresh sequence number and format the station-prefixed
+        run_id -- see docs/architecture.md "Run ID Format". Deliberately
+        no timestamp component (start_time/end_time already exist on
+        run_summary) -- uniqueness comes entirely from the sequence
+        allocator, not wall-clock resolution.
+        """
+        self._sequence_number = self._allocate_sequence_number()
+        return f"{dev_cfg.STATION_INFO['station_id']}-{self._sequence_number:08d}"
+
+    def begin_new_run_id(self) -> str:
+        """
+        Reassign self.run_id to a freshly-allocated value, WITHOUT closing/
+        reopening either underlying DB connection -- see docs/
+        architecture.md "Group -> ALL Support". Every subsequent
+        start_run_summary()/record_measurement()/log_event()/
+        record_execution_state() call scopes to this NEW run_id, exactly
+        as if a fresh DataStorage had been opened, but sharing the SAME
+        two open connections across an entire "Group -> ALL" operation:
+        each position gets its own independent run_summary row
+        (run_summary.run_id is UNIQUE NOT NULL -- see
+        CREATE_RUN_SUMMARY_SQL), while every position's event_log/
+        measurements rows remain queryable from the same open connections
+        and the same on-disk database files.
+
+        No `suffix` parameter -- the previous timestamp-based run_id
+        needed one to disambiguate two positions started within the same
+        wall-clock second; the sequence-number-based run_id below is
+        unique by construction on every call, so nothing to disambiguate
+        remains. Single-position callers (the pre-existing, unchanged
+        behavior for every workflow before Group -> ALL support) never
+        call this at all -- the run_id generated at open() time continues
+        to be used for the whole process lifetime, exactly as before.
+        """
+        self.run_id = self._new_run_id()
         return self.run_id
 
     # ------------------------------------------------------------------
@@ -439,31 +519,59 @@ class DataStorage(StorageBackend):
         try:
             os.makedirs(self.s.DATA_DIR, exist_ok=True)
             os.makedirs(self.s.CSV_DIR, exist_ok=True)
-            self._db = sqlite3.connect(self.s.DATABASE_FILE)
+
+            index_path = index_database_file(self.s)
+            telemetry_path = telemetry_database_file(self.s)
+            self._telemetry_db_name = os.path.basename(telemetry_path)
+
+            # Permanent index database -- run_summary/station_state/
+            # run_sequence. Never rotates (see data/rotation.py).
+            self._db_index = sqlite3.connect(index_path)
+            self._db_index.execute(CREATE_STATION_STATE_SQL)
+            self._db_index.execute(CREATE_RUN_SUMMARY_SQL)
+            self._db_index.execute(CREATE_RUN_SEQUENCE_SQL)
+            self._db_index.execute("INSERT OR IGNORE INTO run_sequence (id, next_value) VALUES (1, 1)")
+            # Additive migration -- brings a pre-existing index/legacy
+            # database up to the current schema without touching any
+            # existing row. No-op on a brand-new database (CREATE TABLE
+            # above already has every column) and no-op on an
+            # already-migrated one. MUST run before CREATE_RUN_SUMMARY_
+            # INDEXES_SQL below -- that index is on sequence_number, a
+            # column a legacy run_summary table won't have until this
+            # migration adds it.
+            _migrate_add_missing_columns(self._db_index, "station_state", _STATION_STATE_MIGRATION_COLUMNS)
+            _migrate_add_missing_columns(self._db_index, "run_summary", _RUN_SUMMARY_MIGRATION_COLUMNS)
+            for _stmt in CREATE_RUN_SUMMARY_INDEXES_SQL:
+                self._db_index.execute(_stmt)
+            self._db_index.commit()
+
+            # Telemetry database -- measurements/event_log/raw_hardware_log.
+            # Resolved ONCE, here, and never re-read for this instance's
+            # life -- see data/rotation.py's module docstring for why this
+            # is what makes "never split a group across databases" true by
+            # construction, with no extra guard needed.
+            self._db = sqlite3.connect(telemetry_path)
             self._db.execute(CREATE_TABLE_SQL)
-            self._db.execute(CREATE_STATION_STATE_SQL)
-            self._db.execute(CREATE_RUN_SUMMARY_SQL)
             self._db.execute(CREATE_EVENT_LOG_SQL)
             # Hardware Audit Trail (see docs/architecture.md) -- schema only,
             # created here so the table/indexes are visible via this
             # connection immediately, even before any hardware call has
             # happened. Actual writes go through data/raw_hardware_log.py::
-            # RawHardwareLogWriter's own, independent connection (see that
-            # module's docstring for why) -- this DataStorage instance never
-            # writes to raw_hardware_log itself.
+            # RawHardwareLogWriter's own, independent connection to this
+            # SAME telemetry file (see that module's docstring for why) --
+            # this DataStorage instance never writes to raw_hardware_log
+            # itself.
             self._db.execute(CREATE_RAW_HARDWARE_LOG_SQL)
             for _stmt in CREATE_RAW_HARDWARE_LOG_INDEXES_SQL:
                 self._db.execute(_stmt)
-            # Additive migration -- brings a pre-Milestone-II database (e.g.
-            # an existing data_output/development/nipxi_dev.db) up to the
-            # current schema without touching any existing row. No-op on a
-            # brand-new database (CREATE TABLE above already has every
-            # column) and no-op on an already-migrated one.
             _migrate_add_missing_columns(self._db, "measurements", _MEASUREMENT_MIGRATION_COLUMNS)
-            _migrate_add_missing_columns(self._db, "station_state", _STATION_STATE_MIGRATION_COLUMNS)
-            _migrate_add_missing_columns(self._db, "run_summary", _RUN_SUMMARY_MIGRATION_COLUMNS)
             self._db.commit()
-            self.log.info("Storage opened. run_id=%s", self.run_id)
+
+            self.run_id = self._new_run_id()
+            self.log.info(
+                "Storage opened. run_id=%s index_db=%s telemetry_db=%s",
+                self.run_id, index_path, self._telemetry_db_name,
+            )
         except (OSError, sqlite3.Error) as e:
             self.log.error("Failed to open storage: %s", e)
             raise
@@ -477,12 +585,14 @@ class DataStorage(StorageBackend):
         self._csv_files.clear()
         self._csv_writers.clear()
 
-        if self._db is not None:
-            try:
-                self._db.close()
-            except sqlite3.Error as e:
-                self.log.warning("Error closing database: %s", e)
-            self._db = None
+        for attr in ("_db", "_db_index"):
+            conn = getattr(self, attr)
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error as e:
+                    self.log.warning("Error closing database (%s): %s", attr, e)
+                setattr(self, attr, None)
 
         self.log.info("Storage closed.")
 
@@ -567,7 +677,7 @@ class DataStorage(StorageBackend):
         silent no-op, a caller relying on this for recovery/display data
         should know immediately if it silently didn't persist.
         """
-        if self._db is None:
+        if self._db_index is None:
             raise RuntimeError("DataStorage.record_execution_state() called before open()")
         row = {
             "run_id": self.run_id,
@@ -582,11 +692,11 @@ class DataStorage(StorageBackend):
             row.setdefault(key, None)
         cols = ["run_id"] + _STATION_STATE_COLUMNS
         placeholders = ", ".join("?" for _ in cols)
-        cursor = self._db.execute(
+        cursor = self._db_index.execute(
             f"INSERT INTO station_state ({', '.join(cols)}) VALUES ({placeholders})",
             [row[c] for c in cols],
         )
-        self._db.commit()
+        self._db_index.commit()
         return cursor.lastrowid
 
     def get_last_execution_state(self):
@@ -601,9 +711,9 @@ class DataStorage(StorageBackend):
         implied or performed here -- display only (see
         test.py::run_proto_test_execution()).
         """
-        if self._db is None:
+        if self._db_index is None:
             return None
-        cur = self._db.execute(
+        cur = self._db_index.execute(
             f"SELECT {', '.join(_STATION_STATE_COLUMNS)} FROM station_state "
             f"ORDER BY id DESC LIMIT 1"
         )
@@ -838,8 +948,14 @@ class DataStorage(StorageBackend):
 
         Raises if the storage backend is not open, same policy as
         record_measurement()/record_execution_state().
+
+        `sequence_number`/`station_id`/`station_name`/`telemetry_db` are
+        NEVER read from `fields` -- see docs/architecture.md "Global Run
+        Sequence" / "Station Identity" / "telemetry_db Lookup Strategy":
+        these are facts about how THIS DataStorage instance was actually
+        allocated/opened, not something any caller supplies or overrides.
         """
-        if self._db is None:
+        if self._db_index is None:
             raise RuntimeError("DataStorage.start_run_summary() called before open()")
         row = {
             "run_id": self.run_id,
@@ -852,13 +968,17 @@ class DataStorage(StorageBackend):
                 row[key] = fields[key]
         for key in optional_cols:
             row.setdefault(key, None)
+        row["sequence_number"] = self._sequence_number
+        row["station_id"] = dev_cfg.STATION_INFO["station_id"]
+        row["station_name"] = dev_cfg.STATION_INFO["station_name"]
+        row["telemetry_db"] = self._telemetry_db_name
         cols = ["run_id", "test_type", "start_time"] + optional_cols
         placeholders = ", ".join("?" for _ in cols)
-        self._db.execute(
+        self._db_index.execute(
             f"INSERT INTO run_summary ({', '.join(cols)}) VALUES ({placeholders})",
             [row[c] for c in cols],
         )
-        self._db.commit()
+        self._db_index.commit()
 
     def finish_run_summary(self, stop_reason: str = None, result: str = None, **fields) -> None:
         """
@@ -869,7 +989,7 @@ class DataStorage(StorageBackend):
         this run_id, rather than raising -- a missing summary row is a
         historical-visibility gap, not a safety-relevant failure.
         """
-        if self._db is None:
+        if self._db_index is None:
             raise RuntimeError("DataStorage.finish_run_summary() called before open()")
         end_time = datetime.now().isoformat()
         updates = {"end_time": end_time, "stop_reason": stop_reason, "result": result}
@@ -882,7 +1002,7 @@ class DataStorage(StorageBackend):
         if "duration_s" in fields:
             updates["duration_s"] = fields["duration_s"]
         else:
-            cur = self._db.execute(
+            cur = self._db_index.execute(
                 "SELECT start_time FROM run_summary WHERE run_id = ?", (self.run_id,)
             )
             row = cur.fetchone()
@@ -893,7 +1013,7 @@ class DataStorage(StorageBackend):
                 except ValueError:
                     pass
         set_clause = ", ".join(f"{k} = ?" for k in updates)
-        cur = self._db.execute(
+        cur = self._db_index.execute(
             f"UPDATE run_summary SET {set_clause} WHERE run_id = ?",
             [*updates.values(), self.run_id],
         )
@@ -902,13 +1022,13 @@ class DataStorage(StorageBackend):
                 "finish_run_summary(): no run_summary row found for run_id=%s "
                 "(start_run_summary() was never called for this run)", self.run_id,
             )
-        self._db.commit()
+        self._db_index.commit()
 
     def get_last_run_summary(self):
         """Return the most recent run_summary row (by id) as a dict, or None."""
-        if self._db is None:
+        if self._db_index is None:
             return None
-        cur = self._db.execute(
+        cur = self._db_index.execute(
             f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary ORDER BY id DESC LIMIT 1"
         )
         row = cur.fetchone()
@@ -916,9 +1036,9 @@ class DataStorage(StorageBackend):
 
     def get_run_summary(self, run_id: str):
         """Return the run_summary row for a specific run_id as a dict, or None."""
-        if self._db is None:
+        if self._db_index is None:
             return None
-        cur = self._db.execute(
+        cur = self._db_index.execute(
             f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary WHERE run_id = ?",
             (run_id,),
         )
@@ -927,9 +1047,9 @@ class DataStorage(StorageBackend):
 
     def list_run_summaries(self) -> list:
         """Return every run_summary row, most recent first."""
-        if self._db is None:
+        if self._db_index is None:
             return []
-        cur = self._db.execute(
+        cur = self._db_index.execute(
             f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary ORDER BY id DESC"
         )
         return [dict(zip(_RUN_SUMMARY_COLUMNS, row)) for row in cur.fetchall()]

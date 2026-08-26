@@ -13,6 +13,20 @@ data categories, and cycle/state recovery — remains future architecture, writt
 down now so it gets designed deliberately instead of improvised later. See
 `docs/architecture.md` "System Modes" for how `SYSTEM_MODE` feeds into this.
 
+**Section 5.1 (database rotation) is now IMPLEMENTED** -- see
+`docs/architecture.md` Section 83 "Station Identity, Global Run Sequence,
+Telemetry/Index Database Split, Monthly Rotation". The as-built design
+follows this section's own refined recommendation closely (rotate only the
+telemetry tables, keep a non-rotating index database for `run_summary`/
+`station_state`), with two differences from what's sketched below: rotation
+is monthly only (no quarterly/yearly option was built), and the rotation
+*trigger* is gated on group/sequence/scheduler idleness (see Section 83),
+not just a bare month check -- a refinement added after this section was
+written, to guarantee a group can never be split across telemetry files
+regardless of how long it runs. Section 83 is authoritative over the
+rotation mechanics described below; this section's motivating discussion
+(why rotate, why split by category) remains accurate background.
+
 **Note (SMU/Discharge/Roadmap review, see `docs/architecture.md` Sections 29-35):**
 this review's changes (SMU implementation status, Discharge Cutoff Policy, DAQ
 telemetry strategy, SMU Functional Validation milestone, ChargeCycle/DischargeCycle

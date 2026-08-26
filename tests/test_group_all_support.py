@@ -138,7 +138,11 @@ class RunChargeOrDischargeAllPositionsWiringTests(unittest.TestCase):
         self.assertIsNotNone(self._first_index('if cfg.get("enabled")'))
 
     def test_a_fresh_run_id_is_started_for_every_position(self):
-        self.assertIsNotNone(self._first_index("storage.begin_new_run_id(suffix="))
+        # begin_new_run_id() no longer takes a suffix -- a freshly
+        # allocated sequence number (see data/storage.py::
+        # DataStorage._new_run_id()) is unique on every call by
+        # construction, so there is nothing left to disambiguate.
+        self.assertIsNotNone(self._first_index("storage.begin_new_run_id()"))
 
     def test_cancelled_result_stops_the_loop(self):
         cancelled_idx = self._first_index('if result == "CANCELLED":')

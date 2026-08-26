@@ -1,6 +1,7 @@
 """
 Device-level configuration and channel mapping.
-Maps physical hardware to logical battery channels.
+Maps physical hardware to logical battery channels, and identifies the
+physical station (rack) this configuration belongs to (STATION_INFO below).
 """
 
 import os
@@ -17,6 +18,25 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import Settings
+
+# =============================================================================
+# Station Identity -- identifies the PHYSICAL RACK this configuration
+# describes, not the PC running the software (see docs/architecture.md
+# "Station Identity"). Manually set per deployment; never inferred from
+# hostname/IP -- a PC can be swapped without changing which rack it
+# controls, and vice versa. `station_id` is the short, stable token used
+# as the run_id prefix (data/storage.py) and as the multi-rack unique-key
+# component alongside `sequence_number` once databases are ever merged
+# centrally -- keep it short and immutable once assigned. `hostname`/
+# `ip_address` are deliberately NOT stored here -- they remain a live,
+# runtime-only diagnostic (socket.gethostname()), never persisted as
+# identity, since they describe the PC, not the rack.
+# =============================================================================
+STATION_INFO = {
+    "station_id":   "RACK01",
+    "station_name": "FIN-RACK01",
+    "location":     "Finland - Line 1",
+}
 
 # =============================================================================
 # PXI chassis inventory -- single source of truth for every PXI-slot-resident

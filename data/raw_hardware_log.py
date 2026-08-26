@@ -39,6 +39,8 @@ import sqlite3
 import uuid
 from datetime import datetime
 
+from data.rotation import telemetry_database_file
+
 _log = logging.getLogger("nipxi.raw_hw_log")
 
 # -----------------------------------------------------------------------
@@ -143,6 +145,7 @@ class RawHardwareLogWriter:
         self.s = settings
         self.session_id = get_session_id()
         self._db: sqlite3.Connection | None = None
+        self._telemetry_path: str | None = None
         self._connect_failed = False  # avoids retrying a hard failure on every single call
 
     def _ensure_connection(self) -> sqlite3.Connection | None:
@@ -152,7 +155,12 @@ class RawHardwareLogWriter:
             return None
         try:
             os.makedirs(self.s.DATA_DIR, exist_ok=True)
-            db = sqlite3.connect(self.s.DATABASE_FILE)
+            # Same telemetry file DataStorage's measurements/event_log use
+            # (see data/rotation.py) -- resolved fresh on first connection
+            # attempt, then cached on self._db for this writer's lifetime,
+            # same "pin at open time" property DataStorage relies on.
+            self._telemetry_path = telemetry_database_file(self.s)
+            db = sqlite3.connect(self._telemetry_path)
             # WAL mode reduces writer/reader lock contention for this
             # additive, best-effort write path -- see docs/architecture.md
             # "Database Growth Protection". busy_timeout gives a transient
@@ -170,7 +178,7 @@ class RawHardwareLogWriter:
             self._connect_failed = True
             _log.warning("raw_hardware_log: could not open/initialize database (%s) -- "
                          "hardware audit logging disabled for this session, hardware "
-                         "operation is NOT affected: %s", self.s.DATABASE_FILE, e)
+                         "operation is NOT affected: %s", self._telemetry_path, e)
             return None
         return self._db
 
@@ -209,7 +217,7 @@ class RawHardwareLogWriter:
             # retries a fresh open rather than reusing a possibly-broken one.
             _log.warning("raw_hardware_log: write failed for %s.%s (%s) -- "
                          "hardware operation is NOT affected: %s",
-                         device_name, command, self.s.DATABASE_FILE, e)
+                         device_name, command, self._telemetry_path, e)
             self._db = None
         except Exception as e:  # pragma: no cover -- defense in depth, see class docstring
             _log.warning("raw_hardware_log: unexpected logging failure for %s.%s -- "

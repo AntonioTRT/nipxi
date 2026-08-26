@@ -106,7 +106,7 @@ class OpenStorageGuardedSuccessTests(unittest.TestCase):
         self.addCleanup(storage.close)
         provider = hw_mgr.attached_providers[0]
         first_run_id = provider()
-        storage.begin_new_run_id(suffix="pos2")
+        storage.begin_new_run_id()
         second_run_id = provider()
         self.assertNotEqual(first_run_id, second_run_id)
         self.assertEqual(second_run_id, storage.run_id)

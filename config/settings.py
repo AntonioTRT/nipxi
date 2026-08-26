@@ -356,8 +356,8 @@ class Settings:
 
     # -------------------------------------------------------------------------
     # Data storage -- mode-separated (see docs/DATABASE_ROADMAP.md). Each
-    # mode gets its own subdirectory and database file so DEVELOPMENT
-    # experiments can never collide with VALIDATION or PRODUCTION data.
+    # mode gets its own subdirectory so DEVELOPMENT experiments can never
+    # collide with VALIDATION or PRODUCTION data.
     #
     # NOTE: the roadmap's illustrative paths were "data/dev/nipxi_dev.db"
     # etc., but this project already has a "data/" PACKAGE directory
@@ -367,19 +367,27 @@ class Settings:
     # accidental import-path collision. This uses the existing
     # "data_output/" root (already gitignored as generated output) with a
     # mode subdirectory instead: data_output/development|validation/production/.
+    #
+    # There is deliberately no single DATABASE_FILE constant anymore (see
+    # docs/architecture.md "Telemetry / Index Database Split"): two
+    # database files now live under DATA_DIR --
+    #   - the permanent index database (run_summary/station_state/
+    #     run_sequence), resolved by data/rotation.py::index_database_file()
+    #   - the current month's telemetry database (measurements/event_log/
+    #     raw_hardware_log), resolved by data/rotation.py::
+    #     telemetry_database_file() -- "nipxi_<YYYY>_<MM>.db"
+    # Both resolvers read DATA_DIR live (a plain attribute lookup, not
+    # baked in at class-definition time like the old DATABASE_FILE was),
+    # and both accept a settings-level override (a DATABASE_FILE/
+    # INDEX_DATABASE_FILE attribute, if a caller sets one) for tests/
+    # legacy single-file callers -- see that module's docstring.
     # -------------------------------------------------------------------------
     _MODE_DB_SUBDIR = {
         "DEVELOPMENT": "development",
         "VALIDATION":  "validation",
         "PRODUCTION":  "production",
     }
-    _MODE_DB_NAME = {
-        "DEVELOPMENT": "nipxi_dev.db",
-        "VALIDATION":  "nipxi_validation.db",
-        "PRODUCTION":  "nipxi.db",
-    }
 
     DATA_DIR         = os.path.join("data_output", _MODE_DB_SUBDIR.get(SYSTEM_MODE, "development"))
-    DATABASE_FILE    = os.path.join(DATA_DIR, _MODE_DB_NAME.get(SYSTEM_MODE, "nipxi_dev.db"))
     CSV_DIR          = os.path.join(DATA_DIR, "csv")
     REPORT_DIR       = os.path.join(DATA_DIR, "reports")
