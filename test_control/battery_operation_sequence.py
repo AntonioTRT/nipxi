@@ -468,10 +468,20 @@ class BatteryOperationSequence:
             raise
 
         except NIPXITimeoutError as e:
-            # Classified as StopReason.TIMEOUT, not the generic FAILED --
-            # see docs/architecture.md "Timeout Traceability". Shutdown
-            # sequence is identical to every other fault (emergency_stop()),
-            # only the recorded stop_reason/execution_state differ.
+            # Classified as StopReason.TIMEOUT with its OWN dedicated
+            # result="TIMEOUT" (not the generic "FAIL") -- see docs/
+            # architecture.md "Timeout Traceability". A timeout means the
+            # end condition was never confirmed within the expected window;
+            # it is a distinct, investigator-relevant outcome from "the
+            # station/battery actively failed a check" (result="FAIL",
+            # used by RelayError/SafetyViolationError/generic-Exception
+            # above) -- collapsing both into "FAIL" made TIMEOUT and FAIL
+            # runs indistinguishable by `result` alone (only `stop_reason`
+            # disambiguated them), which is exactly the kind of overload a
+            # forensic/incident query should not have to know to work
+            # around. Shutdown sequence is identical to every other fault
+            # (emergency_stop()) -- only the recorded stop_reason/result/
+            # execution_state differ.
             self.log.error("Timeout while %s channel %d: %s", verb, channel, e)
             on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
             on_event("timeout detected")
@@ -485,7 +495,7 @@ class BatteryOperationSequence:
             if final_v is not None:
                 fields["end_voltage"] = final_v
             self.storage.finish_run_summary(
-                stop_reason=StopReason.TIMEOUT, result="FAIL",
+                stop_reason=StopReason.TIMEOUT, result="TIMEOUT",
                 **fields,
             )
             self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)

@@ -282,6 +282,58 @@ class SafetyCorrelationTests(_Base):
         self.assertFalse(export["incident_summary"]["operator_acknowledged"])
 
 
+class RelatedRunsTests(_Base):
+    """
+    data/storage.py's `parent_run_id` column + get_child_run_summaries()
+    (added for test_control/cycle_sequence.py) -- exercised here at the
+    export layer with two independent DataStorage instances, mirroring
+    exactly what CycleSequence._make_phase_storage() does in production:
+    a cycle-level run, then a phase-level run that records
+    parent_run_id=<cycle run_id>.
+    """
+
+    def _make_cycle_and_phase_runs(self):
+        cycle_storage = DataStorage(settings=self.settings)
+        cycle_storage.open()
+        cycle_run_id = cycle_storage.run_id
+        cycle_storage.start_run_summary(test_type="cycle_battery", group_name="B1", position_in_group=1)
+        cycle_storage.finish_run_summary(stop_reason="COMPLETED", result="PASS", cycle_count=1)
+        cycle_storage.close()
+
+        phase_storage = DataStorage(settings=self.settings)
+        phase_storage.open()
+        phase_run_id = phase_storage.run_id
+        phase_storage.start_run_summary(
+            test_type="charge_battery", group_name="B1", position_in_group=1,
+            parent_run_id=cycle_run_id,
+        )
+        phase_storage.finish_run_summary(stop_reason="COMPLETED", result="PASS")
+        phase_storage.close()
+        return cycle_run_id, phase_run_id
+
+    def test_phase_export_shows_the_parent_cycle_run(self):
+        cycle_run_id, phase_run_id = self._make_cycle_and_phase_runs()
+        export = build_export(phase_run_id, settings=self.settings)
+        self.assertEqual(export["related_runs"]["parent"]["run_id"], cycle_run_id)
+        self.assertEqual(export["related_runs"]["parent"]["test_type"], "cycle_battery")
+        self.assertEqual(export["related_runs"]["children"], [])
+
+    def test_cycle_export_shows_the_child_phase_run(self):
+        cycle_run_id, phase_run_id = self._make_cycle_and_phase_runs()
+        export = build_export(cycle_run_id, settings=self.settings)
+        self.assertIsNone(export["related_runs"]["parent"])
+        children = export["related_runs"]["children"]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0]["run_id"], phase_run_id)
+        self.assertEqual(children[0]["test_type"], "charge_battery")
+
+    def test_a_run_with_no_cycle_relationship_has_empty_related_runs(self):
+        run_id = self._make_plain_run()
+        export = build_export(run_id, settings=self.settings)
+        self.assertIsNone(export["related_runs"]["parent"])
+        self.assertEqual(export["related_runs"]["children"], [])
+
+
 class VerificationResultMappingTests(_Base):
     def _run_with_verification_result(self, verification_result):
         storage = DataStorage(settings=self.settings)
@@ -448,7 +500,7 @@ class DeterministicOutputTests(_Base):
         self.assertEqual(
             list(export.keys()),
             ["metadata", "incident_summary", "timeline", "safety", "forensic_findings",
-             "critical_events", "run_summary", "execution_state", "event_log",
+             "critical_events", "run_summary", "related_runs", "execution_state", "event_log",
              "measurements", "raw_hardware_log"],
         )
 
@@ -463,7 +515,7 @@ class DeterministicOutputTests(_Base):
         # would also match "safety" appearing as an array ELEMENT inside
         # metadata.sections_included, earlier in the document.
         keys = ["metadata", "incident_summary", "timeline", "safety", "forensic_findings",
-                "critical_events", "run_summary", "execution_state", "event_log",
+                "critical_events", "run_summary", "related_runs", "execution_state", "event_log",
                 "measurements", "raw_hardware_log"]
         positions = [raw.index(f'\n  "{k}":') for k in keys]
         self.assertEqual(positions, sorted(positions))

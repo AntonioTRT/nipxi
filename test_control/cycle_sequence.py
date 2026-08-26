@@ -34,6 +34,25 @@ phase between charge and discharge, cooperative cancellation via the same
 token/checkpoints, the "no remaining repetitions run after a failure"
 stop condition, and the "one cycle-level run_summary row + one row per
 phase" reporting model -- follows Section 67 exactly.
+
+Post-implementation additions (from the CycleSequence engineering review,
+made before any real-hardware validation so they cost nothing to change
+now rather than after real data exists):
+
+  3. Each phase's run_summary row records `parent_run_id` = the umbrella
+     cycle_battery row's run_id (see _make_phase_storage()) -- lets
+     scripts/export_run.py resolve a cycle's phases (or a phase's parent
+     cycle) via a direct query (DataStorage.get_child_run_summaries()),
+     with no group_name/position/time-proximity heuristic required.
+  4. A phase that raises a STATION_HARDWARE_EXCEPTIONS member (RelayError/
+     SMUError/DMMError/DAQError/DMMMeasurementLostError) has its OWN
+     run_summary/station_state rows reclassified to STATION_FAULT before
+     the exception propagates (see _reclassify_phase_as_station_fault())
+     -- previously only the cycle-level row got this treatment (via
+     test.py's outer _classify_position_exception() reclassification,
+     which has no reference to the phase's own storage/run_id), leaving
+     the phase's own row permanently mislabeled FAILED/"FAIL" for what was
+     actually a station-hardware fault.
 """
 
 from data.storage import DataStorage
@@ -42,6 +61,8 @@ from test_control.charge_sequence import ChargeSequence
 from test_control.discharge_sequence import DischargeSequence
 from test_control.safety_monitor import SafetyMonitor
 from utils.cancellation import check_cancellation, interruptible_sleep
+from utils.errors import STATION_HARDWARE_EXCEPTIONS
+from utils.stop_reason import StopReason
 
 
 class CycleSequence(BatteryOperationSequence):
@@ -79,6 +100,11 @@ class CycleSequence(BatteryOperationSequence):
         responsibility here -- otherwise the phase's own finish_run_summary()
         (inside its run_guarded()/complete()) would have no row to update.
 
+        Passes `parent_run_id=self.storage.run_id` -- the phase's row
+        always links back to the umbrella cycle_battery row that created
+        it (data/storage.py's `parent_run_id` column), giving
+        scripts/export_run.py a direct join instead of a heuristic.
+
         KNOWN, DOCUMENTED LIMITATION: the HardwareManager audit-trail
         run_id_provider is wired ONCE by the caller (test.py's
         open_storage_guarded(), via hw_mgr.attach_run_id_provider()) to
@@ -97,8 +123,33 @@ class CycleSequence(BatteryOperationSequence):
         phase_storage.open()
         phase_storage.start_run_summary(
             test_type=test_type, group_name=self.group_name, position_in_group=channel,
+            parent_run_id=self.storage.run_id,
         )
         return phase_storage
+
+    def _reclassify_phase_as_station_fault(self, phase_storage: DataStorage, *, channel: int,
+                                            relay_address: int) -> None:
+        """
+        Overwrite `phase_storage`'s own run_summary/station_state rows to
+        STATION_FAULT -- mirrors test.py::_run_one_charge_or_discharge_
+        position()'s existing outer reclassification (same UPDATE ... WHERE
+        run_id=? mechanism finish_run_summary() already uses for that
+        purpose), but applied to the PHASE's own storage/run_id, which the
+        outer reclassification has no reference to and therefore cannot
+        reach on its own (see docs/architecture.md "CycleSequence --
+        Forensic Consistency"). Without this, a charge-phase STATION_FAULT
+        left the cycle-level row correctly reclassified to STATION_FAULT
+        while the charge-phase's own row stayed permanently stuck at
+        whatever run_guarded() first wrote (FAILED/"FAIL") for the
+        underlying station-hardware exception -- a confirmed forensic
+        inconsistency found during the CycleSequence engineering review.
+        Called BEFORE `phase_storage.close()`, while its own run_id is
+        still the active one for this DataStorage instance.
+        """
+        phase_storage.record_execution_state(
+            channel=channel, relay=relay_address, state=StopReason.STATION_FAULT,
+        )
+        phase_storage.finish_run_summary(stop_reason=StopReason.STATION_FAULT, result="STATION_FAULT")
 
     def run(self, channel: int, relay_address: int, battery_cfg: dict,
             test_setpoints: dict, ntc_channel: str = None, token=None) -> bool:
@@ -150,6 +201,11 @@ class CycleSequence(BatteryOperationSequence):
                         channel=channel, relay_address=relay_address, battery_cfg=battery_cfg,
                         test_setpoints=test_setpoints, ntc_channel=ntc_channel, token=token,
                     )
+                except STATION_HARDWARE_EXCEPTIONS:
+                    self._reclassify_phase_as_station_fault(
+                        charge_storage, channel=channel, relay_address=relay_address,
+                    )
+                    raise
                 finally:
                     charge_storage.close()
 
@@ -176,6 +232,11 @@ class CycleSequence(BatteryOperationSequence):
                         channel=channel, relay_address=relay_address, battery_cfg=battery_cfg,
                         test_setpoints=test_setpoints, ntc_channel=ntc_channel, token=token,
                     )
+                except STATION_HARDWARE_EXCEPTIONS:
+                    self._reclassify_phase_as_station_fault(
+                        discharge_storage, channel=channel, relay_address=relay_address,
+                    )
+                    raise
                 finally:
                     discharge_storage.close()
 

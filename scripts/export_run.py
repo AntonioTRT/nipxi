@@ -418,6 +418,29 @@ def _build_raw_hardware_log_section(rows: list, include_full: bool, telemetry_av
     return section
 
 
+def _run_ref(row: dict) -> dict:
+    return {
+        "run_id": row.get("run_id"), "test_type": row.get("test_type"),
+        "stop_reason": row.get("stop_reason"), "result": row.get("result"),
+    }
+
+
+def _build_related_runs(*, parent_run: dict, child_runs: list) -> dict:
+    """
+    Cycle/phase forensic linkage (see data/storage.py's `parent_run_id`
+    column and test_control/cycle_sequence.py) -- lets a reader/AI walk
+    from a CycleSequence phase row to its umbrella cycle_battery row, or
+    from a cycle_battery row to its charge/discharge phase rows, WITHOUT a
+    second export_run.py invocation or a fragile group_name/position/time-
+    proximity heuristic. Both lists are empty/null for a run that has no
+    cycle relationship at all (every non-CycleSequence run_id).
+    """
+    return {
+        "parent": _run_ref(parent_run) if parent_run else None,
+        "children": [_run_ref(row) for row in child_runs],
+    }
+
+
 def _build_metadata(*, run_id: str, run: dict, telemetry_available: bool,
                      telemetry_unavailable_reason, flags: dict, sections_included: list) -> dict:
     return {
@@ -457,6 +480,8 @@ def build_export(run_id: str, *, settings=Settings, summary_only: bool = False,
         telemetry_available = storage._db is not None
         unavailable_reason = storage.telemetry_unavailable_reason
         station_state_rows = storage.get_station_state_for_run(run_id)
+        child_runs = storage.get_child_run_summaries(run_id)
+        parent_run = storage.get_run_summary(run["parent_run_id"]) if run and run.get("parent_run_id") else None
         if telemetry_available:
             event_rows = storage.get_recent_events(run_id=run_id, limit=None)
             measurement_rows = storage.get_measurements(run_id=run_id)
@@ -474,6 +499,7 @@ def build_export(run_id: str, *, settings=Settings, summary_only: bool = False,
     incident_summary = _build_incident_summary(
         run, station_state_rows, safety_section, event_rows, telemetry_available,
     )
+    related_runs = _build_related_runs(parent_run=parent_run, child_runs=child_runs)
 
     if summary_only:
         timeline, critical_events, execution_state, event_log = [], [], [], []
@@ -486,7 +512,7 @@ def build_export(run_id: str, *, settings=Settings, summary_only: bool = False,
     measurements = _build_measurements_section(measurement_rows, include_measurements, telemetry_available, unavailable_reason)
     raw_hardware_log = _build_raw_hardware_log_section(raw_rows, include_raw_hardware_log, telemetry_available, unavailable_reason)
 
-    sections_included = ["metadata", "incident_summary", "safety", "forensic_findings", "run_summary"]
+    sections_included = ["metadata", "incident_summary", "safety", "forensic_findings", "run_summary", "related_runs"]
     if not summary_only:
         sections_included += ["timeline", "critical_events", "execution_state", "event_log"]
     if include_measurements:
@@ -507,6 +533,9 @@ def build_export(run_id: str, *, settings=Settings, summary_only: bool = False,
     # Key order matches the approved top-level order exactly -- json.dump()
     # preserves dict insertion order; NEVER pass sort_keys=True downstream,
     # that would alphabetize and destroy this deliberate ordering.
+    # `related_runs` is a later, additive field (cycle/phase linkage via
+    # parent_run_id) -- placed immediately after `run_summary` since it's
+    # directly about that section, not part of the original approved order.
     return {
         "metadata": metadata,
         "incident_summary": incident_summary,
@@ -515,6 +544,7 @@ def build_export(run_id: str, *, settings=Settings, summary_only: bool = False,
         "forensic_findings": forensic_findings,
         "critical_events": critical_events,
         "run_summary": run,
+        "related_runs": related_runs,
         "execution_state": execution_state,
         "event_log": event_log,
         "measurements": measurements,

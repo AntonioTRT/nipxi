@@ -5943,6 +5943,63 @@ a charge-phase failure produces exactly one `charge_battery` row, zero
 first repetition marks the cycle-level row `CANCELLED` with zero phase
 rows created. Full repository suite: **575/575 passing**, no regressions.
 
+### Post-implementation hardening (pre-hardware-validation review)
+
+A CycleSequence engineering review (conducted before any real-hardware
+run, specifically to catch this class of issue while it was still cheap
+to fix) identified three findings, all closed in the same pass rather
+than deferred, per the explicit design goal of minimizing rework once
+real hardware data exists:
+
+1. **TIMEOUT result collapsed into "FAIL"** -- `run_guarded()`'s
+   `NIPXITimeoutError` branch (`test_control/battery_operation_sequence.py`)
+   wrote `result="FAIL"`, identical to `RelayError`/generic-`Exception`
+   branches; only `stop_reason="TIMEOUT"` disambiguated it. **Fixed**:
+   `result="TIMEOUT"` now, its own dedicated value. Historical rows written
+   before this fix keep `result="FAIL"` (no backfill -- no reliable way to
+   distinguish a pre-fix timeout row from a genuine failure after the fact
+   without re-deriving it from `stop_reason`, which is exactly the
+   asymmetry this fix removes going forward).
+2. **CycleSequence phase rows had no link back to their cycle** --
+   `run_summary` gained a `parent_run_id` column (`data/storage.py`,
+   migration-safe via `_migrate_add_missing_columns()`, indexed). Populated
+   by `CycleSequence._make_phase_storage()` on every phase row; NULL for
+   every other run_summary row, including the cycle-level row itself.
+   `DataStorage.get_child_run_summaries(parent_run_id)` added as the read
+   path. `scripts/export_run.py` gained a `related_runs` section
+   (`{"parent": {...} | null, "children": [...]}`) using this column
+   directly -- closes the forensic-export gap identified in the original
+   Forensic Export review ("no schema-level link between a cycle's row and
+   its phase rows... a fragile heuristic" would otherwise be required).
+3. **STATION_FAULT reclassification only reached the cycle-level row** --
+   `test.py::_run_one_charge_or_discharge_position()`'s existing
+   `_classify_position_exception()` reclassification overwrites the
+   run_summary/station_state rows of whatever `storage` object it was
+   given, which for a Cycle Battery run is the CYCLE-level storage only --
+   it has no reference to `CycleSequence`'s internally-created
+   `charge_storage`/`discharge_storage`. A charge-phase `STATION_HARDWARE_
+   EXCEPTIONS` fault therefore left the cycle-level row correctly
+   reclassified to `STATION_FAULT` while the phase's own row stayed
+   permanently `FAILED`/`"FAIL"`. **Fixed**:
+   `CycleSequence._reclassify_phase_as_station_fault()` catches
+   `STATION_HARDWARE_EXCEPTIONS` around each phase's `.run()` call and
+   applies the identical reclassification (`record_execution_state()` +
+   `finish_run_summary()`, same `UPDATE ... WHERE run_id=?` mechanism) to
+   that phase's own storage before re-raising -- the outer, orchestration-
+   level reclassification in `test.py` is untouched and still runs
+   afterward for the cycle-level row.
+
+None of these three change CycleSequence's execution flow, stop
+conditions, or console behavior -- all three are purely about what gets
+persisted, addressing "minimal rework later / deterministic logging /
+forensic traceability" ahead of a real-hardware validation still months
+away. Test suite after these fixes: **587/587 passing** (12 new cases:
+`tests/test_run_guarded_result_classification.py` pins the full
+stop_reason/result table for all five `run_guarded()` exception branches;
+`tests/test_cycle_sequence.py` gained `parent_run_id` linkage and
+phase-level `STATION_FAULT` reclassification cases;
+`tests/test_export_run.py` gained `RelatedRunsTests`).
+
 ## 68. Post-Isolation SMU Setpoint Zeroing (CURRENT IMPLEMENTATION)
 
 **Origin:** a real-hardware investigation following a `ChargeSequence`

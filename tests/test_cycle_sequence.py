@@ -21,7 +21,7 @@ from data.storage import DataStorage
 from test_control.cycle_sequence import CycleSequence
 from test_control.safety_monitor import SafetyStatus
 from utils.cancellation import CancellationToken
-from utils.errors import OperationCancelledError
+from utils.errors import OperationCancelledError, RelayError
 
 
 class _ScriptedDmm:
@@ -85,6 +85,16 @@ class _FakeRelay:
         pass
 
 
+class _RelayThatFailsOnClose(_FakeRelay):
+    """A station-hardware fault raised the moment the charge/discharge
+    phase tries to close its relay -- before any SMU output is enabled,
+    so this is a clean, deterministic STATION_HARDWARE_EXCEPTIONS trigger
+    for the phase-level reclassification tests below."""
+
+    def close(self, channel):
+        raise RelayError("relay comms lost")
+
+
 class _RecordingSafety:
     def set_battery_limits(self, battery_cfg):
         pass
@@ -139,7 +149,7 @@ class _Base(unittest.TestCase):
         finally:
             conn.close()
 
-    def _make_cycle(self, smu, dmm, channel=1):
+    def _make_cycle(self, smu, dmm, channel=1, relay=None):
         # Mirrors test.py::_run_one_charge_or_discharge_position(), which
         # always calls start_run_summary() on the CALLER's storage before
         # constructing the sequence -- ChargeSequence/DischargeSequence
@@ -147,7 +157,7 @@ class _Base(unittest.TestCase):
         # never call it themselves.
         self.storage.start_run_summary(test_type="cycle_battery", group_name="B1", position_in_group=channel)
         seq = CycleSequence(
-            smu=smu, dmm=dmm, relay=_FakeRelay(), safety=_RecordingSafety(),
+            smu=smu, dmm=dmm, relay=relay or _FakeRelay(), safety=_RecordingSafety(),
             storage=self.storage, settings=self.settings, group_name="B1",
         )
         seq.log.disabled = True
@@ -225,6 +235,20 @@ class SuccessfulSingleCycleTests(_Base):
         self.assertTrue(any("discharge phase starting" in m for m in messages))
         self.assertTrue(any("repetition 1/1: complete" in m for m in messages))
 
+    def test_phase_rows_link_back_to_the_cycle_row_via_parent_run_id(self):
+        dmm = _ScriptedDmm([3.5, 4.0, 3.5, 2.9])
+        smu = _ScriptedSmu([0.05, 0.1])
+        seq = self._make_cycle(smu, dmm)
+        seq.run(channel=1, relay_address=1, battery_cfg=BATTERY_CFG,
+                test_setpoints={**TEST_SETPOINTS, "cycle_count": 1})
+        rows = self._index_rows("run_summary", ["run_id", "test_type", "parent_run_id"])
+        cycle_run_id = next(r[0] for r in rows if r[1] == "cycle_battery")
+        phase_parent_ids = [r[2] for r in rows if r[1] != "cycle_battery"]
+        self.assertEqual(phase_parent_ids, [cycle_run_id, cycle_run_id])
+        # The cycle-level row itself has no parent -- it IS the umbrella.
+        cycle_parent_id = next(r[2] for r in rows if r[1] == "cycle_battery")
+        self.assertIsNone(cycle_parent_id)
+
 
 class FailureStopsTheCycleTests(_Base):
     def test_charge_phase_failure_prevents_discharge_and_further_repetitions(self):
@@ -261,6 +285,53 @@ class CancellationTests(_Base):
         # No phase ever started -- cancellation checkpoint fires before
         # the charge phase is even constructed.
         self.assertEqual(len([r for r in rows if r[0] != "cycle_battery"]), 0)
+
+
+class StationFaultPhaseReclassificationTests(_Base):
+    """
+    A charge/discharge phase's OWN run_summary/station_state rows must be
+    reclassified to STATION_FAULT when the phase raises a station-hardware
+    exception -- not just the cycle-level row (which test.py's outer
+    _classify_position_exception() reclassification already handled before
+    this fix; that layer is exercised separately by
+    tests/test_group_all_fault_classification.py and is NOT re-tested
+    here). Before this fix, the phase's own row stayed permanently stuck
+    at FAILED/"FAIL" -- a confirmed forensic inconsistency found during the
+    CycleSequence engineering review.
+    """
+
+    def test_charge_phase_relay_error_reclassifies_the_charge_phase_row(self):
+        dmm = _ScriptedDmm([3.5])
+        smu = _ScriptedSmu([0.05])
+        seq = self._make_cycle(smu, dmm, relay=_RelayThatFailsOnClose())
+        with self.assertRaises(RelayError):
+            seq.run(channel=1, relay_address=1, battery_cfg=BATTERY_CFG,
+                    test_setpoints={**TEST_SETPOINTS, "cycle_count": 1})
+
+        rows = self._index_rows("run_summary", ["test_type", "stop_reason", "result"])
+        charge_row = next(r for r in rows if r[0] == "charge_battery")
+        self.assertEqual(charge_row[1], "STATION_FAULT")
+        self.assertEqual(charge_row[2], "STATION_FAULT")
+
+        # The cycle-level row is NOT touched by this fix -- CycleSequence's
+        # own run_guarded() still classifies a bare RelayError as FAILED/
+        # "FAIL" at that level; only test.py's outer, orchestration-level
+        # reclassification (untouched, separately tested) upgrades it to
+        # STATION_FAULT for a real Group -> ALL run.
+        cycle_row = next(r for r in rows if r[0] == "cycle_battery")
+        self.assertEqual(cycle_row[1], "FAILED")
+        self.assertEqual(cycle_row[2], "FAIL")
+
+    def test_reclassification_also_updates_the_phase_station_state_row(self):
+        dmm = _ScriptedDmm([3.5])
+        smu = _ScriptedSmu([0.05])
+        seq = self._make_cycle(smu, dmm, relay=_RelayThatFailsOnClose())
+        with self.assertRaises(RelayError):
+            seq.run(channel=1, relay_address=1, battery_cfg=BATTERY_CFG,
+                    test_setpoints={**TEST_SETPOINTS, "cycle_count": 1})
+
+        rows = self._index_rows("station_state", ["state"])
+        self.assertIn("STATION_FAULT", [r[0] for r in rows])
 
 
 if __name__ == "__main__":

@@ -253,12 +253,14 @@ CREATE TABLE IF NOT EXISTS run_summary (
     sequence_number                    INTEGER,
     station_id                         TEXT,
     station_name                       TEXT,
-    telemetry_db                       TEXT
+    telemetry_db                       TEXT,
+    parent_run_id                      TEXT
 );
 """
 
 CREATE_RUN_SUMMARY_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_run_summary_sequence ON run_summary(sequence_number);",
+    "CREATE INDEX IF NOT EXISTS idx_run_summary_parent_run_id ON run_summary(parent_run_id);",
 ]
 
 _RUN_SUMMARY_COLUMNS = [
@@ -316,6 +318,14 @@ _RUN_SUMMARY_COLUMNS = [
     # look up run_summary.telemetry_db by run_id, then open exactly that
     # file, no month-arithmetic guessing required.
     "sequence_number", "station_id", "station_name", "telemetry_db",
+    # Cycle/phase forensic linkage (see test_control/cycle_sequence.py) --
+    # the run_id of the umbrella cycle_battery row this row is a phase of
+    # (charge_battery/discharge_battery), or NULL for a run that is not a
+    # CycleSequence phase (including the cycle_battery row itself). Unlike
+    # sequence_number/station_id/etc. above, this IS caller-suppliable via
+    # **fields -- DataStorage has no way to know on its own whether "this"
+    # run is a sub-phase of another; only CycleSequence knows that.
+    "parent_run_id",
 ]
 
 # Runtime event history -- Milestone II. Fine-grained, timestamped narrative
@@ -407,6 +417,9 @@ _RUN_SUMMARY_MIGRATION_COLUMNS = [
     ("station_id", "TEXT"),
     ("station_name", "TEXT"),
     ("telemetry_db", "TEXT"),
+    # Cycle/phase forensic linkage -- additive, for a run_summary table
+    # created before CycleSequence existed.
+    ("parent_run_id", "TEXT"),
 ]
 
 # Permanent, non-rotating global run counter -- lives in the INDEX database
@@ -1067,6 +1080,22 @@ class DataStorage(StorageBackend):
         )
         row = cur.fetchone()
         return dict(zip(_RUN_SUMMARY_COLUMNS, row)) if row else None
+
+    def get_child_run_summaries(self, parent_run_id: str) -> list:
+        """
+        Every run_summary row whose parent_run_id == `parent_run_id` -- the
+        phase rows a CycleSequence run created (test_control/cycle_sequence.py
+        ::_make_phase_storage()), in creation order (charge then discharge,
+        per repetition). Empty list for a run_id that isn't a CycleSequence
+        umbrella row -- the normal case for every non-cycle_battery run.
+        """
+        if self._db_index is None:
+            return []
+        cur = self._db_index.execute(
+            f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary WHERE parent_run_id = ? ORDER BY id ASC",
+            (parent_run_id,),
+        )
+        return [dict(zip(_RUN_SUMMARY_COLUMNS, row)) for row in cur.fetchall()]
 
     def list_run_summaries(self) -> list:
         """Return every run_summary row, most recent first."""

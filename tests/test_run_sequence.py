@@ -175,13 +175,14 @@ class RunSummaryExtensionTests(_Base):
     def test_run_summary_migration_adds_new_columns_to_a_legacy_index_database(self):
         # A pre-existing index database (or the old combined database, in
         # its role as the future index database) whose run_summary table
-        # predates sequence_number/station_id/station_name/telemetry_db.
-        # Realistic pre-Phase-A schema: every column run_summary already
-        # had (see data/storage.py's own pre-this-change shape), just
-        # missing the 4 new ones (sequence_number/station_id/station_name/
-        # telemetry_db) -- NOT an artificially bare 4-column table, which
-        # would misrepresent what a real legacy database actually looks
-        # like (every one of these columns has existed since Milestone II).
+        # predates sequence_number/station_id/station_name/telemetry_db/
+        # parent_run_id. Realistic pre-Phase-A schema: every column
+        # run_summary already had (see data/storage.py's own pre-this-
+        # change shape), just missing those 5 new ones -- NOT an
+        # artificially bare table, which would misrepresent what a real
+        # legacy database actually looks like (every one of these columns
+        # has existed since Milestone II, except parent_run_id which
+        # predates CycleSequence).
         index_path = index_database_file(self.settings)
         os.makedirs(self.settings.DATA_DIR, exist_ok=True)
         conn = sqlite3.connect(index_path)
@@ -218,6 +219,7 @@ class RunSummaryExtensionTests(_Base):
             self.assertIsNone(row["sequence_number"], "legacy row has no historical sequence_number to backfill")
             self.assertIsNone(row["station_id"])
             self.assertIsNone(row["telemetry_db"])
+            self.assertIsNone(row["parent_run_id"], "legacy row predates CycleSequence -- no parent to backfill")
         finally:
             storage.close()
 
