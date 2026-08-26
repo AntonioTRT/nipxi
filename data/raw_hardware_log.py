@@ -79,6 +79,18 @@ CREATE_RAW_HARDWARE_LOG_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_raw_hw_log_failure ON raw_hardware_log(success) WHERE success = 0;",
 ]
 
+# Column order, single source of truth for readers (see
+# data/storage.py::DataStorage.get_raw_hardware_log(), added for the
+# Forensic Export feature -- docs/architecture.md "Forensic Export") --
+# DataStorage never writes to this table itself (see module docstring)
+# but reads it directly off its own telemetry connection, so the column
+# list belongs here, next to the DDL it must stay in sync with.
+RAW_HARDWARE_LOG_COLUMNS = [
+    "id", "timestamp", "run_id", "session_id", "position", "device_type", "device_name",
+    "resource", "command", "command_parameters", "response", "success", "duration_ms",
+    "error_type", "error_message", "additional_metadata",
+]
+
 # Free-text/JSON fields are capped so one pathological call (a huge
 # array argument, a verbose instrument error string) can never balloon a
 # single row -- see docs/architecture.md "Database Growth Protection".

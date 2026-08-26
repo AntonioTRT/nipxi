@@ -16,6 +16,18 @@ populated by DataStorage.log_event() itself on every row -- repeating it
 inside message text would be redundant, not additive.
 """
 
+import re
+
+# Matches the position immediately BEFORE an uppercase KEY= token that is
+# preceded by whitespace -- used to split a formatted message back into
+# its individual "KEY=value" fields without breaking on a free-text
+# field's own embedded spaces (e.g. REASON=<a whole sentence>). Requires
+# the key to start with an uppercase letter (format_event() always
+# upper()s keys), so a lowercase "key=value" occurring INSIDE a free-text
+# value (e.g. "...verification_result=still_enabled)." inside a REASON
+# value) is never mistaken for a field boundary.
+_FIELD_BOUNDARY = re.compile(r"(?=\s[A-Z][A-Z0-9_]*=)")
+
 
 class EventType:
     """
@@ -97,3 +109,34 @@ def format_event(event_type: str, **fields) -> str:
         if value is not None:
             parts.append(f"{key.upper()}={value}")
     return " ".join(parts)
+
+
+def parse_event_fields(message: str) -> dict:
+    """
+    Inverse of format_event() -- parses a "EVENT_TYPE=<type> KEY=<value>
+    ..." message back into a dict with lowercased keys (e.g.
+    {"event_type": "SAFETY_FAULT_RAISED", "fault_id": "...", "reason": "..."}).
+    Added for the Forensic Export feature (see docs/architecture.md
+    "Forensic Export") -- lets the exporter recover structured fields from
+    event_log.message without a second, parallel storage format.
+
+    Returns {} for a message that doesn't start with "EVENT_TYPE=" (a
+    plain free-text event_log message, e.g. "Run started") -- never
+    raises, since this is applied to arbitrary historical rows.
+
+    A field's value extends up to (but not including) the next KEY=
+    boundary or the end of the string, so a free-text field passed last
+    (e.g. REASON=<a whole sentence>, always the last kwarg at every real
+    call site -- see utils/safety_fault.py::report_safety_fault()) comes
+    back whole, spaces and all, rather than being cut at its first space.
+    """
+    if not message.startswith("EVENT_TYPE="):
+        return {}
+    fields = {}
+    for part in _FIELD_BOUNDARY.split(message):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        fields[key.lower()] = value
+    return fields

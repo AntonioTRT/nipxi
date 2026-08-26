@@ -35,7 +35,65 @@ import uuid
 
 from config.settings import Settings
 from data.raw_hardware_log import RawHardwareLogWriter
-from utils.event_format import EventType, format_event
+from utils.event_format import EventType, format_event, parse_event_fields
+
+# Fixed, human-readable explanations of each hardware/smu.py::
+# OutputVerificationResult value -- used by the Forensic Export feature
+# (see docs/architecture.md "Forensic Export" / "Verification Result
+# Representation") so a raw enum token is never handed to an AI/human
+# reader without its meaning attached. Deliberately plain constants, not
+# generated text -- see verification_result_meaning() below.
+VERIFICATION_RESULT_MEANINGS = {
+    "disabled": "SMU output was verified OFF.",
+    "still_enabled": "SMU output was electrically confirmed as still enabled.",
+    "verification_comm_failure": "Readback verification failed. Actual output state could not be determined.",
+}
+
+# Deterministic forensic-findings mapping -- see docs/architecture.md
+# "Forensic Export"/"Forensic Findings". NO heuristics, NO confidence
+# scoring: every value here is a fixed lookup, never computed from
+# anything but the verification_result string itself. UNKNOWN (not LOW)
+# is the approved terminology for a communication failure -- "LOW
+# confidence it's still enabled" would wrongly imply "probably fine",
+# the opposite of "unknown state = unsafe state".
+FORENSIC_FINDINGS_BY_VERIFICATION_RESULT = {
+    "still_enabled": {"physical_state_confidence": "HIGH", "communication_failure": False},
+    "verification_comm_failure": {"physical_state_confidence": "UNKNOWN", "communication_failure": True},
+}
+
+
+def verification_result_meaning(value) -> str:
+    """
+    Fixed, human-readable meaning for an OutputVerificationResult value --
+    see VERIFICATION_RESULT_MEANINGS above. Never raises; an unrecognized
+    value (should not happen -- this codebase only ever produces the 3
+    known values) still returns a descriptive string rather than KeyError,
+    since this is called while assembling a forensic artifact that must
+    never fail outright over one unexpected field.
+    """
+    return VERIFICATION_RESULT_MEANINGS.get(value, f"Unrecognized verification_result value: {value!r}")
+
+
+def parse_safety_fault_event(message: str) -> dict:
+    """
+    Parse one SAFETY_FAULT_RAISED or SAFETY_FAULT_ACKNOWLEDGED event_log
+    message (see report_safety_fault()/acknowledge_safety_fault() above)
+    into a dict with the safety-specific fields typed appropriately
+    (`position` as int when present). Thin wrapper over
+    utils/event_format.py::parse_event_fields() -- kept here, not there,
+    so the safety-specific field vocabulary/typing stays co-located with
+    the code that actually produces these messages. Returns {} for any
+    other message shape.
+    """
+    fields = parse_event_fields(message)
+    if fields.get("event_type") not in (EventType.SAFETY_FAULT_RAISED, EventType.SAFETY_FAULT_ACKNOWLEDGED):
+        return {}
+    if "position" in fields:
+        try:
+            fields["position"] = int(fields["position"])
+        except ValueError:
+            pass
+    return fields
 
 
 def new_fault_id() -> str:

@@ -19,7 +19,9 @@ from datetime import datetime
 
 import config.devices as dev_cfg
 from config.settings import Settings
-from data.raw_hardware_log import CREATE_RAW_HARDWARE_LOG_INDEXES_SQL, CREATE_RAW_HARDWARE_LOG_SQL
+from data.raw_hardware_log import (
+    CREATE_RAW_HARDWARE_LOG_INDEXES_SQL, CREATE_RAW_HARDWARE_LOG_SQL, RAW_HARDWARE_LOG_COLUMNS,
+)
 from data.rotation import index_database_file, telemetry_database_file
 
 
@@ -451,6 +453,8 @@ class DataStorage(StorageBackend):
         self._db_index: sqlite3.Connection | None = None    # permanent (run_summary/station_state/run_sequence)
         self._csv_writers: dict = {}
         self._csv_files: dict = {}
+        # Set only by open_for_forensic_export() -- see that method.
+        self.telemetry_unavailable_reason: str | None = None
 
     def _allocate_sequence_number(self) -> int:
         """
@@ -721,6 +725,25 @@ class DataStorage(StorageBackend):
         if row is None:
             return None
         return dict(zip(_STATION_STATE_COLUMNS, row))
+
+    def get_station_state_for_run(self, run_id: str) -> list:
+        """
+        Return every station_state row for ONE specific run_id, in
+        chronological order -- added for the Forensic Export feature (see
+        docs/architecture.md "Forensic Export"). Distinct from
+        get_last_execution_state() above, which deliberately reads ACROSS
+        every run_id (by design, for "what did the station last do"): a
+        forensic export needs exactly this run's own execution-state
+        transitions, not the global most-recent row.
+        """
+        if self._db_index is None:
+            return []
+        cur = self._db_index.execute(
+            f"SELECT {', '.join(_STATION_STATE_COLUMNS)} FROM station_state "
+            f"WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        )
+        return [dict(zip(_STATION_STATE_COLUMNS, row)) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Historical measurements (Milestone II) -- the authoritative result
@@ -1081,9 +1104,9 @@ class DataStorage(StorageBackend):
 
     def get_recent_events(self, run_id: str = None, limit: int = 20, channel: int = None) -> list:
         """
-        Return the most recent `limit` event_log rows for `run_id`
-        (defaults to this DataStorage instance's own run_id), oldest first
-        (natural reading order for a "recent events" panel).
+        Return event_log rows for `run_id` (defaults to this DataStorage
+        instance's own run_id), oldest first (natural reading order for a
+        "recent events" panel).
 
         `channel` (default None -- unchanged behavior, every existing
         caller unaffected): when given, restricts to rows tagged with that
@@ -1098,6 +1121,12 @@ class DataStorage(StorageBackend):
         printed to the console directly at the time they happened; the
         live panel's job is "what's happening now for this position", not
         replaying one-time setup traceability.
+
+        `limit=None` returns EVERY matching row (added for the Forensic
+        Export feature -- see docs/architecture.md "Forensic Export" --
+        which needs a run's complete event narrative, not just the most
+        recent 20). Every existing caller passes an explicit int and is
+        unaffected.
         """
         if self._db is None:
             return []
@@ -1106,13 +1135,119 @@ class DataStorage(StorageBackend):
         if channel is not None:
             conditions.append("channel = ?")
             params.append(channel)
+        where = f"WHERE {' AND '.join(conditions)}"
+        if limit is None:
+            cur = self._db.execute(
+                f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log {where} ORDER BY id ASC",
+                params,
+            )
+            return [dict(zip(_EVENT_LOG_COLUMNS, row)) for row in cur.fetchall()]
         cur = self._db.execute(
-            f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log "
-            f"WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ?",
+            f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log {where} ORDER BY id DESC LIMIT ?",
             [*params, limit],
         )
         rows = [dict(zip(_EVENT_LOG_COLUMNS, row)) for row in cur.fetchall()]
         return list(reversed(rows))
+
+    def get_raw_hardware_log(self, run_id: str) -> list:
+        """
+        Return every raw_hardware_log row for ONE run_id, chronological --
+        added for the Forensic Export feature (see docs/architecture.md
+        "Forensic Export"). DataStorage never WRITES to this table
+        (data/raw_hardware_log.py::RawHardwareLogWriter owns that, via its
+        own independent connection -- see that module's docstring), but
+        the table is a normal part of the telemetry database DataStorage
+        already has open, so reading it here needs no new connection.
+        `command_parameters`/`response`/`additional_metadata` come back as
+        the raw JSON text exactly as stored (_safe_json()-encoded by the
+        writer) -- decoding them into nested objects is an export-
+        formatting concern, left to the caller.
+        """
+        if self._db is None:
+            return []
+        cur = self._db.execute(
+            f"SELECT {', '.join(RAW_HARDWARE_LOG_COLUMNS)} FROM raw_hardware_log "
+            f"WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        )
+        return [dict(zip(RAW_HARDWARE_LOG_COLUMNS, row)) for row in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Forensic Export (see docs/architecture.md "Forensic Export")
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def open_for_forensic_export(cls, settings, run_id: str):
+        """
+        Open a DataStorage instance scoped to reading ONE historical run,
+        entirely read-only. Returns (storage, error):
+
+            (DataStorage, None)   -- run_id found; self._db_index is open
+                                     and self.run_id/self._sequence_number
+                                     are populated. self._db (telemetry)
+                                     is ALSO open IF run_summary.telemetry_db
+                                     was recorded for this run AND that
+                                     file still exists -- otherwise self._db
+                                     stays None and
+                                     self.telemetry_unavailable_reason
+                                     explains why (see docs/architecture.md
+                                     "telemetry_db Lookup Strategy" -- never
+                                     inferred from a timestamp).
+            (None, "reason")     -- the index database itself doesn't
+                                     exist, or run_id isn't in it. Nothing
+                                     is left open in this case.
+
+        Never allocates a run_sequence value, never runs CREATE TABLE/
+        migration, never creates a CSV directory, and never mutates either
+        database -- both connections are opened via sqlite3's `mode=ro`
+        URI, which raises on any write attempt as defense in depth on top
+        of this method simply never calling a write method. Close with the
+        ordinary close() -- already generic enough to handle either or
+        both connections being set (or not).
+        """
+        instance = cls(settings)
+
+        index_path = index_database_file(settings)
+        if not os.path.exists(index_path):
+            return None, f"Index database not found at {index_path}."
+        try:
+            instance._db_index = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            return None, f"Could not open index database ({index_path}) read-only: {e}"
+
+        run = instance.get_run_summary(run_id)
+        if run is None:
+            instance._db_index.close()
+            instance._db_index = None
+            return None, f"run_id {run_id!r} not found in {index_path}."
+
+        instance.run_id = run_id
+        instance._sequence_number = run.get("sequence_number")
+        instance._telemetry_db_name = run.get("telemetry_db")
+
+        if not instance._telemetry_db_name:
+            instance.telemetry_unavailable_reason = (
+                "no telemetry_db recorded for this run -- it predates the telemetry/index "
+                "database split; its telemetry, if any, is in a legacy combined database "
+                "file, which this exporter does not search."
+            )
+            return instance, None
+
+        telemetry_path = os.path.join(instance.s.DATA_DIR, instance._telemetry_db_name)
+        if not os.path.exists(telemetry_path):
+            instance.telemetry_unavailable_reason = (
+                f"telemetry database {instance._telemetry_db_name!r} not found at "
+                f"{telemetry_path} -- it may have been archived or deleted."
+            )
+            return instance, None
+
+        try:
+            instance._db = sqlite3.connect(f"file:{telemetry_path}?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            instance.telemetry_unavailable_reason = f"could not open telemetry database read-only: {e}"
+            return instance, None
+
+        return instance, None
 
     # ------------------------------------------------------------------
     # Internal helpers
