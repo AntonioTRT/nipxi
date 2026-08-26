@@ -111,6 +111,17 @@ class Settings:
                                  #      two different questions (objective vs. floor).
     DISCHARGE_TIMEOUT_S = 7200  # s  - max discharge time
 
+    # -------------------------------------------------------------------------
+    # Cycle parameters (test_control/cycle_sequence.py::CycleSequence -- see
+    # docs/architecture.md Section 67 "CycleSequence -- Final Design")
+    # -------------------------------------------------------------------------
+    # Rest period between the charge phase and the discharge phase within one
+    # Cycle Battery repetition -- passive dwell only (SMU already off, relay
+    # already open by the time this runs; see CycleSequence.run()). A
+    # per-group override is supported via test_setpoints["cycle_rest_s"];
+    # this is only the fallback when a group doesn't set one.
+    CYCLE_REST_S = 60.0  # s -- rest between charge and discharge phases
+
     # Hard ceiling for a per-group test_setpoints["charge_timeout_s"]/
     # ["discharge_timeout_s"] validation override (see docs/architecture.md
     # "Configurable Validation Timeout"). Deliberately NOT a way to disable

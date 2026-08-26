@@ -5655,13 +5655,62 @@ that applies every rule above and produces the `enabled_workers` set
 lists. `worker_runtime.py` consumes that resolved result -- it never
 re-implements RunSpec's own selection rules.
 
-## 67. CycleSequence -- Final Design (FUTURE PLANNED ARCHITECTURE, design persisted here for the first time)
+## 67. CycleSequence -- Final Design (CURRENT IMPLEMENTATION)
+
+**Now implemented** -- `test_control/cycle_sequence.py::CycleSequence`,
+wired into `test.py`'s Run Main Test submenu ("4. Cycle Battery",
+`_run_cycle_battery()`), replacing the previous "not yet implemented"
+stub. The design below (originally written up as future/planned
+architecture) was implemented essentially as agreed, with two deviations
+forced by a fact discovered only at implementation time: `RunSpec` and
+`orchestration/worker_runtime.py`, which this design's "Interaction with
+RunSpec"/"Interaction with worker_runtime" subsections assumed as
+`CycleSequence`'s caller, **do not exist anywhere in this codebase** --
+grepped and confirmed absent. `CycleSequence` was instead wired into the
+REAL current caller, `test.py`'s existing Charge/Discharge orchestration:
+
+1. **`cycle_count` is read from `test_setpoints["cycle_count"]`** (default
+   `1`), not a separate `run()` parameter as sketched below. This makes
+   `CycleSequence.run()`'s signature IDENTICAL to `ChargeSequence.run()`/
+   `DischargeSequence.run()`, which is what lets it slot into
+   `test.py::_run_charge_or_discharge()` /
+   `_run_one_charge_or_discharge_position()` /
+   `_run_charge_or_discharge_all_positions()` as a drop-in `sequence_cls`
+   with **zero changes** to that shared, already-validated code -- Group
+   -> ALL support for Cycle Battery is free as a result. A new,
+   optional `test_setpoints["cycle_rest_s"]` key (falling back to
+   `Settings.CYCLE_REST_S = 60.0`) controls the rest duration the same
+   way. Both added to `config/devices.py::BATTERY_GROUPS["B1"]
+   ["test_setpoints"]` as explicit, documented, optional overrides.
+2. **`storage_factory` is not a caller-injected constructor parameter** --
+   `CycleSequence._make_phase_storage()` builds its own fresh per-phase
+   `DataStorage` internally, from the same `Settings` (`self.s`)
+   `CycleSequence` itself was constructed with. This keeps
+   `CycleSequence`'s constructor signature identical to
+   `ChargeSequence`/`DischargeSequence`'s, for the same drop-in reason as
+   (1).
+
+**A real gap this design's original pseudocode did not account for, found
+and fixed while writing the tests:** `ChargeSequence`/`DischargeSequence`
+deliberately never call `start_run_summary()` themselves -- that has
+always been the CALLER's responsibility (`test.py::
+_run_one_charge_or_discharge_position()` calls it before constructing the
+sequence). The original pseudocode below composes `ChargeSequence`/
+`DischargeSequence.run()` directly with no mention of this -- doing so
+literally means each phase's own `finish_run_summary()` (inside its
+`run_guarded()`/`complete()`) has no row to update.
+`_make_phase_storage()` was extended to also call `start_run_summary()`
+for each phase it creates, closing this gap. This was caught by
+`tests/test_cycle_sequence.py` failing with exactly the error
+`data/storage.py` already logs for this case ("no run_summary row found
+... start_run_summary() was never called for this run") -- not
+discovered by inspection.
 
 **Same motivation as Section 66:** this design was agreed upon in an
-earlier design discussion and never written down. `CycleSequence` does
-not exist as code anywhere in this repository as of this section being
-written. This is the authoritative, persisted version, so `CycleSequence`
-can eventually be built against it without re-deriving these decisions.
+earlier design discussion and never written down. This is the
+authoritative, persisted version of that original discussion (below,
+unchanged from when it was first written), which `CycleSequence` was
+then implemented against.
 
 ### Core structural decision
 
@@ -5872,6 +5921,27 @@ later, at implementation time) -- all confirmed unchanged by this
 design. `CycleSequence` adds exactly: one new class, one new
 `phase_detail` value, one new constructor parameter (`storage_factory`)
 scoped to itself only, and a per-repetition composition loop.
+
+**As actually implemented**: no `storage_factory` constructor parameter
+after all (see deviation 2 above -- built internally instead); otherwise
+matches this list exactly. `run_summary_report.py`'s Cycle stub was not
+filled in as part of this implementation pass -- flagged as a remaining
+follow-up, not silently dropped.
+
+### Test suite
+
+`tests/test_cycle_sequence.py` (7 cases, real temp-directory `DataStorage`
+-- `CycleSequence` constructs real `DataStorage` instances internally, so
+a mock/fake storage object cannot exercise that path -- with scripted
+fake SMU/DMM/relay/safety): one cycle-level `run_summary` row plus two
+phase-level rows for a single repetition; five total rows for
+`cycle_count=2`; every phase gets a distinct `run_id`; rest/phase-boundary
+events logged to `event_log`; `cycle_count` defaults to `1` when omitted;
+a charge-phase failure produces exactly one `charge_battery` row, zero
+`discharge_battery` rows, and no further repetitions (direct test of the
+"unknown state = unsafe state" stop condition); cancellation before the
+first repetition marks the cycle-level row `CANCELLED` with zero phase
+rows created. Full repository suite: **575/575 passing**, no regressions.
 
 ## 68. Post-Isolation SMU Setpoint Zeroing (CURRENT IMPLEMENTATION)
 

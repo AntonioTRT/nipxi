@@ -5286,6 +5286,34 @@ def _run_discharge_battery():
     )
 
 
+def _run_cycle_battery():
+    """
+    Cycle Battery -- charge -> rest -> discharge, repeated
+    test_setpoints["cycle_count"] times (default 1), via CycleSequence
+    (built on BatteryOperationSequence, composing fresh ChargeSequence/
+    DischargeSequence instances per repetition). See
+    test_control/cycle_sequence.py and docs/architecture.md Section 67
+    "CycleSequence -- Final Design". CycleSequence.run() has the IDENTICAL
+    signature to ChargeSequence.run()/DischargeSequence.run(), so it slots
+    into _run_charge_or_discharge() as a drop-in `sequence_cls` with no
+    changes to that shared workflow, Group -> ALL support included.
+    `limit_line_fn` receives the group's validated test_setpoints, same
+    convention as _run_charge_battery()/_run_discharge_battery().
+    """
+    from test_control.cycle_sequence import CycleSequence
+    _run_charge_or_discharge(
+        "Cycle Battery", CycleSequence, "cycle_battery",
+        lambda setpoints: (
+            f"\nCharge Current (commanded):\n{setpoints['charge_current_a']:.3f} A   "
+            f"CV Target: {setpoints['charge_voltage_v']:.2f} V\n"
+            f"\nDischarge Current (commanded):\n{setpoints['discharge_current_a']:.3f} A   "
+            f"Cutoff Target: {setpoints['discharge_cutoff_v']:.2f} V\n"
+            f"\nCycle Count:\n{int(setpoints.get('cycle_count', 1))}   "
+            f"Rest Between Phases: {setpoints.get('cycle_rest_s', Settings.CYCLE_REST_S):.0f} s"
+        ),
+    )
+
+
 def _ntc_group_snapshot(storage, daq, group: str, size: int, source: str,
                          phase_detail: str = None, log_summary: bool = False) -> list:
     """
@@ -5410,10 +5438,12 @@ def run_main_test():
     """
     Run Main Test -- battery-centric operator workflow entry point
     (Milestone II Monitor Battery blueprint). Submenu: Monitor Battery,
-    Charge Battery, Discharge Battery, Monitor Battery Scan, and NTC Group
-    Scan are implemented; Cycle Battery (charge -> rest -> discharge
-    composition) remains a placeholder for future work -- see
-    docs/architecture.md Section 35 "Revised Roadmap".
+    Charge Battery, Discharge Battery, Cycle Battery, Monitor Battery
+    Scan, and NTC Group Scan are all implemented -- Cycle Battery
+    (charge -> rest -> discharge composition, repeated
+    test_setpoints["cycle_count"] times) via
+    test_control/cycle_sequence.py::CycleSequence, see
+    docs/architecture.md Section 67 "CycleSequence -- Final Design".
     """
     print("RUN MAIN TEST")
     print("\n1. Monitor Battery")
@@ -5431,7 +5461,7 @@ def run_main_test():
     elif choice == "3":
         _run_discharge_battery()
     elif choice == "4":
-        print("\nCycle Battery -- not yet implemented.")
+        _run_cycle_battery()
     elif choice == "5":
         _run_monitor_battery_scan()
     elif choice == "6":

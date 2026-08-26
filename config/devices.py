@@ -753,6 +753,13 @@ BATTERY_GROUPS = {
             "discharge_timeout_s": 600,    # VALIDATION ONLY, TEMPORARY -- 10 min, down from the prior 8h
                                             #    (28800s) validation value. Same rationale/constraints as
                                             #    charge_timeout_s above.
+            "cycle_count":         1,      # Cycle Battery (test_control/cycle_sequence.py::CycleSequence)
+                                            #    -- how many charge->rest->discharge repetitions one Cycle
+                                            #    Battery run performs. Optional -- defaults to 1 if omitted.
+            "cycle_rest_s":        60,     # VALIDATION ONLY -- matches Settings.CYCLE_REST_S's default;
+                                            #    listed explicitly here (rather than relying on the global
+                                            #    fallback alone) so it's visible alongside the other
+                                            #    validation-scale timeouts above. Optional per group.
         },
         "positions": {
             # daq_ntc_ch is Dev1/ai0-ai7 -- bench-confirmed real wiring (see
