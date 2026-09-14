@@ -112,15 +112,14 @@ class RunChargeOrDischargeAllPositionsWiringTests(unittest.TestCase):
     """
     Source-inspection of _run_charge_or_discharge_all_positions() --
     mirrors the established technique in
-    tests/test_presence_precheck_testpy_wiring.py for the same reason:
-    this function's own logic (enabled-position filtering, per-position
-    run_id scoping, cancellation stopping the loop, other results
-    continuing it) is a real behavioral property this test pins, without
-    needing a full HardwareManager-level integration harness (the
-    per-position workflow itself is exercised directly by
-    tests/test_hardware_event_logging.py and
-    tests/test_battery_removal_during_charge.py against
-    ChargeSequence/DischargeSequence).
+    tests/test_presence_precheck_testpy_wiring.py. Since the actual
+    position loop was extracted into _run_group_all_positions() (see
+    orchestration/concurrent_supervisor.py's run_group_factory, which
+    reuses that same extracted function), this class now only covers
+    what THIS function itself still does: enabled-position filtering
+    and connecting hardware exactly once before delegating the loop.
+    The loop's own structural properties are covered by
+    RunGroupAllPositionsWiringTests below.
     """
 
     def setUp(self):
@@ -136,6 +135,50 @@ class RunChargeOrDischargeAllPositionsWiringTests(unittest.TestCase):
 
     def test_only_enabled_positions_are_selected(self):
         self.assertIsNotNone(self._first_index('if cfg.get("enabled")'))
+
+    def test_hardware_connects_only_once_before_delegating_the_loop(self):
+        # connect_all() must appear exactly once, before handing off to
+        # _run_group_all_positions() -- never re-connected per position.
+        connect_indices = [i for i, line in enumerate(self.lines) if "hw_mgr.connect_all()" in line]
+        delegate_idx = self._first_index("_run_group_all_positions(")
+        self.assertEqual(len(connect_indices), 1)
+        self.assertIsNotNone(delegate_idx)
+        self.assertLess(connect_indices[0], delegate_idx)
+
+    def test_sequence_classes_are_never_referenced_by_name_inside_this_function(self):
+        # "Do NOT add multi-position logic inside the sequence classes" --
+        # this function must only ever pass sequence_cls through
+        # generically, never import/construct ChargeSequence/
+        # DischargeSequence directly.
+        self.assertNotIn("ChargeSequence(", self.src)
+        self.assertNotIn("DischargeSequence(", self.src)
+
+
+class RunGroupAllPositionsWiringTests(unittest.TestCase):
+    """
+    Source-inspection of _run_group_all_positions() -- the actual
+    Group -> ALL position loop, extracted from
+    _run_charge_or_discharge_all_positions() so orchestration/
+    concurrent_supervisor.py's run_group_factory can reuse it without
+    duplicating the loop's own logic (enabled-position filtering
+    happens in the caller; per-position run_id scoping, cancellation
+    stopping the loop, other results continuing it, all live here). The
+    per-position workflow body itself
+    (_run_one_charge_or_discharge_position()) and ChargeSequence/
+    DischargeSequence are covered by their own, separate test files;
+    this file does not re-test that behavior.
+    """
+
+    def setUp(self):
+        self.src = inspect.getsource(test_module._run_group_all_positions)
+        self.lines = self.src.splitlines()
+
+    def _first_index(self, needle):
+        for i, line in enumerate(self.lines):
+            stripped = line.strip()
+            if needle in line and stripped and not stripped.startswith("#"):
+                return i
+        return None
 
     def test_a_fresh_run_id_is_started_for_every_position(self):
         # begin_new_run_id() no longer takes a suffix -- a freshly
@@ -185,14 +228,6 @@ class RunChargeOrDischargeAllPositionsWiringTests(unittest.TestCase):
         self.assertIsNotNone(loop_idx)
         self.assertIsNotNone(summary_idx)
         self.assertLess(loop_idx, summary_idx)
-
-    def test_hardware_connects_only_once_not_once_per_position(self):
-        # connect_all() must appear exactly once, outside/before the loop
-        # -- never re-connected per position.
-        connect_indices = [i for i, line in enumerate(self.lines) if "hw_mgr.connect_all()" in line]
-        loop_idx = self._first_index("for position in positions:")
-        self.assertEqual(len(connect_indices), 1)
-        self.assertLess(connect_indices[0], loop_idx)
 
     def test_sequence_classes_are_never_referenced_by_name_inside_this_function(self):
         # "Do NOT add multi-position logic inside the sequence classes" --

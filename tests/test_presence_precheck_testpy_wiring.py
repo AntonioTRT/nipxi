@@ -29,8 +29,17 @@ class _SourceInspectionMixin:
 
 
 class MonitorBatteryWiringTests(_SourceInspectionMixin, unittest.TestCase):
+    """
+    The precheck/sequence-construction wiring this class inspects lives
+    in _run_one_monitor_position() -- the per-position workflow body
+    extracted from _run_monitor_battery() so a non-interactive caller
+    (orchestration/concurrent_supervisor.py's run_group_factory) can
+    reuse it, mirroring _run_one_charge_or_discharge_position()'s
+    identical extraction (see ChargeOrDischargeWiringTests below).
+    """
+
     def setUp(self):
-        self.src = inspect.getsource(test_module._run_monitor_battery)
+        self.src = inspect.getsource(test_module._run_one_monitor_position)
         self.lines = self.src.splitlines()
 
     def test_precheck_is_called(self):
@@ -48,8 +57,13 @@ class MonitorBatteryWiringTests(_SourceInspectionMixin, unittest.TestCase):
         construct_idx = self._first_index("sequence = MonitorBatterySequence(")
         self.assertIsNotNone(gate_idx)
         self.assertIsNotNone(construct_idx)
-        # The nearest "return" after the gate must precede construction.
-        return_idx = next(i for i in range(gate_idx, len(self.lines)) if self.lines[i].strip() == "return")
+        # The nearest "return" after the gate must precede construction --
+        # returns a classification string ("FAIL"), not a bare return,
+        # since this function reports outcomes to its caller (same
+        # convention as _run_one_charge_or_discharge_position()).
+        return_idx = next(
+            i for i in range(gate_idx, len(self.lines)) if self.lines[i].strip() == 'return "FAIL"'
+        )
         self.assertLess(return_idx, construct_idx)
 
     def test_failure_path_prints_the_presence_precheck_report(self):
@@ -85,7 +99,8 @@ class MonitorBatteryWiringTests(_SourceInspectionMixin, unittest.TestCase):
         self.assertIsNotNone(station_fault_idx)
         self.assertIsNotNone(construct_idx)
         return_idx = next(
-            i for i in range(station_fault_idx, len(self.lines)) if self.lines[i].strip() == "return"
+            i for i in range(station_fault_idx, len(self.lines))
+            if self.lines[i].strip() == 'return "STATION_FAULT"'
         )
         self.assertLess(return_idx, construct_idx)
 

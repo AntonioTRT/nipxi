@@ -14,6 +14,8 @@ import csv
 import logging
 import os
 import sqlite3
+import threading
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 
@@ -464,10 +466,33 @@ class DataStorage(StorageBackend):
         self._telemetry_db_name: str | None = None
         self._db: sqlite3.Connection | None = None          # telemetry (measurements/event_log/raw_hardware_log)
         self._db_index: sqlite3.Connection | None = None    # permanent (run_summary/station_state/run_sequence)
+        # A bare sqlite3.Connection is NOT safe for concurrent statement
+        # execution from multiple threads even with check_same_thread=False
+        # -- that flag only disables Python's OWN thread-affinity check, it
+        # does not serialize access to the underlying C connection. Under
+        # orchestration/concurrent_supervisor.py, multiple GroupWorker
+        # threads share this ONE DataStorage instance (see that module's
+        # docstring for why storage is not split per-group), so every
+        # method that touches self._db or self._db_index must hold the
+        # matching lock for the full statement/transaction, not just at
+        # open() time. Single-group callers pay a negligible uncontended
+        # lock acquisition and see no behavior change.
+        self._db_lock = threading.Lock()
+        self._db_index_lock = threading.Lock()
         self._csv_writers: dict = {}
         self._csv_files: dict = {}
         # Set only by open_for_forensic_export() -- see that method.
         self.telemetry_unavailable_reason: str | None = None
+
+    #: Retry budget for _allocate_sequence_number()'s BEGIN IMMEDIATE below
+    #: -- under single-group execution this contends with nothing and never
+    #: retries; under orchestration/concurrent_supervisor.py running
+    #: multiple GroupRuntimes against this SAME shared DataStorage instance
+    #: (see that module's docstring), several groups' _new_run_id() calls
+    #: can land on this lock at once. busy_timeout (set in open(), above)
+    #: already absorbs most of that; this retry loop is a second layer for
+    #: the rare case a lock is still held when busy_timeout itself expires.
+    _SEQUENCE_ALLOCATION_MAX_RETRIES = 5
 
     def _allocate_sequence_number(self) -> int:
         """
@@ -479,16 +504,23 @@ class DataStorage(StorageBackend):
         """
         if self._db_index is None:
             raise RuntimeError("DataStorage._allocate_sequence_number() called before open()")
-        self._db_index.execute("BEGIN IMMEDIATE")
-        try:
-            cur = self._db_index.execute("SELECT next_value FROM run_sequence WHERE id = 1")
-            value = cur.fetchone()[0]
-            self._db_index.execute("UPDATE run_sequence SET next_value = next_value + 1 WHERE id = 1")
-        except sqlite3.Error:
-            self._db_index.rollback()
-            raise
-        self._db_index.commit()
-        return value
+        for attempt in range(self._SEQUENCE_ALLOCATION_MAX_RETRIES):
+            try:
+                with self._db_index_lock:
+                    self._db_index.execute("BEGIN IMMEDIATE")
+                    try:
+                        cur = self._db_index.execute("SELECT next_value FROM run_sequence WHERE id = 1")
+                        value = cur.fetchone()[0]
+                        self._db_index.execute("UPDATE run_sequence SET next_value = next_value + 1 WHERE id = 1")
+                    except sqlite3.Error:
+                        self._db_index.rollback()
+                        raise
+                    self._db_index.commit()
+                    return value
+            except sqlite3.OperationalError:
+                if attempt == self._SEQUENCE_ALLOCATION_MAX_RETRIES - 1:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def _new_run_id(self) -> str:
         """
@@ -532,66 +564,117 @@ class DataStorage(StorageBackend):
     # StorageBackend interface
     # ------------------------------------------------------------------
 
+    #: Retry budget for open()'s schema-creation/migration DDL below --
+    #: mirrors _allocate_sequence_number()'s own retry loop, for the same
+    #: reason: orchestration/group_runtime.py::GroupRuntime.connect()
+    #: means several GroupRuntimes now routinely call open() against the
+    #: SAME index database file within milliseconds of each other (every
+    #: GroupWorker thread starts at once). busy_timeout (set below)
+    #: absorbs most of that; a schema-modifying DDL statement can still
+    #: occasionally hit SQLite's own schema lock before busy_timeout's
+    #: window elapses -- caught during development via a real,
+    #: reproducible two-GroupRuntime race, not a hypothetical.
+    _OPEN_MAX_RETRIES = 5
+
     def open(self):
-        try:
-            os.makedirs(self.s.DATA_DIR, exist_ok=True)
-            os.makedirs(self.s.CSV_DIR, exist_ok=True)
+        for attempt in range(self._OPEN_MAX_RETRIES):
+            try:
+                self._open_once()
+                return
+            except sqlite3.OperationalError as e:
+                self._close_partial()
+                if attempt == self._OPEN_MAX_RETRIES - 1:
+                    self.log.error("Failed to open storage: %s", e)
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+            except (OSError, sqlite3.Error) as e:
+                self._close_partial()
+                self.log.error("Failed to open storage: %s", e)
+                raise
 
-            index_path = index_database_file(self.s)
-            telemetry_path = telemetry_database_file(self.s)
-            self._telemetry_db_name = os.path.basename(telemetry_path)
+    def _close_partial(self) -> None:
+        """Close and discard whatever connections a failed open() attempt
+        left behind, so the next retry starts from a clean slate instead
+        of leaking connections across attempts."""
+        for attr in ("_db", "_db_index"):
+            conn = getattr(self, attr)
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+                setattr(self, attr, None)
 
-            # Permanent index database -- run_summary/station_state/
-            # run_sequence. Never rotates (see data/rotation.py).
-            self._db_index = sqlite3.connect(index_path)
-            self._db_index.execute(CREATE_STATION_STATE_SQL)
-            self._db_index.execute(CREATE_RUN_SUMMARY_SQL)
-            self._db_index.execute(CREATE_RUN_SEQUENCE_SQL)
-            self._db_index.execute("INSERT OR IGNORE INTO run_sequence (id, next_value) VALUES (1, 1)")
-            # Additive migration -- brings a pre-existing index/legacy
-            # database up to the current schema without touching any
-            # existing row. No-op on a brand-new database (CREATE TABLE
-            # above already has every column) and no-op on an
-            # already-migrated one. MUST run before CREATE_RUN_SUMMARY_
-            # INDEXES_SQL below -- that index is on sequence_number, a
-            # column a legacy run_summary table won't have until this
-            # migration adds it.
-            _migrate_add_missing_columns(self._db_index, "station_state", _STATION_STATE_MIGRATION_COLUMNS)
-            _migrate_add_missing_columns(self._db_index, "run_summary", _RUN_SUMMARY_MIGRATION_COLUMNS)
-            for _stmt in CREATE_RUN_SUMMARY_INDEXES_SQL:
-                self._db_index.execute(_stmt)
-            self._db_index.commit()
+    def _open_once(self) -> None:
+        os.makedirs(self.s.DATA_DIR, exist_ok=True)
+        os.makedirs(self.s.CSV_DIR, exist_ok=True)
 
-            # Telemetry database -- measurements/event_log/raw_hardware_log.
-            # Resolved ONCE, here, and never re-read for this instance's
-            # life -- see data/rotation.py's module docstring for why this
-            # is what makes "never split a group across databases" true by
-            # construction, with no extra guard needed.
-            self._db = sqlite3.connect(telemetry_path)
-            self._db.execute(CREATE_TABLE_SQL)
-            self._db.execute(CREATE_EVENT_LOG_SQL)
-            # Hardware Audit Trail (see docs/architecture.md) -- schema only,
-            # created here so the table/indexes are visible via this
-            # connection immediately, even before any hardware call has
-            # happened. Actual writes go through data/raw_hardware_log.py::
-            # RawHardwareLogWriter's own, independent connection to this
-            # SAME telemetry file (see that module's docstring for why) --
-            # this DataStorage instance never writes to raw_hardware_log
-            # itself.
-            self._db.execute(CREATE_RAW_HARDWARE_LOG_SQL)
-            for _stmt in CREATE_RAW_HARDWARE_LOG_INDEXES_SQL:
-                self._db.execute(_stmt)
-            _migrate_add_missing_columns(self._db, "measurements", _MEASUREMENT_MIGRATION_COLUMNS)
-            self._db.commit()
+        index_path = index_database_file(self.s)
+        telemetry_path = telemetry_database_file(self.s)
+        self._telemetry_db_name = os.path.basename(telemetry_path)
 
-            self.run_id = self._new_run_id()
-            self.log.info(
-                "Storage opened. run_id=%s index_db=%s telemetry_db=%s",
-                self.run_id, index_path, self._telemetry_db_name,
-            )
-        except (OSError, sqlite3.Error) as e:
-            self.log.error("Failed to open storage: %s", e)
-            raise
+        # Permanent index database -- run_summary/station_state/
+        # run_sequence. Never rotates (see data/rotation.py).
+        # check_same_thread=False + WAL/busy_timeout: orchestration/
+        # group_runtime.py::GroupRuntime gives each concurrently-running
+        # group its OWN DataStorage instance (never shared -- see that
+        # module's docstring for why), but every instance opens a
+        # connection to these SAME underlying files. WAL/busy_timeout/
+        # the retry loop above are what make multiple independent
+        # connections to one file safe -- the standard SQLite multi-
+        # connection pattern, mirroring the pragmas data/
+        # raw_hardware_log.py::RawHardwareLogWriter already applies to
+        # its own connection on this same telemetry file.
+        self._db_index = sqlite3.connect(index_path, check_same_thread=False)
+        self._db_index.execute("PRAGMA journal_mode=WAL")
+        self._db_index.execute("PRAGMA busy_timeout=2000")
+        self._db_index.execute(CREATE_STATION_STATE_SQL)
+        self._db_index.execute(CREATE_RUN_SUMMARY_SQL)
+        self._db_index.execute(CREATE_RUN_SEQUENCE_SQL)
+        self._db_index.execute("INSERT OR IGNORE INTO run_sequence (id, next_value) VALUES (1, 1)")
+        # Additive migration -- brings a pre-existing index/legacy
+        # database up to the current schema without touching any
+        # existing row. No-op on a brand-new database (CREATE TABLE
+        # above already has every column) and no-op on an
+        # already-migrated one. MUST run before CREATE_RUN_SUMMARY_
+        # INDEXES_SQL below -- that index is on sequence_number, a
+        # column a legacy run_summary table won't have until this
+        # migration adds it.
+        _migrate_add_missing_columns(self._db_index, "station_state", _STATION_STATE_MIGRATION_COLUMNS)
+        _migrate_add_missing_columns(self._db_index, "run_summary", _RUN_SUMMARY_MIGRATION_COLUMNS)
+        for _stmt in CREATE_RUN_SUMMARY_INDEXES_SQL:
+            self._db_index.execute(_stmt)
+        self._db_index.commit()
+
+        # Telemetry database -- measurements/event_log/raw_hardware_log.
+        # Resolved ONCE, here, and never re-read for this instance's
+        # life -- see data/rotation.py's module docstring for why this
+        # is what makes "never split a group across databases" true by
+        # construction, with no extra guard needed.
+        self._db = sqlite3.connect(telemetry_path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=2000")
+        self._db.execute(CREATE_TABLE_SQL)
+        self._db.execute(CREATE_EVENT_LOG_SQL)
+        # Hardware Audit Trail (see docs/architecture.md) -- schema only,
+        # created here so the table/indexes are visible via this
+        # connection immediately, even before any hardware call has
+        # happened. Actual writes go through data/raw_hardware_log.py::
+        # RawHardwareLogWriter's own, independent connection to this
+        # SAME telemetry file (see that module's docstring for why) --
+        # this DataStorage instance never writes to raw_hardware_log
+        # itself.
+        self._db.execute(CREATE_RAW_HARDWARE_LOG_SQL)
+        for _stmt in CREATE_RAW_HARDWARE_LOG_INDEXES_SQL:
+            self._db.execute(_stmt)
+        _migrate_add_missing_columns(self._db, "measurements", _MEASUREMENT_MIGRATION_COLUMNS)
+        self._db.commit()
+
+        self.run_id = self._new_run_id()
+        self.log.info(
+            "Storage opened. run_id=%s index_db=%s telemetry_db=%s",
+            self.run_id, index_path, self._telemetry_db_name,
+        )
 
     def close(self):
         for ch, f in list(self._csv_files.items()):
@@ -619,22 +702,23 @@ class DataStorage(StorageBackend):
 
         if self._db is not None:
             try:
-                self._db.execute(
-                    "INSERT INTO measurements "
-                    "(run_id, channel, timestamp, elapsed_s, phase, voltage_v, current_a, temp_c) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        self.run_id,
-                        channel,
-                        now,
-                        sample.get("elapsed_s"),
-                        sample.get("phase"),
-                        sample.get("voltage_v"),
-                        sample.get("current_a"),
-                        sample.get("temp_c"),
-                    ),
-                )
-                self._db.commit()
+                with self._db_lock:
+                    self._db.execute(
+                        "INSERT INTO measurements "
+                        "(run_id, channel, timestamp, elapsed_s, phase, voltage_v, current_a, temp_c) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            self.run_id,
+                            channel,
+                            now,
+                            sample.get("elapsed_s"),
+                            sample.get("phase"),
+                            sample.get("voltage_v"),
+                            sample.get("current_a"),
+                            sample.get("temp_c"),
+                        ),
+                    )
+                    self._db.commit()
             except sqlite3.Error as e:
                 self.log.error("DB write failed (channel=%d): %s", channel, e)
                 raise
@@ -656,10 +740,11 @@ class DataStorage(StorageBackend):
             params.append(channel)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         try:
-            cur = self._db.execute(
-                f"SELECT {', '.join(_COLUMNS)} FROM measurements {where}", params
-            )
-            return [dict(zip(_COLUMNS, row)) for row in cur.fetchall()]
+            with self._db_lock:
+                cur = self._db.execute(
+                    f"SELECT {', '.join(_COLUMNS)} FROM measurements {where}", params
+                )
+                return [dict(zip(_COLUMNS, row)) for row in cur.fetchall()]
         except sqlite3.Error as e:
             self.log.error("DB query failed: %s", e)
             return []
@@ -709,12 +794,13 @@ class DataStorage(StorageBackend):
             row.setdefault(key, None)
         cols = ["run_id"] + _STATION_STATE_COLUMNS
         placeholders = ", ".join("?" for _ in cols)
-        cursor = self._db_index.execute(
-            f"INSERT INTO station_state ({', '.join(cols)}) VALUES ({placeholders})",
-            [row[c] for c in cols],
-        )
-        self._db_index.commit()
-        return cursor.lastrowid
+        with self._db_index_lock:
+            cursor = self._db_index.execute(
+                f"INSERT INTO station_state ({', '.join(cols)}) VALUES ({placeholders})",
+                [row[c] for c in cols],
+            )
+            self._db_index.commit()
+            return cursor.lastrowid
 
     def get_last_execution_state(self):
         """
@@ -730,11 +816,12 @@ class DataStorage(StorageBackend):
         """
         if self._db_index is None:
             return None
-        cur = self._db_index.execute(
-            f"SELECT {', '.join(_STATION_STATE_COLUMNS)} FROM station_state "
-            f"ORDER BY id DESC LIMIT 1"
-        )
-        row = cur.fetchone()
+        with self._db_index_lock:
+            cur = self._db_index.execute(
+                f"SELECT {', '.join(_STATION_STATE_COLUMNS)} FROM station_state "
+                f"ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
         if row is None:
             return None
         return dict(zip(_STATION_STATE_COLUMNS, row))
@@ -751,12 +838,13 @@ class DataStorage(StorageBackend):
         """
         if self._db_index is None:
             return []
-        cur = self._db_index.execute(
-            f"SELECT {', '.join(_STATION_STATE_COLUMNS)} FROM station_state "
-            f"WHERE run_id = ? ORDER BY id ASC",
-            (run_id,),
-        )
-        return [dict(zip(_STATION_STATE_COLUMNS, row)) for row in cur.fetchall()]
+        with self._db_index_lock:
+            cur = self._db_index.execute(
+                f"SELECT {', '.join(_STATION_STATE_COLUMNS)} FROM station_state "
+                f"WHERE run_id = ? ORDER BY id ASC",
+                (run_id,),
+            )
+            return [dict(zip(_STATION_STATE_COLUMNS, row)) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Historical measurements (Milestone II) -- the authoritative result
@@ -825,12 +913,13 @@ class DataStorage(StorageBackend):
             c for c in _MEASUREMENT_ALL_COLUMNS if c not in ("run_id", "channel", "timestamp")
         ]
         placeholders = ", ".join("?" for _ in cols)
-        cursor = self._db.execute(
-            f"INSERT INTO measurements ({', '.join(cols)}) VALUES ({placeholders})",
-            [row[c] for c in cols],
-        )
-        self._db.commit()
-        return cursor.lastrowid
+        with self._db_lock:
+            cursor = self._db.execute(
+                f"INSERT INTO measurements ({', '.join(cols)}) VALUES ({placeholders})",
+                [row[c] for c in cols],
+            )
+            self._db.commit()
+            return cursor.lastrowid
 
     def get_measurements(self, run_id: str = None, channel: int = None,
                           recent_limit: int = None) -> list:
@@ -861,21 +950,22 @@ class DataStorage(StorageBackend):
             params.append(channel)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         try:
-            if recent_limit is not None:
+            with self._db_lock:
+                if recent_limit is not None:
+                    cur = self._db.execute(
+                        f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
+                        f"{where} ORDER BY id DESC LIMIT ?",
+                        [*params, recent_limit],
+                    )
+                    rows = [dict(zip(_MEASUREMENT_ALL_COLUMNS, row)) for row in cur.fetchall()]
+                    rows.reverse()
+                    return rows
                 cur = self._db.execute(
                     f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
-                    f"{where} ORDER BY id DESC LIMIT ?",
-                    [*params, recent_limit],
+                    f"{where} ORDER BY id",
+                    params,
                 )
-                rows = [dict(zip(_MEASUREMENT_ALL_COLUMNS, row)) for row in cur.fetchall()]
-                rows.reverse()
-                return rows
-            cur = self._db.execute(
-                f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
-                f"{where} ORDER BY id",
-                params,
-            )
-            return [dict(zip(_MEASUREMENT_ALL_COLUMNS, row)) for row in cur.fetchall()]
+                return [dict(zip(_MEASUREMENT_ALL_COLUMNS, row)) for row in cur.fetchall()]
         except sqlite3.Error as e:
             self.log.error("DB query failed (get_measurements): %s", e)
             return []
@@ -954,12 +1044,13 @@ class DataStorage(StorageBackend):
             params.append(channel)
         where = "WHERE " + " AND ".join(conditions)
         try:
-            cur = self._db.execute(
-                f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
-                f"{where} ORDER BY id ASC LIMIT 1",
-                params,
-            )
-            row = cur.fetchone()
+            with self._db_lock:
+                cur = self._db.execute(
+                    f"SELECT {', '.join(_MEASUREMENT_ALL_COLUMNS)} FROM measurements "
+                    f"{where} ORDER BY id ASC LIMIT 1",
+                    params,
+                )
+                row = cur.fetchone()
             return dict(zip(_MEASUREMENT_ALL_COLUMNS, row)) if row else None
         except sqlite3.Error as e:
             self.log.error("DB query failed (get_first_measurement): %s", e)
@@ -1010,11 +1101,12 @@ class DataStorage(StorageBackend):
         row["telemetry_db"] = self._telemetry_db_name
         cols = ["run_id", "test_type", "start_time"] + optional_cols
         placeholders = ", ".join("?" for _ in cols)
-        self._db_index.execute(
-            f"INSERT INTO run_summary ({', '.join(cols)}) VALUES ({placeholders})",
-            [row[c] for c in cols],
-        )
-        self._db_index.commit()
+        with self._db_index_lock:
+            self._db_index.execute(
+                f"INSERT INTO run_summary ({', '.join(cols)}) VALUES ({placeholders})",
+                [row[c] for c in cols],
+            )
+            self._db_index.commit()
 
     def finish_run_summary(self, stop_reason: str = None, result: str = None, **fields) -> None:
         """
@@ -1035,50 +1127,53 @@ class DataStorage(StorageBackend):
                     "analysis_result"):
             if key in fields:
                 updates[key] = fields[key]
-        if "duration_s" in fields:
-            updates["duration_s"] = fields["duration_s"]
-        else:
+        with self._db_index_lock:
+            if "duration_s" in fields:
+                updates["duration_s"] = fields["duration_s"]
+            else:
+                cur = self._db_index.execute(
+                    "SELECT start_time FROM run_summary WHERE run_id = ?", (self.run_id,)
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    try:
+                        start_dt = datetime.fromisoformat(row[0])
+                        updates["duration_s"] = (datetime.fromisoformat(end_time) - start_dt).total_seconds()
+                    except ValueError:
+                        pass
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
             cur = self._db_index.execute(
-                "SELECT start_time FROM run_summary WHERE run_id = ?", (self.run_id,)
+                f"UPDATE run_summary SET {set_clause} WHERE run_id = ?",
+                [*updates.values(), self.run_id],
             )
-            row = cur.fetchone()
-            if row and row[0]:
-                try:
-                    start_dt = datetime.fromisoformat(row[0])
-                    updates["duration_s"] = (datetime.fromisoformat(end_time) - start_dt).total_seconds()
-                except ValueError:
-                    pass
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        cur = self._db_index.execute(
-            f"UPDATE run_summary SET {set_clause} WHERE run_id = ?",
-            [*updates.values(), self.run_id],
-        )
-        if cur.rowcount == 0:
-            self.log.warning(
-                "finish_run_summary(): no run_summary row found for run_id=%s "
-                "(start_run_summary() was never called for this run)", self.run_id,
-            )
-        self._db_index.commit()
+            if cur.rowcount == 0:
+                self.log.warning(
+                    "finish_run_summary(): no run_summary row found for run_id=%s "
+                    "(start_run_summary() was never called for this run)", self.run_id,
+                )
+            self._db_index.commit()
 
     def get_last_run_summary(self):
         """Return the most recent run_summary row (by id) as a dict, or None."""
         if self._db_index is None:
             return None
-        cur = self._db_index.execute(
-            f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary ORDER BY id DESC LIMIT 1"
-        )
-        row = cur.fetchone()
+        with self._db_index_lock:
+            cur = self._db_index.execute(
+                f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
         return dict(zip(_RUN_SUMMARY_COLUMNS, row)) if row else None
 
     def get_run_summary(self, run_id: str):
         """Return the run_summary row for a specific run_id as a dict, or None."""
         if self._db_index is None:
             return None
-        cur = self._db_index.execute(
-            f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary WHERE run_id = ?",
-            (run_id,),
-        )
-        row = cur.fetchone()
+        with self._db_index_lock:
+            cur = self._db_index.execute(
+                f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary WHERE run_id = ?",
+                (run_id,),
+            )
+            row = cur.fetchone()
         return dict(zip(_RUN_SUMMARY_COLUMNS, row)) if row else None
 
     def get_child_run_summaries(self, parent_run_id: str) -> list:
@@ -1091,20 +1186,22 @@ class DataStorage(StorageBackend):
         """
         if self._db_index is None:
             return []
-        cur = self._db_index.execute(
-            f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary WHERE parent_run_id = ? ORDER BY id ASC",
-            (parent_run_id,),
-        )
-        return [dict(zip(_RUN_SUMMARY_COLUMNS, row)) for row in cur.fetchall()]
+        with self._db_index_lock:
+            cur = self._db_index.execute(
+                f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary WHERE parent_run_id = ? ORDER BY id ASC",
+                (parent_run_id,),
+            )
+            return [dict(zip(_RUN_SUMMARY_COLUMNS, row)) for row in cur.fetchall()]
 
     def list_run_summaries(self) -> list:
         """Return every run_summary row, most recent first."""
         if self._db_index is None:
             return []
-        cur = self._db_index.execute(
-            f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary ORDER BY id DESC"
-        )
-        return [dict(zip(_RUN_SUMMARY_COLUMNS, row)) for row in cur.fetchall()]
+        with self._db_index_lock:
+            cur = self._db_index.execute(
+                f"SELECT {', '.join(_RUN_SUMMARY_COLUMNS)} FROM run_summary ORDER BY id DESC"
+            )
+            return [dict(zip(_RUN_SUMMARY_COLUMNS, row)) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Event log (Milestone II) -- fine-grained runtime narrative. NOT a
@@ -1123,13 +1220,14 @@ class DataStorage(StorageBackend):
         """
         if self._db is None:
             raise RuntimeError("DataStorage.log_event() called before open()")
-        cursor = self._db.execute(
-            "INSERT INTO event_log (run_id, timestamp, channel, relay, level, source, message) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (self.run_id, datetime.now().isoformat(), channel, relay, level, source, message),
-        )
-        self._db.commit()
-        return cursor.lastrowid
+        with self._db_lock:
+            cursor = self._db.execute(
+                "INSERT INTO event_log (run_id, timestamp, channel, relay, level, source, message) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (self.run_id, datetime.now().isoformat(), channel, relay, level, source, message),
+            )
+            self._db.commit()
+            return cursor.lastrowid
 
     def get_recent_events(self, run_id: str = None, limit: int = 20, channel: int = None) -> list:
         """
@@ -1165,17 +1263,18 @@ class DataStorage(StorageBackend):
             conditions.append("channel = ?")
             params.append(channel)
         where = f"WHERE {' AND '.join(conditions)}"
-        if limit is None:
+        with self._db_lock:
+            if limit is None:
+                cur = self._db.execute(
+                    f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log {where} ORDER BY id ASC",
+                    params,
+                )
+                return [dict(zip(_EVENT_LOG_COLUMNS, row)) for row in cur.fetchall()]
             cur = self._db.execute(
-                f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log {where} ORDER BY id ASC",
-                params,
+                f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log {where} ORDER BY id DESC LIMIT ?",
+                [*params, limit],
             )
-            return [dict(zip(_EVENT_LOG_COLUMNS, row)) for row in cur.fetchall()]
-        cur = self._db.execute(
-            f"SELECT {', '.join(_EVENT_LOG_COLUMNS)} FROM event_log {where} ORDER BY id DESC LIMIT ?",
-            [*params, limit],
-        )
-        rows = [dict(zip(_EVENT_LOG_COLUMNS, row)) for row in cur.fetchall()]
+            rows = [dict(zip(_EVENT_LOG_COLUMNS, row)) for row in cur.fetchall()]
         return list(reversed(rows))
 
     def get_raw_hardware_log(self, run_id: str) -> list:
@@ -1194,12 +1293,13 @@ class DataStorage(StorageBackend):
         """
         if self._db is None:
             return []
-        cur = self._db.execute(
-            f"SELECT {', '.join(RAW_HARDWARE_LOG_COLUMNS)} FROM raw_hardware_log "
-            f"WHERE run_id = ? ORDER BY id ASC",
-            (run_id,),
-        )
-        return [dict(zip(RAW_HARDWARE_LOG_COLUMNS, row)) for row in cur.fetchall()]
+        with self._db_lock:
+            cur = self._db.execute(
+                f"SELECT {', '.join(RAW_HARDWARE_LOG_COLUMNS)} FROM raw_hardware_log "
+                f"WHERE run_id = ? ORDER BY id ASC",
+                (run_id,),
+            )
+            return [dict(zip(RAW_HARDWARE_LOG_COLUMNS, row)) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Forensic Export (see docs/architecture.md "Forensic Export")
@@ -1240,7 +1340,17 @@ class DataStorage(StorageBackend):
         if not os.path.exists(index_path):
             return None, f"Index database not found at {index_path}."
         try:
-            instance._db_index = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
+            # immutable=1 -- the live DataStorage connections now run in WAL
+            # mode (see open(), above), and an ordinary mode=ro connection to
+            # a WAL database still creates -wal/-shm sidecar files on open
+            # (SQLite must be able to check for a WAL to stay consistent).
+            # immutable=1 tells SQLite this file will not change for the
+            # life of this connection, skipping that check entirely -- which
+            # is exactly this method's own contract (a completed run's
+            # database, opened strictly read-only, never mutated). Preserves
+            # the "export creates no new files" guarantee this method has
+            # always had.
+            instance._db_index = sqlite3.connect(f"file:{index_path}?mode=ro&immutable=1", uri=True)
         except sqlite3.Error as e:
             return None, f"Could not open index database ({index_path}) read-only: {e}"
 
@@ -1271,7 +1381,7 @@ class DataStorage(StorageBackend):
             return instance, None
 
         try:
-            instance._db = sqlite3.connect(f"file:{telemetry_path}?mode=ro", uri=True)
+            instance._db = sqlite3.connect(f"file:{telemetry_path}?mode=ro&immutable=1", uri=True)
         except sqlite3.Error as e:
             instance.telemetry_unavailable_reason = f"could not open telemetry database read-only: {e}"
             return instance, None
