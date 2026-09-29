@@ -2005,6 +2005,299 @@ def test_relay_safety_selftest(name=None, cfg=None):
 
 
 # =============================================================================
+# 5e2. Relay-Range Ownership Diagnostic -- EXPERIMENTAL hardware evidence
+#      only, for the Matrix + Relay-Range Ownership study (see
+#      orchestration/resource_ownership.py's module docstring, "THIS PHASE
+#      IS OWNERSHIP-VALIDATION ONLY -- HARDWARE IS STILL UNCHANGED"). Does
+#      NOT modify relay_eth.py, write_all(), verify_all(),
+#      _force_all_off_and_verify(), _emergency_all_off(), close_all(),
+#      GroupRuntime, or HardwareManager -- diagnostic only, no fixes.
+# =============================================================================
+
+def test_relay_range_ownership_diagnostic(name=None, cfg=None):
+    """
+    EXPERIMENTAL. Gathers real-hardware evidence for whether the Numato
+    unit's NATIVE single-relay command (write()/read_relay()/read_all() --
+    NOT RelayBase.close()/open()) preserves one relay's state while a
+    DIFFERENT relay on the same physical matrix is toggled -- the actual
+    open physical question a future Phase 4 range-scoped write path would
+    depend on. This is a diagnostic, not a workflow, not a unit test
+    (Phase 1-3's config/ownership logic is already covered by tests/), and
+    not a fix.
+
+    Deliberately does NOT call RelayBase.close()/open() at all: those
+    force the WHOLE bank off on every call (hardware/relay_eth.py::
+    _force_all_off_and_verify()), which would trivially and
+    uninterestingly clear every other relay on every single step and
+    prove nothing new -- that hazard is already established by reading
+    the code (see orchestration/resource_ownership.py's module
+    docstring). This diagnostic instead uses the same native primitives
+    test_relay_ethernet_test() already validates independently, to ask
+    whether the raw hardware command itself is inherently single-relay-
+    scoped.
+
+    Discovers exactly two groups sharing the selected matrix
+    (BATTERY_GROUPS[group]["relay_matrix"] == this device's name) that
+    each declare a `relay_range` (config/devices.py's Phase 1 field) --
+    never hardcodes a group name. Aborts with an actionable message if
+    fewer than two such groups are configured (true for every group in
+    production today, by design -- see tests/test_relay_range_config.py::
+    test_every_production_group_has_no_relay_range_declared).
+
+    Procedure, for every relay in the lower-range group's ("Group A")
+    range, repeated for every relay in the higher-range group's
+    ("Group B") range:
+
+        Group B relay ON  -> read_all() -> log bitmap
+        for each Group A relay in range:
+            Group A relay ON  -> read_all() -> verify A ON, B still ON,
+                nothing outside {A, B} unexpectedly active -> Group A relay OFF
+        verify Group B relay is STILL on -> Group B relay OFF -> read_all()
+
+    Never raises/aborts on a mismatch -- logs it as an anomaly and keeps
+    going (unlike Safety Self-Test's stop-on-first-failure policy, this is
+    a data-gathering pass over every combination, not a pass/fail gate).
+    Ends with a full per-relay summary and the four questions this
+    diagnostic exists to answer, based purely on what was observed on
+    this run.
+    """
+    if cfg is None:
+        name, cfg = _select_device(dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS, "Numato Relay Matrix devices")
+        if cfg is None:
+            return []
+    _print_device_config(name, cfg)
+
+    host        = cfg.get("ip", "")
+    port        = cfg.get("port", 23)
+    driver      = cfg.get("driver", "RELAY32ETHRL00")
+    relay_count = cfg.get("channel_count", cfg.get("num_channels", Settings.RELAY_COUNT))
+    config_ref  = f"config/devices.py -> {name} ({driver} / {host}:{port}, RELAY_COUNT={relay_count})"
+    results     = []
+
+    # ---- Discover Group A / Group B from configured relay_range values on
+    # THIS matrix -- config-driven, never a hardcoded group name. ----
+    candidates = []
+    for group, grp in dev_cfg.BATTERY_GROUPS.items():
+        if grp.get("relay_matrix") != name:
+            continue
+        relay_range = grp.get("relay_range")
+        if relay_range is None:
+            continue
+        lo, hi = relay_range
+        candidates.append((lo, hi, group))
+    candidates.sort()
+
+    if len(candidates) < 2:
+        return [_warn(
+            "Relay-Range Ownership Diagnostic", "Group discovery", config_ref,
+            f"Found {len(candidates)} group(s) on {name!r} with a configured "
+            f"'relay_range' -- this diagnostic needs at least two. Assign "
+            f"relay_range=(lo, hi) to two groups sharing this matrix in "
+            f"config/devices.py (Phase 1 field; production behavior is "
+            f"unaffected until a group actually uses it -- see "
+            f"config/devices.py::compose_relay_resource_name()) before "
+            f"running this diagnostic."
+        )]
+
+    (lo_a, hi_a, group_a), (lo_b, hi_b, group_b) = candidates[0], candidates[1]
+    range_a = range(lo_a, hi_a + 1)
+    range_b = range(lo_b, hi_b + 1)
+
+    print(f"\nGroup A = {group_a!r}  relays {lo_a}-{hi_a}")
+    print(f"Group B = {group_b!r}  relays {lo_b}-{hi_b}")
+
+    try:
+        from hardware.relay_factory import RelayFactory
+        relay = RelayFactory.create(cfg)
+    except Exception as e:
+        return [_fail("Relay-Range Ownership Diagnostic", "Factory", config_ref,
+                      f"Import / factory error: {e}")]
+
+    import signal
+    from utils.cancellation import CancellationToken, install_sigint_handler, check_cancellation
+    from utils.errors import OperationCancelledError
+
+    token = CancellationToken(owner="test.py:relay_range_ownership_diagnostic")
+    previous_sigint_handler = install_sigint_handler(token, owner="test.py:relay_range_ownership_diagnostic")
+    print("\nExperimental diagnostic -- press Ctrl+C to cancel safely.\n")
+
+    def _addr_to_index(addr):
+        return addr - 1  # native 0-based; config relay_address/relay_range are 1-based
+
+    def _bit(addr):
+        return 1 << _addr_to_index(addr)
+
+    def _log_step(b_relay, a_relay, expected_mask, actual_mask, note=""):
+        unexpected = actual_mask ^ expected_mask
+        print(
+            f"    Group A relay: {a_relay if a_relay is not None else '-':<4} "
+            f"Group B relay: {b_relay:<4} "
+            f"Expected: 0x{expected_mask:08X}  Actual: 0x{actual_mask:08X}"
+            + (f"  ** UNEXPECTED CHANGE (diff=0x{unexpected:08X}) **" if unexpected else "")
+            + (f"  {note}" if note else "")
+        )
+        return unexpected
+
+    per_b_summary = []   # [(b_relay, stayed_on_throughout: bool, [anomaly strings])]
+    cancelled = False
+
+    try:
+        with _numato_relay_debug_logging():
+            try:
+                relay.connect()
+            except Exception as e:
+                return [_fail("Relay-Range Ownership Diagnostic", "Connect + Auth", config_ref,
+                              f"Reason:\n{_classify_relay_error(e)}\n"
+                              f"Diagnostic aborted -- device not available.")]
+
+            results.append(_ok("Relay-Range Ownership Diagnostic", "Connect + Auth", config_ref,
+                               f"Connected and authenticated to {driver} at {host}:{port}"))
+
+            relay.write_all(0)
+            relay.verify_all(0)
+            relay.settle()
+
+            for b_relay in range_b:
+                try:
+                    check_cancellation(token)
+                except OperationCancelledError as e:
+                    results.append(_warn("Relay-Range Ownership Diagnostic", "Cancelled by operator", config_ref, str(e)))
+                    cancelled = True
+                if cancelled:
+                    break
+
+                print(f"\n  == Group B relay {b_relay} ON ==")
+                relay.write(_addr_to_index(b_relay), True)
+                relay.settle()
+                bitmap = relay.read_all()
+                b_unexpected_events = []
+                unexpected = _log_step(b_relay, None, _bit(b_relay), bitmap, note="(Group B activated)")
+                if unexpected:
+                    b_unexpected_events.append(f"Group B activation itself produced unexpected bits: 0x{unexpected:08X}")
+
+                for a_relay in range_a:
+                    try:
+                        check_cancellation(token)
+                    except OperationCancelledError as e:
+                        results.append(_warn("Relay-Range Ownership Diagnostic", "Cancelled by operator", config_ref, str(e)))
+                        cancelled = True
+                    if cancelled:
+                        break
+
+                    relay.write(_addr_to_index(a_relay), True)
+                    relay.settle()
+                    bitmap = relay.read_all()
+                    expected = _bit(b_relay) | _bit(a_relay)
+                    unexpected = _log_step(b_relay, a_relay, expected, bitmap)
+                    if not (bitmap & _bit(b_relay)):
+                        b_unexpected_events.append(
+                            f"Group B relay {b_relay} was CLEARED while activating Group A relay {a_relay}")
+                    if not (bitmap & _bit(a_relay)):
+                        b_unexpected_events.append(
+                            f"Group A relay {a_relay} failed to activate (bitmap=0x{bitmap:08X})")
+                    if unexpected:
+                        b_unexpected_events.append(
+                            f"Relay {a_relay}: unexpected bits 0x{unexpected:08X} outside "
+                            f"{{A={a_relay}, B={b_relay}}}")
+
+                    relay.write(_addr_to_index(a_relay), False)
+                    relay.settle()
+
+                if cancelled:
+                    break
+
+                bitmap = relay.read_all()
+                unexpected = _log_step(b_relay, None, _bit(b_relay), bitmap,
+                                       note="(Group A range complete -- Group B expected still ON)")
+                b_final_on = bool(bitmap & _bit(b_relay))
+                if not b_final_on:
+                    b_unexpected_events.append(
+                        f"Group B relay {b_relay} was NOT on after Group A's full range completed")
+                if unexpected and b_final_on:
+                    b_unexpected_events.append(
+                        f"Unexpected bits present alongside Group B relay {b_relay}: 0x{unexpected:08X}")
+
+                relay.write(_addr_to_index(b_relay), False)
+                relay.settle()
+                bitmap = relay.read_all()
+                if bitmap != 0:
+                    b_unexpected_events.append(
+                        f"Bitmap not all-OFF after deactivating Group B relay {b_relay}: 0x{bitmap:08X}")
+
+                per_b_summary.append((b_relay, b_final_on, b_unexpected_events))
+
+                if b_unexpected_events:
+                    results.append(_warn(
+                        "Relay-Range Ownership Diagnostic", f"Group B relay {b_relay}", config_ref,
+                        "\n".join(b_unexpected_events)
+                    ))
+                else:
+                    results.append(_ok(
+                        "Relay-Range Ownership Diagnostic", f"Group B relay {b_relay}", config_ref,
+                        f"Remained ON throughout Group A's full range ({lo_a}-{hi_a}); "
+                        f"no unexpected bits observed"
+                    ))
+
+            # Best-effort final safe state regardless of outcome -- uses the
+            # SAME unmodified native primitives, never a fix, never a
+            # workaround.
+            try:
+                relay.write_all(0)
+                relay.verify_all(0)
+                relay.settle()
+            except Exception as e:
+                results.append(_warn("Relay-Range Ownership Diagnostic", "Final OFF ALL", config_ref, str(e)))
+
+            try:
+                relay.disconnect()
+            except Exception as e:
+                results.append(_warn("Relay-Range Ownership Diagnostic", "Disconnect", config_ref, str(e)))
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+
+    # ---- Final report -- the four questions this diagnostic exists to
+    # answer, based only on what this run actually observed. ----
+    any_cleared = any((not stayed_on) or events for _, stayed_on, events in per_b_summary)
+
+    print("\n" + "=" * 60)
+    print("Relay-Range Ownership Diagnostic -- Summary")
+    print("=" * 60)
+    for b_relay, stayed_on, events in per_b_summary:
+        print(f"  Group B relay {b_relay}: "
+              f"{'REMAINED ACTIVE' if stayed_on else 'WAS CLEARED'} while Group A operated"
+              + (f"  -- {len(events)} anomaly(ies)" if events else ""))
+        for ev in events:
+            print(f"      - {ev}")
+
+    if not per_b_summary:
+        q1 = q2 = q3 = q4 = "Inconclusive -- diagnostic was cancelled/aborted before completing any Group B relay."
+    else:
+        q1 = ("NO -- unexpected clearing/anomalies were observed on at least one relay" if any_cleared else
+              "YES -- Group B state was preserved across every native single-relay Group A operation observed")
+        q2 = "YES, at least once" if any_cleared else "NO -- not observed in this run"
+        q3 = ("At the NATIVE single-relay-write level tested here: "
+              + ("NO -- evidence contradicts this" if any_cleared else "YES -- evidence is consistent with this") +
+              ". NOT tested here: RelayBase.close()/open() (the wrapper every real workflow actually calls) still "
+              "forces the whole bank off on every call and is known, by inspection, to clear other owners' relays "
+              "regardless of this result.")
+        q4 = ("Phase 4 (a range-scoped write/verify path in relay_eth.py) is still required for the close()/open() "
+              "wrapper regardless of this result -- this diagnostic only tested whether the underlying native "
+              "command layer PHYSICALLY supports partial writes, which is a PRECONDITION for Phase 4, not a "
+              "substitute for redesigning the wrapper.")
+
+    print("\nFinal Report:")
+    print(f"  1. Does the native single-relay write preserve another range? {q1}")
+    print(f"  2. Did any Group A operation clear Group B state?             {q2}")
+    print(f"  3. Can relay-range ownership coexist with the current driver? {q3}")
+    print(f"  4. Is Phase 4 redesign required based on this evidence?       {q4}")
+
+    results.append(_ok("Relay-Range Ownership Diagnostic", "Final Report", config_ref,
+                       f"Q1: {q1}\nQ2: {q2}\nQ3: {q3}\nQ4: {q4}"))
+
+    return results
+
+
+# =============================================================================
 # 5f. Numato Relay Matrix -- hardware-category menu entry (Identity +
 #     Functional Validation), reusing the tests above
 # =============================================================================
@@ -2091,6 +2384,7 @@ def _functional_relay_numato(name: str, cfg: dict):
         ("Matrix Scan (ON -> READ -> OFF, scoped by group)", _test_relay_matrix_scan_scoped),
         ("RelayEthernetTest (native 0-based primitives)", test_relay_ethernet_test),
         ("Safety Self-Test (1..N, stop on first failure)", test_relay_safety_selftest),
+        ("Relay-Range Ownership Diagnostic (EXPERIMENTAL)", test_relay_range_ownership_diagnostic),
     ]
     print(f"\n{name} -- Functional Validation\n")
     for i, (label, _fn) in enumerate(options, 1):
