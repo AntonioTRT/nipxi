@@ -4,11 +4,10 @@ config/devices.py (see docs/architecture.md "Future Architecture:
 Topology Discovery"). NOT part of the current execution path: nothing in
 test.py, main.py, or test_control/ imports this module.
 
-Adds no new config fields and no new hardware assumptions -- it only
-reads the existing per-group hardware role names (relay_matrix/smu/dmm/
-daq/ntc_daq) already declared in config/devices.py::BATTERY_GROUPS, and
-aggregates "which enabled groups use which physical resource" into a
-lookup.
+Adds no new hardware assumptions -- it only reads the existing per-group
+hardware role names (relay_matrix/relay_range/smu/dmm/daq/ntc_daq)
+already declared in config/devices.py::BATTERY_GROUPS, and aggregates
+"which enabled groups use which physical resource" into a lookup.
 
 Deliberately does NOT call config/devices.py::hardware_for_group() --
 that function always resolves against the real, global BATTERY_GROUPS/
@@ -17,8 +16,11 @@ IT, which would make this module untestable against a synthetic rack
 config (Rack B/C/D-shaped dicts standing in for hardware that does not
 exist yet). Instead, this module reads the plain role-name fields
 directly off each group dict -- the same fields hardware_for_group()
-itself reads -- and replicates its one non-trivial rule (ntc_daq falling
-back to daq when unset) inline. If that rule ever changes in
+itself reads -- and replicates its non-trivial rules (ntc_daq falling
+back to daq when unset; relay_matrix_name composed with any relay_range
+via config/devices.py::compose_relay_resource_name(), the one pure
+helper this module DOES call, since it has no group-shaped input of its
+own to diverge from) inline. If either rule ever changes in
 hardware_for_group(), this must be updated to match.
 """
 
@@ -75,7 +77,9 @@ def discover_topology(battery_groups: dict = None) -> dict:
         # docstring for why it is duplicated here rather than calling
         # that function directly.
         roles = {
-            "relay_matrix_name": grp.get("relay_matrix"),
+            "relay_matrix_name": dev_cfg.compose_relay_resource_name(
+                grp.get("relay_matrix"), grp.get("relay_range")
+            ),
             "smu_name": grp.get("smu"),
             "dmm_name": grp.get("dmm"),
             "daq_name": grp.get("daq"),

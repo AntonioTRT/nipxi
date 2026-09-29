@@ -633,10 +633,37 @@ def _placeholder_group() -> dict:
     shape as a real group, every role None, empty positions. Used for every
     group that doesn't have real hardware wired to it today."""
     return {
-        "relay_matrix": None, "smu": None, "dmm": None, "daq": None, "ntc_daq": None,
+        "relay_matrix": None, "relay_range": None,
+        "smu": None, "dmm": None, "daq": None, "ntc_daq": None,
         "enabled": False, "battery_type": None, "test_setpoints": None,
         "positions": {},
     }
+
+
+def compose_relay_resource_name(relay_matrix, relay_range=None) -> str:
+    """
+    Matrix + Relay-Range Ownership -- PHASE 1 (config only; relay_eth.py's
+    driver behavior and every workflow are unchanged; see orchestration/
+    resource_ownership.py's module docstring for the full picture and what
+    is deliberately NOT implemented yet).
+
+    Composes the resource-identity string ownership/topology code uses --
+    NEVER the device-lookup key (ETHERNET_DEVICES is still keyed by the
+    bare `relay_matrix` name; only this composed string changes). A group
+    with no `relay_range` (every group in production today) gets back the
+    bare `relay_matrix` string unchanged -- byte-for-byte the same value
+    hardware_for_group() has always returned, so existing single-owner-
+    per-matrix deployments (B1) are byte-for-byte unaffected.
+
+    A group that DOES declare `relay_range=(lo, hi)` gets
+    "<relay_matrix>:<lo>-<hi>" instead -- e.g. "MATRIX_NUMATO_202:1-8" --
+    which is what orchestration/resource_ownership.py and resource_graph.py
+    parse to detect range overlap between groups sharing one matrix.
+    """
+    if relay_matrix is None or relay_range is None:
+        return relay_matrix
+    lo, hi = relay_range
+    return f"{relay_matrix}:{lo}-{hi}"
 
 
 BATTERY_GROUPS = {
@@ -850,7 +877,7 @@ def hardware_for_group(group: str) -> dict:
     grp = BATTERY_GROUPS[group]
     ntc_daq_key = grp.get("ntc_daq") or grp["daq"]
     return {
-        "relay_matrix_name": grp["relay_matrix"],
+        "relay_matrix_name": compose_relay_resource_name(grp["relay_matrix"], grp.get("relay_range")),
         "relay_matrix_cfg":  ETHERNET_DEVICES.get(grp["relay_matrix"]),
         "smu_name": grp["smu"],
         "smu_cfg":  SMU_ASSIGNMENTS.get(grp["smu"]),

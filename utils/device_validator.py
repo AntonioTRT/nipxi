@@ -11,6 +11,8 @@ Only config/devices.py content and driver construction (never connect())
 are exercised -- this module never talks to hardware.
 """
 
+from itertools import combinations
+
 from utils.errors import DeviceConfigError
 
 REQUIRED_FIELDS = {
@@ -206,6 +208,103 @@ def _check_relay_count_consistency(dev_cfg, positions: dict, errors: list):
                 )
 
 
+def _check_relay_range_definitions(dev_cfg, errors: list):
+    """
+    Matrix + Relay-Range Ownership -- PHASE 3 (static, config-load-time
+    validation only; hardware/relay_eth.py and every workflow are
+    unchanged -- see orchestration/resource_ownership.py's module
+    docstring). Validates the optional, per-group `relay_range` field
+    (config/devices.py::compose_relay_resource_name()):
+
+      - a declared `relay_range` must be a (lo, hi) integer pair with
+        1 <= lo <= hi, and hi must fit within that matrix's own
+        channel_count (when known).
+      - every position's own `relay_address` must fall within its
+        group's declared `relay_range`, when one is declared.
+      - two groups sharing the same `relay_matrix` may not declare
+        overlapping ranges, and a group with NO relay_range (a
+        whole-matrix owner) may not share a matrix with any group that
+        DOES declare one -- partial segmentation is not a valid
+        configuration.
+
+    Deliberately does NOT flag two groups sharing a bare `relay_matrix`
+    when NEITHER declares a `relay_range` -- that is every matrix in
+    production today (e.g. B1-B4 all reference MATRIX_NUMATO_202) and is
+    valid: only one such group is ever requested to run at a time, and
+    that exclusivity is enforced at runtime by
+    orchestration/resource_ownership.py, not here. This check only
+    activates once a config actually starts using `relay_range`.
+    """
+    groups = getattr(dev_cfg, "BATTERY_GROUPS", {})
+    matrix_configs = getattr(dev_cfg, "NUMATO_RELAY_MATRIX_CONFIGS", {})
+
+    by_matrix: dict = {}
+    for group, grp in groups.items():
+        relay_matrix = grp.get("relay_matrix")
+        relay_range = grp.get("relay_range")
+        if relay_matrix is None:
+            continue
+
+        if relay_range is not None:
+            valid_shape = (
+                isinstance(relay_range, (tuple, list)) and len(relay_range) == 2
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in relay_range)
+            )
+            if not valid_shape:
+                errors.append(
+                    f"BATTERY_GROUPS[{group!r}]['relay_range']: must be an "
+                    f"(lo, hi) pair of integers, got {relay_range!r}"
+                )
+                continue
+            lo, hi = relay_range
+            if lo < 1 or hi < lo:
+                errors.append(
+                    f"BATTERY_GROUPS[{group!r}]['relay_range']: invalid range "
+                    f"({lo}, {hi}) -- must satisfy 1 <= lo <= hi"
+                )
+                continue
+            limit = matrix_configs.get(relay_matrix, {}).get("channel_count")
+            if limit and hi > limit:
+                errors.append(
+                    f"BATTERY_GROUPS[{group!r}]['relay_range']: ({lo}, {hi}) "
+                    f"exceeds relay '{relay_matrix}' channel_count ({limit})"
+                )
+                continue
+            for pos, ch in grp.get("positions", {}).items():
+                addr = ch.get("relay_address")
+                if addr is not None and not (lo <= addr <= hi):
+                    errors.append(
+                        f"BATTERY_GROUPS[{group!r}]['positions'][{pos}]: "
+                        f"relay_address {addr} is outside this group's own "
+                        f"relay_range {relay_range}"
+                    )
+
+        by_matrix.setdefault(relay_matrix, []).append((group, relay_range))
+
+    for relay_matrix, entries in by_matrix.items():
+        if not any(r is not None for _, r in entries):
+            continue
+        for (group_a, range_a), (group_b, range_b) in combinations(entries, 2):
+            if range_a is None or range_b is None:
+                whole = group_a if range_a is None else group_b
+                ranged = group_b if range_a is None else group_a
+                errors.append(
+                    f"relay '{relay_matrix}': group {whole!r} owns the whole "
+                    f"matrix (no relay_range) but group {ranged!r} declares "
+                    f"one on the same matrix -- partial segmentation is not "
+                    f"valid; every group sharing this matrix must declare a "
+                    f"non-overlapping relay_range, or none of them may"
+                )
+                continue
+            lo_a, hi_a = range_a
+            lo_b, hi_b = range_b
+            if lo_a <= hi_b and lo_b <= hi_a:
+                errors.append(
+                    f"relay '{relay_matrix}': group {group_a!r} relay_range "
+                    f"{range_a} overlaps group {group_b!r} relay_range {range_b}"
+                )
+
+
 def validate_devices(dev_cfg) -> list:
     """
     Validate config/devices.py before any hardware communication.
@@ -228,6 +327,13 @@ def validate_devices(dev_cfg) -> list:
           Settings.RELAY_COUNT, and every relay_address in range on its
           own relay_matrix)
         - every relay 'type' is registered in RelayFactory
+        - Matrix + Relay-Range Ownership (Phase 3, optional 'relay_range'
+          field): valid (lo, hi) shape, within the matrix's own
+          channel_count, every position's relay_address inside its own
+          group's range, and no overlapping/partial-segmentation ranges
+          across groups sharing one matrix -- a no-op against any config
+          where no group declares 'relay_range' (i.e. every config in
+          production today)
     """
     errors = []
     registry = _build_registry(dev_cfg)
@@ -243,6 +349,7 @@ def validate_devices(dev_cfg) -> list:
     _check_duplicate_com_ports(registry, errors)
     positions = _check_relay_identifiers(dev_cfg, errors)
     _check_relay_count_consistency(dev_cfg, positions, errors)
+    _check_relay_range_definitions(dev_cfg, errors)
 
     return errors
 

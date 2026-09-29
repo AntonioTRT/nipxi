@@ -140,6 +140,60 @@ class SyntheticRackScalingTests(unittest.TestCase):
         self.assertEqual(graph.conflicts, {})
 
 
+class RelayRangeOwnershipTests(unittest.TestCase):
+    """
+    Matrix + Relay-Range Ownership (Phase 1-2): two SMU-anchored workers
+    whose groups declare DISJOINT relay_range values on the SAME physical
+    matrix must NOT be reported as a resource_graph conflict, while
+    OVERLAPPING ranges (or a whole-matrix owner alongside any ranged
+    owner) still must be. Config load/hardware behavior is unchanged --
+    this only exercises orchestration/resource_graph.py's overlap-aware
+    conflict rule.
+    """
+
+    def _rack_b_ranged_config(self, range_b1, range_b2):
+        return {
+            "B1": {
+                "relay_matrix": "MATRIX_NUMATO_202", "relay_range": range_b1,
+                "smu": "AUX_SMU_1", "dmm": None, "daq": None, "ntc_daq": None,
+                "enabled": True, "positions": {1: {}},
+            },
+            "B2": {
+                "relay_matrix": "MATRIX_NUMATO_202", "relay_range": range_b2,
+                "smu": "AUX_SMU_2", "dmm": None, "daq": None, "ntc_daq": None,
+                "enabled": True, "positions": {1: {}},
+            },
+        }
+
+    def test_disjoint_ranges_on_one_matrix_do_not_conflict(self):
+        graph = build_resource_graph(self._rack_b_ranged_config((1, 8), (9, 16)))
+        self.assertEqual(graph.conflicts, {})
+
+    def test_overlapping_ranges_on_one_matrix_conflict(self):
+        graph = build_resource_graph(self._rack_b_ranged_config((1, 8), (5, 12)))
+        self.assertEqual(len(graph.conflicts), 1)
+        (pair, shared), = graph.conflicts.items()
+        self.assertEqual(set(pair), {"AUX_SMU_1", "AUX_SMU_2"})
+        self.assertEqual(shared, {"MATRIX_NUMATO_202:1-8", "MATRIX_NUMATO_202:5-12"})
+
+    def test_whole_matrix_owner_conflicts_with_ranged_owner(self):
+        graph = build_resource_graph(self._rack_b_ranged_config(None, (9, 16)))
+        self.assertEqual(len(graph.conflicts), 1)
+        (pair, shared), = graph.conflicts.items()
+        self.assertEqual(set(pair), {"AUX_SMU_1", "AUX_SMU_2"})
+        self.assertEqual(shared, {"MATRIX_NUMATO_202", "MATRIX_NUMATO_202:9-16"})
+
+    def test_composed_resource_name_matches_compose_relay_resource_name(self):
+        """discover_topology()'s composed name must stay byte-for-byte in
+        sync with config/devices.py::compose_relay_resource_name() -- if
+        this ever drifts, ownership/graph matching silently breaks."""
+        usage = discover_topology(self._rack_b_ranged_config((1, 8), (9, 16)))
+        expected_b1 = ResourceKey("relay_matrix_name", dev_cfg.compose_relay_resource_name("MATRIX_NUMATO_202", (1, 8)))
+        expected_b2 = ResourceKey("relay_matrix_name", dev_cfg.compose_relay_resource_name("MATRIX_NUMATO_202", (9, 16)))
+        self.assertEqual(usage[expected_b1], {"B1"})
+        self.assertEqual(usage[expected_b2], {"B2"})
+
+
 class SequentialGroupsWithinOneWorkerTests(unittest.TestCase):
     """
     "Worker 1: B1, B2" (one SMU serving two groups) means B1/B2 run

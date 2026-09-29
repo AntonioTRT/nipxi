@@ -25,6 +25,77 @@ from orchestration.topology import discover_topology
 from orchestration.workers import discover_workers, WorkerPlan
 
 
+def _split_resource_name(resource_name: str):
+    """
+    Matrix + Relay-Range Ownership -- PHASE 2. Split a resource_name into
+    (matrix, range_or_None). "MATRIX_NUMATO_202:1-8" splits into
+    ("MATRIX_NUMATO_202", (1, 8)); a bare "MATRIX_NUMATO_202" (no range --
+    the ONLY form that existed before this phase, and still what every
+    non-relay resource -- SMU/DMM/DAQ names -- and every whole-matrix
+    relay owner produces) splits into ("MATRIX_NUMATO_202", None). Any
+    string that isn't a valid "<matrix>:<lo>-<hi>" suffix (including one
+    that simply has no ':') is treated as an unranged, whole-resource
+    name -- unchanged pre-range behavior.
+    """
+    if ":" not in resource_name:
+        return resource_name, None
+    matrix, _, range_part = resource_name.rpartition(":")
+    lo_s, _, hi_s = range_part.partition("-")
+    try:
+        lo, hi = int(lo_s), int(hi_s)
+    except ValueError:
+        return resource_name, None
+    return matrix, (lo, hi)
+
+
+def _resource_names_conflict(name_a: str, name_b: str) -> bool:
+    """
+    True if two resource_name strings identify overlapping hardware.
+
+    Identical strings always conflict (this is the ENTIRE pre-range rule,
+    preserved exactly). Two different strings only conflict if they name
+    the same underlying matrix AND either side is unranged -- whole-matrix
+    ownership still conflicts with any sub-range on that matrix, since
+    hardware/relay_eth.py's write_all()/verify_all() safety sequence is
+    UNCHANGED by this phase and still operates on the whole physical bank
+    -- or their declared ranges actually overlap. Disjoint ranges on the
+    same matrix (e.g. "MATRIX_NUMATO_202:1-8" vs
+    "MATRIX_NUMATO_202:9-16") do NOT conflict -- this is the one new
+    outcome this phase introduces relative to the old exact-equality rule.
+    """
+    if name_a == name_b:
+        return True
+    matrix_a, range_a = _split_resource_name(name_a)
+    matrix_b, range_b = _split_resource_name(name_b)
+    if matrix_a != matrix_b:
+        return False
+    if range_a is None or range_b is None:
+        return True
+    (lo_a, hi_a), (lo_b, hi_b) = range_a, range_b
+    return lo_a <= hi_b and lo_b <= hi_a
+
+
+def _overlapping_resources(names_a: set, names_b: set) -> set:
+    """
+    Every resource name in `names_a` or `names_b` that conflicts (see
+    _resource_names_conflict()) with something in the other set. Replaces
+    the plain `names_a & names_b` set-intersection used before Matrix +
+    Relay-Range Ownership existed -- for every resource that never uses a
+    range suffix (SMU/DMM/DAQ names, and any relay matrix nobody has ever
+    assigned a relay_range to, which today is EVERY relay matrix in
+    production), this produces the exact same result as `&`, since two
+    unranged names only ever "conflict" here by being the identical
+    string -- exactly what `&` already found.
+    """
+    overlap = set()
+    for name_a in names_a:
+        for name_b in names_b:
+            if _resource_names_conflict(name_a, name_b):
+                overlap.add(name_a)
+                overlap.add(name_b)
+    return overlap
+
+
 @dataclass
 class ResourceGraph:
     """
@@ -71,7 +142,7 @@ def build_resource_graph(battery_groups: dict = None) -> ResourceGraph:
 
     conflicts = {}
     for worker_a, worker_b in combinations(workers, 2):
-        overlap = worker_a.shared_dependencies & worker_b.shared_dependencies
+        overlap = _overlapping_resources(worker_a.shared_dependencies, worker_b.shared_dependencies)
         if overlap:
             conflicts[(worker_a.smu_name, worker_b.smu_name)] = overlap
 

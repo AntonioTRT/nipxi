@@ -5,53 +5,57 @@ Fails fast, before any GroupRuntime is constructed or any hardware is
 touched, if two groups requested to run CONCURRENTLY would end up
 sharing a physical resource.
 
-CURRENT OWNERSHIP MODEL -- MATRIX-LEVEL, EXCLUSIVE (deliberate, not
-provisional)
+OWNERSHIP MODEL -- MATRIX-LEVEL BY DEFAULT, RANGE-AWARE WHERE DECLARED
 =============================================================================
 Every relay matrix (position-control AND sense-routing) is owned, in
-full, by at most one requested group. "One matrix == one owner" is
-enforced by treating a matrix's bare device name (e.g.
-"MATRIX_NUMATO_202") as the unit of ownership -- never a sub-range of
-its channels. This matches hardware/relay_eth.py::NumatoRelayMatrix.
-close()'s existing behavior (write_all(0) across the WHOLE matrix
-before enabling any requested channel): a matrix is not safely
-partitionable across two owners today, so ownership below the
-whole-matrix level would be unsafe to validate as "fine" even if this
-validator tried to allow it. This module does not implement, and must
-not be extended to implement, any channel-level or channel-range
-conflict check -- see "Future: matrix segmentation" below.
+full, by at most one requested group UNLESS two or more groups
+explicitly declare disjoint `relay_range` sub-ranges of the same matrix
+(config/devices.py::compose_relay_resource_name() -- Matrix + Relay-Range
+Ownership, PHASE 1-3). A group that declares no `relay_range` (every
+group in production today) is still, exactly as before, an exclusive
+whole-matrix owner: its bare "MATRIX_NUMATO_202"-style resource_name
+conflicts with ANYTHING else on that matrix, ranged or not (see
+orchestration/resource_graph.py::_resource_names_conflict()). Two groups
+that both declare a `relay_range` on the same matrix conflict only if
+their ranges actually overlap.
 
-FUTURE: MATRIX SEGMENTATION (explicitly deferred, not implemented here)
+THIS PHASE IS OWNERSHIP-VALIDATION ONLY -- HARDWARE IS STILL UNCHANGED
 =============================================================================
-The long-term hardware intent is that a single relay matrix may
-eventually host multiple battery groups on disjoint channel ranges
-(e.g. MATRIX_NUMATO_202 channels 1-8 -> B1, 9-16 -> B2, ...), with an
-analogous per-channel model for sense-routing. That is NOT implemented
-here, and this validator's current pass/fail rule (exact resource-name
-overlap) is deliberately the wrong rule for it: "MATRIX_NUMATO_202:1-8"
-and "MATRIX_NUMATO_202:5-12" are different strings but overlapping
-channels, so a future segmented-ownership model would need interval-
-overlap logic in this module (and in orchestration/resource_graph.py,
-which this module builds on), plus a channel-range-aware close()/write
-path in hardware/relay_eth.py -- a hardware-safety-philosophy change
-this module does not make. Until that day, every requested group must
-resolve to a distinct whole-matrix resource_name, full stop.
+hardware/relay_eth.py::NumatoRelayMatrix.write_all()/verify_all()/
+close()/_force_all_off_and_verify()/_emergency_all_off()/close_all() are
+completely UNCHANGED and still operate on the WHOLE physical bank. This
+means: even though this validator will now ALLOW two groups with disjoint
+relay_range values to be requested together, actually running them
+concurrently against the SAME physical Numato unit is still unsafe --
+one owner's routine close()/open() still force-off/verify the entire
+bank, which would trip the other owner's relay and very likely their own
+false-positive emergency shutdown. Nothing in config, ownership, or
+resource_graph.py claims otherwise; a channel-range-aware write/verify
+path in hardware/relay_eth.py (and a shared-driver/serialization story in
+orchestration/group_runtime.py, since each GroupRuntime today opens its
+own exclusive socket to the matrix) is a SEPARATE, not-yet-started,
+genuinely safety-critical redesign. Declaring relay_range in config today
+is only useful for validating a FUTURE config shape ahead of that
+redesign -- it must not be used to actually run two groups against one
+physical matrix at the same time yet.
 
-WHY THIS STAYS EXTENSIBLE WITHOUT A REDESIGN
+WHY THIS STAYED EXTENSIBLE WITHOUT A REDESIGN OF THE SURROUNDING LAYERS
 =============================================================================
 This validator, orchestration/concurrent_supervisor.py,
 orchestration/group_runtime.py, and orchestration/group_worker.py all
 identify a matrix purely by the resource_name STRING config/devices.py
-already returns (via hardware_for_group()/topology.py's role reads) --
-none of them parse or assume anything about that string's structure.
-The day config/devices.py starts returning "MATRIX_NUMATO_202:1-8"
-instead of "MATRIX_NUMATO_202" for a channel-range-scoped group, this
-module's usage-map construction and those three classes' consumption of
-it need NO change; only the equality-based conflict check just below
-would need to become an interval-overlap check. That containment is by
-design, not accidental -- see docs/architecture.md "Future Architecture:
-Resource Dependency Graph" for the equivalent note on
-resource_graph.py.
+returns (via hardware_for_group()/topology.py's role reads) -- none of
+them parse or assume anything about that string's structure. That is why
+adding relay_range support needed no change to those three classes, and
+only a contained change to orchestration/resource_graph.py's conflict
+rule (exact equality -> interval overlap, see
+_resource_names_conflict()/_overlapping_resources() there) plus
+topology.py/config/devices.py composing the range into the resource_name
+string in the first place. This module's own check_ownership() needed NO
+logic change: it already consumed resource_graph.py's conflict set
+opaquely by exact string match, and that match still holds since the
+overlap-aware set resource_graph.py now returns is built from the same
+usage-map strings as before.
 """
 
 from __future__ import annotations

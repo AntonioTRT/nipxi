@@ -18,10 +18,11 @@ from orchestration.resource_ownership import (
 )
 
 
-def _group(relay_matrix, smu=None, dmm=None, daq=None, sense_channel=None):
+def _group(relay_matrix, smu=None, dmm=None, daq=None, sense_channel=None, relay_range=None):
     return {
         "enabled": True,
         "relay_matrix": relay_matrix,
+        "relay_range": relay_range,
         "smu": smu,
         "dmm": dmm,
         "daq": daq,
@@ -107,16 +108,25 @@ class MatrixConflictTests(unittest.TestCase):
         report = check_ownership(["B1", "B2"], battery_groups=groups)
         self.assertTrue(report.ok)
 
-    def test_channel_range_style_names_are_treated_as_distinct_today(self):
+    def test_disjoint_channel_range_style_names_do_not_conflict(self):
         """
-        Documents the CURRENT (matrix-level, exact-string) rule: two
-        groups naming DIFFERENT channel-range-style strings on the same
-        physical matrix do NOT conflict under today's equality check --
-        this is expected, not a bug, because channel-range ownership is
-        explicitly deferred (see module docstring's "Future: matrix
-        segmentation"). This test exists to make that boundary explicit
-        and to break loudly the day someone adds real range-overlap
-        logic without updating this test.
+        Matrix + Relay-Range Ownership (Phase 2): two groups naming
+        DIFFERENT, non-overlapping channel-range-style strings on the
+        same physical matrix do NOT conflict -- this used to hold only
+        because the old rule compared resource_name strings for exact
+        equality (a coincidence, not real overlap awareness -- see git
+        history for this test's prior docstring). It still holds now,
+        but for the right reason: orchestration/resource_graph.py::
+        _resource_names_conflict() parses "MATRIX_A:1-8"/"MATRIX_A:9-16"
+        and finds the ranges genuinely disjoint. See
+        test_overlapping_channel_ranges_are_rejected below for the case
+        that DOES change relative to the old exact-string rule.
+
+        NOTE: passing already-suffixed strings straight into
+        relay_matrix (bypassing the relay_range field) instead of using
+        `relay_range=` is deliberate here, matching this test's original
+        form -- it exercises resource_graph.py's string-parsing directly
+        rather than config/devices.py::compose_relay_resource_name().
         """
         groups = {
             "B1": _group("MATRIX_A:1-8"),
@@ -124,6 +134,62 @@ class MatrixConflictTests(unittest.TestCase):
         }
         report = ResourceOwnershipValidator.validate(["B1", "B2"], battery_groups=groups)
         self.assertTrue(report.ok)
+
+    def test_overlapping_channel_ranges_are_rejected(self):
+        """
+        The actual behavior FLIP introduced by Phase 2: under the old
+        exact-string rule, "MATRIX_A:1-8" and "MATRIX_A:5-12" were
+        different strings and would NOT have conflicted, even though
+        they genuinely overlap on relays 5-8. That was always the wrong
+        answer for this case -- this test proves it's now correctly
+        rejected.
+        """
+        groups = {
+            "B1": _group("MATRIX_A", relay_range=(1, 8), smu="SMU_1"),
+            "B2": _group("MATRIX_A", relay_range=(5, 12), smu="SMU_2"),
+        }
+        with self.assertRaises(ResourceOwnershipConflict) as ctx:
+            ResourceOwnershipValidator.validate(["B1", "B2"], battery_groups=groups)
+        conflicts = ctx.exception.conflicts
+        # Each group's own composed resource_name (a distinct string --
+        # "MATRIX_A:1-8" vs "MATRIX_A:5-12") gets its own usage entry, so
+        # the conflict report has one entry per side, not one merged
+        # entry -- unlike the identical-string case in
+        # test_two_requested_groups_sharing_a_relay_matrix_is_rejected.
+        self.assertEqual(len(conflicts), 2)
+        roles = {key.role for key in conflicts}
+        self.assertEqual(roles, {"relay_matrix_name"})
+        owners = {name for names in conflicts.values() for name in names}
+        self.assertEqual(owners, {"B1", "B2"})
+
+    def test_disjoint_relay_range_field_is_allowed(self):
+        """The Option-B example from the architecture study: four groups
+        with disjoint relay_range values on ONE matrix must be allowed."""
+        groups = {
+            "B1": _group("MATRIX_A", relay_range=(1, 8), smu="SMU_1"),
+            "B2": _group("MATRIX_A", relay_range=(9, 16), smu="SMU_2"),
+            "B3": _group("MATRIX_A", relay_range=(17, 24), smu="SMU_3"),
+            "B4": _group("MATRIX_A", relay_range=(25, 32), smu="SMU_4"),
+        }
+        report = ResourceOwnershipValidator.validate(["B1", "B2", "B3", "B4"], battery_groups=groups)
+        self.assertTrue(report.ok)
+
+    def test_whole_matrix_owner_conflicts_with_any_sub_range_owner(self):
+        """
+        A group with NO relay_range is a whole-matrix owner (unchanged
+        pre-Phase-2 meaning) and must still conflict with ANY other group
+        on that matrix, ranged or not -- hardware/relay_eth.py's
+        write_all()/verify_all() safety sequence is unchanged and still
+        touches the whole bank, so a declared sub-range never makes a
+        matrix genuinely partitionable while a whole-matrix owner is
+        also requested on it.
+        """
+        groups = {
+            "B1": _group("MATRIX_A", smu="SMU_1"),  # no relay_range -- whole matrix
+            "B2": _group("MATRIX_A", relay_range=(9, 16), smu="SMU_2"),
+        }
+        with self.assertRaises(ResourceOwnershipConflict):
+            ResourceOwnershipValidator.validate(["B1", "B2"], battery_groups=groups)
 
 
 class SenseRoutingConflictTests(unittest.TestCase):
