@@ -19,6 +19,7 @@ there is no import cycle.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -28,6 +29,11 @@ from datetime import datetime
 from data.rotation import telemetry_database_file
 
 _log = logging.getLogger("nipxi.test_execution_log")
+
+# Same cap raw_hardware_log.py applies to its own JSON-encoded fields -- one
+# pathological raw= payload (an oversized dict, a huge nested structure)
+# must never balloon a single row. See data/raw_hardware_log.py::_safe_json().
+_MAX_RAW_DATA_LEN = 1000
 
 CREATE_TEST_EXECUTION_SQL = """
 CREATE TABLE IF NOT EXISTS test_execution (
@@ -49,7 +55,8 @@ CREATE TABLE IF NOT EXISTS test_execution_step (
     step_order   INTEGER NOT NULL,
     device       TEXT,
     result       TEXT    NOT NULL,
-    detail       TEXT
+    detail       TEXT,
+    raw_data     TEXT
 );
 """
 
@@ -58,6 +65,35 @@ CREATE_TEST_EXECUTION_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_test_execution_timestamp ON test_execution(timestamp);",
     "CREATE INDEX IF NOT EXISTS idx_test_execution_step_exec ON test_execution_step(execution_id);",
 ]
+
+# Additive migration for a test_execution_step table created before raw_data
+# existed -- same "ALTER TABLE ... ADD COLUMN, never touch existing rows"
+# convention data/storage.py::_migrate_add_missing_columns() already uses.
+_TEST_EXECUTION_STEP_MIGRATION_COLUMNS = [("raw_data", "TEXT")]
+
+
+def _migrate_add_missing_columns(conn: sqlite3.Connection, table: str, columns: list) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, sql_type in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+
+
+def _safe_raw_json(raw: dict | None) -> str | None:
+    """JSON-encode `raw` for storage, capped at _MAX_RAW_DATA_LEN. Never
+    raises -- mirrors data/raw_hardware_log.py::_safe_json()."""
+    if raw is None:
+        return None
+    try:
+        text = json.dumps(raw, default=str)
+    except Exception:
+        try:
+            text = repr(raw)
+        except Exception:
+            text = "<unrepresentable>"
+    if len(text) > _MAX_RAW_DATA_LEN:
+        text = text[:_MAX_RAW_DATA_LEN] + "...<truncated>"
+    return text
 
 # Result severity, worst wins -- same PASS/WARNING/FAIL vocabulary as
 # test.py::Status.
@@ -118,6 +154,8 @@ def record_test_executions(settings, results: list, duration_s: float | None = N
             conn.execute(CREATE_TEST_EXECUTION_STEP_SQL)
             for stmt in CREATE_TEST_EXECUTION_INDEXES_SQL:
                 conn.execute(stmt)
+            _migrate_add_missing_columns(conn, "test_execution_step",
+                                          _TEST_EXECUTION_STEP_MIGRATION_COLUMNS)
 
             groups: dict[str, list] = {}
             for r in results:
@@ -139,10 +177,12 @@ def record_test_executions(settings, results: list, duration_s: float | None = N
                 execution_id = cur.lastrowid
                 conn.executemany(
                     "INSERT INTO test_execution_step "
-                    "(execution_id, step_order, device, result, detail) VALUES (?, ?, ?, ?, ?)",
+                    "(execution_id, step_order, device, result, detail, raw_data) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     [
                         (execution_id, i, getattr(s, "device", None),
-                         getattr(s, "status", "PASS"), getattr(s, "details", None))
+                         getattr(s, "status", "PASS"), getattr(s, "details", None),
+                         _safe_raw_json(getattr(s, "raw", None)))
                         for i, s in enumerate(steps)
                     ],
                 )

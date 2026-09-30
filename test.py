@@ -248,12 +248,21 @@ class Status:
 
 class TestResult:
     def __init__(self, status: str, module: str, device: str,
-                 config_ref: str, details: str = ""):
+                 config_ref: str, details: str = "", raw: dict | None = None):
         self.status     = status
         self.module     = module
         self.device     = device
         self.config_ref = config_ref
         self.details    = details
+        # Optional structured raw diagnostic values (e.g. expected/actual
+        # relay bitmasks) -- opt-in per call site, never printed to console
+        # (details already carries the human-readable summary); persisted
+        # as JSON in test_execution_step.raw_data by
+        # data/test_execution_log.py so a historical record can be
+        # root-caused without the original console output. None for every
+        # existing call site that doesn't pass raw= -- fully backward
+        # compatible.
+        self.raw        = raw
 
     def print_detail(self):
         tag = {"PASS": "PASS", "WARNING": "WARN", "FAIL": "FAIL"}[self.status]
@@ -264,14 +273,14 @@ class TestResult:
                 print(f"         {line}")
 
 
-def _ok(module, device, ref, detail=""):
-    return TestResult(Status.PASS, module, device, ref, detail)
+def _ok(module, device, ref, detail="", raw=None):
+    return TestResult(Status.PASS, module, device, ref, detail, raw=raw)
 
-def _warn(module, device, ref, detail):
-    return TestResult(Status.WARNING, module, device, ref, detail)
+def _warn(module, device, ref, detail, raw=None):
+    return TestResult(Status.WARNING, module, device, ref, detail, raw=raw)
 
-def _fail(module, device, ref, detail):
-    return TestResult(Status.FAIL, module, device, ref, detail)
+def _fail(module, device, ref, detail, raw=None):
+    return TestResult(Status.FAIL, module, device, ref, detail, raw=raw)
 
 
 # =============================================================================
@@ -1686,6 +1695,7 @@ def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_r
                 dwell_s = Settings.RELAY_MATRIX_SCAN_DWELL_S
 
                 relay.close(ch)              # ON (READ -> VERIFY -> WRITE -> SETTLE -> READ -> VERIFY, see RelayBase.close())
+                confirmed_on_mask = relay.last_known_mask  # set by close()'s own internal verify_all() read
                 state = relay.read(ch)       # READ (post-activation)
                 relay.log.info(
                     "Relay Matrix Scan: relay %d activated (READ reported %s)",
@@ -1703,16 +1713,20 @@ def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_r
                 relay.log.info(
                     "Relay Matrix Scan: relay %d deactivated", ch,
                 )
+                raw = {"channel": ch, "expected_mask": 1 << (ch - 1),
+                       "confirmed_mask": confirmed_on_mask, "read_state": state}
                 if state:
                     results.append(_ok("Relay Matrix Scan", f"Relay {ch}", config_ref,
-                                       f"ON -> READ -> DWELL {dwell_s:.1f}s -> OFF  OK  (READ reported ON)"))
+                                       f"ON -> READ -> DWELL {dwell_s:.1f}s -> OFF  OK  (READ reported ON)",
+                                       raw=raw))
                 else:
                     results.append(_warn("Relay Matrix Scan", f"Relay {ch}", config_ref,
                                          f"ON -> READ -> DWELL {dwell_s:.1f}s -> OFF sent, but READ reported OFF "
-                                         "-- verify wiring/relay bank"))
+                                         "-- verify wiring/relay bank", raw=raw))
             except Exception as e:
                 results.append(_fail("Relay Matrix Scan", f"Relay {ch}", config_ref,
-                                     f"Reason:\n{_classify_relay_error(e)}"))
+                                     f"Reason:\n{_classify_relay_error(e)}",
+                                     raw={"channel": ch, "error": str(e)}))
             finally:
                 try:
                     relay.open(ch)   # leave each channel in the safe state
@@ -1848,19 +1862,34 @@ def test_relay_ethernet_test(name=None, cfg=None):
                     relay.write_all(0)
                     relay.verify_all(0)
                     relay.settle()   # Settings.RELAY_SETTLE_TIME_S -- see hardware/relay.py::RelayBase.settle()
+                    pre_on_mask = relay.last_known_mask
 
                     relay.write(relay_index, True)
                     relay.verify_all(1 << relay_index)
                     relay.settle()
+                    on_mask = relay.last_known_mask
 
                     relay.write_all(0)
                     relay.verify_all(0)
                     relay.settle()
+                    final_mask = relay.last_known_mask
 
                     results.append(_ok(
                         "RelayEthernetTest", f"Relay index {relay_index}", config_ref,
                         "read_all (pre-check) -> write_all(OFF) -> verify -> settle -> write(ON) -> "
-                        "verify -> settle -> write_all(OFF) -> verify -> settle  PASS"
+                        "verify -> settle -> write_all(OFF) -> verify -> settle  PASS",
+                        # Exact masks each verify_all() call above confirmed
+                        # (relay.last_known_mask, set by that call's own
+                        # internal read_all()) -- captured verbatim, not
+                        # re-derived, for later root-cause analysis.
+                        raw={
+                            "relay_index": relay_index,
+                            "write_all_mask": 0,
+                            "pre_on_verify_mask": pre_on_mask,
+                            "expected_mask": 1 << relay_index,
+                            "actual_mask": on_mask,
+                            "final_verify_mask": final_mask,
+                        },
                     ))
                 except Exception as e:
                     results.append(_fail(
@@ -1868,7 +1897,9 @@ def test_relay_ethernet_test(name=None, cfg=None):
                         f"Relay Number    : {relay_index}\n"
                         f"Expected State  : see sequence step that failed above\n"
                         f"Actual State    : verification failed (see cause)\n"
-                        f"Cause           : {e}"
+                        f"Cause           : {e}",
+                        raw={"relay_index": relay_index, "expected_mask": 1 << relay_index,
+                             "actual_mask": relay.last_known_mask, "error": str(e)},
                     ))
                     stopped_early = True
                     break   # fail immediately -- do not continue to remaining relays
@@ -1969,8 +2000,15 @@ def test_relay_safety_selftest(name=None, cfg=None):
             print(f"\n  -- Relay {ch}/{num_channels} --")
             try:
                 relay.close(ch)   # OFF ALL -> VERIFY OFF -> ON ch -> VERIFY ch-only-ON
+                # relay.last_known_mask is set by the internal verify_all()
+                # bulk read that just confirmed this PASS -- the exact mask
+                # this decision was made from, captured verbatim (not
+                # re-derived) for root-cause analysis later.
                 results.append(_ok("Relay Safety Self-Test", f"Relay {ch}", config_ref,
-                                   f"OFF ALL -> VERIFY OFF -> ON {ch} -> VERIFY {ch} only  PASS"))
+                                   f"OFF ALL -> VERIFY OFF -> ON {ch} -> VERIFY {ch} only  PASS",
+                                   raw={"relay": ch, "expected_mask": 1 << (ch - 1),
+                                        "actual_mask": relay.last_known_mask,
+                                        "verification_result": "PASS"}))
                 relay.open(ch)    # OFF ALL -> VERIFY OFF, restore safe state before next channel
             except Exception as e:
                 results.append(_fail(
@@ -1978,7 +2016,10 @@ def test_relay_safety_selftest(name=None, cfg=None):
                     f"Relay Number    : {ch}\n"
                     f"Expected State  : ONLY relay {ch} ON, all others OFF\n"
                     f"Actual State    : verification failed (see cause)\n"
-                    f"Cause           : {e}"
+                    f"Cause           : {e}",
+                    raw={"relay": ch, "expected_mask": 1 << (ch - 1),
+                         "actual_mask": relay.last_known_mask,
+                         "verification_result": "FAIL", "error": str(e)}
                 ))
                 stopped_early = True
                 break   # STOP IMMEDIATELY -- do not continue to remaining channels
@@ -2182,6 +2223,12 @@ def test_native_relay_coexistence_probe(name=None, cfg=None):
                 relay.write(_addr_to_index(b_relay), True)
                 relay.settle()
                 b_unexpected_events = []
+                # Raw per-(a_relay, b_relay) observations -- exactly the
+                # values this probe's own PASS/WARNING decisions above are
+                # made from, kept verbatim (not summarized) so a future
+                # engineer can reconstruct the sweep from the persisted
+                # test_execution_step.raw_data without the console output.
+                raw_observations = []
 
                 for a_relay in range_a:
                     try:
@@ -2198,6 +2245,11 @@ def test_native_relay_coexistence_probe(name=None, cfg=None):
                     bitmap = relay.read_all()
                     expected = _bit(b_relay) | _bit(a_relay)
                     unexpected = _log_step(b_relay, a_relay, "ON", expected, bitmap)
+                    raw_observations.append({
+                        "a_relay": a_relay, "b_relay": b_relay, "a_state": "ON",
+                        "expected_mask": expected, "actual_mask": bitmap,
+                        "unexpected_mask": unexpected,
+                    })
                     if not (bitmap & _bit(b_relay)):
                         b_unexpected_events.append(
                             f"Relay B {b_relay} was CLEARED while turning Relay A {a_relay} ON")
@@ -2215,6 +2267,11 @@ def test_native_relay_coexistence_probe(name=None, cfg=None):
                     bitmap = relay.read_all()
                     expected = _bit(b_relay)
                     unexpected = _log_step(b_relay, a_relay, "OFF", expected, bitmap)
+                    raw_observations.append({
+                        "a_relay": a_relay, "b_relay": b_relay, "a_state": "OFF",
+                        "expected_mask": expected, "actual_mask": bitmap,
+                        "unexpected_mask": unexpected,
+                    })
                     if not (bitmap & _bit(b_relay)):
                         b_unexpected_events.append(
                             f"Relay B {b_relay} was CLEARED while turning Relay A {a_relay} OFF")
@@ -2229,6 +2286,9 @@ def test_native_relay_coexistence_probe(name=None, cfg=None):
                 bitmap = relay.read_all()
                 b_final_on = bool(bitmap & _bit(b_relay))
                 unexpected = bitmap ^ _bit(b_relay)
+                final_sweep_expected_mask = _bit(b_relay)
+                final_sweep_actual_mask = bitmap
+                final_sweep_unexpected_mask = unexpected
                 print(f"    Relay B {b_relay} after full Range A sweep -- "
                       f"Expected: 0x{_bit(b_relay):08X}  Actual: 0x{bitmap:08X}"
                       + ("  ** UNEXPECTED CHANGE (diff=0x%08X) **" % unexpected if unexpected else ""))
@@ -2248,13 +2308,22 @@ def test_native_relay_coexistence_probe(name=None, cfg=None):
 
                 per_b_summary.append((b_relay, b_final_on, b_unexpected_events))
 
+                raw = {
+                    "b_relay": b_relay,
+                    "observations": raw_observations,
+                    "final_sweep_check": {
+                        "expected_mask": final_sweep_expected_mask,
+                        "actual_mask": final_sweep_actual_mask,
+                        "unexpected_mask": final_sweep_unexpected_mask,
+                    },
+                }
                 if b_unexpected_events:
                     results.append(_warn(label, f"Relay B {b_relay}", config_ref,
-                                         "\n".join(b_unexpected_events)))
+                                         "\n".join(b_unexpected_events), raw=raw))
                 else:
                     results.append(_ok(label, f"Relay B {b_relay}", config_ref,
                                        f"Remained ON throughout Range A's full sweep ({lo_a}-{hi_a}); "
-                                       f"no unexpected bits observed"))
+                                       f"no unexpected bits observed", raw=raw))
 
             # Best-effort final safe state regardless of outcome -- uses the
             # SAME unmodified native primitives, never a fix, never a
