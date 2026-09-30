@@ -6042,9 +6042,17 @@ def run_section(label, fn):
     print(f"\n{'-' * 60}")
     print(f"  {label}")
     print(f"{'-' * 60}")
+    start = time.perf_counter()
     results = fn()
+    duration_s = time.perf_counter() - start
     for r in results:
         r.print_detail()
+    try:
+        from data.test_execution_log import record_test_executions
+        record_test_executions(Settings, results, duration_s)
+    except Exception as e:
+        logging.getLogger("nipxi.test_execution_log").warning(
+            "Could not persist test execution record for %r: %s", label, e)
     return results
 
 
