@@ -34,6 +34,12 @@ from test_control.storage_session import (
     start_run_summary_guarded as _shared_start_run_summary_guarded,
 )
 from test_control.ntc_snapshot import ntc_group_snapshot as _shared_ntc_group_snapshot
+from test_control.diagnostic_audit import (
+    instrumented_relay as _instrumented_relay,
+    instrumented_smu as _instrumented_smu,
+    instrumented_dmm as _instrumented_dmm,
+    instrumented_daq as _instrumented_daq,
+)
 from utils.event_format import EventType, format_event
 
 # Suppress NI driver / serial noise during tests
@@ -445,8 +451,7 @@ def _identify_smu(name: str, cfg: dict):
     display  = dev_cfg.device_display_name(cfg)
     ref      = f"config/devices.py -> SMU_ASSIGNMENTS[{name!r}] ({resource} / {model})"
 
-    from hardware.smu import SMU
-    smu = SMU(cfg)
+    smu = _instrumented_smu(cfg)
     try:
         smu.connect()
         identity = smu.identify()
@@ -478,8 +483,7 @@ def _identify_dmm(name: str, cfg: dict):
     display  = dev_cfg.device_display_name(cfg)
     ref      = f"config/devices.py -> DMM_CONFIGS[{name!r}] ({resource} / {model})"
 
-    from hardware.dmm import DMM
-    dmm = DMM(cfg)
+    dmm = _instrumented_dmm(cfg)
     try:
         dmm.connect()
         identity = dmm.identify()
@@ -512,8 +516,7 @@ def _identify_daq(name: str, cfg: dict):
     display  = dev_cfg.device_display_name(cfg)
     ref      = f"config/devices.py -> DAQ_CONFIGS[{name!r}] ({resource} / {model})"
 
-    from hardware.daq import DAQ
-    daq = DAQ(cfg)
+    daq = _instrumented_daq(cfg)
     try:
         daq.connect()
         identity = daq.identify()
@@ -553,8 +556,7 @@ def _identify_temperature(name: str, cfg: dict):
     display  = dev_cfg.device_display_name(cfg)
     ref      = f"config/devices.py -> PXI_SLOTS[{name!r}] ({resource} / {model})"
 
-    from hardware.daq import DAQ
-    daq = DAQ(cfg)
+    daq = _instrumented_daq(cfg)
     try:
         daq.connect()
         identity = daq.identify()
@@ -592,8 +594,7 @@ def _identify_relay_eth(name: str, cfg: dict):
     ref     = f"config/devices.py -> NUMATO_RELAY_MATRIX_CONFIGS[{name!r}] ({driver} / {host}:{port})"
 
     try:
-        from hardware.relay_factory import RelayFactory
-        relay = RelayFactory.create(cfg)
+        relay = _instrumented_relay(cfg)
     except Exception as e:
         return _fail("Hardware Discovery", f"Numato Relay Matrix: {display}", ref,
                      f"Import / factory error: {e}")
@@ -625,8 +626,7 @@ def _identify_relay_serial(name: str, cfg: dict):
     baud = cfg.get("baud_rate", Settings.RELAY_BAUD_RATE)
     ref  = f"config/devices.py -> RELAY_SERIAL_CONFIGS[{name!r}] ({port} / {baud} baud)"
 
-    from hardware.relay_factory import RelayFactory
-    relay = RelayFactory.create(cfg)
+    relay = _instrumented_relay(cfg)
     try:
         relay.connect()
         return _ok("Hardware Discovery", f"Relay (Serial): {name}", ref,
@@ -903,8 +903,7 @@ def _functional_smu(name: str, cfg: dict):
         return [_warn("SMU Functional", display, config_ref,
                       "Cancelled by operator before sourcing began")]
 
-    from hardware.smu import SMU
-    smu = SMU(cfg)
+    smu = _instrumented_smu(cfg)
     try:
         smu.connect()
     except Exception as e:
@@ -1061,8 +1060,7 @@ def _functional_dmm(name: str, cfg: dict):
         return [_warn("DMM Functional", display, config_ref,
                       "Cancelled by operator before measurement began")]
 
-    from hardware.dmm import DMM
-    dmm = DMM(cfg)
+    dmm = _instrumented_dmm(cfg)
     try:
         dmm.connect()
     except Exception as e:
@@ -1138,8 +1136,7 @@ def _functional_daq(name: str, cfg: dict):
     test_ch    = dev_cfg.BATTERY_GROUPS["B1"]["positions"][1]["daq_voltage_ch"]
     results    = []
 
-    from hardware.daq import DAQ
-    daq = DAQ(cfg)
+    daq = _instrumented_daq(cfg)
     try:
         daq.connect()
     except Exception as e:
@@ -1228,9 +1225,8 @@ def test_relay_serial():
 
     # Step 1: factory + interface check  -- offline, no hardware ---------------
     try:
-        from hardware.relay_factory import RelayFactory
         from hardware.relay import RelayBase
-        relay = RelayFactory.create(cfg)
+        relay = _instrumented_relay(cfg)
         if not isinstance(relay, RelayBase):
             results.append(_fail("Relay Serial", "Factory", config_ref,
                                  "RelayFactory did not return a RelayBase instance"))
@@ -1446,9 +1442,8 @@ def _run_relay_numato_matrix_test(cfg, name, host, port, driver, user, config_re
 
     # Step 1: factory + interface check  -- offline, no hardware ---------------
     try:
-        from hardware.relay_factory import RelayFactory
         from hardware.relay import RelayBase
-        relay = RelayFactory.create(cfg)
+        relay = _instrumented_relay(cfg)
         if not isinstance(relay, RelayBase):
             results.append(_fail("Numato Relay Matrix", "Factory", config_ref,
                                  "RelayFactory did not return a RelayBase instance"))
@@ -1643,8 +1638,7 @@ def _run_relay_matrix_scan(cfg, host, port, driver, user, num_channels, config_r
 
     results = []
     try:
-        from hardware.relay_factory import RelayFactory
-        relay = RelayFactory.create(cfg)
+        relay = _instrumented_relay(cfg)
     except Exception as e:
         results.append(_fail("Relay Matrix Scan", "Factory", config_ref,
                              f"Import / factory error: {e}"))
@@ -1800,8 +1794,7 @@ def test_relay_ethernet_test(name=None, cfg=None):
     results     = []
 
     try:
-        from hardware.relay_factory import RelayFactory
-        relay = RelayFactory.create(cfg)
+        relay = _instrumented_relay(cfg)
     except Exception as e:
         return [_fail("RelayEthernetTest", "Factory", config_ref,
                       f"Import / factory error: {e}")]
@@ -1974,8 +1967,7 @@ def test_relay_safety_selftest(name=None, cfg=None):
     results      = []
 
     try:
-        from hardware.relay_factory import RelayFactory
-        relay = RelayFactory.create(cfg)
+        relay = _instrumented_relay(cfg)
     except Exception as e:
         return [_fail("Relay Safety Self-Test", "Factory", config_ref,
                       f"Import / factory error: {e}")]
@@ -2163,8 +2155,7 @@ def test_native_relay_coexistence_probe(name=None, cfg=None):
     print(f"Range B = relays {lo_b}-{hi_b}")
 
     try:
-        from hardware.relay_factory import RelayFactory
-        relay = RelayFactory.create(cfg)
+        relay = _instrumented_relay(cfg)
     except Exception as e:
         return [_fail(label, "Factory", config_ref, f"Import / factory error: {e}")]
 
@@ -2758,9 +2749,8 @@ def test_sensors():
         return results
 
     daq_ref = f"{selected_device} / {ntc_daq_cfg.get('model', 'N/A')} (session-selected)"
-    from hardware.daq import DAQ
     session_daq_cfg = {**ntc_daq_cfg, "resource": selected_device}
-    daq = DAQ(session_daq_cfg)
+    daq = _instrumented_daq(session_daq_cfg)
 
     # Consolidated NTC Summary rows -- built alongside the existing
     # per-channel PASS/WARN/FAIL results below, from the SAME acquired
@@ -6111,14 +6101,20 @@ def run_section(label, fn):
     print(f"\n{'-' * 60}")
     print(f"  {label}")
     print(f"{'-' * 60}")
+    from test_control.diagnostic_audit import begin_diagnostic, end_diagnostic
+    hardware_session_tag = begin_diagnostic(label)
     start = time.perf_counter()
-    results = fn()
+    try:
+        results = fn()
+    finally:
+        end_diagnostic()
     duration_s = time.perf_counter() - start
     for r in results:
         r.print_detail()
     try:
         from data.test_execution_log import record_test_executions
-        record_test_executions(Settings, results, duration_s)
+        record_test_executions(Settings, results, duration_s,
+                                hardware_session_tag=hardware_session_tag)
     except Exception as e:
         logging.getLogger("nipxi.test_execution_log").warning(
             "Could not persist test execution record for %r: %s", label, e)

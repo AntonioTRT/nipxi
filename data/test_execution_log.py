@@ -43,14 +43,15 @@ _MAX_RAW_DATA_LEN = 200_000
 
 CREATE_TEST_EXECUTION_SQL = """
 CREATE TABLE IF NOT EXISTS test_execution (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp      TEXT    NOT NULL,
-    test_name      TEXT    NOT NULL,
-    config_ref     TEXT,
-    duration_s     REAL,
-    overall_result TEXT    NOT NULL,
-    git_branch     TEXT,
-    git_commit     TEXT
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp             TEXT    NOT NULL,
+    test_name             TEXT    NOT NULL,
+    config_ref            TEXT,
+    duration_s            REAL,
+    overall_result        TEXT    NOT NULL,
+    git_branch            TEXT,
+    git_commit            TEXT,
+    hardware_session_tag  TEXT
 );
 """
 
@@ -76,6 +77,12 @@ CREATE_TEST_EXECUTION_INDEXES_SQL = [
 # existed -- same "ALTER TABLE ... ADD COLUMN, never touch existing rows"
 # convention data/storage.py::_migrate_add_missing_columns() already uses.
 _TEST_EXECUTION_STEP_MIGRATION_COLUMNS = [("raw_data", "TEXT")]
+
+# Additive migration for a test_execution table created before
+# hardware_session_tag existed (see test_control/diagnostic_audit.py --
+# the TEST_<timestamp>_<test_name> correlation tag joining this table to
+# raw_hardware_log.run_id).
+_TEST_EXECUTION_MIGRATION_COLUMNS = [("hardware_session_tag", "TEXT")]
 
 
 def _migrate_add_missing_columns(conn: sqlite3.Connection, table: str, columns: list) -> None:
@@ -137,11 +144,21 @@ def _overall_result(statuses: list) -> str:
     return worst if worst in _SEVERITY else "PASS"
 
 
-def record_test_executions(settings, results: list, duration_s: float | None = None) -> None:
+def record_test_executions(settings, results: list, duration_s: float | None = None,
+                            hardware_session_tag: str | None = None) -> None:
     """
     Persist one test_execution + N test_execution_step row(s) per distinct
     `module` value found in `results` (a list of test.py::TestResult-like
     objects: status/module/device/config_ref/details attributes).
+
+    `hardware_session_tag`, if given, is the SAME TEST_<timestamp>_<test_
+    name> correlation tag test_control/diagnostic_audit.py attached to
+    this diagnostic's raw_hardware_log rows (via instrument_hardware_
+    instance()'s run_id_provider) -- stored verbatim so a query can JOIN
+    test_execution.hardware_session_tag = raw_hardware_log.run_id to go
+    from a PASS/FAIL row straight to the exact hardware commands that
+    produced it. None for a diagnostic that touches no instrumented
+    hardware (e.g. test_configuration()).
 
     Best-effort: any failure (missing DATA_DIR, locked file, disk full) is
     logged as a warning and swallowed -- persistence must never interrupt
@@ -162,6 +179,8 @@ def record_test_executions(settings, results: list, duration_s: float | None = N
                 conn.execute(stmt)
             _migrate_add_missing_columns(conn, "test_execution_step",
                                           _TEST_EXECUTION_STEP_MIGRATION_COLUMNS)
+            _migrate_add_missing_columns(conn, "test_execution",
+                                          _TEST_EXECUTION_MIGRATION_COLUMNS)
 
             groups: dict[str, list] = {}
             for r in results:
@@ -177,8 +196,9 @@ def record_test_executions(settings, results: list, duration_s: float | None = N
                 cur = conn.execute(
                     "INSERT INTO test_execution "
                     "(timestamp, test_name, config_ref, duration_s, overall_result, "
-                    " git_branch, git_commit) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (timestamp, test_name, config_ref, duration_s, overall, branch, commit),
+                    " git_branch, git_commit, hardware_session_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (timestamp, test_name, config_ref, duration_s, overall, branch, commit,
+                     hardware_session_tag),
                 )
                 execution_id = cur.lastrowid
                 conn.executemany(
