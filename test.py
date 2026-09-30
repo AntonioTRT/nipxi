@@ -6097,27 +6097,131 @@ MENU = [
 ]
 
 
-def run_section(label, fn):
-    print(f"\n{'-' * 60}")
-    print(f"  {label}")
-    print(f"{'-' * 60}")
-    from test_control.diagnostic_audit import begin_diagnostic, end_diagnostic
-    hardware_session_tag = begin_diagnostic(label)
-    start = time.perf_counter()
-    try:
-        results = fn()
-    finally:
-        end_diagnostic()
-    duration_s = time.perf_counter() - start
-    for r in results:
-        r.print_detail()
+#: Steps every diagnostic's own connect/setup phase is already named after
+#: (see e.g. test_native_relay_coexistence_probe/test_relay_ethernet_test/
+#: test_relay_safety_selftest/every _identify_*() Hardware Discovery helper)
+#: -- used below to generically approximate "Test logic started" as the
+#: first step AFTER setup, without any individual test needing to say so
+#: itself. A test that doesn't follow this naming convention just gets
+#: "Test logic started" collapsed to the same instant as "Test started" --
+#: degraded granularity, never a failure.
+_LIFECYCLE_SETUP_STEP_NAMES = frozenset({"Factory", "Connect + Auth"})
+
+
+def _persist_lifecycle(label, hardware_session_tag, events, duration_s):
+    """Best-effort persistence of synthetic lifecycle events -- same
+    test_execution/test_execution_step path real diagnostic steps use,
+    module=label so they always form their own dedicated test_execution
+    row (see run_section()'s docstring below for why), correlated to the
+    diagnostic's own row(s) via the shared hardware_session_tag."""
     try:
         from data.test_execution_log import record_test_executions
-        record_test_executions(Settings, results, duration_s,
+        record_test_executions(Settings, events, duration_s,
                                 hardware_session_tag=hardware_session_tag)
     except Exception as e:
         logging.getLogger("nipxi.test_execution_log").warning(
-            "Could not persist test execution record for %r: %s", label, e)
+            "Could not persist lifecycle record for %r: %s", label, e)
+
+
+def run_section(label, fn):
+    """
+    Run one MENU entry's fn() and persist its results, exactly as before,
+    PLUS a generic, centrally-derived set of lifecycle events -- Test
+    started / Test logic started / Warning condition detected / Anomaly
+    detected / Test completed / Test aborted -- requiring zero changes
+    inside any individual test.py diagnostic (current or future).
+
+    Lifecycle events are persisted with module=label (the MENU label,
+    e.g. "Test Numato Relay Matrix (Ethernet)"), which is ALWAYS distinct
+    from whatever module name(s) the diagnostic itself uses internally
+    (e.g. "Native Relay Coexistence Probe") -- so they land in their OWN
+    dedicated test_execution row rather than being interleaved into the
+    diagnostic's existing step list (preserving that list's shape exactly
+    as every existing query/report already expects). The two rows share
+    the same hardware_session_tag and near-identical timestamps, so a
+    JOIN on hardware_session_tag reconstructs the full timeline -- see
+    the module-level query examples in the "Universal Test Lifecycle
+    Tracking" design review.
+    """
+    print(f"\n{'-' * 60}")
+    print(f"  {label}")
+    print(f"{'-' * 60}")
+    from datetime import datetime
+    from test_control.diagnostic_audit import begin_diagnostic, end_diagnostic
+    hardware_session_tag = begin_diagnostic(label)
+    start_wall = datetime.now()
+    start = time.perf_counter()
+
+    try:
+        results = fn()
+    except Exception as exc:
+        duration_s = time.perf_counter() - start
+        end_diagnostic()
+        events = [
+            _ok(label, "Test started", f"MENU entry: {label}", "", raw={
+                "timestamp": start_wall.isoformat(),
+                "hardware_session_tag": hardware_session_tag,
+            }),
+            _fail(label, "Test aborted", f"MENU entry: {label}",
+                  f"Unhandled exception: {type(exc).__name__}: {exc}", raw={
+                      "timestamp": datetime.now().isoformat(),
+                      "hardware_session_tag": hardware_session_tag,
+                      "duration_s": duration_s,
+                      "abort_reason": "unhandled_exception",
+                      "exception_type": type(exc).__name__,
+                      "exception_message": str(exc),
+                  }),
+        ]
+        _persist_lifecycle(label, hardware_session_tag, events, duration_s)
+        raise  # preserve existing exception handling in _dispatch_menu_choice() exactly
+
+    end_diagnostic()
+    duration_s = time.perf_counter() - start
+    for r in results:
+        r.print_detail()
+
+    # --- Generic lifecycle events, derived entirely from `results` and
+    # timing already available here -- no per-diagnostic code involved. ---
+    logic_started_step = next(
+        (r for r in results if getattr(r, "device", None) not in _LIFECYCLE_SETUP_STEP_NAMES),
+        None,
+    )
+    lifecycle_events = [
+        _ok(label, "Test started", f"MENU entry: {label}", "", raw={
+            "timestamp": start_wall.isoformat(),
+            "hardware_session_tag": hardware_session_tag,
+        }),
+        _ok(label, "Test logic started", f"MENU entry: {label}", "", raw={
+            "hardware_session_tag": hardware_session_tag,
+            "first_logic_step": getattr(logic_started_step, "device", None),
+        }),
+    ]
+
+    warning_steps = [r for r in results if getattr(r, "status", None) == Status.WARNING]
+    if warning_steps:
+        devices = [getattr(r, "device", None) for r in warning_steps]
+        lifecycle_events.append(_warn(
+            label, "Warning condition detected", f"MENU entry: {label}",
+            f"{len(warning_steps)} step(s) reported WARNING: {', '.join(map(str, devices))}",
+            raw={"hardware_session_tag": hardware_session_tag, "warning_steps": devices},
+        ))
+
+    anomaly_steps = [r for r in results if getattr(r, "status", None) == Status.FAIL]
+    if anomaly_steps:
+        devices = [getattr(r, "device", None) for r in anomaly_steps]
+        lifecycle_events.append(_fail(
+            label, "Anomaly detected", f"MENU entry: {label}",
+            f"{len(anomaly_steps)} step(s) reported FAIL: {', '.join(map(str, devices))}",
+            raw={"hardware_session_tag": hardware_session_tag, "anomaly_steps": devices},
+        ))
+
+    lifecycle_events.append(_ok(label, "Test completed", f"MENU entry: {label}", "", raw={
+        "timestamp": datetime.now().isoformat(),
+        "hardware_session_tag": hardware_session_tag,
+        "duration_s": duration_s,
+    }))
+
+    _persist_lifecycle(label, hardware_session_tag, results + lifecycle_events, duration_s)
     return results
 
 
