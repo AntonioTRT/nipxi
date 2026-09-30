@@ -30,10 +30,16 @@ from data.rotation import telemetry_database_file
 
 _log = logging.getLogger("nipxi.test_execution_log")
 
-# Same cap raw_hardware_log.py applies to its own JSON-encoded fields -- one
-# pathological raw= payload (an oversized dict, a huge nested structure)
-# must never balloon a single row. See data/raw_hardware_log.py::_safe_json().
-_MAX_RAW_DATA_LEN = 1000
+# Safety guard, not a real-world limit: measured worst-case payloads top out
+# around 65 KB (Native Relay Coexistence Probe, a full 32-channel matrix
+# split 16/16 -- the product-maximizing case) -- see the "raw_data
+# truncation" design review. 200,000 chars gives ~3x headroom over that
+# measured worst case so no legitimate diagnostic payload from any of
+# these four test.py functions is ever truncated; it exists only to catch
+# a genuine bug (e.g. a runaway loop appending observations indefinitely)
+# before it writes an unbounded row. See data/raw_hardware_log.py::
+# _safe_json() for the equivalent guard on that table's fields.
+_MAX_RAW_DATA_LEN = 200_000
 
 CREATE_TEST_EXECUTION_SQL = """
 CREATE TABLE IF NOT EXISTS test_execution (
