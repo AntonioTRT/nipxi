@@ -20,8 +20,19 @@ REQUIRED_FIELDS = {
     "dmm":            ("resource",),
     "daq":            ("resource",),
     "relay_ethernet": ("ip", "port", "channel_count"),
+    "relay_niswitch": ("resource", "channel_count"),
     "relay_serial":   ("port",),
 }
+
+# Registry kinds that are relay matrices driven through RelayFactory.
+_RELAY_MATRIX_KINDS = ("relay_ethernet", "relay_niswitch")
+
+
+def _relay_matrix_configs(dev_cfg) -> dict:
+    """Every relay matrix cfg, any vendor/transport. Falls back to the
+    Numato-only dict for a config object that predates the vendor-neutral
+    RELAY_MATRIX_CONFIGS registry."""
+    return getattr(dev_cfg, "RELAY_MATRIX_CONFIGS", None) or getattr(dev_cfg, "NUMATO_RELAY_MATRIX_CONFIGS", {})
 
 
 def _build_registry(dev_cfg) -> list:
@@ -33,8 +44,9 @@ def _build_registry(dev_cfg) -> list:
         registry.append(("dmm", name, cfg))
     for name, cfg in dev_cfg.DAQ_CONFIGS.items():
         registry.append(("daq", name, cfg))
-    for name, cfg in dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS.items():
-        registry.append(("relay_ethernet", name, cfg))
+    for name, cfg in _relay_matrix_configs(dev_cfg).items():
+        kind = "relay_niswitch" if cfg.get("type", "").lower() == "niswitch" else "relay_ethernet"
+        registry.append((kind, name, cfg))
     for name, cfg in dev_cfg.RELAY_SERIAL_CONFIGS.items():
         registry.append(("relay_serial", name, cfg))
     return registry
@@ -49,7 +61,7 @@ def _check_required_fields(kind: str, name: str, cfg: dict, errors: list):
 def _check_factory_type(kind: str, name: str, cfg: dict, errors: list):
     """Every relay 'type' must be registered in RelayFactory (SMU/DMM/DAQ have
     exactly one driver class each -- there is no type dispatch to check)."""
-    if kind not in ("relay_ethernet", "relay_serial"):
+    if kind not in (*_RELAY_MATRIX_KINDS, "relay_serial"):
         return
     from hardware.relay_factory import RelayFactory
     relay_type = cfg.get("type", "").lower()
@@ -74,7 +86,7 @@ def _check_instantiable(kind: str, name: str, cfg: dict, errors: list):
         elif kind == "daq":
             from hardware.daq import DAQ
             DAQ(cfg)
-        elif kind in ("relay_ethernet", "relay_serial"):
+        elif kind in (*_RELAY_MATRIX_KINDS, "relay_serial"):
             from hardware.relay_factory import RelayFactory
             RelayFactory.create(cfg)
     except Exception as e:
@@ -94,10 +106,10 @@ def _check_duplicate_names(registry: list, errors: list):
 
 
 def _check_duplicate_resources(registry: list, errors: list):
-    """SMU/DMM/DAQ share the same PXI bus -- no two may claim the same VISA resource."""
+    """SMU/DMM/DAQ/PXI switch share the same PXI bus -- no two may claim the same VISA resource."""
     seen = {}
     for kind, name, cfg in registry:
-        if kind not in ("smu", "dmm", "daq"):
+        if kind not in ("smu", "dmm", "daq", "relay_niswitch"):
             continue
         resource = cfg.get("resource")
         if not resource:
@@ -182,7 +194,7 @@ def _check_relay_count_consistency(dev_cfg, positions: dict, errors: list):
     """
     from config.settings import Settings
 
-    for name, cfg in dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS.items():
+    for name, cfg in _relay_matrix_configs(dev_cfg).items():
         num_channels  = cfg.get("num_channels")
         channel_count = cfg.get("channel_count")
         if num_channels != channel_count:
@@ -190,7 +202,10 @@ def _check_relay_count_consistency(dev_cfg, positions: dict, errors: list):
                 f"relay '{name}': num_channels ({num_channels}) != "
                 f"channel_count ({channel_count}) -- must match"
             )
-        if channel_count != Settings.RELAY_COUNT:
+        # Settings.RELAY_COUNT is the Numato bank size (32). Other matrix
+        # types (e.g. niswitch) carry their own channel_count and are not
+        # bound to it.
+        if cfg.get("type", "ethernet").lower() == "ethernet" and channel_count != Settings.RELAY_COUNT:
             errors.append(
                 f"relay '{name}': channel_count ({channel_count}) != "
                 f"Settings.RELAY_COUNT ({Settings.RELAY_COUNT}) -- "
@@ -236,7 +251,7 @@ def _check_relay_range_definitions(dev_cfg, errors: list):
     activates once a config actually starts using `relay_range`.
     """
     groups = getattr(dev_cfg, "BATTERY_GROUPS", {})
-    matrix_configs = getattr(dev_cfg, "NUMATO_RELAY_MATRIX_CONFIGS", {})
+    matrix_configs = _relay_matrix_configs(dev_cfg)
 
     by_matrix: dict = {}
     for group, grp in groups.items():

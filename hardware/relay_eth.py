@@ -476,6 +476,16 @@ class NumatoRelayMatrix(RelayBase):
         """Alias for query() -- matches the manufacturer's "relay read N" naming."""
         return self.query(channel)
 
+    def closed_channels(self) -> list:
+        """
+        1-based channels currently ON, from ONE native "relay readall"
+        instead of RelayBase's generic per-channel query() loop (32 "relay
+        read" round trips). Read-only optimization: it never writes and is
+        not part of close()/open()/open_all(), which keep verifying with
+        their own readbacks exactly as before.
+        """
+        return self._mask_to_channels(self.read_all())
+
     def open_all(self):
         """Open (de-energize) every relay: force-all-off + verify."""
         self._force_all_off_and_verify()

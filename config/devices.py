@@ -234,18 +234,26 @@ PXI_SLOTS = {
         "nickname":      "CHASSIS_RELAY_MATRIX",
         "driver_family": "niswitch",
         "category":      "switch",
-        "role":          "PXI-resident electromechanical relay/switch matrix -- "
-                          "present in the chassis but NOT the active relay driver.",
-        "enabled":       False,
-        "validation_notes": "The original VI plan (flowcharts/vi plan.md: "
-                             "'2569 relay') anticipated this card as THE relay "
-                             "matrix. The implemented production relay path is "
-                             "instead the Numato Lab 32-Channel Ethernet Relay "
-                             "Module (see NUMATO_RELAY_MATRIX_CONFIG below), which "
-                             "is what hardware/relay_eth.py actually drives. This "
-                             "card has no driver class in this codebase today -- "
-                             "repurposing it would need a future niswitch-based "
-                             "hardware/switch.py, not implemented here.",
+        "role":          "PXI-resident electromechanical relay matrix (100 SPST) -- "
+                          "driven by hardware/relay_niswitch.py with the same safety "
+                          "model as the Numato matrices. Not yet assigned to any "
+                          "BATTERY_GROUPS entry.",
+        "enabled":       True,
+        # Relay count/topology: NI-SWITCH topology "2569/100-SPST" (100
+        # independent SPST relays). channel_count must equal the card's
+        # reported relay count -- the driver refuses to connect otherwise.
+        "channel_count": 100,
+        "topology":      "2569/100-SPST",
+        "validation_notes": "Driven by hardware/relay_niswitch.py "
+                             "(NIPXIe2569RelayMatrix, registered as relay type "
+                             "'niswitch'). Requires the python 'niswitch' package "
+                             "and the NI-SWITCH driver. Hardware validation: "
+                             "Test PXI Relay Matrix -> Functional Validation "
+                             "(Relay Range Validation). Logical channel N is "
+                             "assumed to be relay N in the card's own relay list "
+                             "-- confirm on the rack with the validation's dwell. "
+                             "The Numato matrices remain the production relay "
+                             "path.",
     },
     # -------------------------------------------------------------------
     # Hardware cleanup (post-Milestone-II Phase 3 review): TEMP_MODULE
@@ -878,7 +886,7 @@ def hardware_for_group(group: str) -> dict:
     ntc_daq_key = grp.get("ntc_daq") or grp["daq"]
     return {
         "relay_matrix_name": compose_relay_resource_name(grp["relay_matrix"], grp.get("relay_range")),
-        "relay_matrix_cfg":  ETHERNET_DEVICES.get(grp["relay_matrix"]),
+        "relay_matrix_cfg":  RELAY_MATRIX_CONFIGS.get(grp["relay_matrix"]),
         "smu_name": grp["smu"],
         "smu_cfg":  SMU_ASSIGNMENTS.get(grp["smu"]),
         "dmm_name": grp["dmm"],
@@ -1113,6 +1121,56 @@ NUMATO_RELAY_MATRIX_CONFIGS = dict(ETHERNET_DEVICES)
 
 # Backward-compat alias -- this dict was previously named RELAY_ETH_CONFIGS.
 RELAY_ETH_CONFIGS = NUMATO_RELAY_MATRIX_CONFIGS
+
+
+def _niswitch_relay_matrix_configs() -> dict:
+    """
+    Relay-matrix cfg dicts for every ENABLED PXI_SLOTS entry with
+    category="switch" (today: PXI_SLOTS[11], the PXIe-2569, enabled=False,
+    so this returns {} and nothing below changes). Shaped like an
+    ETHERNET_DEVICES entry so RelayFactory/startup validation/the startup
+    safety sweep treat it uniformly: "type": "niswitch" selects the future
+    NI-SWITCH driver (hardware/relay_niswitch.py -- not implemented yet, so
+    enabling the slot before that driver exists makes startup validation
+    fail closed with "type 'niswitch' is not registered in RelayFactory",
+    never a silent no-op). channel_count is taken from the slot entry and
+    is intentionally NOT defaulted -- it must be confirmed against the
+    real card/topology on the bench before the slot is enabled.
+    """
+    configs = {}
+    for slot_cfg in PXI_SLOTS.values():
+        if slot_cfg.get("category") != "switch" or not slot_cfg.get("enabled"):
+            continue
+        name = slot_cfg.get("nickname")
+        count = slot_cfg.get("channel_count")
+        configs[name] = {
+            "type":          "niswitch",
+            "name":          name,
+            "resource":      slot_cfg.get("resource"),
+            "model":         slot_cfg.get("model"),
+            "slot":          slot_cfg.get("slot"),
+            "category":      "switch",
+            "num_channels":  count,
+            "channel_count": count,
+        }
+        # Optional driver knobs, passed through only when the slot sets them.
+        for key in ("topology", "debounce_timeout_ms", "relay_names", "simulate"):
+            if key in slot_cfg:
+                configs[name][key] = slot_cfg[key]
+    return configs
+
+
+# Vendor-neutral registry of EVERY relay matrix the system can drive,
+# regardless of transport (Numato Ethernet today; PXI NI-SWITCH matrices
+# such as the PXIe-2569 once enabled). Generic consumers -- the startup
+# safety sweep, startup device validation, BATTERY_GROUPS->matrix
+# resolution (hardware_for_group()), SenseRouter -- iterate/look up THIS,
+# so a new matrix is a config change, never a code change in any consumer.
+# NUMATO_RELAY_MATRIX_CONFIGS above stays Numato-only on purpose: the
+# Numato-specific diagnostics in test.py (RelayEthernetTest, Matrix Scan,
+# Native Relay Coexistence Probe, ...) exercise native Numato primitives
+# and must keep seeing only Numato units.
+RELAY_MATRIX_CONFIGS = {**NUMATO_RELAY_MATRIX_CONFIGS, **_niswitch_relay_matrix_configs()}
 
 # =============================================================================
 # Operator-facing display names -- config-driven, derived from each device's

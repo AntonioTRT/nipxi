@@ -117,8 +117,8 @@ class ConfigDrivenSenseRouter(SenseRouter):
             from config.devices import SENSE_ROUTING
             sense_routing = SENSE_ROUTING
         if relay_matrix_configs is None:
-            from config.devices import ETHERNET_DEVICES
-            relay_matrix_configs = ETHERNET_DEVICES
+            from config.devices import RELAY_MATRIX_CONFIGS
+            relay_matrix_configs = RELAY_MATRIX_CONFIGS
         if relay_factory_create is None:
             from hardware.relay_factory import RelayFactory
             relay_factory_create = RelayFactory.create

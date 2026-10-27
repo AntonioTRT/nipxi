@@ -167,8 +167,11 @@ class HardwareManager:
             self._instrument(self._ntc_daq, "DAQ")
 
         relay_class = self._relay.__class__.__name__
-        if relay_cfg.get("type", "serial").lower() == "ethernet":
+        relay_type = relay_cfg.get("type", "serial").lower()
+        if relay_type == "ethernet":
             detail = f"IP: {relay_cfg.get('ip', '')}"
+        elif relay_type == "niswitch":
+            detail = f"Resource: {relay_cfg.get('resource', '')}"
         else:
             detail = f"Port: {relay_cfg.get('port', '')}"
         self.log.info("Selected Relay: %s  %s", relay_class, detail)

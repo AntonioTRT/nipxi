@@ -51,7 +51,10 @@ def run_startup_safety_sweep(settings=Settings, *, smu_assignments=None, relay_m
     """
     Raises SafetyFaultBlocked if any configured SMU/relay matrix that
     connected could not be verified safe. Tolerates (logs, per
-    SYSTEM_MODE) a device that simply fails to connect at all.
+    SYSTEM_MODE) a device that simply fails to connect at all, and returns
+    the list of those devices ("SMU <name>"/"Relay <name>") that were NOT
+    swept -- empty when every configured device was swept -- so a caller can
+    report a clean sweep differently from a partial one.
 
     `smu_assignments`/`relay_matrix_configs`/`smu_factory`/
     `relay_factory_create` default to the real config/devices.py globals
@@ -65,12 +68,13 @@ def run_startup_safety_sweep(settings=Settings, *, smu_assignments=None, relay_m
     if smu_assignments is None:
         smu_assignments = dev_cfg.SMU_ASSIGNMENTS
     if relay_matrix_configs is None:
-        relay_matrix_configs = dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS
+        relay_matrix_configs = getattr(dev_cfg, "RELAY_MATRIX_CONFIGS", dev_cfg.NUMATO_RELAY_MATRIX_CONFIGS)
     if relay_factory_create is None:
         relay_factory_create = RelayFactory.create
 
     mode_policy = get_mode_policy(settings)
     level = mode_policy.hardware_failure_log_level
+    unavailable = []
 
     for name, cfg in smu_assignments.items():
         smu = smu_factory(cfg)
@@ -81,6 +85,7 @@ def run_startup_safety_sweep(settings=Settings, *, smu_assignments=None, relay_m
                 level, "Startup safety sweep: SMU %s not available (%s mode, sweep "
                 "continues): %s", name, mode_policy.mode.value, e,
             )
+            unavailable.append(f"SMU {name}")
             continue
         try:
             if not smu.emergency_output_off("startup safety sweep"):
@@ -107,6 +112,7 @@ def run_startup_safety_sweep(settings=Settings, *, smu_assignments=None, relay_m
                 level, "Startup safety sweep: Relay %s not available (%s mode, sweep "
                 "continues): %s", name, mode_policy.mode.value, e,
             )
+            unavailable.append(f"Relay {name}")
             continue
         try:
             try:
@@ -127,3 +133,4 @@ def run_startup_safety_sweep(settings=Settings, *, smu_assignments=None, relay_m
                 pass
 
     _log.info("Startup safety sweep complete.")
+    return unavailable

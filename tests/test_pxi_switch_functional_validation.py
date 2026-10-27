@@ -4,14 +4,16 @@ CHASSIS_RELAY_MATRIX)'s Functional Validation path -- test.py::
 _functional_switch(), wired into test_pxi_relay_matrix() via the shared
 _run_hardware_category() workflow.
 
-No niswitch-based driver exists in this codebase for this card (see
-PXI_SLOTS[11]'s own validation_notes) -- these tests confirm Functional
-Validation reports the same honest WARNING/N/A result Identity
-Validation already does, rather than _run_hardware_category()'s generic
-"not yet implemented" placeholder, and never touches hardware.
+When the card is NOT enabled as a relay matrix (PXI_SLOTS[11]
+enabled=False -> absent from RELAY_MATRIX_CONFIGS) there is no relay driver
+to validate -- these tests confirm Functional Validation then reports an
+honest WARNING/N/A result rather than _run_hardware_category()'s generic
+"not yet implemented" placeholder, and never touches hardware. When it IS
+enabled, Functional Validation runs Relay Range Validation against it.
 """
 
 import unittest
+from unittest import mock
 
 import test as test_module  # noqa: F401 -- importing this calls logging.disable(logging.CRITICAL)
 from config import devices as dev_cfg
@@ -22,6 +24,13 @@ def _chassis_relay_matrix_cfg():
 
 
 class FunctionalSwitchTests(unittest.TestCase):
+    def setUp(self):
+        # Simulate the card NOT being enabled as a relay matrix.
+        patcher = mock.patch.dict(dev_cfg.RELAY_MATRIX_CONFIGS)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        dev_cfg.RELAY_MATRIX_CONFIGS.pop("CHASSIS_RELAY_MATRIX", None)
+
     def test_reports_warning_not_pass_or_fail(self):
         cfg = _chassis_relay_matrix_cfg()
         results = test_module._functional_switch("CHASSIS_RELAY_MATRIX", cfg)
@@ -42,23 +51,32 @@ class FunctionalSwitchTests(unittest.TestCase):
         self.assertIn("PXI1Slot11", functional_ref)
         self.assertIn("PXIe-2569", functional_ref)
 
-    def test_details_include_the_no_driver_reason_and_validation_notes(self):
+    def test_details_include_the_not_enabled_reason_and_validation_notes(self):
         cfg = _chassis_relay_matrix_cfg()
         result = test_module._functional_switch("CHASSIS_RELAY_MATRIX", cfg)[0]
-        self.assertIn("no niswitch-based driver exists", result.details)
+        self.assertIn("not enabled as a relay matrix", result.details)
         self.assertIn(cfg["validation_notes"], result.details)
 
     def test_never_imports_or_touches_any_hardware_driver(self):
-        # No driver class exists for this category -- confirm this
-        # function's source never imports or constructs one, matching
-        # _identify_switch()'s identical, already-established guarantee.
-        # (The word "niswitch" itself legitimately appears in prose --
-        # explaining THAT no such driver exists -- so check for actual
+        # This function never imports or constructs a driver itself -- the
+        # enabled path delegates to test_relay_range_validation(). (The word
+        # "niswitch" legitimately appears in prose, so check for actual
         # import/construction patterns, not the bare word.)
         import inspect
         src = inspect.getsource(test_module._functional_switch)
         for forbidden in ("import niswitch", "RelayFactory", "hardware.relay", "hardware.switch"):
             self.assertNotIn(forbidden, src)
+
+
+class FunctionalSwitchRoutesToRangeValidationWhenEnabledTests(unittest.TestCase):
+    def test_enabled_niswitch_matrix_runs_relay_range_validation(self):
+        relay_cfg = dev_cfg.RELAY_MATRIX_CONFIGS["CHASSIS_RELAY_MATRIX"]
+        self.assertEqual(relay_cfg["type"], "niswitch")
+        sentinel = [object()]
+        with mock.patch.object(test_module, "test_relay_range_validation", return_value=sentinel) as run:
+            result = test_module._functional_switch("CHASSIS_RELAY_MATRIX", _chassis_relay_matrix_cfg())
+        run.assert_called_once_with("CHASSIS_RELAY_MATRIX", relay_cfg)
+        self.assertIs(result, sentinel)
 
 
 class PxiRelayMatrixMenuWiringTests(unittest.TestCase):

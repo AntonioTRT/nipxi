@@ -134,6 +134,14 @@ class SerialRelay(RelayBase):
         upper = response.upper().strip()
         return any(kw in upper for kw in ("ON", "CLOSED", "1"))
 
+    def open_all(self):
+        """Open every channel one at a time (the placeholder serial protocol
+        has no bulk command); each open() applies the settle delay. Explicit
+        since RelayBase.open_all() is abstract. No interlock/verification --
+        diagnostic-only driver."""
+        for ch in range(1, self.num_channels + 1):
+            self.open(ch)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

@@ -141,13 +141,9 @@ class SimulatedRelay(RelayBase):
     def open_all(self):
         self._active_channel = None
 
-    def close_all(self):
-        raise NotImplementedError(
-            "close_all() is intentionally not supported -- matches the "
-            "interlock behavior of the production NumatoRelayMatrix driver "
-            "(hardware/relay_eth.py), where only one relay may ever be "
-            "active at a time."
-        )
+    # close_all() intentionally not overridden: RelayBase.close_all() raises
+    # RelayError, matching the interlock of the production NumatoRelayMatrix
+    # driver (only one relay may ever be active at a time).
 
 
 class SimulatedBattery:

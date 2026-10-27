@@ -20,6 +20,26 @@ Supported relay types (as of this revision):
 Relay convention (electrical):
   close(channel) -- energizes the coil, makes the contact, current can flow
   open(channel)  -- de-energizes the coil, breaks the contact, current cannot flow
+
+Vendor-neutral contract (what every sequence/HardwareManager depends on, and
+the ONLY relay API they may use -- no sequence calls write()/read_all()/
+write_all()/verify_all(), those are NumatoRelayMatrix native primitives used
+only by Numato-specific diagnostics in test.py):
+  connect() / disconnect()
+  close(channel)  -- "select position": after it returns, ONLY `channel` is
+                     closed on the matrix and that was VERIFIED by readback
+  open(channel)   -- after it returns, the matrix is all-open and VERIFIED
+  open_all()      -- all-open, VERIFIED (startup, shutdown, atexit, sweeps)
+  query(channel)  -- commanded/readback state of one channel
+  settle()        -- the single global settle delay (RELAY_SETTLE_TIME_S)
+  RelayStateVerificationError on any failed verification, after the driver's
+  own best-effort all-open attempt (unknown relay state = unsafe state).
+
+A new driver (e.g. a future NI-SWITCH PXIe-2569 driver registered as
+"niswitch") must satisfy this contract in its own _close_impl/_open_impl/
+open_all -- including the exclusive-select interlock (force all open ->
+verify -> close target -> verify only target closed), which today lives in
+NumatoRelayMatrix and is NOT enforced by this base class.
 """
 
 import time
@@ -27,7 +47,12 @@ from abc import abstractmethod
 
 from config.settings import Settings
 from hardware.base import HardwareBase
-from utils.errors import ValidationError
+from utils.errors import RelayError, RelayStateVerificationError, ValidationError
+
+# Methods that are the single enforcement point for the mandatory settle
+# delay -- a driver that overrides one would bypass it, so subclassing
+# RelayBase with any of these fails at class-definition time.
+_FINAL_METHODS = ("open", "close", "settle")
 
 
 class RelayBase(HardwareBase):
@@ -46,9 +71,32 @@ class RelayBase(HardwareBase):
     time in between, and no caller needs (or is permitted) to add its own
     relay-settle delay. RELAY_SETTLE_TIME_S must never be 0.
 
-    open_all / close_all have default implementations that loop over channels;
-    override them if the hardware supports a faster bulk command.
+    FAIL-CLOSED DEFAULTS. A new driver never inherits behavior that could
+    leave the matrix in an unsafe multi-relay state:
+      - open_all() is abstract: every driver must provide its own bulk,
+        VERIFIED all-open (the old per-channel default paid one full settle
+        per channel and had no verification story).
+      - close_all() raises RelayError unless a driver explicitly overrides
+        it -- "close every channel" connects every battery at once and is
+        never a valid target state on an interlocked matrix.
+      - open/close/settle cannot be overridden (see _FINAL_METHODS).
+      - closed_channels()/verify_all_open()/verify_only_closed() are
+        read-only verification helpers built on query(); they never write.
+
+    Behavioral contract every driver must satisfy: tests/_relay_conformance.py
+    (run against each driver by tests/test_relay_conformance.py).
     """
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        overridden = [m for m in _FINAL_METHODS if m in cls.__dict__]
+        if overridden:
+            raise TypeError(
+                f"{cls.__name__} overrides RelayBase.{'/'.join(overridden)}() -- "
+                f"these are the single enforcement point for the mandatory "
+                f"relay settle delay and may not be overridden. Implement "
+                f"_open_impl()/_close_impl() instead."
+            )
 
     def __init__(self, name: str, num_channels: int = 8):
         super().__init__(name)
@@ -109,18 +157,61 @@ class RelayBase(HardwareBase):
         """Return True if the relay contact is closed (energized)."""
 
     # ------------------------------------------------------------------
-    # Default bulk operations -- override for hardware-level speed-up
+    # Bulk operations -- no unsafe default
     # ------------------------------------------------------------------
 
+    @abstractmethod
     def open_all(self):
-        """Open every relay channel (safe state -- all batteries disconnected)."""
-        for ch in range(1, self.num_channels + 1):
-            self.open(ch)
+        """
+        Drive EVERY channel open and verify it (safe state -- all batteries
+        disconnected). Called at startup, shutdown, atexit, safety sweeps
+        and emergency paths, so it must be one bulk operation (not a
+        per-channel loop that pays RELAY_SETTLE_TIME_S per channel) and it
+        must raise RelayStateVerificationError if any channel cannot be
+        confirmed open.
+        """
 
     def close_all(self):
-        """Close every relay channel (all batteries connected simultaneously)."""
-        for ch in range(1, self.num_channels + 1):
-            self.close(ch)
+        """
+        Not supported unless a driver explicitly overrides it: closing every
+        channel connects every battery simultaneously, which is never a
+        valid target state on an interlocked matrix.
+        """
+        raise RelayError(
+            f"close_all() is not supported by {type(self).__name__} '{self.name}': "
+            f"closing every channel at once is never a valid state. A driver "
+            f"must explicitly override close_all() to allow it."
+        )
+
+    # ------------------------------------------------------------------
+    # Read-only verification helpers (built on query(); never write)
+    # ------------------------------------------------------------------
+
+    def closed_channels(self) -> list:
+        """1-based channels query() currently reports closed. Generic and
+        slow (one query() per channel) -- a driver with a bulk readback may
+        override it, but must keep the same return shape."""
+        return [ch for ch in range(1, self.num_channels + 1) if self.query(ch)]
+
+    def verify_all_open(self):
+        """Raise RelayStateVerificationError unless every channel reads open."""
+        closed = self.closed_channels()
+        if closed:
+            raise RelayStateVerificationError(
+                f"Relay '{self.name}' verification FAILED: expected all channels "
+                f"open, channels {closed} read closed."
+            )
+
+    def verify_only_closed(self, channel: int):
+        """Raise RelayStateVerificationError unless `channel` is the one and
+        only closed channel."""
+        self._validate_channel(channel)
+        closed = self.closed_channels()
+        if closed != [channel]:
+            raise RelayStateVerificationError(
+                f"Relay '{self.name}' verification FAILED: expected only channel "
+                f"{channel} closed, channels {closed} read closed."
+            )
 
     # ------------------------------------------------------------------
     # Shared helper

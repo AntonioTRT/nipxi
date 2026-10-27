@@ -316,6 +316,14 @@ class Settings:
     # -------------------------------------------------------------------------
     RELAY_MATRIX_SCAN_DWELL_S = 5.0  # s -- ON-state dwell, Matrix Scan only
 
+    # test.py::test_relay_range_validation() -- how long each relay in the
+    # operator-selected range is held closed (after it is verified as the
+    # only closed relay, before it is opened) so the operator can observe
+    # the click/LED. Separate from RELAY_SETTLE_TIME_S, which still applies
+    # on top via RelayBase.open()/close(); same separation as
+    # RELAY_MATRIX_SCAN_DWELL_S above.
+    RELAY_RANGE_VALIDATION_DWELL_S = 2.0  # s -- per-relay closed-state dwell
+
     # How long a position's relay is held closed AFTER the initial settled
     # voltage/DAQ reading, to observe relay/measurement stability over time
     # before moving to the next position -- see the CLOSED-state monitoring

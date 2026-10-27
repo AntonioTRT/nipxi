@@ -20,6 +20,8 @@ handling, safety sequence, logging) -- there is no per-device special
 casing anywhere in this factory or in the driver it dispatches to.
 
 Supported types:
+    "niswitch" -- NIPXIe2569RelayMatrix (hardware/relay_niswitch.py) -- NI PXIe-2569,
+                  same safety model as NumatoRelayMatrix
     "serial"   -- SerialRelay       (hardware/relay_serial.py) -- diagnostic only
     "ethernet" -- NumatoRelayMatrix (hardware/relay_eth.py)    -- PRODUCTION
                   ("ethernet" names the transport interface, same as
@@ -42,8 +44,9 @@ from utils.errors import ValidationError
 # Import lazily inside create() to avoid import errors when a driver's
 # optional dependency (e.g. pyserial) is not installed.
 _DRIVERS = {
-    "serial":   ("hardware.relay_serial", "SerialRelay"),
-    "ethernet": ("hardware.relay_eth",    "NumatoRelayMatrix"),
+    "serial":   ("hardware.relay_serial",   "SerialRelay"),
+    "ethernet": ("hardware.relay_eth",      "NumatoRelayMatrix"),
+    "niswitch": ("hardware.relay_niswitch", "NIPXIe2569RelayMatrix"),
 }
 
 

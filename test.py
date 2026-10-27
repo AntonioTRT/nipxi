@@ -41,6 +41,7 @@ from test_control.diagnostic_audit import (
     instrumented_daq as _instrumented_daq,
 )
 from utils.event_format import EventType, format_event
+from utils import menu_status as _menu_status
 
 # Suppress NI driver / serial noise during tests
 logging.disable(logging.CRITICAL)
@@ -204,10 +205,15 @@ def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn
         break
 
     while True:
+        identity_status, functional_status = _CATEGORY_VALIDATION_STATUS.get(
+            identify_fn, (_menu_status.FUTURE, _menu_status.FUTURE))
         print(f"\n{dev_cfg.device_display_name(cfg)}  [{name}]\n")
-        print("[1] Identity Validation")
-        print("[2] Functional Validation (future)")
+        print(_menu_status.style("[1] Identity Validation", identity_status))
+        print(_menu_status.style(
+            "[2] Functional Validation" + (" (future)" if functional_status == _menu_status.FUTURE else ""),
+            functional_status))
         print("[0] Back")
+        print(_menu_status.legend())
         try:
             raw = input("\nChoice: ").strip()
         except (KeyboardInterrupt, EOFError):
@@ -272,7 +278,7 @@ class TestResult:
 
     def print_detail(self):
         tag = {"PASS": "PASS", "WARNING": "WARN", "FAIL": "FAIL"}[self.status]
-        print(f"  [{tag}] {self.device}")
+        print(f"  {_menu_status.style(f'[{tag}]', _menu_status.result_style(self.status))} {self.device}")
         print(f"         Config : {self.config_ref}")
         if self.details:
             for line in self.details.splitlines():
@@ -645,40 +651,42 @@ def _identify_relay_serial(name: str, cfg: dict):
 def _identify_switch(name: str, cfg: dict):
     """
     PXI-resident switch/relay card (PXI_SLOTS[11], category="switch")
-    presence check. Reported honestly as N/A -- no niswitch-based driver
-    exists in this codebase (see PXI_SLOTS[11]'s validation_notes), so this
-    never fakes a real identity query against it.
+    presence check. Identity is not implemented for this card (the
+    niswitch relay driver validates relay operation, not identity), so this
+    is reported honestly as N/A and never fakes an identity query -- use
+    Functional Validation (Relay Range Validation) to exercise the card.
     """
     resource = cfg.get("resource", "")
     model = cfg.get("model", "")
     display = dev_cfg.device_display_name(cfg)
-    note = cfg.get("validation_notes", "No driver class implemented for this category.")
+    note = cfg.get("validation_notes", "No identity check implemented for this category.")
     ref = f"config/devices.py -> PXI_SLOTS[{name!r}] ({resource} / {model})"
     return _warn("Hardware Discovery", f"Switch/Relay (PXI): {display}", ref,
-                 f"Not applicable -- no niswitch-based driver exists in this codebase.\n{note}")
+                 f"Not applicable -- identity validation is not implemented for this card.\n{note}")
 
 
 def _functional_switch(name: str, cfg: dict):
     """
-    Switch/Relay (PXI) Functional Validation -- see PXI_SLOTS[11]'s
-    validation_notes and _identify_switch()'s identical rationale. No
-    niswitch-based driver exists in this codebase to functionally
-    validate against (no energize/read-back cycle is possible), so this
-    reports the same honest N/A/WARNING result Identity Validation does,
-    reached via the "[2] Functional Validation" menu path instead of
-    _run_hardware_category()'s generic "not yet implemented for this
-    hardware category" placeholder -- an operator who explicitly chose
-    Functional Validation for this card should see WHY it can't be done,
-    not a vague stub message indistinguishable from "not built yet."
-    Never touches hardware -- there is no driver class to touch.
+    Switch/Relay (PXI) Functional Validation. When the card is an enabled
+    relay matrix (PXI_SLOTS[11] enabled -> RELAY_MATRIX_CONFIGS, driven by
+    hardware/relay_niswitch.py), this runs Relay Range Validation against
+    it -- the same hardware validation the Numato matrices have. If the
+    slot is not enabled/configured as a relay matrix there is nothing to
+    validate, and this reports an honest N/A/WARNING instead of a vague
+    "not yet implemented" stub; in that case it never touches hardware.
     """
+    relay_cfg = dev_cfg.RELAY_MATRIX_CONFIGS.get(name)
+    if relay_cfg is not None and relay_cfg.get("type", "").lower() == "niswitch":
+        return test_relay_range_validation(name, relay_cfg)
+
     resource = cfg.get("resource", "")
     model = cfg.get("model", "")
     display = dev_cfg.device_display_name(cfg)
-    note = cfg.get("validation_notes", "No driver class implemented for this category.")
+    note = cfg.get("validation_notes", "No relay matrix configured for this category.")
     ref = f"config/devices.py -> PXI_SLOTS[{name!r}] ({resource} / {model})"
     return [_warn("Switch Functional", f"Switch/Relay (PXI): {display}", ref,
-                  f"Not applicable -- no niswitch-based driver exists in this codebase.\n{note}")]
+                  f"Not applicable -- this PXI switch card is not enabled as a relay matrix "
+                  f"(PXI_SLOTS enabled=False), so there is no relay driver to validate.\n{note}")]
 
 
 def _pxi_slots_by_category(category: str) -> dict:
@@ -2376,6 +2384,225 @@ def test_native_relay_coexistence_probe(name=None, cfg=None):
 
 
 # =============================================================================
+# 5e3. Relay Range Validation -- driver-agnostic hardware validation of the
+#      RelayBase safety contract (one relay closed at a time, every
+#      selection starts from a verified all-open, state verified by an
+#      independent readback) over an operator-chosen relay subset. Works on
+#      any matrix in RELAY_MATRIX_CONFIGS: run it on a Numato first as the
+#      reference, then on a PXIe-2569 once its driver exists.
+# =============================================================================
+
+class _RangeValidationMismatch(Exception):
+    """Independent readback disagreed with the expected closed set."""
+
+    def __init__(self, phase, expected, actual):
+        super().__init__(f"{phase}: expected closed {expected}, read closed {actual}")
+        self.phase, self.expected, self.actual = phase, expected, actual
+
+
+def _prompt_relay_bounds(limit: int):
+    """Prompt 'Start Relay' / 'End Relay' (1-based, inclusive, 1..limit).
+    Returns (start, end), or None on blank input/Ctrl+C/invalid input --
+    never guesses a range."""
+    try:
+        raw_start = input("Start Relay:\n> ").strip()
+        if raw_start == "":
+            return None
+        raw_end = input("End Relay:\n> ").strip()
+        if raw_end == "":
+            return None
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return None
+    try:
+        start, end = int(raw_start), int(raw_end)
+    except ValueError:
+        print("  Invalid input -- Start Relay and End Relay must be integers.")
+        return None
+    if not (1 <= start <= end <= limit):
+        print(f"  Invalid range ({start}, {end}) -- must satisfy 1 <= Start <= End <= {limit}.")
+        return None
+    return start, end
+
+
+def _relay_matrix_ref(name: str, cfg: dict) -> str:
+    where = f"{cfg.get('ip')}:{cfg.get('port', '')}" if cfg.get("ip") else (cfg.get("resource") or cfg.get("port") or "")
+    driver = cfg.get("driver") or cfg.get("model") or cfg.get("type", "")
+    count = cfg.get("channel_count", cfg.get("num_channels"))
+    return f"config/devices.py -> {name} ({driver} / {where}, {count} ch)"
+
+
+def test_relay_range_validation(name=None, cfg=None):
+    """
+    Relay Range Validation -- for every relay N in the operator's
+    Start Relay..End Relay range:
+
+        1. open_all()
+        2. verify all open          (independent closed_channels() readback)
+        3. close(N)
+        4. verify N is the only closed relay
+        5. dwell Settings.RELAY_RANGE_VALIDATION_DWELL_S (operator observes)
+        6. open(N)
+        7. verify all open
+        8. next relay
+
+    Stops at the first failure (a partial PASS list means the untested
+    relays are unknown, not good). ALWAYS ends with a verified open_all(),
+    on PASS, FAIL and Ctrl+C alike. Ctrl+C is cooperative: checked before
+    each relay and during the dwell, never between a write and its readback.
+
+    The verification here does NOT trust the driver's own internal checks:
+    state is read back through closed_channels() separately, so a driver
+    that reports success without the hardware being in the right state
+    fails this test. Per-relay raw_data carries the expected/actual closed
+    sets and phase durations; every driver call lands in raw_hardware_log
+    via _instrumented_relay().
+    """
+    label = "Relay Range Validation"
+    if cfg is None:
+        name, cfg = _select_device(dev_cfg.RELAY_MATRIX_CONFIGS, "Relay Matrix devices")
+        if cfg is None:
+            return []
+    _print_device_config(name, cfg)
+
+    config_ref = _relay_matrix_ref(name, cfg)
+    channel_count = cfg.get("channel_count", cfg.get("num_channels"))
+    if not channel_count:
+        return [_fail(label, "Configuration", config_ref,
+                      "channel_count is not configured for this relay matrix -- cannot bound the relay range.")]
+
+    dwell_s = Settings.RELAY_RANGE_VALIDATION_DWELL_S
+    print(f"\n{label} -- {name} ({channel_count} relays)\n")
+    bounds = _prompt_relay_bounds(channel_count)
+    if bounds is None:
+        return [_warn(label, "Input", config_ref, "Cancelled or invalid input -- no relay was operated.")]
+    first, last = bounds
+    relays = list(range(first, last + 1))
+    per_relay_s = 2 * Settings.RELAY_SETTLE_TIME_S + dwell_s
+    print(f"\nRelays {first}-{last} ({len(relays)} relay(s)), dwell {dwell_s:.1f}s each, "
+          f"estimated time >= {len(relays) * per_relay_s:.0f}s.")
+    print("Press Ctrl+C to cancel safely.\n")
+
+    try:
+        relay = _instrumented_relay(cfg)
+    except Exception as e:
+        return [_fail(label, "Factory", config_ref, f"Import / factory error: {e}")]
+
+    import signal
+    from utils.cancellation import CancellationToken, install_sigint_handler, check_cancellation, interruptible_sleep
+    from utils.errors import OperationCancelledError
+
+    token = CancellationToken(owner="test.py:relay_range_validation")
+    previous_sigint_handler = install_sigint_handler(token, owner="test.py:relay_range_validation")
+    results = []
+    debug_logging = (_numato_relay_debug_logging() if cfg.get("type", "").lower() == "ethernet"
+                     else contextlib.nullcontext())
+
+    try:
+        with debug_logging:
+            try:
+                relay.connect()
+            except Exception as e:
+                return [_fail(label, "Connect + Auth", config_ref,
+                              f"Reason:\n{_classify_relay_error(e)}\nValidation aborted -- device not available.")]
+            results.append(_ok(label, "Connect + Auth", config_ref, f"Connected to {name}"))
+
+            failed = False
+            try:
+                for index, n in enumerate(relays, 1):
+                    try:
+                        check_cancellation(token)
+                    except OperationCancelledError as e:
+                        results.append(_warn(label, "Cancelled by operator", config_ref,
+                                             f"Reason:\n{e}\nRemaining relays not tested."))
+                        break
+
+                    print(f"  -- Relay {n} ({index}/{len(relays)}) --")
+                    raw = {"relay": n, "dwell_s": dwell_s, "durations_s": {}}
+
+                    def phase(phase_name, action, expected_closed=None):
+                        t0 = time.perf_counter()
+                        action()
+                        if expected_closed is not None:
+                            actual = list(relay.closed_channels())
+                            raw[f"closed_{phase_name}"] = actual
+                            raw["durations_s"][phase_name] = round(time.perf_counter() - t0, 3)
+                            if actual != expected_closed:
+                                raise _RangeValidationMismatch(phase_name, expected_closed, actual)
+                        else:
+                            raw["durations_s"][phase_name] = round(time.perf_counter() - t0, 3)
+
+                    try:
+                        phase("open_all", relay.open_all)
+                        phase("verify_all_open", lambda: None, [])
+                        phase("close", lambda: relay.close(n))
+                        phase("verify_only_closed", lambda: None, [n])
+                        phase("dwell", lambda: interruptible_sleep(dwell_s, token))
+                        phase("open", lambda: relay.open(n))
+                        phase("verify_all_open_after_open", lambda: None, [])
+                    except OperationCancelledError as e:
+                        results.append(_warn(label, "Cancelled by operator", config_ref,
+                                             f"Reason:\n{e}\nCancelled during relay {n}; it is opened by the final open_all()."))
+                        break
+                    except _RangeValidationMismatch as e:
+                        raw["result"] = "FAIL"
+                        results.append(_fail(
+                            label, f"Relay {n}", config_ref,
+                            f"Relay Number    : {n}\nPhase           : {e.phase}\n"
+                            f"Expected closed : {e.expected}\nActual closed   : {e.actual}",
+                            raw=raw))
+                        print(f"     FAIL at {e.phase}: expected closed {e.expected}, read {e.actual}")
+                        failed = True
+                        break
+                    except Exception as e:
+                        raw["result"] = "FAIL"
+                        raw["error"] = f"{type(e).__name__}: {e}"
+                        results.append(_fail(
+                            label, f"Relay {n}", config_ref,
+                            f"Relay Number    : {n}\nCause           : {type(e).__name__}: {e}", raw=raw))
+                        print(f"     FAIL: {type(e).__name__}: {e}")
+                        failed = True
+                        break
+
+                    raw["result"] = "PASS"
+                    d = raw["durations_s"]
+                    results.append(_ok(
+                        label, f"Relay {n}", config_ref,
+                        f"open_all -> verify open -> close -> verify only {n} closed -> dwell "
+                        f"{dwell_s:.1f}s -> open -> verify open  PASS "
+                        f"(close {d['close']:.2f}s, open {d['open']:.2f}s)", raw=raw))
+                    print(f"     PASS  close {d['close']:.2f}s | open {d['open']:.2f}s")
+            finally:
+                # Always: verified all-open at exit.
+                try:
+                    relay.open_all()
+                    leftover = list(relay.closed_channels())
+                    if leftover:
+                        results.append(_fail(label, "Final open_all", config_ref,
+                                             f"Channels still closed after final open_all(): {leftover}. "
+                                             f"Hardware may still be energized.", raw={"closed": leftover}))
+                    else:
+                        results.append(_ok(label, "Final open_all", config_ref,
+                                           "All relays open and verified at exit", raw={"closed": []}))
+                except Exception as e:
+                    results.append(_fail(label, "Final open_all", config_ref,
+                                         f"Could not verify the all-open state at exit: {type(e).__name__}: {e}. "
+                                         f"Hardware may still be energized."))
+                try:
+                    relay.disconnect()
+                except Exception as e:
+                    results.append(_warn(label, "Disconnect", config_ref, str(e)))
+
+            if failed:
+                results.append(_fail(label, "Validation aborted", config_ref,
+                                     "Stopped at first failure -- remaining relays not tested"))
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+
+    return results
+
+
+# =============================================================================
 # 5f. Numato Relay Matrix -- hardware-category menu entry (Identity +
 #     Functional Validation), reusing the tests above
 # =============================================================================
@@ -2463,11 +2690,13 @@ def _functional_relay_numato(name: str, cfg: dict):
         ("RelayEthernetTest (native 0-based primitives)", test_relay_ethernet_test),
         ("Safety Self-Test (1..N, stop on first failure)", test_relay_safety_selftest),
         ("Native Relay Coexistence Probe (EXPERIMENTAL)", test_native_relay_coexistence_probe),
+        ("Relay Range Validation (Start/End Relay, open_all -> close N -> verify -> dwell -> open)", test_relay_range_validation),
     ]
     print(f"\n{name} -- Functional Validation\n")
-    for i, (label, _fn) in enumerate(options, 1):
-        print(f"[{i}] {label}")
+    for i, (label, fn) in enumerate(options, 1):
+        print(_menu_status.style(f"[{i}] {label}", _RELAY_FUNCTIONAL_STATUS.get(fn)))
     print("0. Back")
+    print(_menu_status.legend())
     try:
         raw = input("\nChoice: ").strip()
     except (KeyboardInterrupt, EOFError):
@@ -4169,7 +4398,7 @@ def print_summary(all_results):
                 break
             if r.status == Status.WARNING:
                 worst = Status.WARNING
-        print(f"  {worst:8s}  {module}")
+        print(f"  {_menu_status.style(f'{worst:8s}', _menu_status.result_style(worst))}  {module}")
     total  = len(all_results)
     passed = sum(1 for r in all_results if r.status == Status.PASS)
     warned = sum(1 for r in all_results if r.status == Status.WARNING)
@@ -4205,6 +4434,11 @@ def test_device_validation():
     return [_fail("Device Validation", "config/devices.py", ref, e) for e in errors]
 
 
+#: Operator-facing area names for preflight_check()'s status lines, keyed by
+#: TestResult.module. Any other module is shown under its own name.
+_PREFLIGHT_LABELS = {"Configuration": "Configuration", "Device Validation": "Devices"}
+
+
 def preflight_check():
     """
     Runs before the menu is shown, gating it exactly like test_configuration()
@@ -4212,16 +4446,30 @@ def preflight_check():
     device-level validation (test_device_validation) -- both before any
     hardware communication, and before Hardware Discovery or any other test.
     """
-    results  = test_configuration() + test_device_validation()
+    results = test_configuration() + test_device_validation()
+
+    # One status line per validation area (OK / WARNING / FAIL, only the word
+    # colored), followed by the non-PASS details of that area.
+    by_module = {}
+    for r in results:
+        by_module.setdefault(r.module, []).append(r)
+    for module, group in by_module.items():
+        label = _PREFLIGHT_LABELS.get(module, module)
+        group_failures = [r for r in group if r.status == Status.FAIL]
+        group_warnings = [r for r in group if r.status == Status.WARNING]
+        if group_failures:
+            word, status = "FAIL", _menu_status.FAILED
+        elif group_warnings:
+            word, status = "WARNING", _menu_status.PARTIAL
+        else:
+            word, status = "OK", _menu_status.VERIFIED
+        print(_menu_status.status_line(label, word, status))
+        for r in group_failures + group_warnings:
+            tag = "FAIL" if r.status == Status.FAIL else "WARN"
+            print(f"    {_menu_status.style(f'[{tag}]', _menu_status.result_style(r.status))} "
+                  f"{r.device}: {r.details.splitlines()[0]}")
+
     failures = [r for r in results if r.status == Status.FAIL]
-    warnings = [r for r in results if r.status == Status.WARNING]
-    if not failures and not warnings:
-        print("  Configuration: OK")
-        return results, True
-    for r in failures:
-        print(f"  [FAIL] {r.device}: {r.details.splitlines()[0]}")
-    for r in warnings:
-        print(f"  [WARN] {r.device}: {r.details.splitlines()[0]}")
     return results, len(failures) == 0
 
 
@@ -5902,12 +6150,17 @@ def run_main_test():
     docs/architecture.md Section 67 "CycleSequence -- Final Design".
     """
     print("RUN MAIN TEST")
-    print("\n1. Monitor Battery")
-    print("2. Charge Battery")
-    print("3. Discharge Battery")
-    print("4. Cycle Battery")
-    print("5. Monitor Battery Scan (relay/DMM/DAQ path validation, no charging)")
-    print("6. NTC Group Scan (temperature/presence check via DAQ, no relay/PSU)")
+    print()
+    for line, fn in (
+        ("1. Monitor Battery", _run_monitor_battery),
+        ("2. Charge Battery", _run_charge_battery),
+        ("3. Discharge Battery", _run_discharge_battery),
+        ("4. Cycle Battery", _run_cycle_battery),
+        ("5. Monitor Battery Scan (relay/DMM/DAQ path validation, no charging)", _run_monitor_battery_scan),
+        ("6. NTC Group Scan (temperature/presence check via DAQ, no relay/PSU)", _run_ntc_group_scan),
+    ):
+        print(_menu_status.style(line, _MAIN_TEST_STATUS.get(fn)))
+    print(_menu_status.legend())
     choice = input("\nSelect mode: ").strip()
 
     if choice == "1":
@@ -6095,6 +6348,56 @@ MENU = [
     ("Last Test Summary",             _show_last_test_summary),
     ("UI Test (demo screens -- no hardware, no database)", test_ui_preview),
 ]
+
+# -----------------------------------------------------------------------------
+# Verification status shown by the menus (see utils/menu_status.py). This is
+# REAL-BENCH validation history, not "code exists" -- promote an entry only
+# after it has been run on the rack. Keyed by function so MENU's (label, fn)
+# tuple shape (unpacked by tests and _dispatch_menu_choice) is unchanged.
+# Entries not listed render with no color (future/experimental/offline).
+# -----------------------------------------------------------------------------
+_V, _P, _F = _menu_status.VERIFIED, _menu_status.PARTIAL, _menu_status.FUTURE
+
+MENU_STATUS = {
+    run_main_test:           _P,   # submenu mixes verified/partial/future entries
+    run_proto_test_execution: _V,
+    test_hardware_discovery: _V,
+    test_smu:                _V,
+    test_dmm:                _V,
+    test_daq:                _P,   # identity verified; functional reads placeholder daq_voltage_ch
+    test_relay_numato:       _V,
+    test_pxi_relay_matrix:   _F,   # no niswitch driver
+    test_sensors:            _V,   # NTC on MAIN_DAQ, Dev1/ai0..ai7 bench-validated
+}
+
+_MAIN_TEST_STATUS = {
+    _run_monitor_battery:      _P,
+    _run_charge_battery:       _P,   # real 100 mA charge exercised; broader coverage pending
+    _run_discharge_battery:    _F,
+    _run_cycle_battery:        _F,
+    _run_monitor_battery_scan: _P,
+    _run_ntc_group_scan:       _V,
+}
+
+# identify_fn -> (identity status, functional status) for the hardware-
+# category submenu (_run_hardware_category).
+_CATEGORY_VALIDATION_STATUS = {
+    _identify_smu:         (_V, _V),
+    _identify_dmm:         (_V, _V),
+    _identify_daq:         (_V, _P),
+    _identify_relay_eth:   (_V, _V),
+    _identify_temperature: (_F, _F),
+    _identify_switch:      (_F, _F),
+}
+
+_RELAY_FUNCTIONAL_STATUS = {
+    test_relay_numato_matrix:   _V,
+    _test_relay_matrix_scan_scoped: _V,
+    test_relay_ethernet_test:   _V,
+    test_relay_safety_selftest: _V,
+    test_native_relay_coexistence_probe: _P,   # 4 runs, MATRIX_NUMATO_202 only, ch 1-24
+    test_relay_range_validation: _F,           # new; not yet run on hardware
+}
 
 
 #: Steps every diagnostic's own connect/setup phase is already named after
@@ -6337,23 +6640,30 @@ def main():
     _config_results, config_ok = preflight_check()
 
     if not config_ok:
-        print("\n  Configuration has FAIL errors.")
+        print(_menu_status.style("\n  Configuration has FAIL errors.", _menu_status.FAILED))
         print("  Fix config/ files before running hardware tests.")
         sys.exit(1)
 
     print("\n[Pre-flight: Startup Safety Sweep]")
     from test_control.safety_sweep import SafetyFaultBlocked, run_startup_safety_sweep
     try:
-        run_startup_safety_sweep()
+        not_swept = run_startup_safety_sweep() or []
     except SafetyFaultBlocked as e:
-        print(f"\n  Startup blocked -- {e}")
+        print(_menu_status.status_line("Startup safety sweep", "FAIL", _menu_status.FAILED))
+        print(_menu_status.style(f"\n  Startup blocked -- {e}", _menu_status.FAILED))
         sys.exit(1)
+    if not_swept:
+        print(_menu_status.status_line("Startup safety sweep", "PARTIAL", _menu_status.PARTIAL))
+        print(f"    Not available, not swept: {', '.join(not_swept)}")
+    else:
+        print(_menu_status.status_line("Startup safety sweep", "OK", _menu_status.VERIFIED))
 
     while True:
         print()
-        for i, (label, _) in enumerate(MENU, 1):
-            print(f"  {i:2}. {label}")
+        for i, (label, fn) in enumerate(MENU, 1):
+            print(_menu_status.style(f"  {i:2}. {label}", MENU_STATUS.get(fn)))
         print("   0. Exit")
+        print(_menu_status.legend())
         print()
 
         try:

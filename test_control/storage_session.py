@@ -89,10 +89,12 @@ def hardware_snapshot_fields(smu_name, smu_cfg, dmm_name, dmm_cfg, daq_name, daq
         "smu_name": smu_name, "smu_resource": smu_cfg.get("resource"), "smu_model": smu_cfg.get("model"),
         "daq_name": daq_name, "daq_resource": daq_cfg.get("resource"), "daq_model": daq_cfg.get("model"),
         "relay_matrix_name": relay_cfg.get("name"),
-        "relay_matrix_model": relay_cfg.get("driver"),
+        "relay_matrix_model": relay_cfg.get("driver") or relay_cfg.get("model"),
         "relay_matrix_resource": (
             f"{relay_cfg.get('ip', '')}:{relay_cfg.get('port', '')}"
             if relay_cfg.get("type", "").lower() == "ethernet"
+            else str(relay_cfg.get("resource", ""))
+            if relay_cfg.get("type", "").lower() == "niswitch"
             else str(relay_cfg.get("port", ""))
         ),
     }
