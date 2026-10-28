@@ -6348,10 +6348,11 @@ MENU = [
 
 # -----------------------------------------------------------------------------
 # Verification status shown by the menus (see utils/menu_status.py). This is
-# REAL-BENCH validation history, not "code exists" -- promote an entry only
-# after it has been run on the rack. Keyed by function so MENU's (label, fn)
+# validation history, not "code exists": hardware entries are promoted only
+# after a run on the rack; offline tools (no hardware involved) are promoted
+# once every option they offer has been run and works. Keyed by function so MENU's (label, fn)
 # tuple shape (unpacked by tests and _dispatch_menu_choice) is unchanged.
-# Entries not listed render with no color (future/experimental/offline).
+# Entries not listed render with no color (future/experimental/unvalidated).
 # -----------------------------------------------------------------------------
 _V, _P, _F = _menu_status.VERIFIED, _menu_status.PARTIAL, _menu_status.FUTURE
 
@@ -6363,8 +6364,12 @@ MENU_STATUS = {
     test_dmm:                _V,
     test_daq:                _P,   # identity verified; functional reads placeholder daq_voltage_ch
     test_relay_numato:       _V,
-    test_pxi_relay_matrix:   _F,   # no niswitch driver
+    test_pxi_relay_matrix:   _F,   # niswitch driver implemented, never run on the real PXIe-2569
     test_sensors:            _V,   # NTC on MAIN_DAQ, Dev1/ai0..ai7 bench-validated
+    test_safety_monitor:     _V,   # offline: real SafetyMonitor logic tests + workflow walkthroughs, all run
+    test_database_tools:     _V,   # offline: all 7 options run (inspection + temp-DB self-tests)
+    _show_last_test_summary: _V,   # offline: renders the latest real run_summary
+    test_ui_preview:         _P,   # 4 demo screens work; Cycle Battery / Historical Results screens not implemented
 }
 
 _MAIN_TEST_STATUS = {

@@ -3,17 +3,17 @@ Status styling for operator menus and startup/pre-flight messages (test.py).
 
 One three-color scheme everywhere:
 
-  VERIFIED  green    menus: validated on real hardware
+  VERIFIED  green    menus: validated on real hardware, or (offline tools with
+                     no hardware) every option run and working
                      startup: validation passed / configuration valid / OK
   PARTIAL   yellow   menus: works and exercised, still needs broader testing
                      startup: warning / partial validation / degraded mode
   FAILED    red      startup: validation failed / startup-blocking error /
                      hardware fault
-  FUTURE    neutral  menus only: unimplemented, experimental, offline-only,
-                     or without real-hardware validation
+  FUTURE    neutral  menus only: unimplemented, experimental, or hardware
+                     functionality without real-hardware validation
 
-Menu status describes REAL-BENCH validation history, not whether code
-exists. Only the status WORD is colored; the word itself ("OK", "WARNING",
+Menu status describes validation history, not whether code exists. Only the status WORD is colored; the word itself ("OK", "WARNING",
 "FAIL", "PARTIAL") always carries the meaning, so output stays readable
 with colors off.
 
