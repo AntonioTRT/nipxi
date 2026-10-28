@@ -26,10 +26,28 @@ Design (see docs/architecture.md "Safe Cancellation Architecture"):
 import logging
 import signal
 import time
+import weakref
 
 from utils.errors import OperationCancelledError
 
 _shutdown_trace_log = logging.getLogger("nipxi.cancellation")
+
+# Every token ever created (weak -- never keeps one alive). Lets
+# utils/termination.py cancel whatever operation is running when the process
+# is asked to terminate (SIGTERM, Ctrl+Break, console close) without needing a
+# reference to the operation's own token.
+_LIVE_TOKENS = weakref.WeakSet()
+
+
+def cancel_all_tokens(reason: str) -> int:
+    """Request cancellation on every live token. Returns how many were
+    cancelled by this call. Does no I/O beyond what request_cancel() logs."""
+    count = 0
+    for token in list(_LIVE_TOKENS):
+        if not token.requested:
+            token.request_cancel(reason)
+            count += 1
+    return count
 
 
 class CancellationToken:
@@ -49,6 +67,7 @@ class CancellationToken:
         self._reason = ""
         self._requested_at = None
         self.log = logging.getLogger("nipxi.cancellation")
+        _LIVE_TOKENS.add(self)
 
     @property
     def requested(self) -> bool:

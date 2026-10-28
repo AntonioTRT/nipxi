@@ -102,6 +102,36 @@ class DMMMeasurementLostError(SafetyViolationError):
     """
 
 
+class MeasurementFrozenError(DMMMeasurementLostError):
+    """
+    A measurement channel (DMM voltage, SMU current or NTC voltage) returned
+    an unchanging value for longer than its configured window while the
+    physical signal is expected to move -- see test_control/frozen_signal.py.
+    A DMMMeasurementLostError subclass so it reuses the same STATION-level
+    classification and run_guarded() safety shutdown; "the instrument
+    answers but the value is stale" is treated like "the instrument does not
+    answer".
+    """
+
+
+class StorageFailureError(SafetyViolationError):
+    """
+    Persisting test data failed (database write error, disk full, or free
+    space below the abort threshold) during an energized operation. A
+    battery test must not continue without traceability, so this triggers
+    the standard safety shutdown -- see test_control/storage_guard.py.
+    """
+
+
+class WatchdogTimeoutError(SafetyViolationError):
+    """
+    The sampling loop stopped making progress (a blocking hardware call hung
+    or the loop stalled) for longer than Settings.LOOP_WATCHDOG_TIMEOUT_S --
+    see utils/watchdog.py. The watchdog thread has already forced the
+    hardware safe by the time the main thread sees this.
+    """
+
+
 class OperationCancelledError(NIPXIError):
     """
     Raised when a cancellation checkpoint (see utils/cancellation.py) finds
@@ -131,6 +161,15 @@ class RelayStateVerificationError(RelayError):
     Raised when a relay's actual (readback) state does not match the
     state the driver just commanded. Always fatal -- execution must stop
     rather than proceed with an unverified/ambiguous relay configuration.
+    """
+
+
+class RelayCommLostError(RelayError):
+    """
+    The relay matrix stopped answering during an energized operation (the
+    periodic heartbeat read failed). Raised with the relay still presumed
+    closed -- the caller's safety shutdown must treat the relay state as
+    unknown, not open.
     """
 
 
@@ -227,7 +266,11 @@ STATION_HARDWARE_EXCEPTIONS = (
     DMMMeasurementLostError,  # DMM comms permanently lost (bounded retry
                               # exhausted) -- a SafetyViolationError
                               # subclass, listed here explicitly; see the
-                              # ordering note above
+                              # ordering note above (also covers
+                              # MeasurementFrozenError)
+    StorageFailureError,      # test data cannot be persisted -- station-wide,
+                              # every remaining position would fail the same way
+    WatchdogTimeoutError,     # sampling loop hung -- station-level stall
 )
 
 BATTERY_UNDER_TEST_EXCEPTIONS = (

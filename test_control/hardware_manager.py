@@ -51,6 +51,7 @@ from hardware.dmm import DMM
 from hardware.relay_factory import RelayFactory
 from utils.errors import HardwareInitError
 from utils.safety_fault import acknowledge_safety_fault, display_safety_fault_screen, report_safety_fault
+from utils.termination import register_hardware
 
 
 class HardwareManager:
@@ -188,6 +189,12 @@ class HardwareManager:
         # hard process kill -- nothing in userspace can.
         atexit.register(self._atexit_relay_shutdown)
         atexit.register(self._atexit_smu_shutdown)
+
+        # Termination safety net (utils/termination.py): SIGTERM, Ctrl+Break,
+        # console close, logoff and system shutdown do NOT run atexit hooks on
+        # Windows, so the termination handler needs a way to ask this manager
+        # whether it is safe and, past a grace period, to force it safe.
+        register_hardware(self)
 
     # ------------------------------------------------------------------
     # Hardware Audit Trail (see docs/architecture.md "Hardware Audit Trail")
@@ -584,6 +591,21 @@ class HardwareManager:
 
         self.log.info("All hardware disconnected.")
         self.log.warning("[SHUTDOWN-TRACE] disconnect_all() completed")
+
+    def is_safe(self) -> bool:
+        """True once neither the relay nor the SMU is still connected -- i.e.
+        disconnect_all() completed (it leaves the SMU session open and
+        therefore 'connected' when its output could not be verified OFF)."""
+        return not (self._relay.connected or self._smu.connected)
+
+    def emergency_shutdown(self, reason: str = "termination") -> None:
+        """Force the SMU off, then the relay open (same order and same
+        never-raises contract as the atexit nets). Used by
+        utils/termination.py when a cooperative shutdown did not finish in
+        time."""
+        self.log.critical("Emergency hardware shutdown requested: %s", reason)
+        self._atexit_smu_shutdown()
+        self._atexit_relay_shutdown()
 
     def _atexit_relay_shutdown(self):
         """

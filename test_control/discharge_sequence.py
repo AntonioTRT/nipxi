@@ -293,6 +293,7 @@ class DischargeSequence(BatteryOperationSequence):
 
                     while True:
                         check_cancellation(token)
+                        self._periodic_safety_checks(channel=channel, relay_address=relay_address)
 
                         elapsed = time.monotonic() - t_start
                         if elapsed > discharge_timeout_s:
@@ -338,6 +339,7 @@ class DischargeSequence(BatteryOperationSequence):
 
                         t_c = None
                         presence = None
+                        ntc_v = None
                         if self.daq is not None and ntc_channel is not None:
                             try:
                                 ntc_v = self.daq.read_channel(ntc_channel)
@@ -360,6 +362,9 @@ class DischargeSequence(BatteryOperationSequence):
                                     )
                                 last_ntc_state = "fault"
 
+                        self._frozen_check_samples(
+                            v=v, i=i, ntc_v=ntc_v, channel=channel, relay_address=relay_address,
+                        )
                         status = self.safety.check(v, i, t_c, mode="discharge")
                         if not status.safe:
                             raise SafetyViolationError(f"Channel {channel}: {status.reason}")
@@ -407,7 +412,7 @@ class DischargeSequence(BatteryOperationSequence):
                             "Channel %d: PMU output could not be verified OFF after discharge sequence.",
                             channel,
                         )
-                    self.storage.log_event(
+                    self._safe_log_event(
                         level="INFO" if smu_disabled_ok else "CRITICAL",
                         source="discharge_battery", channel=channel, relay=relay_address,
                         message=format_event(

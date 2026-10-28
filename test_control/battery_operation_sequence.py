@@ -23,16 +23,22 @@ by every operation, not where they are first resolved.
 """
 
 import logging
+import sqlite3
+import time
 
 import config.devices as dev_cfg
+from test_control.frozen_signal import FrozenSignalDetector
 from test_control.safety_monitor import SafetyMonitor
+from test_control.storage_guard import StorageSpaceGuard
+from utils.watchdog import LoopWatchdog
 from test_control.execution_screen import (
     RECENT_EVENTS_DISPLAY_LIMIT, RECENT_MEASUREMENTS_DISPLAY_LIMIT,
     ExecutionFrame, render_execution_frame,
 )
 from utils.errors import (
     SafetyViolationError, RelayError, OperationCancelledError, ReversePolarityError,
-    NIPXITimeoutError,
+    NIPXITimeoutError, MeasurementFrozenError, RelayCommLostError, RelayStateVerificationError,
+    StorageFailureError,
 )
 from utils.event_format import EventType, format_event
 from utils.stop_reason import StopReason
@@ -101,6 +107,7 @@ class BatteryOperationSequence:
         # dmm.measure_dc_voltage() directly.
         self.sense_router = sense_router
         self.sense_channel = sense_channel
+        self._reset_supervision()
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -118,9 +125,14 @@ class BatteryOperationSequence:
         their one fixed `channel` (== position_in_group under the Group
         Ownership Migration -- see config/devices.py::BATTERY_GROUPS).
         """
-        return self.storage.record_measurement(
-            group_name=self.group_name, position_in_group=position_in_group, **fields,
-        )
+        try:
+            return self.storage.record_measurement(
+                group_name=self.group_name, position_in_group=position_in_group, **fields,
+            )
+        except (sqlite3.Error, OSError) as e:
+            # A battery test must not continue without a record -- classified
+            # as a safety violation so run_guarded() runs the standard shutdown.
+            raise StorageFailureError(f"Measurement could not be persisted: {e}") from e
 
     def _run_number(self):
         """The current run_summary row's integer id, or None if not found --
@@ -373,15 +385,202 @@ class BatteryOperationSequence:
                 self.log.warning("Failed to record shutdown-trace event %r: %s", message, log_err)
         return _on_event
 
+    # ------------------------------------------------------------------
+    # Energized-operation supervision -- called once per sampling iteration
+    # by Charge/Discharge/Monitor Battery via _periodic_safety_checks().
+    # ------------------------------------------------------------------
+
+    def _setting(self, name, default):
+        return getattr(self.s, name, default)
+
+    def _reset_supervision(self):
+        """Fresh watchdog/heartbeat/space-guard/frozen-detector state for one
+        guarded run."""
+        self._bookkeeping_failures = []
+        self._frozen_detectors = {}
+        self._last_heartbeat = None
+        self._space_guard = StorageSpaceGuard(self.s)
+        self._watchdog = LoopWatchdog(
+            self._setting("LOOP_WATCHDOG_TIMEOUT_S", 0), self._watchdog_expired, name=self.source,
+        )
+
+    def _watchdog_expired(self, reason: str):
+        """Runs on the watchdog thread when the loop stopped making progress:
+        the same SMU-off-then-relay-open sequence every other fault uses."""
+        self.log.critical("%s -- running emergency stop from the watchdog thread.", reason)
+        self.safety.emergency_stop(self.smu, self.relay, reason)
+
+    def _safe_log_event(self, **kwargs):
+        """storage.log_event() that never raises -- for code that runs while
+        hardware is being made safe, where a storage failure must not be able
+        to interrupt the safing."""
+        try:
+            return self.storage.log_event(**kwargs)
+        except Exception as e:
+            self.log.error("event_log write failed (%s): %s", kwargs.get("message"), e)
+            return None
+
+    def _best_effort(self, what: str, fn, *args, **kwargs):
+        """Run a bookkeeping call after the safety shutdown; failures are
+        recorded and logged, never raised."""
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            self._bookkeeping_failures.append(what)
+            self.log.error("Post-shutdown bookkeeping failed (%s): %s", what, e)
+            return None
+
+    def _periodic_safety_checks(self, *, channel, relay_address):
+        """
+        One call per sampling iteration, at the top of the loop:
+          - pets the loop watchdog (raises if it already fired);
+          - relay heartbeat, time-gated by Settings.RELAY_HEARTBEAT_INTERVAL_S;
+          - storage free-space check, time-gated by
+            Settings.STORAGE_CHECK_INTERVAL_S.
+        Any failure raises and unwinds through the caller's own try/finally
+        (SMU off) into run_guarded()'s safety shutdown.
+        """
+        self._watchdog.pet()
+        self._relay_heartbeat(channel=channel, relay_address=relay_address)
+        self._space_guard.check(on_warn=lambda message: self._safe_log_event(
+            level="WARNING", source=self.source, channel=channel, relay=relay_address, message=message,
+        ))
+
+    def _relay_heartbeat(self, *, channel, relay_address):
+        """
+        Re-read the relay bank while a relay is closed under test, so a lost
+        relay link is found within RELAY_HEARTBEAT_INTERVAL_S instead of at the
+        end of the run. Verifies only communication plus "exactly the expected
+        channel reads closed" -- a readback of the COMMANDED state, not an
+        independent contact check.
+        """
+        interval = self._setting("RELAY_HEARTBEAT_INTERVAL_S", 0)
+        closed_channels = getattr(self.relay, "closed_channels", None)
+        if not interval or interval <= 0 or closed_channels is None:
+            return
+        now = time.monotonic()
+        if self._last_heartbeat is None:
+            self._last_heartbeat = now   # close() just verified the bank; start the clock
+            return
+        if now - self._last_heartbeat < interval:
+            return
+        self._last_heartbeat = now
+        try:
+            closed = list(closed_channels())
+        except (RelayError, NIPXITimeoutError) as e:
+            message = (f"Channel {channel}: relay {getattr(self.relay, 'name', '')} stopped "
+                       f"answering during the run -- {e}")
+            self._safe_log_event(level="ERROR", source=self.source, channel=channel,
+                                 relay=relay_address, message=message)
+            raise RelayCommLostError(message) from e
+        if closed != [relay_address]:
+            raise RelayStateVerificationError(
+                f"Channel {channel}: relay heartbeat expected only channel {relay_address} "
+                f"closed, read {closed}."
+            )
+
+    def _frozen_check(self, key, value, *, window_setting, epsilon_setting, label,
+                      channel, relay_address, active=True):
+        """
+        Feed one sample to this run's FrozenSignalDetector for `key`. `active`
+        False means the signal is not expected to move right now (e.g. no
+        current flowing) -- the detector is reset instead of fed. Raises
+        MeasurementFrozenError once the window is full.
+        """
+        if not self._setting("FROZEN_DETECTION_ENABLED", False) or value is None:
+            return
+        detector = self._frozen_detectors.get(key)
+        if detector is None:
+            detector = self._frozen_detectors[key] = FrozenSignalDetector(
+                self._setting(window_setting, 60), self._setting(epsilon_setting, 0.0),
+            )
+        if not active:
+            detector.reset()
+            return
+        if detector.update(value):
+            message = (f"Channel {channel}: {label} frozen -- {detector.count} consecutive "
+                       f"identical samples ({value!r}); measurement is stale.")
+            self.log.error(message)
+            self._safe_log_event(level="ERROR", source=self.source, channel=channel,
+                                 relay=relay_address, message=message)
+            raise MeasurementFrozenError(message)
+
+    def _frozen_check_samples(self, *, channel, relay_address, v=None, i=None, ntc_v=None,
+                               voltage_active=True):
+        """
+        Frozen-measurement checks for one sampling iteration (see
+        test_control/frozen_signal.py). Current is always judged; voltage only
+        while current flows (|I| >= FROZEN_CURRENT_MIN_ACTIVE_A) AND the caller
+        says the voltage is expected to move (`voltage_active` -- False during
+        the CV hold, where a regulated voltage legitimately sits still); NTC
+        voltage always when supplied.
+        """
+        common = dict(channel=channel, relay_address=relay_address)
+        if i is not None:
+            self._frozen_check("current", i, window_setting="FROZEN_CURRENT_SAMPLES",
+                               epsilon_setting="FROZEN_CURRENT_EPSILON_A", label="SMU current", **common)
+            if v is not None:
+                flowing = abs(i) >= self._setting("FROZEN_CURRENT_MIN_ACTIVE_A", 0.01)
+                self._frozen_check("voltage", v, window_setting="FROZEN_VOLTAGE_SAMPLES",
+                                   epsilon_setting="FROZEN_VOLTAGE_EPSILON_V", label="DMM voltage",
+                                   active=flowing and voltage_active, **common)
+        if ntc_v is not None:
+            self._frozen_check("ntc", ntc_v, window_setting="FROZEN_NTC_SAMPLES",
+                               epsilon_setting="FROZEN_NTC_EPSILON_V", label="NTC voltage", **common)
+
+    def _abort_run(self, exc, *, channel, relay_address, trace, events, state, stop_reason,
+                    result, final_ctx, extra_fn, cancelled=False):
+        """
+        Abnormal-exit handling shared by every run_guarded() branch.
+
+        ORDER (fixed): safety shutdown FIRST (SMU off verified, then relay
+        open), THEN best-effort bookkeeping. Persistence used to run first, so
+        a storage failure -- the likeliest thing to be broken when a run
+        aborts -- skipped the shutdown entirely. Every bookkeeping call below
+        is individually guarded; a failure is logged, never raised.
+        """
+        self._watchdog.stop()
+        on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
+        on_event(trace)
+
+        try:
+            if cancelled:
+                self.safety.safe_cancel_shutdown(self.smu, self.relay, str(exc), on_event=on_event)
+            else:
+                self.safety.emergency_stop(self.smu, self.relay, str(exc), on_event=on_event)
+        except Exception as shutdown_err:
+            self.log.critical(
+                "Safety shutdown raised unexpectedly: %s. Hardware may still be energized -- "
+                "physically disconnect power if this cannot be resolved immediately.", shutdown_err,
+            )
+
+        for level, message in events:
+            self._best_effort("event_log", self.storage.log_event, level=level, source=self.source,
+                              channel=channel, relay=relay_address, message=message)
+        self._best_effort("execution_state", self.storage.record_execution_state,
+                          channel=channel, relay=relay_address, state=state)
+        fields = self._best_effort("run_summary fields", extra_fn) or {}
+        # Taken AFTER the shutdown: a defensive reading must never delay or
+        # block the safing. The position is isolated by now, so this is a
+        # resting (open-circuit) voltage rather than a loaded one.
+        final_v = self._safe_final_voltage_reading(final_ctx)
+        if final_v is not None:
+            fields["end_voltage"] = final_v
+        self._best_effort("run_summary", self.storage.finish_run_summary,
+                          stop_reason=stop_reason, result=result, **fields)
+        if self._bookkeeping_failures:
+            self.log.critical(
+                "Channel %s: hardware was made safe, but traceability is INCOMPLETE for this "
+                "run (failed: %s).", channel, ", ".join(self._bookkeeping_failures),
+            )
+
     def run_guarded(self, fn, *, channel, relay_address, label, verb, cancel_message,
                      extra_run_summary_fields_fn=lambda: {}):
         """
         Run `fn()` under the cancellation/safety/relay/unexpected-error
-        handling every operation needs: log the event, record execution
-        state, finish run_summary, run the matching SafetyMonitor shutdown,
-        and re-raise -- identical to what MonitorBatterySequence/
-        MonitorBatteryScanSequence each independently implemented before
-        this extraction.
+        handling every operation needs: run the matching SafetyMonitor
+        shutdown FIRST, then (best effort) log the event, record execution
+        state and finish run_summary, and re-raise -- see _abort_run().
 
         `label` (e.g. "Monitor Battery"/"Monitor Battery Scan") and `verb`
         (e.g. "monitoring"/"scanning") parameterize only the diagnostic log
@@ -393,133 +592,66 @@ class BatteryOperationSequence:
         exception, not at call time, so it reflects state as of the failure.
 
         Returns fn()'s return value on success. Re-raises on any of the
-        four handled exception types after the shutdown bookkeeping above.
+        handled exception types after the shutdown/bookkeeping above.
         """
+        self._reset_supervision()
+
+        def abort(exc, **kwargs):
+            self._abort_run(exc, channel=channel, relay_address=relay_address,
+                            extra_fn=extra_run_summary_fields_fn, **kwargs)
+
         try:
             return fn()
 
         except OperationCancelledError as e:
             self.log.warning("%s cancelled: %s", label, e)
-            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
-            on_event("cancellation detected")
-            self.storage.log_event(
-                level="INFO", source=self.source, channel=channel, relay=relay_address,
-                message=cancel_message,
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.CANCELLED)
-            fields = extra_run_summary_fields_fn()
-            final_v = self._safe_final_voltage_reading("operator cancellation")
-            if final_v is not None:
-                fields["end_voltage"] = final_v
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.CANCELLED, result="STOPPED_BY_OPERATOR",
-                **fields,
-            )
-            self.safety.safe_cancel_shutdown(self.smu, self.relay, str(e), on_event=on_event)
+            abort(e, trace="cancellation detected", events=[("INFO", cancel_message)],
+                  state=StopReason.CANCELLED, stop_reason=StopReason.CANCELLED,
+                  result="STOPPED_BY_OPERATOR", final_ctx="operator cancellation", cancelled=True)
             raise
 
         except SafetyViolationError as e:
             self.log.error("Safety violation while %s channel %d: %s", verb, channel, e)
-            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
-            on_event("safety violation detected")
-            self.storage.log_event(
-                level="ERROR", source=self.source, channel=channel, relay=relay_address,
-                message=f"Safety violation -- {e}",
-            )
             # Standardized Hardware Event Logging (see docs/architecture.md)
             # -- covers every SafetyViolationError source uniformly
             # (reverse polarity, a real safety.check() limit violation,
-            # battery-removal-during-charge) via this one shared branch,
-            # rather than duplicating the same event at each raise site.
-            self.storage.log_event(
-                level="ERROR", source=self.source, channel=channel, relay=relay_address,
-                message=format_event(EventType.SAFETY_MONITOR_TRIGGERED, reason=str(e)),
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.SAFETY_VIOLATION)
-            fields = extra_run_summary_fields_fn()
-            final_v = self._safe_final_voltage_reading("safety violation")
-            if final_v is not None:
-                fields["end_voltage"] = final_v
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.SAFETY_VIOLATION, result="FAIL",
-                **fields,
-            )
-            self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)
+            # battery-removal-during-charge, frozen measurement, storage
+            # failure, watchdog) via this one shared branch.
+            abort(e, trace="safety violation detected",
+                  events=[("ERROR", f"Safety violation -- {e}"),
+                          ("ERROR", format_event(EventType.SAFETY_MONITOR_TRIGGERED, reason=str(e)))],
+                  state=StopReason.SAFETY_VIOLATION, stop_reason=StopReason.SAFETY_VIOLATION,
+                  result="FAIL", final_ctx="safety violation")
             raise
 
         except RelayError as e:
             self.log.error("Relay verification fault while %s channel %d: %s", verb, channel, e)
-            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
-            on_event("relay fault detected")
-            self.storage.log_event(
-                level="ERROR", source=self.source, channel=channel, relay=relay_address,
-                message=f"Relay verification fault -- {e}",
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.FAILED)
-            fields = extra_run_summary_fields_fn()
-            final_v = self._safe_final_voltage_reading("relay fault")
-            if final_v is not None:
-                fields["end_voltage"] = final_v
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.FAILED, result="FAIL",
-                **fields,
-            )
-            self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)
+            kind = "Relay communication lost" if isinstance(e, RelayCommLostError) else "Relay verification fault"
+            abort(e, trace="relay fault detected", events=[("ERROR", f"{kind} -- {e}")],
+                  state=StopReason.FAILED, stop_reason=StopReason.FAILED,
+                  result="FAIL", final_ctx="relay fault")
             raise
 
         except NIPXITimeoutError as e:
             # Classified as StopReason.TIMEOUT with its OWN dedicated
             # result="TIMEOUT" (not the generic "FAIL") -- see docs/
-            # architecture.md "Timeout Traceability". A timeout means the
-            # end condition was never confirmed within the expected window;
-            # it is a distinct, investigator-relevant outcome from "the
-            # station/battery actively failed a check" (result="FAIL",
-            # used by RelayError/SafetyViolationError/generic-Exception
-            # above) -- collapsing both into "FAIL" made TIMEOUT and FAIL
-            # runs indistinguishable by `result` alone (only `stop_reason`
-            # disambiguated them), which is exactly the kind of overload a
-            # forensic/incident query should not have to know to work
-            # around. Shutdown sequence is identical to every other fault
-            # (emergency_stop()) -- only the recorded stop_reason/result/
-            # execution_state differ.
+            # architecture.md "Timeout Traceability". Shutdown sequence is
+            # identical to every other fault (emergency_stop()).
             self.log.error("Timeout while %s channel %d: %s", verb, channel, e)
-            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
-            on_event("timeout detected")
-            self.storage.log_event(
-                level="ERROR", source=self.source, channel=channel, relay=relay_address,
-                message=f"Timeout -- {e}",
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.TIMEOUT)
-            fields = extra_run_summary_fields_fn()
-            final_v = self._safe_final_voltage_reading("timeout")
-            if final_v is not None:
-                fields["end_voltage"] = final_v
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.TIMEOUT, result="TIMEOUT",
-                **fields,
-            )
-            self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)
+            abort(e, trace="timeout detected", events=[("ERROR", f"Timeout -- {e}")],
+                  state=StopReason.TIMEOUT, stop_reason=StopReason.TIMEOUT,
+                  result="TIMEOUT", final_ctx="timeout")
             raise
 
         except Exception as e:
             self.log.error("Unexpected error while %s channel %d: %s", verb, channel, e, exc_info=True)
-            on_event = self._shutdown_trace_logger(channel=channel, relay_address=relay_address)
-            on_event("unexpected error detected")
-            self.storage.log_event(
-                level="ERROR", source=self.source, channel=channel, relay=relay_address,
-                message=f"Unexpected error -- {e}",
-            )
-            self.storage.record_execution_state(channel=channel, relay=relay_address, state=StopReason.FAILED)
-            fields = extra_run_summary_fields_fn()
-            final_v = self._safe_final_voltage_reading("unexpected error")
-            if final_v is not None:
-                fields["end_voltage"] = final_v
-            self.storage.finish_run_summary(
-                stop_reason=StopReason.FAILED, result="FAIL",
-                **fields,
-            )
-            self.safety.emergency_stop(self.smu, self.relay, str(e), on_event=on_event)
+            abort(e, trace="unexpected error detected", events=[("ERROR", f"Unexpected error -- {e}")],
+                  state=StopReason.FAILED, stop_reason=StopReason.FAILED,
+                  result="FAIL", final_ctx="unexpected error")
             raise
+
+        finally:
+            self._watchdog.stop()
 
     def complete(self, *, channel, relay_address, log_message, **extra_run_summary_fields):
         """

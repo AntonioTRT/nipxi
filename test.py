@@ -213,7 +213,6 @@ def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn
             "[2] Functional Validation" + (" (future)" if functional_status == _menu_status.FUTURE else ""),
             functional_status))
         print("[0] Back")
-        print(_menu_status.legend())
         try:
             raw = input("\nChoice: ").strip()
         except (KeyboardInterrupt, EOFError):
@@ -2696,7 +2695,6 @@ def _functional_relay_numato(name: str, cfg: dict):
     for i, (label, fn) in enumerate(options, 1):
         print(_menu_status.style(f"[{i}] {label}", _RELAY_FUNCTIONAL_STATUS.get(fn)))
     print("0. Back")
-    print(_menu_status.legend())
     try:
         raw = input("\nChoice: ").strip()
     except (KeyboardInterrupt, EOFError):
@@ -6160,7 +6158,6 @@ def run_main_test():
         ("6. NTC Group Scan (temperature/presence check via DAQ, no relay/PSU)", _run_ntc_group_scan),
     ):
         print(_menu_status.style(line, _MAIN_TEST_STATUS.get(fn)))
-    print(_menu_status.legend())
     choice = input("\nSelect mode: ").strip()
 
     if choice == "1":
@@ -6636,6 +6633,12 @@ def main():
     print("  Test Framework")
     print("=" * 60)
 
+    # SIGTERM / Ctrl+Break / console close / logoff / shutdown -> cooperative
+    # cancel, then forced hardware safing (utils/termination.py). Ctrl+C keeps
+    # its per-operation handlers.
+    from utils.termination import install_termination_handlers
+    install_termination_handlers()
+
     print("\n[Pre-flight: Configuration Validation]")
     _config_results, config_ok = preflight_check()
 
@@ -6663,7 +6666,6 @@ def main():
         for i, (label, fn) in enumerate(MENU, 1):
             print(_menu_status.style(f"  {i:2}. {label}", MENU_STATUS.get(fn)))
         print("   0. Exit")
-        print(_menu_status.legend())
         print()
 
         try:

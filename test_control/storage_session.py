@@ -19,6 +19,7 @@ from __future__ import annotations
 import sqlite3
 
 from data.storage import DataStorage
+from test_control.storage_guard import check_start_free_space
 
 
 def open_storage_guarded(settings, hw_mgr=None, on_fail=None):
@@ -43,6 +44,30 @@ def open_storage_guarded(settings, hw_mgr=None, on_fail=None):
     future non-interactive caller can pass a logger method or omit it
     entirely.
     """
+    def _abort(*lines):
+        if on_fail is not None:
+            for line in lines:
+                on_fail(line)
+        if hw_mgr is not None:
+            try:
+                hw_mgr.disconnect_all()
+            except Exception as shutdown_err:
+                if on_fail is not None:
+                    on_fail(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
+                    on_fail("           Hardware may still be energized -- "
+                            "physically disconnect power if this cannot be resolved immediately.")
+
+    # Start gate (see test_control/storage_guard.py): never start an energized
+    # operation on a volume too full to record it.
+    space_ok, free_mb = check_start_free_space(settings)
+    if not space_ok:
+        _abort(
+            f"\n[FAIL] Insufficient free storage -- {free_mb:.0f} MB free, "
+            f"{settings.STORAGE_MIN_FREE_MB_START} MB required to start.",
+            "       Free disk space and retry. Aborting, no hardware activated.",
+        )
+        return None
+
     storage = DataStorage(settings=settings)
     try:
         storage.open()
@@ -57,17 +82,10 @@ def open_storage_guarded(settings, hw_mgr=None, on_fail=None):
         if hw_mgr is not None and hasattr(hw_mgr, "attach_run_id_provider"):
             hw_mgr.attach_run_id_provider(lambda: storage.run_id)
     except (OSError, sqlite3.Error) as e:
-        if on_fail is not None:
-            on_fail(f"\n[FAIL] Database unavailable -- could not open storage: {e}")
-            on_fail("       See logs for full diagnostic detail. Aborting, no hardware activated.")
-        if hw_mgr is not None:
-            try:
-                hw_mgr.disconnect_all()
-            except Exception as shutdown_err:
-                if on_fail is not None:
-                    on_fail(f"[CRITICAL] Hardware shutdown failed: {shutdown_err}")
-                    on_fail("           Hardware may still be energized -- "
-                            "physically disconnect power if this cannot be resolved immediately.")
+        _abort(
+            f"\n[FAIL] Database unavailable -- could not open storage: {e}",
+            "       See logs for full diagnostic detail. Aborting, no hardware activated.",
+        )
         return None
     return storage
 

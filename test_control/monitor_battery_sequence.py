@@ -194,11 +194,13 @@ class MonitorBatterySequence(BatteryOperationSequence):
             nonlocal last_ntc_state
             while True:
                 check_cancellation(token)
+                self._periodic_safety_checks(channel=channel, relay_address=relay_address)
 
                 voltage_v = self.dmm.measure_dc_voltage()
                 current_a = None  # DMM is voltage-only -- see module TODO
                 temp_c = None
                 if self.daq is not None and ntc_channel is not None:
+                    ntc_v = None
                     try:
                         ntc_v = self.daq.read_channel(ntc_channel)
                         presence = classify_ntc_presence(ntc_v)
@@ -220,6 +222,11 @@ class MonitorBatterySequence(BatteryOperationSequence):
                             )
                         last_ntc_state = "fault"
 
+                    # Resting battery: voltage legitimately reads steady, so
+                    # only the NTC is judged for freezing here.
+                    self._frozen_check_samples(
+                        ntc_v=ntc_v, channel=channel, relay_address=relay_address,
+                    )
                     status = self.safety.check_temperature(temp_c)
                     if not status.safe:
                         raise SafetyViolationError(f"Channel {channel}: {status.reason}")

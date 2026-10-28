@@ -175,6 +175,60 @@ class Settings:
     DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES = 3
 
     # -------------------------------------------------------------------------
+    # Energized-operation supervision (Charge/Discharge/Monitor Battery):
+    # periodic safety checks run once per sampling iteration by
+    # BatteryOperationSequence._periodic_safety_checks().
+    # -------------------------------------------------------------------------
+
+    # Loop watchdog (utils/watchdog.py): armed on the first loop iteration;
+    # if the loop does not report progress for this long (a hung instrument
+    # call, a stalled loop), a watchdog thread forces SMU output off and all
+    # relays open on its own. Must comfortably exceed one worst-case
+    # iteration (DMM/SMU reads + a relay reconnect cycle, ~20 s).
+    LOOP_WATCHDOG_TIMEOUT_S = 60.0
+
+    # Relay heartbeat: while a relay is closed under test, re-read the bank
+    # state at this interval so a lost relay link (cable, switch, module) is
+    # detected in seconds instead of at the end of the run. Comm check plus
+    # "only the expected channel is closed" -- NOT an independent contact
+    # check (relay weld detection is a separate, postponed item). 0 disables.
+    RELAY_HEARTBEAT_INTERVAL_S = 10.0
+
+    # Storage supervision. Free space on the volume holding DATA_DIR:
+    #   below STORAGE_MIN_FREE_MB_START -> refuse to start an operation
+    #   below STORAGE_WARN_FREE_MB      -> one WARNING event per run
+    #   below STORAGE_ABORT_FREE_MB     -> safety shutdown (StorageFailureError)
+    # Checked every STORAGE_CHECK_INTERVAL_S during a run. 0 interval disables
+    # the runtime check (the start gate still applies).
+    STORAGE_MIN_FREE_MB_START = 500
+    STORAGE_WARN_FREE_MB      = 300
+    STORAGE_ABORT_FREE_MB     = 100
+    STORAGE_CHECK_INTERVAL_S  = 30.0
+
+    # Frozen-measurement detection (test_control/frozen_signal.py): a channel
+    # whose value stays identical (max-min <= epsilon) for this many
+    # consecutive samples is declared frozen. UNCALIBRATED starting values --
+    # tune against raw_hardware_log from real runs before relying on them.
+    # Voltage/current are judged only while current actually flows (charge/
+    # discharge); a resting battery legitimately reads steady, so Monitor
+    # Battery checks the NTC only.
+    FROZEN_DETECTION_ENABLED = True
+    FROZEN_VOLTAGE_SAMPLES   = 60
+    FROZEN_VOLTAGE_EPSILON_V = 0.0
+    FROZEN_CURRENT_SAMPLES   = 60
+    FROZEN_CURRENT_EPSILON_A = 0.0
+    FROZEN_CURRENT_MIN_ACTIVE_A = 0.01   # only judge current/voltage above this |I|
+    FROZEN_NTC_SAMPLES       = 300
+    FROZEN_NTC_EPSILON_V     = 0.0
+
+    # Process-termination handling (utils/termination.py): on SIGTERM /
+    # Ctrl+Break / console close / logoff / system shutdown, running
+    # operations are cancelled cooperatively and given this long to reach a
+    # verified safe state before hardware is forced safe from the handler.
+    TERMINATION_GRACE_S = 8.0
+    CONSOLE_CLOSE_GRACE_S = 4.0   # Windows kills the process shortly after a close event
+
+    # -------------------------------------------------------------------------
     # Hardware Audit Trail (see docs/architecture.md "Hardware Audit Trail" --
     # hardware/audit_proxy.py + data/raw_hardware_log.py). Fully additive and
     # independent of event_log/measurements/EventType -- disabling this never

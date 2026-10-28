@@ -66,11 +66,3 @@ def result_style(result_status: str):
 def status_line(label: str, word: str, status, indent: str = "  ") -> str:
     """'  <label>: <WORD>' with only the word colored."""
     return f"{indent}{label}: {style(word, status)}"
-
-
-def legend() -> str:
-    return "  " + "   ".join((
-        style("green = verified on hardware", VERIFIED),
-        style("yellow = partially verified", PARTIAL),
-        "no color = future / experimental / offline",
-    ))

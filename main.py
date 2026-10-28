@@ -34,6 +34,7 @@ from data.logger import setup as setup_logging
 from utils.cancellation import CancellationToken, install_sigint_handler
 from utils.errors import HardwareInitError, ValidationError, DeviceConfigError
 from utils.stop_reason import StopReason
+from utils.termination import install_termination_handlers
 from utils.validators import validate_settings
 from utils.device_validator import validate_devices_or_raise
 from test_control.hardware_manager import HardwareManager
@@ -67,6 +68,10 @@ def main():
     setup_logging(Settings)
     log = logging.getLogger("nipxi.main")
     log.info("NIPXI %s starting.", Settings.VERSION)
+
+    # SIGTERM / Ctrl+Break / console close / logoff / shutdown handling --
+    # see utils/termination.py.
+    install_termination_handlers()
 
     mode_policy = get_mode_policy(Settings)
     log.info("System mode: %s -- %s", mode_policy.mode.value, mode_policy.description)
