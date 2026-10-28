@@ -91,7 +91,7 @@ the complete remaining-work checklist.
                 |                    EXPANSION_DAQ/PRECISION_DAQ   |
                 |                    (present, not yet channel-    |
                 |                     assigned -- Section 4)       |
-                |   Slot 11: PXIe-2569  CHASSIS_RELAY_MATRIX (n/a) |
+                |   Slot 11: PXIe-2569  CHASSIS_RELAY_MATRIX (drv) |
                 |   Slot 15: PXIe-4353  TEMP_MODULE (identity only)|
                 +---+----------------+-----------+----------------+
                     |                            |
@@ -219,7 +219,7 @@ Confirmed against the real PXI rack (NI-MAX detection) — `config/devices.py::P
 | SMU (high power, present, not yet wired to a channel) | PXIe-4139 | 6 | `HIGH_POWER_SMU` | NI-DCPower | `nidcpower` | same `SMU` class, second `SMU_ASSIGNMENTS` entry |
 | SMU (auxiliary, present, not yet wired to a battery channel) | PXI-4130 | 7 | `AUX_SMU_1` | NI-DCPower | `nidcpower` | same `SMU` class -- NI-DCPower channel `"1"` (confirmed on physical hardware, see `smu_channel` below) |
 | SMU (auxiliary, present, not yet wired to a battery channel) | PXI-4130 | 8 | `AUX_SMU_2` | NI-DCPower | `nidcpower` | same `SMU` class -- NI-DCPower channel `"1"` (confirmed on physical hardware, see `smu_channel` below) |
-| Relay/switch (present, NOT the active relay driver) | PXIe-2569 | 11 | `CHASSIS_RELAY_MATRIX` | NI-SWITCH | `niswitch` | none yet — see Numato Ethernet relay below for the actual production path |
+| Relay/switch (100 SPST; driver implemented, not assigned to any group, never run on the real card) | PXIe-2569 | 11 | `CHASSIS_RELAY_MATRIX` | NI-SWITCH | `niswitch` | `hardware/relay_niswitch.py::NIPXIe2569RelayMatrix` (relay type `niswitch`); requires the `niswitch` package, not installed on the dev PC. The Numato Ethernet relay remains the production path |
 | Temperature module (present, not yet wired into any driver) | PXIe-4353 + TB-4353/0 | 15 | `TEMP_MODULE` | NI-DAQmx | `nidaqmx` | none yet — likely real source for the currently-stubbed per-channel `t_c` reading in `charge_cycle.py`/`discharge_cycle.py` |
 | DAQ (expansion, present, not wired into `HardwareManager`) | PXIe-6368 | 17 | `EXPANSION_DAQ` | NI-DAQmx | `nidaqmx` | same `DAQ` class, second `DAQ_CONFIGS` entry |
 | DAQ (precision, present, not wired into `HardwareManager`) | PXIe-6365 | 18 | `PRECISION_DAQ` | NI-DAQmx | `nidaqmx` | same `DAQ` class, third `DAQ_CONFIGS` entry |
@@ -309,7 +309,8 @@ pip install -r requirements.txt
 # 5. Run the test framework to verify hardware
 python test.py
 
-# 6. Run the application (once hardware drivers are implemented)
+# 6. Run the application (legacy TestExecutor path: no startup safety sweep and none of the
+#    run supervision in architecture.md Section 85 -- operational workflows run from test.py)
 python main.py
 python main.py --channels 1 2 3   # test only channels 1, 2, 3
 python main.py --dry-run           # no hardware, config validation only
@@ -730,6 +731,8 @@ The relay system uses a factory pattern. The rest of the application never impor
 
 **Naming:** the driver class and config dicts were previously named `EthernetRelay`/`RELAY_ETH_CONFIG`/`RELAY_ETH_CONFIGS` — generic names that didn't make clear this is specifically Numato hardware, not a vendor-neutral Ethernet relay. They are now `NumatoRelayMatrix`/`NUMATO_RELAY_MATRIX_CONFIG`/`NUMATO_RELAY_MATRIX_CONFIGS`; the old names are kept as backward-compat aliases (`EthernetRelay = NumatoRelayMatrix`, etc. — see `hardware/relay_eth.py` and `config/devices.py`) so nothing that references them by the old name breaks. `"type": "ethernet"` (the `RelayFactory` dispatch key) is unchanged -- it names the transport interface, the same way `"serial"` does, not a vendor.
 
+**PXIe-2569 (NI-SWITCH).** `hardware/relay_niswitch.py::NIPXIe2569RelayMatrix` (relay type `niswitch`, 100 SPST relays, PXI slot 11) implements the same `RelayBase` contract and safety sequence as the Numato driver. It is enabled in `config/devices.py::PXI_SLOTS[11]` and listed in `RELAY_MATRIX_CONFIGS`, but it is not assigned to any `BATTERY_GROUPS` entry, has never run against the real card, and requires the `niswitch` package, which is not installed on the development PC. Every driver must pass the relay conformance suite (`tests/_relay_conformance.py`, run by `tests/test_relay_conformance.py`). Hardware check: Test PXI Relay Matrix -> Functional Validation (Relay Range Validation: for each relay in an operator-chosen range, force open, verify, close, verify only that relay closed, dwell `RELAY_RANGE_VALIDATION_DWELL_S`, open, verify). Details: `docs/architecture.md` Sections 14.4 and 85.8.
+
 ### 9.1 Unified interface
 
 ```python
@@ -1052,6 +1055,8 @@ Row format (list of dicts):
 ---
 
 ## 11. Safety System
+
+> Current runtime safety model (layers, shutdown ordering, watchdog, relay heartbeat, frozen-signal detection, storage protection, termination handling, open gaps): [docs/architecture.md](docs/architecture.md) Section 85.
 
 `test_control/safety_monitor.py` runs on every measurement sample. If any limit is exceeded, it raises `SafetyViolationError`, which triggers an emergency stop.
 
@@ -1671,7 +1676,7 @@ Ctrl+C -> SIGINT handler (main.py/test.py) -> token.request_cancel("Ctrl+C")
        -> main.py: sys.exit(3) -- distinct from success (0) and failure (1/2)
 ```
 
-**Components:** `utils/cancellation.py::CancellationToken` (single-threaded, idempotent `request_cancel()`/`check()`), `utils/errors.py::OperationCancelledError`, `utils/stop_reason.py::StopReason`. No threads, no stdin listeners, no keyboard polling -- Ctrl+C is translated to a cooperative flag by a `signal.signal(SIGINT, ...)` handler, checked at defined checkpoints, never an asynchronous interrupt.
+**Components:** `utils/cancellation.py::CancellationToken` (idempotent `request_cancel()`/`check()`; live tokens are tracked so `cancel_all_tokens()` can cancel every operation on SIGTERM/console close), `utils/errors.py::OperationCancelledError`, `utils/stop_reason.py::StopReason`. Ctrl+C is translated to a cooperative flag by a `signal.signal(SIGINT, ...)` handler, checked at defined checkpoints, never an asynchronous interrupt; the first press cancels, later presses are ignored. SIGTERM, Ctrl+Break, console close, logoff and system shutdown are handled by `utils/termination.py` (cancel all operations, wait 4-8 s for hardware to reach a safe state, then force SMU off and relays open). A watchdog thread (`utils/watchdog.py`) forces the emergency stop if a run loop stalls for 60 s. Not covered: hard kill, BSOD, power loss. See `docs/architecture.md` Section 85.
 
 **Checkpoints exist only between atomic hardware operations** -- top of the `ChargeCycle`/`DischargeCycle` sampling loop, before each channel in `BatteryTestSequence`, before each channel in the relay matrix scan/RelayEthernetTest -- never inside a relay activate/verify sequence or a PMU verify sequence, since interrupting mid-sequence would leave hardware state less certain, not safer.
 

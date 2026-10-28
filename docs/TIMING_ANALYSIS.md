@@ -126,7 +126,7 @@ manually-paced operator prompt (`input()`) with no timeout at all by design.
 
 ## 5. PXI Relay Matrix
 
-**No timing exists.** `_identify_switch()` (`test.py`) always reports N/A -- there is no `niswitch`-based driver in this codebase (see `docs/architecture.md` Section 23d for the planned future reuse architecture). Nothing to analyze here yet; this section is a placeholder for when a real driver exists, at which point it should inherit the same Relay Safety Verification Pattern (Section 24) and its timing characteristics, per that section's documented plan.
+**Not measured.** `NIPXIe2569RelayMatrix` (`hardware/relay_niswitch.py`) applies the same global settle delay as every relay driver (`RELAY_SETTLE_TIME_S`, 2.0 s after every `open()`/`close()`, enforced in `RelayBase`) and NI-SWITCH debounce (`debounce_timeout_ms`, default 5000 ms, a timeout bound, not a duration). Relay Range Validation adds `RELAY_RANGE_VALIDATION_DWELL_S` (2.0 s) per relay. Real per-operation timings on the card have not been recorded, since the card has not been run.
 
 ---
 

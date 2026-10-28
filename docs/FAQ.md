@@ -882,34 +882,23 @@ is out of scope except where explicitly noted.
 
 ### Q: What happens if Ctrl+C occurs during shutdown?
 
-**Status:** Not Implemented (no protection)
+**Status:** Not Implemented (no protection against a second Ctrl+C)
 
-**Answer:** `safety.emergency_stop()`/`safe_cancel_shutdown()` and `hw_mgr.disconnect_all()` do not install their own SIGINT handler or block signal delivery — Python's default `SIGINT` behavior during these calls raises `KeyboardInterrupt` at whatever line is executing. If that lands mid-shutdown-sequence (e.g. between `smu.emergency_output_off()` and `relay.open_all()`), the shutdown sequence is interrupted and the relay may never receive its `open_all()` call. `test.py`'s SIGINT handler for the operation is restored to the PREVIOUS (usually default) handler in a `finally` block (test.py:4103-4104) BEFORE the outer `finally`'s `storage.close()`/`hw_mgr.disconnect_all()` runs (test.py:4106-4116) — meaning a second Ctrl+C during that final teardown window uses Python's default SIGINT behavior, not the cooperative token.
+**Answer:** `safety.emergency_stop()`/`safe_cancel_shutdown()` and `hw_mgr.disconnect_all()` do not install their own SIGINT handler or block signal delivery. The per-operation SIGINT handler (`install_sigint_handler`) is restored to the previous handler in a `finally` before the outer `finally` runs `storage.close()`/`hw_mgr.disconnect_all()`, so a Ctrl+C during that final teardown uses Python's default behavior and raises `KeyboardInterrupt` at whatever line is executing. While the operation is still cancelling, a second Ctrl+C is ignored (the first one already requested cancellation; there is no escalation). `utils/termination.py` does not cover SIGINT.
 
-**Evidence:**
-- test.py:4103-4116 — SIGINT handler restored before final teardown
-- test_control/safety_monitor.py:114-173 — no signal-blocking in emergency_stop()/safe_cancel_shutdown()
+**Risks:** A well-timed Ctrl+C during final hardware teardown could abort `disconnect_all()` between `smu.emergency_output_off()` and `relay.open_all()`. The `HardwareManager` `atexit` handlers (`_atexit_relay_shutdown`/`_atexit_smu_shutdown`) are the backstop, because the interpreter exits after the `KeyboardInterrupt`.
 
-**Risks:** A well-timed second Ctrl+C during the final hardware-teardown window could abort `disconnect_all()` mid-sequence, potentially leaving the relay closed or SMU output uncertain. `HardwareManager`'s `atexit` handlers (`_atexit_relay_shutdown`/`_atexit_smu_shutdown`) are a documented backstop for exactly this class of process-exit gap.
-
-**Recommendation:** This exact risk is already tracked in docs/architecture.md Section 17 ("the `HardwareManager.connect_all()` SIGINT/teardown gap") for the connect path; the same class of gap exists symmetrically on the disconnect/shutdown path and should be added to that tracked list if not already covered there for shutdown specifically.
+**Recommendation:** Tracked in `docs/architecture.md` Sections 13.7 and 85.9 (S-7, S-14).
 
 ### Q: Is shutdown guaranteed after user cancellation?
 
 **Status:** Partially Implemented
 
-**Answer:** A shutdown ATTEMPT is guaranteed (via `run_guarded()`'s cancellation branch calling `safe_cancel_shutdown()`), and a SECOND independent backstop exists via `HardwareManager`'s `atexit` handlers. Neither can guarantee successful completion under: total hardware communication loss, a second Ctrl+C during the shutdown window itself (see above), or a hard process kill (SIGKILL) which bypasses all Python-level handling including `atexit`.
+**Answer:** A shutdown ATTEMPT is guaranteed: `run_guarded()`'s cancellation branch calls `safe_cancel_shutdown()` first (SMU off, then relay open), before any bookkeeping. Independent backstops: `HardwareManager.disconnect_all()` in the workflow `finally`, the `atexit` hooks, and `utils/termination.py` (SIGTERM, Ctrl+Break, console close, logoff, system shutdown: cancel, wait for a safe state, then force `emergency_shutdown()`). None of these can guarantee success under total hardware communication loss, a Ctrl+C during final teardown (see above), or a hard kill (`SIGKILL`), BSOD or power loss, which bypass all Python-level handling.
 
-**Evidence:**
-- test_control/battery_operation_sequence.py:105-117
-- test_control/hardware_manager.py:399-449 — atexit backstops
-- docs/architecture.md:1330 — "Terminal-close..., Task-Manager kill, and native driver crashes all bypass every safety mechanism in this codebase"
+**Risks:** Inherent to a pure-userspace application; see `docs/architecture.md` Sections 17 and 85.9.
 
-**Risks:** As documented in docs/architecture.md's own Known Risks section — this is an inherent limitation of a pure-userspace application, not a code defect.
-
-**Recommendation:** None beyond what's already documented; a hardware-level fail-safe (relay defaults open on loss of control signal) is the only way to close this gap fully.
-
----
+**Recommendation:** A hardware-level fail-safe (relay defaults open on loss of control signal) is the only way to close this gap fully. Whether the Numato holds or drops its state on loss of the TCP link or PC, and whether the 2569 relays are latching, are unverified bench questions.
 
 ## SECTION 9 — POWER LOSS / RECOVERY
 

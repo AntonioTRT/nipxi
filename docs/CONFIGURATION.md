@@ -184,6 +184,27 @@ same `ETHERNET_DEVICES` nickname namespace every other `relay_matrix`
 role already uses -- no separate backend registry is needed to add a
 second Numato module or a future rack-integrated matrix.
 
+### Runtime safety supervision
+
+Behavior: `docs/architecture.md` Section 85. All values are uncalibrated starting points; none have been tuned on real runs.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `LOOP_WATCHDOG_TIMEOUT_S` | `60.0` | Seconds without a loop `pet()` before the watchdog thread forces the emergency stop. Armed on the first pet. |
+| `RELAY_HEARTBEAT_INTERVAL_S` | `10.0` | Interval of the relay readback heartbeat. `0` disables. |
+| `STORAGE_MIN_FREE_MB_START` | `500` | Refuse to start a workflow below this free space on the `DATA_DIR` volume. |
+| `STORAGE_WARN_FREE_MB` | `300` | Warn once below this. |
+| `STORAGE_ABORT_FREE_MB` | `100` | Abort the run (`StorageFailureError`, standard shutdown) below this. |
+| `STORAGE_CHECK_INTERVAL_S` | `30.0` | Free-space check interval. |
+| `FROZEN_DETECTION_ENABLED` | `True` | Kill switch for frozen-signal detection. |
+| `FROZEN_VOLTAGE_SAMPLES` / `FROZEN_VOLTAGE_EPSILON_V` | `60` / `0.0` | Identical-voltage window. Not applied in Monitor Battery or the charge CV hold. |
+| `FROZEN_CURRENT_SAMPLES` / `FROZEN_CURRENT_EPSILON_A` | `60` / `0.0` | Identical-current window. |
+| `FROZEN_CURRENT_MIN_ACTIVE_A` | `0.01` | Current is only judged when its magnitude is at least this. |
+| `FROZEN_NTC_SAMPLES` / `FROZEN_NTC_EPSILON_V` | `300` / `0.0` | Identical NTC-voltage window. |
+| `TERMINATION_GRACE_S` | `8.0` | Grace for SIGTERM/SIGHUP/Ctrl+Break before forced hardware shutdown. |
+| `CONSOLE_CLOSE_GRACE_S` | `4.0` | Grace for console close/logoff/system shutdown (Windows kills the process shortly after regardless). |
+| `RELAY_RANGE_VALIDATION_DWELL_S` | `2.0` | Per-relay closed-state dwell in Relay Range Validation (pre-existing). |
+
 ### Stabilization and sampling
 
 | Parameter | Default | Type | Description |
@@ -432,7 +453,7 @@ address yet, kept `enabled: False` until one is.
 | `MAIN_DMM` | Slot 3 | PXI-4065 |
 | `MATRIX_NUMATO_201` | 169.254.1.201 | Numato 32-ch Ethernet Relay |
 | `MATRIX_NUMATO_202` | 169.254.1.202 | Numato 32-ch Ethernet Relay |
-| `CHASSIS_RELAY_MATRIX` | Slot 11 | PXIe-2569 (present, no driver -- reported N/A, not disabled) |
+| `CHASSIS_RELAY_MATRIX` | Slot 11 | PXIe-2569 (`enabled=True`; `niswitch` driver implemented; not assigned to any group; `niswitch` package required) |
 
 **Intentionally disabled -- not physically installed** (hardware cleanup pass following the Milestone II Phase 3 review): the `PXI_SLOTS`/`RELAY_CONFIG` entries below are commented out in `config/devices.py`, not deleted, so they disappear entirely from Hardware Discovery/`Test DAQ`/`Test Temperature Module`'s device lists instead of reporting `[FAIL]` for hardware that was never installed:
 
@@ -617,7 +638,7 @@ of truth):
 | 6 | PXIe-4139 | `PXI1Slot6` | `HIGH_POWER_SMU` |
 | 7 | PXI-4130 | `PXI1Slot7` | `AUX_SMU_1` |
 | 8 | PXI-4130 | `PXI1Slot8` | `AUX_SMU_2` |
-| 11 | PXIe-2569 | `PXI1Slot11` | `CHASSIS_RELAY_MATRIX` (not the active relay driver -- see below) |
+| 11 | PXIe-2569 | `PXI1Slot11` | `CHASSIS_RELAY_MATRIX` (driver `hardware/relay_niswitch.py`, relay type `niswitch`; Numato remains the production relay) |
 | 15 | PXIe-4353 + TB-4353/0 | `PXI1Slot15` | `TEMP_MODULE` (not yet wired into any driver) |
 | 17 | PXIe-6368 | `PXI1Slot17` | `EXPANSION_DAQ` |
 | 18 | PXIe-6365 | `PXI1Slot18` | `PRECISION_DAQ` |

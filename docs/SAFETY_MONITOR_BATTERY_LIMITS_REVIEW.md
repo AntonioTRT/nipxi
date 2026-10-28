@@ -1,5 +1,7 @@
 # SafetyMonitor vs. BATTERY_CONFIGS -- Architecture Compliance Review
 
+**HISTORICAL REVIEW DOCUMENT -- NOT THE SOURCE OF TRUTH.** This is a point-in-time analysis kept as a record. Statements below may no longer match the code. Current behavior is documented in `docs/architecture.md`, `README.md` and `docs/CONFIGURATION.md`.
+
 > **Resolved notice:** the gap identified below has been closed. `SafetyMonitor`, `ChargeCycle`, and `DischargeCycle` now consume `BATTERY_CONFIGS` (optional, backward-compatible `battery_cfg` parameter -- `battery_cfg=None` preserves the exact prior global-Settings-only behavior). See `docs/architecture.md` Section 28, "BATTERY_CONFIGS -> SafetyMonitor Integration", for the fix design, code locations, and verification. This document's body below is kept as-is for historical record of the analysis that motivated the fix.
 
 Analysis-only document. No code was modified to produce this review.

@@ -1,5 +1,7 @@
 # NIPXI test.py -- Execution Tree Review
 
+**HISTORICAL REVIEW DOCUMENT -- NOT THE SOURCE OF TRUTH.** This is a point-in-time analysis kept as a record. Statements below may no longer match the code. Current behavior is documented in `docs/architecture.md`, `README.md` and `docs/CONFIGURATION.md`.
+
 > **Superseded snapshot notice:** the `##Antonio` annotations added to this
 > document were reviewed and acted on -- see `docs/architecture.md` Section
 > 23 ("Menu Restructuring Review") and `docs/MILESTONES.md` for what was

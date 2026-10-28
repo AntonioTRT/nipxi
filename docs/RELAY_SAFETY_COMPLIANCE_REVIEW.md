@@ -1,5 +1,7 @@
 # Relay Safety Sequencing -- Architecture Compliance Review
 
+**HISTORICAL REVIEW DOCUMENT -- NOT THE SOURCE OF TRUTH.** This is a point-in-time analysis kept as a record. Statements below may no longer match the code. Current behavior is documented in `docs/architecture.md`, `README.md` and `docs/CONFIGURATION.md`.
+
 > **Resolved notice:** the steps 1-2 gap this review identified (no
 > "Read All -> Verify Current Status" before forcing relays off) has been
 > fixed -- see `docs/architecture.md` Section 24 ("Relay Safety

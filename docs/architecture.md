@@ -31,7 +31,7 @@
                 |   Slot 6:  PXIe-4139  HIGH_POWER_SMU            |
                 |   Slot 7:  PXI-4130   AUX_SMU_1                 |
                 |   Slot 8:  PXI-4130   AUX_SMU_2                 |
-                |   Slot 11: PXIe-2569  CHASSIS_RELAY_MATRIX (n/a)|
+                |   Slot 11: PXIe-2569  CHASSIS_RELAY_MATRIX (drv) |
                 |   Slot 15: PXIe-4353  TEMP_MODULE (identity only)|
                 |   Slot 17: PXIe-6368  EXPANSION_DAQ             |
                 |   Slot 18: PXIe-6365  PRECISION_DAQ             |
@@ -235,6 +235,15 @@ No warning-only mode exists for a relay verification failure anywhere in the sta
 
 Temperature check is skipped when `temp_c=None` (NTC not yet connected).
 
+Run-level supervision rules (enforced by the sequence loop, outside `SafetyMonitor.check()`; see Section 85):
+
+| Rule | Limit | Source |
+|------|-------|--------|
+| Loop stall | no `pet()` for `LOOP_WATCHDOG_TIMEOUT_S` (60 s) | `utils/watchdog.py` |
+| Relay link / state | `closed_channels()` every `RELAY_HEARTBEAT_INTERVAL_S` (10 s) must equal `[active relay]` | `_relay_heartbeat()` |
+| Free space | start < 500 MB refused; < 300 MB warn; < 100 MB abort | `storage_guard.py` |
+| Frozen signal | identical current/voltage (60) or NTC (300) samples | `frozen_signal.py` |
+
 ---
 
 ## 5. Data Flow
@@ -402,14 +411,18 @@ This is enforced in layers, from the moment the application starts to the moment
 
    If the emergency shutdown itself also fails (typically: no working connection at all, so there is no way to force anything from software), that is logged as **CRITICAL** with explicit "hardware may still be energized -- physically disconnect power" wording -- never silently swallowed. Either way, the ORIGINAL exception is still what propagates; the emergency outcome is appended to its message.
 
-**3. Emergency stop (test-workflow level).** `test_control/safety_monitor.py::SafetyMonitor.emergency_stop()` -- called by `BatteryTestSequence.run()` on any `SafetyViolationError` or `RelayError` (which `RelayStateVerificationError` subclasses) -- disables the SMU output then calls `relay.open_all()`. By the time this can still raise, the driver has already made its own internal emergency attempt (layer 2), so a failure here is logged as **CRITICAL**, not a warning.
+**3. Emergency stop (test-workflow level).** `test_control/safety_monitor.py::SafetyMonitor.emergency_stop()` -- called by `BatteryTestSequence.run()` on any `SafetyViolationError` or `RelayError` (which `RelayStateVerificationError` subclasses) -- disables the SMU output, then calls `relay.open_all()`, and always runs BEFORE any storage bookkeeping (Section 85.2). By the time this can still raise, the driver has already made its own internal emergency attempt (layer 2), so a failure here is logged as **CRITICAL**, not a warning.
 
 **4. Application exit protection.** `HardwareManager.disconnect_all()` is the primary shutdown path: disable SMU output -> `relay.open_all()` (force OFF + verify; failure logged CRITICAL, same reasoning as layer 3) -> disconnect every device. It is called from:
    - `main.py`'s `finally:` block (runs on normal completion, `KeyboardInterrupt`, and any other exception -- Python's `finally` always executes), itself wrapped so a shutdown failure is logged critically instead of silently masking whatever was propagating;
    - `test.py`'s `run_main_test()` `finally:` block, same reasoning;
    - `HardwareManager.__exit__` for any caller using it as a context manager.
 
-   A second, independent safety net is registered via `atexit.register()` in `HardwareManager.__init__()` (`_atexit_relay_shutdown()`): it no-ops if the relay was already safely disconnected (the normal case), but catches process-exit paths that bypass the `try/finally` above (an exception during interpreter shutdown, `os._exit()` called elsewhere, etc). **Known limitation:** nothing in userspace can catch `SIGKILL` / a hard process kill -- this is a fundamental OS-level limitation, not a gap in this implementation.
+   A second, independent safety net is registered via `atexit.register()` in `HardwareManager.__init__()` (`_atexit_relay_shutdown()`): it no-ops if the relay was already safely disconnected (the normal case), but catches process-exit paths that bypass the `try/finally` above (an exception during interpreter shutdown, `os._exit()` called elsewhere, etc). `atexit` does NOT run on SIGTERM or a Windows console close; those are covered by layer 4b. **Known limitation:** nothing in userspace can catch `SIGKILL` / a hard process kill -- this is a fundamental OS-level limitation, not a gap in this implementation.
+
+**4b. Process termination handlers** (`utils/termination.py`, installed once at the top of `main()` in `main.py` and `test.py`). SIGTERM, SIGHUP (POSIX), Ctrl+Break, console close, logoff and system shutdown cancel every live `CancellationToken`, wait up to `TERMINATION_GRACE_S` (8 s; `CONSOLE_CLOSE_GRACE_S` = 4 s for close/logoff/shutdown) for every registered `HardwareManager` to report `is_safe()`, and otherwise force `emergency_shutdown()` (SMU off, then relay open) before `os._exit`. Details in Section 85.7.
+
+The PXIe-2569 driver has the same driver-level reflex as the Numato (`NIPXIe2569RelayMatrix._emergency_all_open()`, layer 2).
 
 **5. Relay cleanup manager -- where this is centralized.** `HardwareManager` is the single place responsible for making hardware safe on both ends of the application lifecycle (`connect_all()` for startup, `disconnect_all()` + the `atexit` hook for shutdown) -- not scattered across `main.py`, `test.py`, and the battery-test workflow independently. Those callers all route through the same `HardwareManager`/`NumatoRelayMatrix` methods; `SafetyMonitor.emergency_stop()` is the one exception, and it also just calls `relay.open_all()`, the same underlying operation.
 
@@ -423,7 +436,7 @@ This is enforced in layers, from the moment the application starts to the moment
 | Any safety violation forces all relays OFF | `SafetyMonitor.emergency_stop()` (layer 3) |
 | Any unhandled exception attempts to force all relays OFF | `main.py`/`test.py` `finally:` blocks -> `HardwareManager.disconnect_all()` (layer 4) |
 | Application exit attempts to force all relays OFF | `disconnect_all()` (primary) + `atexit` hook (backstop) (layer 4) |
-| Never *intentionally* leaves relays energized after termination | All of the above; hard process kill (`SIGKILL`) is the one case no userspace code can intercept |
+| Never *intentionally* leaves relays energized after termination | All of the above; hard process kill, BSOD and power loss are the cases no userspace code can intercept |
 
 ---
 
@@ -499,8 +512,8 @@ PRIMARY_SMU
 
 followed by each device's PASS/WARNING/FAIL result (via the standard `TestResult.print_detail()` pass `run_section()` already does for every test). A device whose identity string doesn't match its configured model is reported **WARNING**, not silently accepted, via `_compare_identity()` -- a genuinely wrong/swapped card is caught, without flagging harmless formatting differences (e.g. `"PXIe-4141"` vs `"NI PXIe-4141"`) as false positives.
 
-Categories with no driver class in this codebase are reported **N/A**, never faked as a real check:
-- `switch` (`CHASSIS_RELAY_MATRIX`, PXIe-2569, slot 11) -- no `niswitch`-based driver exists; see Section 14.4.
+Categories with no identity query are reported **N/A**/WARNING, never faked as a real check:
+- `switch` (`CHASSIS_RELAY_MATRIX`, PXIe-2569, slot 11) -- Identity Validation reports WARNING/N/A (no identity query exists for this card); Functional Validation runs Relay Range Validation through the `niswitch` driver (Section 14.4).
 - `GPIB_INSTRUMENTS` -- no confirmed instrument model at that address yet.
 
 It uses the SAME production driver classes as `HardwareManager` and the deeper `test_smu()`/`test_dmm()`/`test_daq()`/`test_temperature_module()` tests -- every `_identify_*()` helper is exactly `driver = DriverClass(cfg); driver.connect(); driver.identify(); driver.disconnect()`, never a direct `nidcpower`/`nidmm`/`nidaqmx`/`pyserial` call. `_identify_temperature()` deliberately reuses `hardware.daq.DAQ` rather than inventing a new driver class -- NI-4353 is an NI-DAQmx-family device, so the same generic device-enumeration + self-test call works, with no channel acquisition attempted. `test_relay_ethernet_test()` and Hardware Discovery's Ethernet-relay check both go through `RelayFactory.create(NUMATO_RELAY_MATRIX_CONFIG)`, i.e. the same `NumatoRelayMatrix` instance type. A failure on one device never stops discovery of the rest (each `_identify_*()` catches its own exceptions and returns a result), and a full PASS/WARNING/FAIL summary is always produced (`print_summary()`).
@@ -1012,17 +1025,12 @@ separate, faster, operator-typed-`ABORT` mechanism) was designed but explicitly
 
 | Component | File | Role |
 |---|---|---|
-| `CancellationToken` | `utils/cancellation.py` | Single-threaded, single-severity flag. `request_cancel(reason)` (idempotent), `.requested`/`.reason`, `.check()` (raises if requested). |
+| `CancellationToken` | `utils/cancellation.py` | Single-severity flag, safe to set from any thread. `request_cancel(reason)` (idempotent), `.requested`/`.reason`, `.check()` (raises if requested). Live tokens are tracked in a WeakSet so `cancel_all_tokens(reason)` can cancel every running operation. |
 | `check_cancellation(token)` | `utils/cancellation.py` | No-op if `token is None`; otherwise `token.check()`. Every checkpoint call site uses this, not `token.check()` directly, so callers that omit a token need no special-casing. |
 | `OperationCancelledError` | `utils/errors.py` | `NIPXIError` subclass raised at a checkpoint. Not a fault -- a deliberate, expected operator action. |
 | `StopReason` | `utils/stop_reason.py` | `COMPLETED` / `FAILED` / `SAFETY_VIOLATION` / `TIMEOUT` (defined, not yet wired end-to-end) / `CANCELLED`. |
 
-No threads, no stdin listeners, no keyboard polling exist anywhere in this
-implementation -- the design deliberately stayed single-threaded (see the
-"No Emergency Abort" scoping decision that produced this feature). A
-`signal.signal(signal.SIGINT, ...)` handler, installed once per cancellable
-operation in `main.py`/`test.py`, is the only producer of `request_cancel()`
-calls today.
+Cancellation is cooperative and checkpoint-based. `request_cancel()` has two producers: the per-operation SIGINT handler (`install_sigint_handler`, installed per cancellable operation in `main.py`/`test.py`; the first Ctrl+C cancels, later presses are ignored) and `utils/termination.py` via `cancel_all_tokens()` (SIGTERM, SIGHUP, Ctrl+Break, console close, logoff, system shutdown). Besides the main thread there are three other threads: the loop watchdog (`utils/watchdog.py`), a termination thread spawned by SIGTERM/SIGHUP, and the Windows console-control-handler thread. There are no stdin listeners and no keyboard polling. See Sections 85.3 and 85.7.
 
 ### 13.2 Cancellation Flow
 
@@ -1182,13 +1190,7 @@ finding for real-hardware validation, not something this feature fixes.
 
 ### 13.7 Current Known Risks
 
-- `HardwareManager.connect_all()` runs before the SIGINT handler/token is
-  installed and before the `try/finally: hw.disconnect_all()` net exists, in
-  both `main.py` and `test.py::run_main_test()` -- a raw `KeyboardInterrupt`
-  during connect bypasses both the internal per-device rollback (which only
-  catches `Exception`, not `BaseException`) and the outer teardown. Low
-  consequence today (no real sourcing exists yet) but should be closed before
-  `output_enable()` is implemented for real.
+- The SIGINT handler is installed before `HardwareManager.connect_all()` in `main.py` and the `test.py` Monitor workflows. The other `test.py` workflows have not been audited for the same ordering (S-14, Section 85.9). A Ctrl+C during connect elsewhere is still a raw `KeyboardInterrupt` that bypasses per-device rollback; the process-level termination handlers (SIGTERM, console close) and the `atexit` nets cover the process-exit part.
 - `test.py::test_relay_safety_selftest()` has no cancellation checkpoint,
   unlike its two structural siblings -- an inconsistency against the
   project-wide "same behavior everywhere" goal.
@@ -1228,7 +1230,7 @@ authoritative, detailed references.
 | 6 | PXIe-4139 | `HIGH_POWER_SMU` | smu | nidcpower | Present, individually testable, not assigned to a channel |
 | 7 | PXI-4130 | `AUX_SMU_1` | smu | nidcpower | Present, individually testable, not assigned to a channel |
 | 8 | PXI-4130 | `AUX_SMU_2` | smu | nidcpower | Present, individually testable, not assigned to a channel |
-| 11 | PXIe-2569 | `CHASSIS_RELAY_MATRIX` | switch | niswitch | Present, **not the active relay driver** -- see 14.4 |
+| 11 | PXIe-2569 | `CHASSIS_RELAY_MATRIX` | switch | niswitch | Driver implemented (`relay_niswitch.py`), enabled, **not assigned to any group, never run on the real card** -- see 14.4 |
 | 15 | PXIe-4353 + TB-4353/0 | `TEMP_MODULE` | temperature | nidaqmx | Present, identity/presence check only -- see 14.5 |
 | 17 | PXIe-6368 | `EXPANSION_DAQ` | daq | nidaqmx | Present, individually testable, not wired into `HardwareManager` |
 | 18 | PXIe-6365 | `PRECISION_DAQ` | daq | nidaqmx | Present, individually testable, not wired into `HardwareManager` |
@@ -1269,9 +1271,9 @@ Nicknames reflect intended system role, not just the model number (`PRIMARY_SMU`
 
 ### 14.4 Current relay architecture
 
-**Numato Lab 32-Channel Ethernet Relay Module remains the only active relay driver** (`NUMATO_RELAY_MATRIX_CONFIG` / `hardware/relay_eth.py::NumatoRelayMatrix`, Section 6) -- confirmed reachable and validated end-to-end against physical hardware (Section 6b/6c).
+**Numato Lab 32-Channel Ethernet Relay Module remains the production relay** (`NUMATO_RELAY_MATRIX_CONFIG` / `hardware/relay_eth.py::NumatoRelayMatrix`, Section 6) -- confirmed reachable and validated end-to-end against physical hardware (Section 6b/6c).
 
-`PXIe-2569` (slot 11, chassis-resident electromechanical relay/switch module) is physically present in the rack -- the original plan (`flowcharts/vi plan.md: '2569 relay'`) anticipated this card as *the* relay matrix, but the implemented production path is the Numato Ethernet module instead. The 2569 has no driver class in this codebase (`niswitch` is a distinct NI driver package, not reused by anything here) and is not connected, tested functionally, or used anywhere in `HardwareManager`/`BatteryTestSequence`. Hardware Discovery lists it as **N/A -- no driver implemented**, never as a fake PASS/FAIL. Repurposing it (as an alternative or supplement to the Numato relay) is an open decision, tracked in `docs/TODO.md`, not something this documentation pass resolves.
+`PXIe-2569` (slot 11, 100 independent SPST electromechanical relays) has a driver: `hardware/relay_niswitch.py::NIPXIe2569RelayMatrix`, registered in `RelayFactory` as type `"niswitch"`. It follows the same safety model as the Numato driver (all-open -> verify -> close -> verify only-target -> settle; same exceptions; `RelayBase` enforces the settle delay) and passes the same relay conformance suite against a faked `niswitch` session. `PXI_SLOTS[11]` is `enabled=True` and its config is exposed through `RELAY_MATRIX_CONFIGS` (vendor-neutral registry used by the startup safety sweep, startup validation, group-to-matrix resolution and Relay Range Validation; `NUMATO_RELAY_MATRIX_CONFIGS` stays Numato-only for the Numato-native diagnostics). **It is not assigned to any `BATTERY_GROUPS` entry, has never run against the real card, and the `niswitch` Python package is not installed on the development PC.** Open bench items: logical-channel-N to relay-N mapping, and whether `get_relay_position` reports physical or only commanded state. See Section 85.8.
 
 ### 14.5 Temperature module
 
@@ -1327,7 +1329,7 @@ Consolidated from the cancellation-architecture review (Section 13.7) and the st
 **Electrical verification limitations:**
 - PMU output verification (`verify_output_disabled()`) trusts the NI-DCPower driver's *self-reported* `session.output_enabled` state -- not an independent electrical measurement, unlike the relay's genuinely separate readback command (`relay readall`, a different query over the same Telnet channel but a distinct command/response, not just a cached property read).
 - No PMU safety logic has been exercised against real current flow -- `output_enable()`/`set_charge_mode()` are still stubs, so `emergency_output_off()` has only ever been verified turning off a session that was never actually sourcing anything.
-- Terminal-close (Windows `CTRL_CLOSE_EVENT`), Task-Manager kill, and native driver crashes all bypass every safety mechanism in this codebase (no code runs) -- this is an inherent limitation of a pure-userspace application, not something any amount of Python-level engineering closes.
+- Terminal close, logoff, system shutdown, Ctrl+Break and SIGTERM are handled by `utils/termination.py` (Section 85.7; verified with fake hardware only, never with real console events). **Not covered:** Task-Manager kill (`SIGKILL`), BSOD, PC power loss and native driver crashes -- inherent to a userspace application.
 
 **Cancellation-specific risks** (see Section 13.7 for full detail, repeated here for a single consolidated risk list): the `HardwareManager.connect_all()` SIGINT/teardown gap, `test_relay_safety_selftest()`'s missing cancellation checkpoint, the harmless-but-real duplicate `emergency_output_off()` call on a mid-cycle cancellation, and the unchunked `STABILIZATION_S` sleep's ~6s worst-case cancellation latency.
 
@@ -1564,15 +1566,15 @@ This IS the future DAQ acquisition architecture: temperature monitoring is expec
 
 **Recommendation: do not standardize.** Collapsing these to one uniform round-trip count would either weaken the safety-wrapper test's mandatory baseline-first behavior, or stop the native-primitive test from exercising the layer it exists to validate. The four tests intentionally exercise four different things (one channel via the safety wrapper, every channel via the safety wrapper, every channel via native primitives, and a scoped subset via the safety wrapper) -- differing speed is the correct, expected signature of that, not an inconsistency. No code was changed for this item.
 
-### 23d. Test PXI Relay Matrix -- Future Reuse Architecture (no code change, no driver exists)
+### 23d. Test PXI Relay Matrix -- niswitch driver reuse
 
-**Reviewed and documented; not implemented (no PXI relay hardware exists to validate against, and this project's testing philosophy is to never fake a check against hardware that isn't there).** The good news found during review: most of the "Numato relay validation suite" is **already** hardware-agnostic and would apply to a future PXI/`niswitch` relay driver with zero changes:
-
-- `test_relay_matrix_scan()` and `test_relay_safety_selftest()` operate entirely through `hardware.relay_factory.RelayFactory.create(cfg)` and the generic `RelayBase` interface (`close()`/`open()`/`read()`/`open_all()`) -- neither references anything Numato-specific. Once a PXI relay driver class implements `RelayBase` and `RelayFactory.create()` gains a branch for its config `"type"` (e.g. `"pxi_switch"`), these two tests work against it unchanged, exactly as they already work identically against `MATRIX_NUMATO_201`/`MATRIX_NUMATO_202` today.
-- Only `test_relay_ethernet_test()` (native 0-based Numato primitives: `write()`/`write_all()`/`verify_all()`) is genuinely Numato-protocol-specific and would NOT apply to a PXI relay -- a future PXI-native equivalent (if the `niswitch` driver exposes comparable native primitives) would need its own dedicated test, following the same "test the native layer independently of the generic `RelayBase` wrapper" pattern, not reusing this function's body.
-- `_functional_relay_numato()`'s 4-option submenu shape (device-agnostic wrapper picking Identity vs. Functional Validation, then a menu of specific checks) is itself the reusable pattern -- a future `_functional_pxi_relay()` should mirror that shape (quick single-channel check / scoped matrix scan / native-primitive test / safety self-test) rather than inventing a new submenu style.
-
-**Recommended path when PXI relay hardware/driver work begins:** (1) implement a `niswitch`-based driver class satisfying `RelayBase`, (2) add a `"pxi_switch"` (or similar) branch to `RelayFactory.create()`, (3) add a `PXI_RELAY_MATRIX_CONFIGS`-equivalent enumeration dict in `config/devices.py` (mirroring `NUMATO_RELAY_MATRIX_CONFIGS`), (4) `test_relay_matrix_scan()`/`test_relay_safety_selftest()` then work against it with **zero changes** to those two functions, (5) build a native-primitives test only if the `niswitch` API has an equivalent worth validating independently. `test_pxi_relay_matrix()`'s Identity Validation (`_identify_switch()`) and its "not yet implemented" Functional Validation remain exactly as-is until step 1 exists.
+The Numato validation suite is hardware-agnostic wherever it goes through `RelayFactory.create(cfg)` and `RelayBase`:
+`test_relay_matrix_scan()`, `test_relay_safety_selftest()` and `test_relay_range_validation()` run unchanged against
+`NIPXIe2569RelayMatrix`. Only `test_relay_ethernet_test()` (native 0-based Numato primitives) is Numato-specific and does not
+apply to the 2569. The "Test PXI Relay Matrix" menu entry (`test_pxi_relay_matrix()` -> `_run_hardware_category()`) reports
+Identity Validation as WARNING/N/A (no identity query exists for the card) and runs Relay Range Validation as its Functional
+Validation, using `RELAY_MATRIX_CONFIGS`. If the slot is not enabled as a relay matrix, Functional Validation reports N/A and
+never touches hardware. Not yet run against the real card; see Section 14.4.
 
 ### 23e. Safety Monitor Workflow Simulator -- Development Reference Implementation
 
@@ -2698,10 +2700,9 @@ from every `run_guarded()` exception branch) or, as a backstop, via
 The intended, fully-verified normal termination path:
 ```
 check_cancellation(token) raises OperationCancelledError
-  -> log_event()
-  -> record_execution_state(CANCELLED)
-  -> finish_run_summary(stop_reason=CANCELLED, result="STOPPED_BY_OPERATOR")
-  -> safety.safe_cancel_shutdown()   (SMU output-off + relay open_all(), both "never raise")
+  -> (trace event "detected")
+  -> safety.safe_cancel_shutdown()   (SMU output-off + relay open_all(), both "never raise")   [FIRST]
+  -> log_event() / record_execution_state(CANCELLED) / finish_run_summary(...)   [after, each guarded]
   -> re-raise
   -> caught cleanly at test.py ("hardware is in a verified safe state")
   -> outer finally: storage.close() + hw_mgr.disconnect_all()
@@ -2718,23 +2719,13 @@ workflow via the standard fault-shutdown path. Consistent with the
 project's stated safety-first philosophy (never mask a real fault by
 retrying blindly).
 
-### Known caveat: mid-run database failure
+### Mid-run database failure
 
-The run always stops and the relay is always opened, but not necessarily
-through the "clean" classified shutdown path. Each `run_guarded()`
-exception branch calls `storage.log_event()`/`record_execution_state()`/
-`finish_run_summary()` **before** `safety.emergency_stop()`/
-`safe_cancel_shutdown()`. If the database itself is the original failure,
-those storage calls raise a second exception (the DB is still broken),
-which propagates out of `run_guarded()` immediately -- skipping
-`safety.emergency_stop()` *at that layer*. Hardware still ends up safe
-via the outer `test.py` `finally`'s `hw_mgr.disconnect_all()` backstop
-(its relay `open_all()` step is independently guarded and cannot raise),
-but the failure's `run_summary`/`event_log` classification (the recorded
-stop reason) may be missing or generic for this specific failure mode,
-rather than cleanly recorded as it would be for a DMM/relay fault. This
-is a diagnostic/traceability gap only, not a hardware-safety gap, and is
-the one documented caveat carried into the GO decision.
+`run_guarded()` runs the hardware shutdown first (`safe_cancel_shutdown()`/`emergency_stop()`: SMU off, then relay open) and
+only then the bookkeeping (`log_event()`, `record_execution_state()`, `finish_run_summary()`), each step independently
+guarded. If the database is the original failure, the relay is still opened; a failed bookkeeping step logs CRITICAL
+("hardware safe, traceability incomplete") and the original exception is re-raised. A measurement write failure during the run
+is raised as `StorageFailureError`, a station-level fault. See Sections 85.2 and 85.6.
 
 ### GO decision
 
@@ -9116,3 +9107,179 @@ determinism (two exports of the same run are byte-identical except
 `exported_at`; top-level key order is fixed), and the actual `main()` CLI
 entry point in-process. Full repository suite: **568/568 passing**, no
 regressions.
+
+---
+
+## 85. Runtime Safety Model (CURRENT IMPLEMENTATION)
+
+What the software does to reach and hold a safe state, what it does not do, and the assumptions it relies on. Nothing here has
+been validated on the production rack unless explicitly stated ("bench-confirmed"); the safety logic was exercised only with
+fake hardware. **Safe state = SMU output OFF (verified) AND every relay open (verified). An unknown state is treated as
+unsafe.**
+
+### 85.1 Layers (outermost = last resort)
+
+| # | Layer | Where | Covers |
+|---|---|---|---|
+| 1 | Startup Safety Sweep | `test_control/safety_sweep.py`, called from `test.py::main()` | Every configured SMU and relay matrix is connected, forced safe, verified, disconnected before the Main Menu |
+| 2 | Connect-time safe state | `HardwareManager.connect_all()` | Relay `open_all()` verified right after connect; startup aborts otherwise |
+| 3 | Per-iteration supervision | `BatteryOperationSequence._periodic_safety_checks()` + `_frozen_check*()` | Watchdog pet, relay heartbeat, free-space check, frozen-signal check (Charge, Discharge, Monitor Battery) |
+| 4 | `SafetyMonitor.check()` | `test_control/safety_monitor.py` | V/I/T limits per sample |
+| 5 | `run_guarded()` -> `_abort_run()` | `test_control/battery_operation_sequence.py` | Every abnormal exit of a run: shutdown FIRST, bookkeeping after |
+| 6 | Cooperative cancellation | `utils/cancellation.py` | Ctrl+C (per-operation SIGINT handler) and, via `cancel_all_tokens()`, process termination |
+| 7 | Termination handlers | `utils/termination.py` | SIGTERM, SIGHUP (POSIX), Ctrl+Break, console close, logoff, system shutdown |
+| 8 | Workflow teardown | `HardwareManager.disconnect_all()` in `finally` blocks | SMU off verified -> relay `open_all()` verified -> disconnect |
+| 9 | `atexit` nets | `HardwareManager._atexit_smu_shutdown/_atexit_relay_shutdown` | Normal interpreter exit paths that skipped layer 8. NOT run on SIGTERM / console close / hard kill |
+| 10 | Driver reflex | `NumatoRelayMatrix._emergency_all_off()`, `NIPXIe2569RelayMatrix._emergency_all_open()` | Any relay verification or communication failure forces all-open before the exception propagates |
+
+Not covered by any layer: `SIGKILL`/Task Manager kill, BSOD, PC power loss, native
+driver crash (see 85.9).
+
+
+### 85.2 Shutdown ordering (`run_guarded()`)
+
+Single choke point for abnormal exits of Charge, Discharge, Monitor Battery. Five
+branches (cancelled, safety violation, relay error, timeout, other); all
+call `_abort_run()`:
+
+1. stop the loop watchdog
+2. emit the shutdown-trace "detected" event
+3. **hardware safety first**: `safe_cancel_shutdown()` (cancel) or `emergency_stop()` (everything else) = SMU `emergency_output_off` -> relay `open_all` -> zero output setpoint (best effort)
+4. bookkeeping, each step independently guarded: `log_event`, execution state, extra run-summary fields, final voltage (read AFTER shutdown, so it is a rest voltage with the relay open), `finish_run_summary`
+5. if any bookkeeping step failed: CRITICAL "hardware safe, traceability incomplete"; the ORIGINAL exception is re-raised
+
+Consequence: a full disk or a broken database can no longer skip the relay
+shutdown (this was a real ordering defect before this phase).
+
+Charge/Discharge `finally` blocks log SMU_OUTPUT_DISABLED through
+`_safe_log_event()` so storage failure cannot skip SMU verification there either.
+
+Group -> ALL: `StorageFailureError` and `WatchdogTimeoutError` are members of
+`STATION_HARDWARE_EXCEPTIONS` (checked before battery-under-test exceptions), so a
+station-level fault aborts the remaining positions.
+
+
+### 85.3 Watchdog (`utils/watchdog.py`)
+
+- `LoopWatchdog(timeout_s, on_expire, ...)`. Armed lazily on the first `pet()` (so slow setup never trips it). `Settings.LOOP_WATCHDOG_TIMEOUT_S` = 60 s.
+- A daemon thread fires `on_expire` if the loop stops petting: it runs `SafetyMonitor.emergency_stop()` from the watchdog thread (SMU off, relay open) without waiting for the stuck main thread.
+- When the main thread eventually returns from the blocked call, `pet()` raises `WatchdogTimeoutError` and the run unwinds through `run_guarded()`.
+- Wired only into the loops that call `_periodic_safety_checks()`: **Charge, Discharge, Monitor Battery.**
+- Known limit: the watchdog thread and a still-blocked operation thread may use the same instrument/socket concurrently. Accepted: the alternative is leaving hardware energized.
+- Known limit: SMU/DMM/DAQ calls have no explicit driver timeouts (Sections 13.6 and 17). The watchdog is the only bound on a hung NI call.
+
+### 85.4 Communication heartbeat (relay)
+
+- Every `Settings.RELAY_HEARTBEAT_INTERVAL_S` (10 s; 0 disables) `_relay_heartbeat()` calls `relay.closed_channels()` (one `relay readall` on the Numato, one position pass on the 2569).
+- Relay/timeout error -> `RelayCommLostError` (a `RelayError`) -> standard shutdown with the "Relay communication lost" label.
+- Closed set != `[active relay]` -> `RelayStateVerificationError`.
+- First call only starts the clock. Skipped when the driver has no `closed_channels()`.
+- **It is a readback of the commanded state, not an independent contact measurement.** It detects link loss and unexpected state, not a welded contact (85.8).
+- No heartbeat to the SMU, DMM or DAQ. Their loss is detected only by the failing measurement call (DMM: `DMM_MEASUREMENT_MAX_CONSECUTIVE_FAILURES`) or by the watchdog.
+
+### 85.5 Frozen measurement detection (`test_control/frozen_signal.py`)
+
+`FrozenSignalDetector(window, epsilon)`: frozen when `max - min <= epsilon` over `window` consecutive samples; `None` samples are ignored. Raises `MeasurementFrozenError` (a `DMMMeasurementLostError`).
+
+| Signal | Setting (samples / epsilon) | Notes |
+|---|---|---|
+| Current | `FROZEN_CURRENT_SAMPLES`=60 / `FROZEN_CURRENT_EPSILON_A`=0.0 | Only judged while `|I| >= FROZEN_CURRENT_MIN_ACTIVE_A` (0.01 A) |
+| Voltage | `FROZEN_VOLTAGE_SAMPLES`=60 / `FROZEN_VOLTAGE_EPSILON_V`=0.0 | Charge: skipped in the CV hold (steady by design). Not applied in Monitor Battery (rest voltage is legitimately flat) |
+| NTC voltage | `FROZEN_NTC_SAMPLES`=300 / `FROZEN_NTC_EPSILON_V`=0.0 | Charge, Discharge, Monitor Battery |
+
+**Thresholds are uncalibrated starting values.** Calibrate against `raw_hardware_log`
+from real runs; epsilon 0.0 assumes noise on a healthy ADC, which is not guaranteed
+for a very stable NTC. `FROZEN_DETECTION_ENABLED` is the kill switch.
+
+### 85.6 Storage protection
+
+- Start gate: `open_storage_guarded()` -> `check_start_free_space()`; below `STORAGE_MIN_FREE_MB_START` (500 MB) the workflow is refused before any hardware is energized (hardware already connected is disconnected).
+- Runtime guard: `StorageSpaceGuard.check()` every `STORAGE_CHECK_INTERVAL_S` (30 s): warn once below `STORAGE_WARN_FREE_MB` (300), raise `StorageFailureError` below `STORAGE_ABORT_FREE_MB` (100). Unknown free space is not treated as low.
+- Write failure: `_record_measurement()` wraps `sqlite3.Error`/`OSError` into `StorageFailureError` -> standard shutdown.
+- Database open failure remains the earlier hardening (Section 42, item 4).
+- `raw_hardware_log` never raises and self-disables silently if it cannot write (85.9, gap S-9).
+- Thresholds are checked against `Settings.DATA_DIR`'s volume only (not the log directory).
+
+### 85.7 Cancellation and termination
+
+**Ctrl+C**: per-operation `CancellationToken` + `install_sigint_handler()`. Cooperative; checkpoints only between atomic hardware operations; the first press requests cancel, **further presses are ignored (no escalation).** Safe cancel runs `safe_cancel_shutdown()`.
+
+**Everything else** (`utils/termination.py`, installed once at the top of `main()` in `main.py` and `test.py`):
+
+| Event | Mechanism | Grace |
+|---|---|---|
+| SIGTERM, SIGHUP | `signal.signal` -> spawns termination thread | `TERMINATION_GRACE_S` 8 s |
+| Ctrl+Break (Win) | `SetConsoleCtrlHandler` (own OS thread) | 8 s |
+| Console close / logoff / system shutdown (Win) | same | `CONSOLE_CLOSE_GRACE_S` 4 s |
+
+Flow: `cancel_all_tokens(reason)` -> wait until every registered `HardwareManager.is_safe()` (relay and SMU disconnected) -> if the grace expires, `emergency_shutdown()` (SMU atexit net, then relay atexit net) -> flush log handlers -> `os._exit(128+n)`.
+
+- `HardwareManager` registers itself (weakref) in `__init__`.
+- Windows terminates the process shortly after a close event regardless of the handler; 4 s is a compromise, not a guarantee.
+- `is_safe()` means "disconnected", so a SMU left connected because its output could not be verified OFF correctly counts as NOT safe.
+- Not exercised against real signals: only logic with fake hardware and a handler-installation smoke test.
+
+### 85.8 Relay architecture and verification
+
+**Abstraction.** `hardware/relay.py::RelayBase` is the contract; `RelayFactory.create(cfg)` selects the driver by `cfg["type"]`:
+
+| type | Class | Role |
+|---|---|---|
+| `ethernet` | `NumatoRelayMatrix` (`relay_eth.py`) | Production (32 ch, Telnet) |
+| `niswitch` | `NIPXIe2569RelayMatrix` (`relay_niswitch.py`) | PXIe-2569, 100 SPST, slot 11. Implemented, **not assigned to any BATTERY_GROUP**, `niswitch` package not installed on the development PC |
+| `serial` | `SerialRelay` | Diagnostic only |
+
+Enforced by the base class: `open()`, `close()`, `settle()` cannot be overridden (class-definition `TypeError`); `open_all()` is abstract; `close_all()` raises unless a driver opts in; `RELAY_SETTLE_TIME_S` (2.0 s, never 0) applies after every switch. `close(N)` semantic = force all open -> verify -> close N -> verify N is the ONLY closed relay. Exclusive-select interlock is enforced in each driver, **not** in the base class.
+
+**Conformance suite.** `tests/_relay_conformance.py` (contract mixin, 16 test clauses) run by `tests/test_relay_conformance.py` against: a simulated driver, `NumatoRelayMatrix` over an in-memory firmware model, `NIPXIe2569RelayMatrix` over a faked niswitch session. Includes stuck-closed / stuck-open fault injection and self-tests proving the suite rejects drivers without interlock or with `close_all()`. The fakes' ground truth is independent of `driver.query()`. A new relay driver must pass this suite before use.
+
+**Relay Range Validation** (`test.py::test_relay_range_validation()`, under Functional Validation for each relay matrix): for each relay N in an operator-chosen range: force open -> verify (independent `closed_channels()`) -> close N -> verify N only -> dwell `RELAY_RANGE_VALIDATION_DWELL_S` (2 s, operator watches/listens) -> open -> verify. Stops on first failure; always ends with verified `open_all()`; Ctrl+C cooperative. Per-relay `raw_data` and every driver call land in `raw_hardware_log`. This is the bench check for the 2569 channel-to-relay mapping assumption.
+
+**Startup Safety Sweep.** Iterates `SMU_ASSIGNMENTS` and `RELAY_MATRIX_CONFIGS` (Numato AND enabled niswitch slots). A device that connects and fails verification is fatal in every mode (`SafetyFaultBlocked`, SAFETY FAULT screen, operator acknowledgement, `sys.exit(1)`). A device that cannot connect is logged and reported "PARTIAL" **in every mode, including PRODUCTION** (85.9, gap S-3). Runs only from `test.py`.
+
+**Verification strength.** Numato: readback is `relay readall` of the firmware's commanded state. 2569: `get_relay_position`. Whether either reflects the physical contact is **unconfirmed (bench question)**. SMU: `verify_output_disabled()` trusts the driver's `output_enabled` property. **Stuck-closed (welded) contact detection is NOT implemented** (postponed): no SMU/DMM cross-validation, no isolation check, no independent relay verification. The conformance suite proves the drivers react to a faked stuck contact, not that real hardware reports one.
+
+### 85.9 Open items register
+
+Permanent register of known gaps. IDs are stable and referenced from other sections.
+
+| ID | Item | Status |
+|---|---|---|
+| S-1 | Relay welded / stuck-closed detection, SMU/DMM cross-validation, isolation check, independent relay verification | Postponed by decision. Not implemented |
+| S-2 | Relay/SMU readback reflects commanded, not physical, state | Unverified on hardware |
+| S-3 | Startup sweep does not block on an unreachable device in PRODUCTION (log + PARTIAL only); `SYSTEM_MODE` affects only the log level | Behavior differs from documentation of intent |
+| S-4 | `main.py` (legacy `TestExecutor` path) has no startup sweep, uses a single hard-wired Numato config, and no watchdog/heartbeat/frozen supervision | Unscoped; decide whether `main.py` is production or legacy |
+| S-5 | Watchdog/heartbeat/frozen not in Monitor Battery Scan, Proto Test, `test.py` diagnostic loops, legacy `TestExecutor` | Open |
+| S-6 | No explicit timeouts on NI-DCPower, NI-DMM, NI-DAQmx calls | Open (watchdog is the only bound) |
+| S-7 | Second Ctrl+C ignored; no escalation | Open |
+| S-8 | NTC loss (`DAQError`, non-PRESENT) tolerated indefinitely; only frozen NTC is caught | Open (policy decision) |
+| S-9 | `logging.disable(logging.CRITICAL)` at import of `test.py` suppresses all CRITICAL shutdown logs when running under `test.py`; `raw_hardware_log` self-disables silently | Open |
+| S-10 | Frozen-signal thresholds uncalibrated | Open (needs data) |
+| S-11 | Hard kill, BSOD, power loss, native driver crash | Inherent; depends on instrument fail-safe (Numato holds state? 2569 latching? SMU output on card power loss?) - all unverified |
+| S-12 | Forced termination may race the operation thread on the same socket/session | Accepted trade-off |
+| S-13 | Fault screen `input()` in `disconnect_all()` can delay forced exit | Open |
+| S-14 | `main.py` and the `test.py` Monitor workflows install the SIGINT handler before `connect_all()` (Section 13.7); other `test.py` workflows were not audited | Verify per workflow |
+| S-15 | Heartbeat/watchdog/storage/termination are unit-tested with fakes only; no bench run | Open |
+| S-16 | `stop_reason` not persisted to DB/report; `TIMEOUT` stop reason not wired end to end | Open (pre-existing) |
+| S-17 | Free-space check covers `DATA_DIR` only | Open |
+| S-18 | Documented "sequence enforced by RelayBase" is not true for the interlock; a new driver could omit it (suite catches it only if the suite is run) | Mitigated by conformance suite |
+
+### 85.10 Assumptions to treat as requirements
+
+1. Relay and SMU readback are trusted as truth for "safe" until S-1/S-2 are resolved.
+2. All safety-relevant code paths go through `RelayBase`/`RelayFactory`; no sequence calls Numato native primitives.
+3. Exactly one relay closed per matrix at a time; `close_all()` is never valid.
+4. `HardwareManager` is the only owner of hardware lifecycle; new entry points must call `install_termination_handlers()` and construct a `HardwareManager` (registration is automatic).
+5. Any new long-running loop must pet the watchdog through `_periodic_safety_checks()` or it is unprotected by Layer 3.
+6. Any new exception that means "station/hardware down" must be added to `STATION_HARDWARE_EXCEPTIONS`.
+7. Storage and bookkeeping failures must never precede hardware safing (`_abort_run()` ordering is a requirement, with a regression test).
+8. Relay settle time is global, never zero, never re-implemented by callers.
+9. `SYSTEM_MODE` must be PRODUCTION for real cycling (production strictness is only partly enforced, see S-3).
+10. Windows is the target OS; POSIX handlers exist but are untested.
+
+### 85.11 Code map
+
+- Modules: `utils/termination.py`, `utils/watchdog.py`, `test_control/storage_guard.py`, `test_control/frozen_signal.py`, `test_control/safety_sweep.py`, `hardware/relay_niswitch.py`; supervision and `run_guarded()`/`_abort_run()` live in `test_control/battery_operation_sequence.py`; `HardwareManager.is_safe()`/`emergency_shutdown()` in `test_control/hardware_manager.py`.
+- Errors (`utils/errors.py`): `MeasurementFrozenError` (a `DMMMeasurementLostError`), `RelayCommLostError` (a `RelayError`), `StorageFailureError` and `WatchdogTimeoutError` (both `SafetyViolationError`, members of `STATION_HARDWARE_EXCEPTIONS`).
+- Settings: `docs/CONFIGURATION.md`, "Runtime safety supervision".
+- Tests: `tests/test_safety_shutdown_phase.py`, `tests/test_relay_conformance.py`, `tests/test_relay_range_validation.py`, `tests/test_startup_safety_sweep.py`. Full suite excludes `tests/test_smu_post_isolation_zeroing.py` and `tests/test_smu_shutdown_sequence_ordering.py`, which need the `nidcpower` package (not installed on the development PC).

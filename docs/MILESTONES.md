@@ -119,8 +119,7 @@ scope for this milestone -- deliberately still a placeholder (see
 - `AUX_SMU_2`'s `smu_channel` was unconfirmed at the *start* of this
   milestone and is now confirmed `"1"` -- no other SMU channel assignments
   remain unconfirmed as of this milestone.
-- GPIB0 instrument identification, PXI-resident switch/relay card
-  (`CHASSIS_RELAY_MATRIX`) driver decision.
+- GPIB0 instrument identification.
 
 ### Risks
 

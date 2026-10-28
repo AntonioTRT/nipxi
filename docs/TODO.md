@@ -27,18 +27,7 @@ the bottom, with a pointer to where the real documentation lives
   -- likely the "Programmable Electronic Load" or "Programmable Power Supply"
   from `equipment_Requirement.md`, not yet confirmed. No GPIB driver class
   exists in this codebase.
-- [ ] `niswitch`-based `CHASSIS_RELAY_MATRIX` (PXIe-2569, slot 11) driver --
-  long-term goal is functional parity with the Numato relay validation
-  suite. Architecture reviewed and documented (`docs/architecture.md`
-  Section 23d): `test_relay_matrix_scan()`/`test_relay_safety_selftest()`
-  already operate purely through `RelayFactory`/`RelayBase` and will work
-  against this driver unchanged once it exists; only
-  `test_relay_ethernet_test()` (Numato-native 0-based primitives) would
-  need a PXI-native equivalent, if one is worth building. Steps: (1)
-  `RelayBase`-conforming driver class, (2) a new `RelayFactory.create()`
-  branch, (3) a `PXI_RELAY_MATRIX_CONFIGS`-equivalent enumeration dict in
-  `config/devices.py`, (4) the two generic tests above then work with zero
-  changes.
+- [ ] PXIe-2569 (`CHASSIS_RELAY_MATRIX`, slot 11): driver `hardware/relay_niswitch.py` is IMPLEMENTED and conformance-tested against a fake session. Remaining: install `niswitch` + NI-SWITCH driver, run Relay Range Validation on the real card (channel N = relay N mapping, readback = physical or commanded), decide whether to assign it to a `BATTERY_GROUPS` entry. See `docs/architecture.md` Sections 14.4 and 85.8.
 - [ ] Multi-SMU/multi-DAQ channel assignment: `HIGH_POWER_SMU`/`AUX_SMU_1`/
   `AUX_SMU_2` and `EXPANSION_DAQ`/`PRECISION_DAQ` are configured and
   individually testable but not yet assigned to any battery channel --
@@ -575,6 +564,18 @@ the bottom, with a pointer to where the real documentation lives
   deliberately not implemented.
 
 ---
+
+### Safety follow-ups (full register: `docs/architecture.md` Section 85.9)
+
+- [ ] [HIGH] Startup sweep: an unreachable device is only logged/PARTIAL in every mode, including PRODUCTION (S-3). Decide and enforce.
+- [ ] [HIGH] Decide whether `main.py` is production or legacy; it has no startup sweep, no supervision and a single hard-wired Numato config (S-4).
+- [ ] [HIGH] Bench-validate: console close/Ctrl+Break/SIGTERM against a real relay + SMU, heartbeat on a real Numato TCP drop, watchdog with a hung NI call (S-15).
+- [ ] [HIGH] Explicit timeouts on NI-DCPower / NI-DMM / NI-DAQmx calls (S-6).
+- [ ] [HIGH] POSTPONED by decision: relay welded/stuck-closed detection, SMU/DMM cross-validation, isolation check, independent relay verification (S-1, S-2).
+- [ ] [MED] Calibrate frozen-signal thresholds from `raw_hardware_log` (S-10); extend supervision to Monitor Battery Scan, Proto Test, diagnostic loops (S-5).
+- [ ] [MED] Remove or scope `logging.disable(logging.CRITICAL)` in `test.py`; make `raw_hardware_log` failure visible (S-9).
+- [ ] [MED] NTC-loss policy (S-8); second-Ctrl+C escalation (S-7).
+- [ ] [LOW] Free-space check for the log volume (S-17); persist `stop_reason` (S-16).
 
 ## Completed (Summary)
 

@@ -1126,16 +1126,12 @@ RELAY_ETH_CONFIGS = NUMATO_RELAY_MATRIX_CONFIGS
 def _niswitch_relay_matrix_configs() -> dict:
     """
     Relay-matrix cfg dicts for every ENABLED PXI_SLOTS entry with
-    category="switch" (today: PXI_SLOTS[11], the PXIe-2569, enabled=False,
-    so this returns {} and nothing below changes). Shaped like an
-    ETHERNET_DEVICES entry so RelayFactory/startup validation/the startup
-    safety sweep treat it uniformly: "type": "niswitch" selects the future
-    NI-SWITCH driver (hardware/relay_niswitch.py -- not implemented yet, so
-    enabling the slot before that driver exists makes startup validation
-    fail closed with "type 'niswitch' is not registered in RelayFactory",
-    never a silent no-op). channel_count is taken from the slot entry and
-    is intentionally NOT defaulted -- it must be confirmed against the
-    real card/topology on the bench before the slot is enabled.
+    category="switch" (today: PXI_SLOTS[11], the PXIe-2569, enabled=True).
+    Shaped like an ETHERNET_DEVICES entry so RelayFactory/startup validation/
+    the startup safety sweep treat it uniformly: "type": "niswitch" selects
+    hardware/relay_niswitch.py (NIPXIe2569RelayMatrix). channel_count comes
+    from the slot entry and is intentionally NOT defaulted; the driver
+    refuses to connect if it differs from the card's reported relay count.
     """
     configs = {}
     for slot_cfg in PXI_SLOTS.values():
@@ -1162,7 +1158,7 @@ def _niswitch_relay_matrix_configs() -> dict:
 
 # Vendor-neutral registry of EVERY relay matrix the system can drive,
 # regardless of transport (Numato Ethernet today; PXI NI-SWITCH matrices
-# such as the PXIe-2569 once enabled). Generic consumers -- the startup
+# such as the PXIe-2569). Generic consumers -- the startup
 # safety sweep, startup device validation, BATTERY_GROUPS->matrix
 # resolution (hardware_for_group()), SenseRouter -- iterate/look up THIS,
 # so a new matrix is a config change, never a code change in any consumer.
