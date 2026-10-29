@@ -313,6 +313,12 @@ class Settings:
     SMU_VOLTAGE_READBACK_TOLERANCE_V = 1e-4   # V
     SMU_CURRENT_READBACK_TOLERANCE_A = 1e-4   # A
 
+    # Remote Sense Validation (test.py SMU menu) -- no-load energized check:
+    # with ~0 A flowing, a correctly wired remote sense must read within this
+    # of the local reading. Validation threshold only, not a measurement-
+    # accuracy spec; unused by any production workflow.
+    SMU_SENSE_WIRING_TOLERANCE_V = 0.05   # V
+
     # -------------------------------------------------------------------------
     # Proto Test Execution (Milestone 2) -- infrastructure validation, no
     # battery connected. Reuses CHARGE_VOLTAGE_V/CHARGE_CURRENT_A/

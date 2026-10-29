@@ -136,6 +136,19 @@ class SMU(HardwareBase):
         # unit/installation.
         self._channel  = cfg.get("smu_channel", "0")
         self._session  = None
+        # FUTURE remote-sense support -- see docs/architecture.md "Battery
+        # Voltage Provider (Future Architecture)". None (the default, and the
+        # value of every production config today) means the session's sense
+        # property is NEVER touched, so NI-DCPower's default (LOCAL) applies
+        # exactly as before this field existed. "local"/"remote" makes
+        # _configure_current_source() apply and verify it. No production
+        # config sets this.
+        self._sense_mode = cfg.get("sense_mode")
+        if self._sense_mode not in (None, "local", "remote"):
+            raise SMUError(
+                f"SMU {resource}: invalid sense_mode {self._sense_mode!r} "
+                f"(expected None, 'local' or 'remote')"
+            )
         # Last output_enabled state actually read from the instrument (via
         # query_output_state()), or None if never queried yet -- see
         # check_current_output_state()/the "PSU Safety Verification
@@ -151,6 +164,30 @@ class SMU(HardwareBase):
         a live instrument query -- identify() remains the real, verified
         model read via self_test()."""
         return self._model
+
+    @property
+    def sense_mode(self):
+        """Configured sense mode: None (untouched/default), "local" or
+        "remote". Config only -- see query_sense() for the instrument's
+        actual state."""
+        return self._sense_mode
+
+    def query_sense(self):
+        """READBACK of the session's actual sense setting: "local",
+        "remote", or None if it cannot be read. Never raises, never changes
+        anything."""
+        if self._session is None:
+            return None
+        try:
+            import nidcpower
+            value = self._session.sense
+            if value == nidcpower.Sense.REMOTE:
+                return "remote"
+            if value == nidcpower.Sense.LOCAL:
+                return "local"
+        except Exception as e:
+            self.log.warning("SMU %s: sense query failed: %s", self.resource, e)
+        return None
 
     def connect(self):
         self.log.info("Opening SMU session: %s (channel %s)", self.resource, self._channel)
@@ -281,6 +318,8 @@ class SMU(HardwareBase):
             self._session.current_level = current_a
             self._session.voltage_limit_range = abs(voltage_limit_v)
             self._session.voltage_limit = voltage_limit_v
+            if self._sense_mode is not None:
+                self._session.sense = self._sense_enum(self._sense_mode)
             self._session.commit()
         except Exception as e:
             raise SMUError(
@@ -298,6 +337,10 @@ class SMU(HardwareBase):
             "voltage_limit", voltage_limit_v, readback_voltage_limit,
             tolerance=Settings.SMU_VOLTAGE_READBACK_TOLERANCE_V,
         )
+        if self._sense_mode is not None:
+            self._verify_config_readback(
+                "sense", self._sense_enum(self._sense_mode), self._session.sense,
+            )
         self.log.info(
             "SMU %s channel %s: %s configured -- %.3f A, %.3f V limit (verified)",
             self.resource, self._channel, context, current_a, voltage_limit_v,
@@ -977,7 +1020,7 @@ class SMU(HardwareBase):
 
     def source_dc_voltage_point(self, voltage_v: float, current_limit_a: float,
                                  voltage_range_v: float, hold_s: float = 0.0,
-                                 during_hold=None, token=None) -> dict:
+                                 during_hold=None, token=None, sense: str = None) -> dict:
         """
         Source a single static DC voltage point and confirm it electrically.
 
@@ -1044,6 +1087,16 @@ class SMU(HardwareBase):
         OFF whether this method returns normally, raises `SMUError`, or is
         cancelled mid-hold.
 
+        `sense` (default None -- existing callers unaffected: the session's
+        sense property is never touched, so NI-DCPower's default LOCAL
+        applies exactly as before), if "local" or "remote", is applied to
+        the session before commit() and read back/verified like every
+        other configuration attribute. It selects WHERE the SMU's ADC and
+        regulation loop observe the output voltage: the output terminals
+        (local) or the dedicated sense terminals (remote). Used only by
+        measure_sense_comparison() (PSU test menu); see docs/architecture.md
+        "Battery Voltage Provider (Future Architecture)".
+
         PSU Safety Verification Pattern (see docs/architecture.md):
         BEFORE any configuration is attempted, this method now calls
         force_output_off_and_verify() -- Query PSU State -> Verify Current
@@ -1071,6 +1124,8 @@ class SMU(HardwareBase):
             self._session.voltage_level_range = voltage_range_v
             self._session.current_limit = current_limit_a
             self._session.voltage_level = voltage_v
+            if sense is not None:
+                self._session.sense = self._sense_enum(sense)
             self._session.output_enabled = True
             self._session.commit()
         except Exception as e:
@@ -1108,6 +1163,8 @@ class SMU(HardwareBase):
                 tolerance=Settings.SMU_CURRENT_READBACK_TOLERANCE_A,
             )
             self._verify_config_readback("output_enabled", True, readback_output_enabled)
+            if sense is not None:
+                self._verify_config_readback("sense", self._sense_enum(sense), self._session.sense)
             # Steps "Enable Output -> Query PSU State -> Verify Output ON"
             # of the PSU safety sequence: the readback just verified above
             # IS that query -- record it as the current known state.
@@ -1183,4 +1240,97 @@ class SMU(HardwareBase):
             "measured_i":    measured_i,
             # Result of the optional during_hold() callback (None if unused).
             "during_hold_result": during_hold_result,
+            # "local"/"remote" if the caller selected one, else None
+            # (session default, untouched).
+            "sense": sense,
         }
+
+    @staticmethod
+    def _sense_enum(sense: str):
+        import nidcpower
+        try:
+            return {"local": nidcpower.Sense.LOCAL, "remote": nidcpower.Sense.REMOTE}[sense]
+        except KeyError:
+            raise SMUError(f"Invalid sense mode {sense!r} (expected 'local' or 'remote')") from None
+
+    def check_remote_sense_accepted(self) -> dict:
+        """
+        Validation-menu helper ONLY. With output verified OFF, asks the
+        instrument to accept sense=REMOTE (set, commit, read back), then
+        restores the previous sense setting. Sources nothing. Returns
+        {"accepted": bool, "readback": "local"/"remote"/None, "previous":
+        ..., "error": str | None}. Verifies that the card/driver supports
+        remote sense configuration -- NOT that any wiring exists (see
+        measure_sense_comparison() for the energized check).
+        """
+        if self._session is None:
+            raise SMUError(f"SMU {self.resource} channel {self._channel} is not connected")
+        if not self.force_output_off_and_verify(context="remote sense acceptance check"):
+            raise SMUError(
+                f"SMU {self.resource} channel {self._channel}: could not verify a safe "
+                f"(output-off) baseline before the remote sense acceptance check."
+            )
+        previous = self.query_sense()
+        error = None
+        readback = None
+        try:
+            self._session.sense = self._sense_enum("remote")
+            self._session.commit()
+            readback = self.query_sense()
+        except Exception as e:
+            error = str(e)
+        finally:
+            try:
+                self._session.sense = self._sense_enum(previous or "local")
+                self._session.commit()
+            except Exception:
+                pass
+        return {"accepted": error is None and readback == "remote",
+                "readback": readback, "previous": previous, "error": error}
+
+    def measure_sense_comparison(self, voltage_v: float, current_limit_a: float,
+                                 voltage_range_v: float) -> dict:
+        """
+        PSU test-menu diagnostic ONLY -- not used by any charge/discharge/
+        monitor path. Sources the same static DC voltage point twice, once
+        with LOCAL sense and once with REMOTE sense, each through
+        source_dc_voltage_point() (so each pass keeps the full PSU Safety
+        Verification Pattern and always ends with output disabled and
+        verified OFF), and returns both readings side by side:
+
+            {"commanded_v", "local": <point dict>, "remote": <point dict> | None,
+             "remote_error": <str> | None}
+
+        NI-DCPower has no way to read local and remote voltage in the same
+        acquisition: `measure(VOLTAGE)` returns the voltage at whichever
+        sense point is currently selected, so the two readings are taken
+        sequentially (two separate output-enabled windows). A REMOTE pass
+        failure (e.g. sense leads not connected, or the card does not
+        support remote sense) is returned as `remote_error` rather than
+        raised, so the LOCAL reading is still shown. Sense is restored to
+        LOCAL (best effort) before returning.
+        """
+        local = self.source_dc_voltage_point(
+            voltage_v, current_limit_a, voltage_range_v, sense="local",
+        )
+        remote = None
+        remote_error = None
+        try:
+            remote = self.source_dc_voltage_point(
+                voltage_v, current_limit_a, voltage_range_v, sense="remote",
+            )
+        except Exception as e:
+            remote_error = str(e)
+            # source_dc_voltage_point() enables output before commit(); a
+            # configuration failure there raises before its own finally
+            # block, so force the verified-off reflex here ("unknown PMU
+            # state = unsafe state").
+            self.emergency_output_off("sense comparison: remote pass failed")
+        finally:
+            try:
+                self._session.sense = self._sense_enum("local")
+                self._session.commit()
+            except Exception:
+                pass
+        return {"commanded_v": voltage_v, "local": local, "remote": remote,
+                "remote_error": remote_error}

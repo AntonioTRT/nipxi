@@ -9283,3 +9283,81 @@ Permanent register of known gaps. IDs are stable and referenced from other secti
 - Errors (`utils/errors.py`): `MeasurementFrozenError` (a `DMMMeasurementLostError`), `RelayCommLostError` (a `RelayError`), `StorageFailureError` and `WatchdogTimeoutError` (both `SafetyViolationError`, members of `STATION_HARDWARE_EXCEPTIONS`).
 - Settings: `docs/CONFIGURATION.md`, "Runtime safety supervision".
 - Tests: `tests/test_safety_shutdown_phase.py`, `tests/test_relay_conformance.py`, `tests/test_relay_range_validation.py`, `tests/test_startup_safety_sweep.py`. Full suite excludes `tests/test_smu_post_isolation_zeroing.py` and `tests/test_smu_shutdown_sequence_ordering.py`, which need the `nidcpower` package (not installed on the development PC).
+
+## 86. Battery Voltage Provider (Future Architecture) + PSU Sense Validation
+
+**Status:** architecture prepared, NOT active. Charge, Discharge, Monitor Battery, SafetyMonitor, EOC and EOD are unchanged: battery voltage is the DMM (PXI-4065, 2-wire, pre-fuse sense tap, optionally via `SenseRouter`). The PSU's own voltage is only recorded (`smu_measured_v`) and displayed.
+
+### Current flow
+
+`ChargeSequence`/`DischargeSequence`: `v = dmm.measure_dc_voltage()`; `i = smu.measure()["current_a"]`; `safety.check(v, i, ...)`; EOC `v >= voltage_limit_v and abs(i) <= CHARGE_CUTOFF_A`; EOD `v <= cutoff_v`. Pre-enable polarity/presence check also uses the DMM with SMU output disabled. CC/CV transition is not software: the SMU regulates internally against its `voltage_limit` using its sense setting (default LOCAL, never changed by the sequences).
+
+### What the PSU (NI PXI-4130 via NI-DCPower) can provide
+
+- `session.measure(VOLTAGE)` / `measure(CURRENT)`: ADC reading at the point selected by `session.sense` (LOCAL = output terminals, REMOTE = sense terminals). There is no simultaneous local+remote reading; they are separate acquisitions with a sense change between them.
+- Requires output enabled/initiated. Not available for the pre-enable check.
+- Update rate and accuracy depend on aperture time and range; not characterized on this rack. Compare against the DMM on the bench before relying on it (NI spec sheet for the 4130; not copied here).
+- Remote sense compensates only the path between the SMU output and wherever the sense leads land; open/wrong sense leads can cause compliance or uncontrolled output up to the range limit.
+
+Suitability (to be validated, not claimed): safety monitoring - usable only as a plausibility/second source, since it is blind with output disabled; charge control/EOC - plausible if sense lands at the battery side, accuracy to be bench-confirmed; discharge/EOD - same, sink mode behavior with remote sense unvalidated.
+
+### Prepared abstraction (`hardware/voltage_provider.py`, unused by real paths)
+
+`BatteryVoltageProvider.read_voltage()` + `source_name` + `available_with_output_disabled`; `DMMVoltageProvider` (today's behavior, wraps `read_battery_voltage_via_sense`); `PSUSenseVoltageProvider` (raises `NotImplementedError` on purpose).
+
+### Migration path (future, each step bench-validated)
+
+1. Inject a provider into `BatteryOperationSequence` (default `DMMVoltageProvider`) and replace the direct `dmm.measure_dc_voltage()` calls in charge/discharge/monitor/`_safe_final_voltage_reading`; behavior-identical for DMM.
+2. Wire SMU sense leads to the battery side, switched per position like the power relay; add `sense` configuration to `SMU._configure_current_source()`.
+3. Implement `PSUSenseVoltageProvider` via `smu.measure()` with `sense=REMOTE`.
+4. Replace the DMM-only pre-enable polarity/presence check (cannot use PSU sense) with a strategy for DMM-less systems (e.g. brief low-current enable with compliance limit), with its own safety review.
+5. Make `dmm` optional in `hardware_for_group()`/`_missing_hardware_roles()`; add provider selection in `BATTERY_GROUPS`.
+6. Keep a plausibility check (SMU local vs remote delta, DMM cross-check when present) and `DMM_MEASUREMENT_*`-style failure events for the PSU provider.
+
+### Implemented now: SMU "Sense Voltage Validation" (test.py)
+
+SMU device menu: `[1] Identity Validation  [2] Functional Validation  [3] Sense Voltage Validation`. `_run_hardware_category()` gained an optional `extra_validations` list (default None; other categories unchanged). `_sense_smu()` calls `SMU.measure_sense_comparison()`, which sources `Settings.CHARGE_VOLTAGE_V` twice via `source_dc_voltage_point(..., sense="local"/"remote")` (new optional kwarg, default None = session untouched) and prints PSU set voltage, PSU measured (LOCAL), PSU remote sense (REMOTE), and the difference. A failed REMOTE pass is reported as a WARNING with the local reading still shown, and forces `emergency_output_off()`. Output is verified OFF after every pass. Tests: `tests/test_voltage_provider_and_sense.py`. Not yet run on real hardware.
+
+### Risks of replacing the DMM with PSU sense
+
+No independent cross-check; no pre-enable measurement; lower-accuracy ADC (to be quantified); regulation and measurement share one device (a sense fault affects both control and decision); sense-lead integrity must be monitored; fuse/relay drops are compensated only if the sense leads land battery-side of them.
+
+### Remote sense preparation (configuration point + validation, DISABLED in production)
+
+- `SMU_ASSIGNMENTS[...]["sense_mode"]` (from the `PXI_SLOTS` entry; `None` for every entry today) -> `SMU._sense_mode`. `None` means the session's `sense` property is never touched (NI-DCPower default LOCAL), so charge/discharge/safety/production behavior is unchanged. `"local"`/`"remote"` makes `_configure_current_source()` apply it and verify it by readback. Anything else raises `SMUError` at construction.
+- `SMU.query_sense()` (read-only readback) and `SMU.check_remote_sense_accepted()` (output OFF: set REMOTE, commit, read back, restore previous).
+- SMU menu `[4] Remote Sense Validation` (`test.py::_remote_sense_smu`): shows configured vs actual sense and whether remote sense is enabled; PASS/FAIL on the PSU accepting REMOTE (verifies card/driver support, not wiring); optional energized no-battery check, PASS if REMOTE tracks LOCAL within `Settings.SMU_SENSE_WIRING_TOLERANCE_V` (50 mV, validation-only), FAIL on a failed/diverging REMOTE reading (open sense leads). It cannot verify that the sense leads land on the intended node; confirm with a handheld DMM. Not yet run on real hardware.
+- Still required to actually use remote sense: per-position SMU sense routing (hardware + `SENSE_ROUTING`), `PSUSenseVoltageProvider`, open-sense protection, bench validation. See the migration path above.
+
+
+## 87. Production Measurement Architecture (CURRENT IMPLEMENTATION)
+
+Confirmed from code (`charge_sequence.py`, `discharge_sequence.py`, `monitor_battery_scan_sequence.py`, `safety_monitor.py`, `hardware/smu.py`) and the PCB design docs (`pcb.md`, `hw/kicad/docs/PINOUT.md`). Remote sense is NOT used in production.
+
+**Voltage source = DMM (MAIN_DMM, PXI-4065, 2-wire DC volts).** Current source = SMU (AUX_SMU_1, PXI-4130) ADC, `smu.measure()["current_a"]`.
+
+| Decision | Voltage | Current |
+|---|---|---|
+| CC/CV transition | not a software decision: the SMU regulates internally against its `voltage_limit` at its own terminals (sense LOCAL, `sense` never set) | SMU setpoint |
+| EOC (`v >= voltage_limit_v and abs(i) <= CHARGE_CUTOFF_A`) | DMM | SMU |
+| EOD (`v <= cutoff_v`) | DMM | not used |
+| Safety (`SafetyMonitor.check`) | DMM | SMU (NTC for temperature) |
+| Polarity/presence pre-check (SMU output OFF) | DMM | n/a |
+| Monitor Battery | DMM (open before / closed dwell / open after) | not measured |
+| Logging | `voltage_v` = DMM; `dmm_measured_v`, `smu_measured_v` both stored; `current_a` = SMU | |
+
+The SMU's own voltage is recorded and displayed only; no decision uses it.
+
+**DMM measurement point:** the pre-fuse SENSE tap on the BLOSS Hub PCB (`TP_Bx` / `JSx` header; net `/BAT_x/SENSE`, branching off at the fuse input `Fx.pad2`), routed to the DMM through the sense relay (`SENSE_ROUTING[1]` = MATRIX_NUMATO_201 relay 1, logical `sense_channel: 1` for B1). In terms of the four candidates: closest to (1) battery-side voltage; NOT after the fuse (2), NOT after the position relay (3), NOT the PSU output (4). Included in the reading: battery connector and pre-fuse trunk drop (mV at ~1 A) and the cell's own internal-resistance drop under load. Excluded: fuse, position relay (MATRIX_NUMATO_202), PSU harness.
+
+```
+Power/current path (SMU current ADC measures here, series):
+ SMU 4130 OUT+ -> harness -> position relay (MATRIX_202) -> fuse 2A -> battery+ ; battery- -> V- -> SMU
+Voltage path used for decisions (DMM):
+ battery+ -> connector -> trunk -> SENSE tap (pre-fuse) -> sense relay (MATRIX_201 ch1) -> DMM 4065
+SMU regulation voltage (CC/CV): SMU output terminals (local sense) = V_bat + I*(harness+relay+fuse+trunk)
+```
+
+**Consequence:** EOC/EOD/safety are evaluated on battery-side voltage, so path drops do not stop a run early. The CC/CV phase is regulated at the PSU side, so with series resistance the SMU clamps earlier than the battery reaches the target (earlier loss of CC, EOC later or timeout). A ~0.8 ohm path resistance was characterized in an earlier B1 run (see Section 69/72 notes, bench-derived, not re-measured); `(smu_measured_v - dmm_measured_v) / current_a` from stored data gives the live value.
+
+**Not verified from the repository (bench items):** where the DMM LO lands (`V-` power return vs the isolated measurement `GND`); how the DMM is routed to the active position (a single `sense_channel` serves all 8 B1 positions); the end-to-end physical wiring between the `JSx` header and the relay/DMM. The "pre-fuse tap" statement is the PCB design intent as documented, not an end-to-end bench measurement.

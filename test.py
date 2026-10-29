@@ -152,7 +152,8 @@ def _discover_and_select(label: str, devices: dict, identify_fn):
     return name, devices[name], discovery_results
 
 
-def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn=None):
+def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn=None,
+                           extra_validations=None):
     """
     Shared bring-up workflow for every hardware category (SMU, DMM, DAQ,
     Temperature Module, Numato Relay Matrix, PXI Relay Matrix):
@@ -171,6 +172,12 @@ def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn
     for this category; otherwise it reports "not yet implemented" -- a
     deliberate placeholder, not a fake PASS (see docs/architecture.md,
     "Identity Validation vs Functional Validation").
+
+    `extra_validations` (default None -- every existing category unaffected),
+    if given, is a list of (menu label, fn(name, cfg)) pairs shown as
+    [3], [4], ... after Functional Validation (e.g. the SMU's "Sense
+    Voltage Validation"). Each fn returns a list of TestResult exactly
+    like functional_fn.
 
     Selecting a device only ever touches that one device -- no other SMU,
     DMM, DAQ, Temperature Module, or relay is read or written by this
@@ -212,6 +219,8 @@ def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn
         print(_menu_status.style(
             "[2] Functional Validation" + (" (future)" if functional_status == _menu_status.FUTURE else ""),
             functional_status))
+        for n, (extra_label, _extra_fn) in enumerate(extra_validations or [], 3):
+            print(f"[{n}] {extra_label}")
         print("[0] Back")
         try:
             raw = input("\nChoice: ").strip()
@@ -230,6 +239,9 @@ def _run_hardware_category(label: str, devices: dict, identify_fn, functional_fn
                 return []
             _print_device_config(name, cfg)
             return functional_fn(name, cfg)
+        if raw.isdigit() and 3 <= int(raw) < 3 + len(extra_validations or []):
+            _print_device_config(name, cfg)
+            return extra_validations[int(raw) - 3][1](name, cfg)
         print("Invalid choice.")
 
 
@@ -838,7 +850,9 @@ def test_smu():
     Validation vs Functional Validation".
     """
     devices = _pxi_slots_by_category("smu")
-    return _run_hardware_category("SMU", devices, _identify_smu, _functional_smu)
+    return _run_hardware_category("SMU", devices, _identify_smu, _functional_smu,
+                                  extra_validations=[("Sense Voltage Validation", _sense_smu),
+                                                     ("Remote Sense Validation", _remote_sense_smu)])
 
 
 def _functional_smu(name: str, cfg: dict):
@@ -1004,6 +1018,233 @@ def _functional_smu(name: str, cfg: dict):
         results.append(_warn("SMU Functional", name, config_ref,
                              "Cancelled by operator -- remaining validation steps not run"))
 
+    return results
+
+
+def _sense_smu(name: str, cfg: dict):
+    """
+    SMU Sense Voltage Validation -- laboratory-only diagnostic. Shows, side
+    by side, the PSU set voltage, the voltage the PSU measures with LOCAL
+    sense (output terminals) and the voltage it measures with REMOTE sense
+    (sense terminals), so the operator can see how much the path between
+    the PSU and the sense point drops. Informational only: nothing here
+    changes which instrument charge/discharge/monitor use for battery
+    voltage (still the DMM -- see docs/architecture.md "Battery Voltage
+    Provider (Future Architecture)").
+
+    Same setpoints as _functional_smu (Settings.CHARGE_VOLTAGE_V /
+    CHARGE_CURRENT_A / BAT_VOLTAGE_MAX), no relay, no battery. Output is
+    enabled only inside hardware/smu.py::SMU.measure_sense_comparison(),
+    which always ends with output disabled and verified OFF; this wrapper
+    also ends with emergency_output_off() on every exit path.
+    """
+    resource   = cfg.get("resource", "")
+    model      = cfg.get("model", "NI-SMU")
+    display    = dev_cfg.device_display_name(cfg)
+    config_ref = f"{resource} / {model}"
+    module     = "SMU Sense Voltage"
+
+    validation_v    = Settings.CHARGE_VOLTAGE_V
+    current_limit_a = Settings.CHARGE_CURRENT_A
+    range_v         = Settings.BAT_VOLTAGE_MAX
+
+    print(f"\nSMU Sense Voltage Validation -- {display} ({config_ref})")
+    print(f"Test voltage (Settings.CHARGE_VOLTAGE_V): {validation_v:.3f} V")
+    print(f"Current limit (Settings.CHARGE_CURRENT_A): {current_limit_a:.3f} A")
+    print("\nThe output is enabled twice (LOCAL sense, then REMOTE sense), no battery.")
+    print("For a meaningful REMOTE reading, connect the SMU sense terminals to the")
+    print("same node as the output (or the point you want to observe). Open sense")
+    print("leads in REMOTE mode are reported as a failed remote reading, not a PASS.")
+    try:
+        input("Press Enter when ready to begin (Ctrl+C to cancel)... ")
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled before sourcing -- output was never enabled.")
+        return [_warn(module, display, config_ref, "Cancelled by operator before sourcing began")]
+
+    smu = _instrumented_smu(cfg)
+    try:
+        smu.connect()
+    except Exception as e:
+        return [_fail(module, display, config_ref, f"[ERROR] SMU connect failed: {e}")]
+
+    results = []
+    try:
+        if not smu.emergency_output_off("SMU Sense Voltage Validation: pre-check safe state"):
+            results.append(_fail(module, display, config_ref,
+                                 "[ERROR] Could not verify a safe starting state -- "
+                                 "output disable/verify failed before sourcing began"))
+            return results
+        try:
+            cmp_ = smu.measure_sense_comparison(validation_v, current_limit_a, range_v)
+        except Exception as e:
+            results.append(_fail(module, display, config_ref, f"[ERROR] {e}"))
+            return results
+
+        local, remote = cmp_["local"], cmp_["remote"]
+        print("\nPSU voltage comparison:")
+        print(f"    PSU set voltage (readback):        {local['readback_v']:.6f} V")
+        print(f"    PSU measured voltage (LOCAL):      {local['measured_v']:.6f} V")
+        if remote is not None:
+            delta = remote["measured_v"] - local["measured_v"]
+            print(f"    PSU remote sense voltage (REMOTE): {remote['measured_v']:.6f} V")
+            print(f"    Remote - Local:                    {delta * 1000:+.3f} mV")
+            print(f"    Current (local / remote):          {local['measured_i']:.6f} A / "
+                  f"{remote['measured_i']:.6f} A")
+            results.append(_ok(module, display, config_ref,
+                               f"Set {local['readback_v']:.6f} V | local {local['measured_v']:.6f} V | "
+                               f"remote {remote['measured_v']:.6f} V (delta {delta * 1000:+.3f} mV) "
+                               f"(informational; verify against handheld DMM)"))
+        else:
+            print(f"    PSU remote sense voltage (REMOTE): NOT AVAILABLE -- {cmp_['remote_error']}")
+            results.append(_warn(module, display, config_ref,
+                                 f"Local {local['measured_v']:.6f} V; remote sense reading failed -- "
+                                 f"{cmp_['remote_error']}"))
+    finally:
+        safe = smu.emergency_output_off("SMU Sense Voltage Validation complete/cancelled/failed")
+        if not safe:
+            results.append(_fail(module, display, config_ref,
+                                 "[ERROR] Output disable could not be verified -- "
+                                 "physically check the SMU output"))
+        try:
+            smu.zero_output_setpoint_best_effort("SMU Sense Voltage Validation complete/cancelled/failed")
+        except Exception:
+            pass
+        try:
+            smu.disconnect()
+        except Exception:
+            pass
+    return results
+
+
+def _remote_sense_smu(name: str, cfg: dict):
+    """
+    SMU Remote Sense Validation -- prepares for FUTURE remote-sense use; no
+    production workflow uses remote sense today (see docs/architecture.md
+    "Battery Voltage Provider (Future Architecture)").
+
+    1. Configuration: shows the configured sense_mode (config/devices.py,
+       None = untouched/LOCAL default) and the session's actual sense
+       readback, and whether remote sense is therefore enabled.
+    2. Acceptance (output OFF, sources nothing): PASS if the card/driver
+       accepts sense=REMOTE and reads it back; the previous setting is
+       restored. CAN verify: driver/card support. CANNOT verify: wiring.
+    3. Optional energized wiring check (no battery, same setpoints as
+       Functional Validation): PASS if the REMOTE reading tracks the LOCAL
+       reading within Settings.SMU_SENSE_WIRING_TOLERANCE_V at ~0 A.
+       CAN detect: open/floating sense leads (error or divergence).
+       CANNOT detect: sense leads landing on the wrong node that happens to
+       carry the same voltage at no load -- confirm with a handheld DMM at
+       the intended sense point.
+    """
+    resource   = cfg.get("resource", "")
+    model      = cfg.get("model", "NI-SMU")
+    display    = dev_cfg.device_display_name(cfg)
+    config_ref = f"{resource} / {model}"
+    module     = "SMU Remote Sense"
+    results    = []
+
+    print(f"\nSMU Remote Sense Validation -- {display} ({config_ref})")
+    smu = _instrumented_smu(cfg)
+    try:
+        smu.connect()
+    except Exception as e:
+        return [_fail(module, display, config_ref, f"[ERROR] SMU connect failed: {e}")]
+
+    try:
+        if not smu.emergency_output_off("SMU Remote Sense Validation: pre-check safe state"):
+            results.append(_fail(module, display, config_ref,
+                                 "[ERROR] Could not verify a safe starting state -- "
+                                 "output disable/verify failed"))
+            return results
+
+        configured = smu.sense_mode
+        actual = smu.query_sense()
+        enabled = (configured == "remote") or (actual == "remote")
+        print("\nSense configuration:")
+        print(f"    Configured sense_mode (config): {configured if configured else 'not set (session default)'}")
+        print(f"    Session sense (readback):       {actual if actual else 'UNKNOWN'}")
+        print(f"    Remote sense enabled:           {'YES' if enabled else 'NO'}")
+        if actual is not None:
+            results.append(_ok(module, display, config_ref,
+                               f"Configured={configured or 'default'}, session={actual}, "
+                               f"remote sense {'ENABLED' if enabled else 'not enabled'}"))
+        else:
+            results.append(_warn(module, display, config_ref,
+                                 f"Configured={configured or 'default'}; session sense could not be read"))
+
+        try:
+            acc = smu.check_remote_sense_accepted()
+        except Exception as e:
+            results.append(_fail(module, display, config_ref, f"[ERROR] Acceptance check: {e}"))
+            return results
+        print("\nRemote sense acceptance (output OFF):")
+        print(f"    Accepted:  {'YES' if acc['accepted'] else 'NO'} (readback {acc['readback']}, "
+              f"restored to {acc['previous']})")
+        if acc["error"]:
+            print(f"    Error:     {acc['error']}")
+        if acc["accepted"]:
+            results.append(_ok(module, display, config_ref,
+                               "PSU accepts remote sense configuration (readback verified)"))
+        else:
+            results.append(_fail(module, display, config_ref,
+                                 f"PSU did not accept remote sense -- "
+                                 f"{acc['error'] or 'readback ' + str(acc['readback'])}"))
+            return results
+
+        print("\nAn energized wiring check sources "
+              f"{Settings.CHARGE_VOLTAGE_V:.3f} V (limit {Settings.CHARGE_CURRENT_A:.3f} A), "
+              "no battery, LOCAL then REMOTE.")
+        print("Not verifiable here: that the sense leads land on the intended node.")
+        try:
+            answer = input("Run energized wiring check? [y/N] (Ctrl+C to skip): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            answer = ""
+            print()
+        if answer != "y":
+            results.append(_warn(module, display, config_ref,
+                                 "Energized wiring check skipped -- sense wiring NOT validated"))
+            return results
+
+        try:
+            cmp_ = smu.measure_sense_comparison(Settings.CHARGE_VOLTAGE_V, Settings.CHARGE_CURRENT_A,
+                                                Settings.BAT_VOLTAGE_MAX)
+        except Exception as e:
+            results.append(_fail(module, display, config_ref, f"[ERROR] {e}"))
+            return results
+        local, remote = cmp_["local"], cmp_["remote"]
+        print("\nEnergized wiring check:")
+        print(f"    PSU measured voltage (LOCAL):      {local['measured_v']:.6f} V")
+        if remote is None:
+            print(f"    PSU remote sense voltage (REMOTE): NOT AVAILABLE -- {cmp_['remote_error']}")
+            results.append(_fail(module, display, config_ref,
+                                 f"Remote sense reading failed (open/unwired sense leads?) -- "
+                                 f"{cmp_['remote_error']}"))
+        else:
+            delta = remote["measured_v"] - local["measured_v"]
+            tol = Settings.SMU_SENSE_WIRING_TOLERANCE_V
+            print(f"    PSU remote sense voltage (REMOTE): {remote['measured_v']:.6f} V")
+            print(f"    Remote - Local:                    {delta * 1000:+.3f} mV (tolerance +/-{tol * 1000:.0f} mV)")
+            if abs(delta) <= tol:
+                results.append(_ok(module, display, config_ref,
+                                   f"Remote tracks local within {tol * 1000:.0f} mV ({delta * 1000:+.3f} mV) -- "
+                                   f"sense leads connected; confirm node with handheld DMM"))
+            else:
+                results.append(_fail(module, display, config_ref,
+                                     f"Remote differs from local by {delta * 1000:+.3f} mV "
+                                     f"(> +/-{tol * 1000:.0f} mV) -- check sense wiring"))
+    finally:
+        if not smu.emergency_output_off("SMU Remote Sense Validation complete/cancelled/failed"):
+            results.append(_fail(module, display, config_ref,
+                                 "[ERROR] Output disable could not be verified -- "
+                                 "physically check the SMU output"))
+        try:
+            smu.zero_output_setpoint_best_effort("SMU Remote Sense Validation complete/cancelled/failed")
+        except Exception:
+            pass
+        try:
+            smu.disconnect()
+        except Exception:
+            pass
     return results
 
 

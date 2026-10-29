@@ -392,6 +392,10 @@ SMU_ASSIGNMENTS = {
         # field above, not a second copy of PXI_SLOTS -- None if the source
         # entry never set it (no capability data available for that card).
         "max_current_a":     cfg.get("max_current_a"),
+        # FUTURE remote sense -- None (untouched session default, i.e.
+        # LOCAL) unless a PXI_SLOTS entry explicitly sets "sense_mode" to
+        # "local"/"remote". No entry sets it today. See hardware/smu.py.
+        "sense_mode":        cfg.get("sense_mode"),
     }
     for cfg in _slots_by_category("smu").values()
 }
